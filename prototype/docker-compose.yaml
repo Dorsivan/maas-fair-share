@@ -1,0 +1,33 @@
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    ports:
+      - "8080:8080"
+      - "9901:9901"
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+    command: envoy -c /etc/envoy/envoy.yaml --log-level info
+    depends_on:
+      wfq-service:
+        condition: service_started
+      mock-llm:
+        condition: service_started
+
+  wfq-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.wfq
+    ports:
+      - "50051:50051"
+    environment:
+      - LOG_LEVEL=INFO
+      - WFQ_QUEUE_TIMEOUT=30
+    volumes:
+      - ./config.yaml:/app/wfq_service/config.yaml:ro
+
+  mock-llm:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock
+    ports:
+      - "8000:8000"

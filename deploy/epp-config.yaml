@@ -1,0 +1,119 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-epp-config
+  namespace: llm            # set to the serving namespace
+data:
+  epp: |
+    apiVersion: llm-d.ai/v1
+    kind: EndpointPickerConfig
+    featureGates: [flowControl]
+    plugins:
+      - type: maas-weighted-fairness
+        name: maas-fairness
+        parameters:
+          identityHeader: x-maas-subscription-id   # lowercase; set by Kuadrant AuthPolicy
+
+          # Weights sum to 100 so each number reads as a guaranteed floor.
+          # First match wins: explicit applications before the prefix catch-all.
+          # DO NOT FINALISE these until the shadow-mode traffic-shape table is read --
+          # they are coupled to the cost weights below.
+          groups:
+            - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+            - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+            - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+          defaultGroup: { name: unclassified, weight: 5 }
+
+          # false = account and emit every metric, but let FCFS decide. Deploy this way
+          # first. Flip only after the shadow period.
+          enforce: false
+          stateLogIntervalSeconds: 30    # flight-recorder log cadence; 0 disables
+
+          # The averaging window. NOT the tightness dial.
+          # A half-life is not a window: 60s still remembers 25% of two minutes ago.
+          # Matching a hard W-second sliding window gives H ~= W/3 (so "1 minute" is
+          # ~20s), BUT that loses to the duration floor: requests take 10-30s here,
+          # and at H=20 a 30s request's provisional charge decays to 35% before it
+          # completes. 60 is near the FLOOR of the sane range, not the middle.
+          # If shadow data looks noisy, move UP to 120. Never down.
+          halfLifeSeconds: 60
+
+          # Additional half-lives to ACCOUNT AND REPORT but not act on. These observe
+          # the ACTUAL request stream through a different smoothing window -- they are
+          # NOT a counterfactual simulation of what that window would have decided.
+          # Read during shadow mode, when the stream is unshaped by any half-life.
+          # 120 is the live alternative if 60 proves noisy; 20 is kept as a CONTROL.
+          observedHalfLivesSeconds: [20, 120]
+
+          # Which resource the tab is denominated in. "tokens" matches the Kuadrant
+          # ceiling and every vLLM dashboard. "vramtime" (= O*(P+O/2), KV residency)
+          # is specified but NOT enabled -- see docs/design.md Part 3 item 9.
+          costModel: tokens
+
+          inputTokenWeight: 1.0
+          # CALIBRATE THIS, don't inherit it. 2.0 is a convention with no physical
+          # basis: prefill and decode cost ~the same FLOPs/token, and the real ratio
+          # is an EFFICIENCY ratio (prefill chunk size / decode batch size), plausibly
+          # 5-20x at typical batch sizes. Commercial APIs price output at 3-5x.
+          # Run the two-profile guidellm experiment in docs/design.md BEFORE shadow
+          # mode -- it changes the unit every later number is read in.
+          outputTokenWeight: 2.0   # PLACEHOLDER until calibrated
+
+          # Discount DISABLED to start. It sets the UNIT the floor is denominated in,
+          # only matters where groups' hit rates DIFFER, and is coupled to the group
+          # weights above. 1.0 matches Kuadrant, which does not discount cached
+          # tokens. Wrong-low breaks other tenants' floors; wrong-high only
+          # under-serves the cacheable tenant -- fail in the second direction.
+          # NEVER 0: that is an exemption, not a discount.
+          cachedInputTokenWeight: 1.0
+
+          # Stops a returning-idle tenant claiming retroactive credit. Exposed as a
+          # flag ONLY so load-test P4 can run both ways -- read the OTHER tenants'
+          # throughput during the transition, not the newcomer's. Turning it off
+          # re-couples fairness to idleness and breaks work conservation.
+          newcomerClamp: true
+
+          provisionalCharge: true
+          # Fallback only. The real output estimate is min(max_tokens, per-group EWMA
+          # of observed output tokens); this applies when neither is available.
+          defaultEstimatedOutputTokens: 512
+          # ~4 chars/token holds for Latin-script prose. CJK is ~1-2 and multimodal is
+          # unrelated to byte size -- both appear as a PERSISTENT BIAS (not noise) in
+          # truing_error_tokens. The tokenizer is deliberately never invoked.
+          estimatedBytesPerToken: 4
+
+          agingTokensPerSecond: 0
+          evictionTtlSeconds: 3600
+          evictionSweepSeconds: 300
+
+      # scheduling profile unchanged from the KServe default
+      - type: single-profile-handler
+      - type: queue-scorer
+      - type: kv-cache-utilization-scorer
+      - type: prefix-cache-scorer
+      - type: max-score-picker
+
+    # Fairness is INTRA-BAND only, so every weighted tenant must share one priority.
+    # Both defaultPriorityBand and the explicit band are set so stray traffic on
+    # another priority is still weighted within its band.
+    # Deliberately no usageLimitPolicyPluginRef: ComputeLimit gates whole bands, and
+    # with every tenant in one band it can only gate all or none.
+    flowControl:
+      # Keep within ~2x of halfLifeSeconds. If requests are shed before the policy can
+      # rebalance toward them, the shed rate becomes the real allocator.
+      defaultRequestTTL: 60s
+      defaultPriorityBand:
+        fairnessPolicyRef: maas-fairness
+        orderingPolicyRef: fcfs-ordering-policy
+      priorityBands:
+        - priority: 0
+          fairnessPolicyRef: maas-fairness
+          maxRequests: "5000"
+
+    schedulingProfiles:
+      - name: default
+        plugins:
+          - { pluginRef: queue-scorer, weight: 2.0 }
+          - { pluginRef: kv-cache-utilization-scorer, weight: 2.0 }
+          - { pluginRef: prefix-cache-scorer, weight: 3.0 }
+          - { pluginRef: max-score-picker }

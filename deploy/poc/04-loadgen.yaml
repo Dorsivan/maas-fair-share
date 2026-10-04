@@ -1,0 +1,147 @@
+# Contention generator: three tenants, IDENTICAL load each, all through the
+# gateway so every request traverses Envoy's ext_proc filter and the plugin.
+#
+# Identical load is the whole point. If the tenants send different volumes the
+# result is confounded by work conservation -- a tenant that gets less than its
+# weight because it ASKED for less is correct behaviour and proves nothing.
+# Only when all three are individually capable of saturating the pool does the
+# delivered ratio mean anything.
+#
+# Sizing: the backend is 2 sim replicas x --max-num-seqs 4 = 8 concurrent
+# slots. 3 tenants x 32 workers = 96 in flight, a ~12x over-offer. That margin
+# is the point -- see the WORKERS comment below for why a merely-saturating
+# load produces an equal split and looks like a broken policy.
+#
+# end-users rotates across EIGHT DISTINCT subscription IDs. That is a test,
+# not decoration: all eight must collapse to the single `end-users` flow via
+# the prefix rule. If grouping were broken they would appear as twelve separate
+# queues each holding weight 65, and end users would receive 8x their share.
+#
+# Run it twice -- once with enforce:false (the FCFS control) and once with
+# enforce:true -- and diff the same counters across the two runs.
+#   oc apply -f deploy/poc/04-loadgen.yaml
+#   oc wait --for=condition=complete job/maas-loadgen -n maas-fairness-poc --timeout=10m
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-loadgen
+  namespace: maas-fairness-poc
+data:
+  run.sh: |
+    #!/bin/bash
+    GW="http://maas-poc-gateway-data-science-gateway-class.maas-fairness-poc.svc.cluster.local"
+    DURATION="${DURATION:-180}"
+    WORKERS="${WORKERS:-12}"
+    END=$(( $(date +%s) + DURATION ))
+
+    # A prompt long enough that prompt tokens are not noise next to output
+    # tokens, and long enough that the bytes/4 estimator is exercised on
+    # something realistic rather than a ten-word string.
+    PROMPT=""
+    for _ in $(seq 1 300); do PROMPT="${PROMPT}the quick brown fox "; done
+
+    # Every response's HTTP status is recorded. This is NOT optional bookkeeping:
+    # `curl -sS` treats a 503 as a perfectly good request and says nothing, so a
+    # run where the backend rejected everything looks identical to a healthy one
+    # -- fast, silent, and completely meaningless. An earlier run of this POC did
+    # exactly that, and only the plugin's own
+    # maas_fairness_requests_without_usage_total gave it away. Tally the codes
+    # here so the generator can indict itself without needing the EPP.
+    OUT=/tmp/codes
+    mkdir -p "$OUT"
+
+    worker() {
+      local sub="$1" group="$2" code
+      while [ "$(date +%s)" -lt "$END" ]; do
+        code=$(curl -sS -o /dev/null -m 180 -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+          -H 'Content-Type: application/json' \
+          -H "x-maas-subscription-id: $sub" \
+          -d "{\"model\":\"llama-3-1-8b\",\"max_tokens\":200,\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" \
+          2>/dev/null) || code=000
+        echo "$code" >> "$OUT/$group"
+      done
+    }
+
+    echo "load: ${WORKERS} workers/tenant for ${DURATION}s"
+    for i in $(seq 1 "$WORKERS"); do
+      worker "app1-production" app1 &
+      worker "app2-batch"      app2 &
+      # Distinct subscription per worker -- all must collapse to `end-users`.
+      worker "end-user-$i"     end-users &
+    done
+    wait
+
+    echo "load: done. HTTP status tally per tenant:"
+    for f in "$OUT"/*; do
+      printf '  %-12s total=%-6s ' "$(basename "$f")" "$(wc -l < "$f")"
+      sort "$f" | uniq -c | sort -rn | awk '{printf "%s=%s ", $2, $1}'
+      echo
+    done
+    echo "A run is only meaningful if these are overwhelmingly 200."
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: maas-loadgen
+  namespace: maas-fairness-poc
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "/script/run.sh"]
+          env:
+            - name: DURATION
+              # Several half-lives (halfLifeSeconds: 60). The tabs start empty
+              # after every EPP restart, so a run shorter than ~3 half-lives
+              # measures the warm-up rather than the equilibrium.
+              value: "240"
+            - name: WORKERS
+              # 32 per tenant = 96 offered against 8 backend slots.
+              #
+              # This number is the single easiest thing to get wrong. At 8
+              # workers/tenant the pool reported saturation and the policy was
+              # consulted, but queue depths sat at 1-4 items -- and a weighted
+              # queue can only apportion work that is actually QUEUED. With
+              # barely more backlog than there are slots, every group gets
+              # served almost immediately and the measured split comes out at
+              # equal thirds no matter what the weights say. That reads exactly
+              # like a broken policy and is really an under-offered load.
+              #
+              # The generator is closed-loop, so a tenant's offered load is
+              # capped by its worker count: it cannot exceed WORKERS requests
+              # in flight however favourably it is scheduled. Each tenant needs
+              # enough workers to saturate the pool ON ITS OWN, or the result
+              # is confounded by work conservation.
+              value: "32"
+          volumeMounts:
+            - name: script
+              mountPath: /script
+          resources:
+            # Deliberately small. This cluster has two Ready workers at ~98%
+            # CPU requested, so anything larger simply never schedules. It is
+            # enough: the simulator's latency is sleeps rather than compute, so
+            # a CPU-starved generator slows all three tenants equally and the
+            # RATIO -- the thing under test -- is unaffected.
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: script
+          configMap:
+            name: maas-loadgen
+            defaultMode: 0755

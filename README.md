@@ -4,7 +4,21 @@ A fairness policy plugin for the **llm-d Router (EPP)** that guarantees each Maa
 subscription a minimum share of a shared model's token throughput **when the model is
 saturated**, and imposes no limit at all when it isn't.
 
-> Status: **design complete, implementation not started.**
+> Status: **implemented, and validated end to end on a GPU-free OpenShift cluster.**
+>
+> The plugin builds into a custom EPP image, loads, and under real contention
+> divides delivered tokens according to the configured weights — measured at
+> 23.8% / 13.5% / 62.8% against a configured 20 / 10 / 65, reproducible across
+> runs, versus equal thirds in shadow mode. Unit tests pass under `-race`.
+>
+> Not yet done: `outputTokenWeight` is still the uncalibrated `2.0` placeholder
+> (the calibration needs GPUs), the cached-token discount path is unexercised
+> (the simulator reports `cached_tokens: 0`), and the production
+> `deploy/llmisvc.yaml` path has not been applied. One open question — the
+> newcomer clamp measurably *hurt* the split in this environment.
+>
+> Full write-up, including the pitfalls that produced healthy-looking runs that
+> measured nothing: **[docs/poc-results.md](docs/poc-results.md)**.
 
 ## The problem
 

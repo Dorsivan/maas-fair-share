@@ -1,0 +1,64 @@
+# A Gateway and HTTPRoute of our own, rather than attaching to the shared
+# data-science-gateway in openshift-ingress.
+#
+# That gateway's listener restricts allowedRoutes to the openshift-ingress and
+# redhat-ods-applications namespaces, so admitting this POC would mean editing
+# a resource RHOAI owns. A throwaway Gateway on the same GatewayClass proves
+# the same thing and can be deleted with the namespace.
+#
+# The InferencePool backendRef is what matters here: the gateway controller
+# sees it, reads the pool's endpointPickerRef, and wires Envoy's ext_proc
+# filter to our EPP. That is the ONLY reason the fairness policy is consulted
+# at all -- route straight to the Service instead and every request bypasses
+# the plugin while still returning perfectly good completions.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-poc-gateway
+  namespace: maas-fairness-poc
+spec:
+  gatewayClassName: data-science-gateway-class
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: maas-poc-route
+  namespace: maas-fairness-poc
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: maas-poc-gateway
+  rules:
+    - name: v1-chat-completions
+      matches:
+        - path:
+            type: PathPrefix
+            value: /v1/chat/completions
+      backendRefs:
+        # The ALPHA group, deliberately -- see the long comment on the second
+        # InferencePool in 02-epp.yaml. This cluster's gateway controller
+        # rejects a v1 InferencePool backendRef outright
+        # ("referencing unsupported backendRef ... kind InferencePool"), while
+        # the EPP itself only watches v1. Both pools exist; the route points at
+        # the one the gateway understands.
+        - group: inference.networking.x-k8s.io
+          kind: InferencePool
+          name: maas-pool
+          port: 8000
+          weight: 1
+      timeouts:
+        # Generation is slow by design in this POC so requests overlap. The
+        # default 30s request timeout would cut them off mid-stream and the
+        # true-up would never run, which is precisely the accounting path
+        # under test.
+        backendRequest: 0s
+        request: 0s

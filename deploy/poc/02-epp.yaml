@@ -1,0 +1,261 @@
+# POC deployment of the custom EPP, standing in for what KServe would otherwise
+# template from its scheduler preset.
+#
+# Why not an LLMInferenceService here: that path insists on a real GPU model
+# server. Running the EPP directly against the simulator isolates the thing
+# under test -- the fairness policy -- from KServe's templating. The production
+# shape is deploy/llmisvc.yaml and overrides only the image; nothing in this
+# file should drift into it.
+#
+# Note the args below are deliberately close to what the RHOAI scheduler preset
+# templates, so a difference in behaviour between POC and production is a
+# difference in KServe's wiring rather than in ours.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maas-epp
+  namespace: maas-fairness-poc
+---
+# Mirrors the upstream EPP Role (deploy/components/inference-gateway/rbac.yaml).
+# Both the legacy x-k8s.io group and the llm-d.ai group are granted: this
+# cluster has BOTH sets of CRDs installed, and the EPP logs that it prefers the
+# new group and ignores the legacy ones -- but it still watches both, so a
+# missing permission on either shows up as a startup error.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: maas-epp
+  namespace: maas-fairness-poc
+rules:
+  - apiGroups: ["inference.networking.x-k8s.io"]
+    resources: ["inferencepools", "inferenceobjectives", "inferencemodelrewrites"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["inference.networking.k8s.io"]
+    resources: ["inferencepools"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: ["llm-d.ai"]
+    resources: ["inferenceobjectives", "inferencemodelrewrites"]
+    verbs: ["get", "watch", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: maas-epp
+  namespace: maas-fairness-poc
+subjects:
+  - kind: ServiceAccount
+    name: maas-epp
+    namespace: maas-fairness-poc
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: maas-epp
+---
+# Cluster-scoped: the EPP calls TokenReview and SubjectAccessReview to
+# authorise /metrics requests (--metrics-endpoint-auth defaults to true). These
+# are non-namespaced APIs, so a Role cannot grant them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: maas-epp-auth-delegator
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maas-epp-auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: maas-epp
+    namespace: maas-fairness-poc
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: maas-epp-auth-delegator
+---
+# The pool the EPP watches. Its selector is how the EPP discovers which pods
+# are candidate endpoints; targetPorts is where it scrapes their metrics.
+apiVersion: inference.networking.k8s.io/v1
+kind: InferencePool
+metadata:
+  name: maas-pool
+  namespace: maas-fairness-poc
+spec:
+  selector:
+    matchLabels:
+      app: maas-sim
+  targetPorts:
+    - number: 8000
+  endpointPickerRef:
+    name: maas-epp
+    port:
+      number: 9002
+    # FailOpen matches the KServe preset. It is the right default -- a dead EPP
+    # should not take the model offline -- but it is also why an EPP restart
+    # means seconds of NO fairness rather than degraded fairness.
+    failureMode: FailOpen
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maas-epp
+  namespace: maas-fairness-poc
+  labels:
+    app: maas-epp
+spec:
+  # One replica, always. All tabs are in-process; a second replica would not
+  # share state, it would shard it, and both would over-dispatch.
+  replicas: 1
+  # Recreate, not the default RollingUpdate, and this is a correctness
+  # requirement rather than a scheduling convenience. RollingUpdate with
+  # maxSurge: 25% rounds up to 1, so for a few seconds TWO EPPs run at once --
+  # precisely the split-brain the replicas: 1 comment above forbids. Each would
+  # see part of each tenant's traffic, judge that tenant under its share, and
+  # both would over-dispatch.
+  #
+  # The cost is a few seconds with no EPP at all. That is the strictly better
+  # failure: the pool's endpointPickerRef is failureMode: FailOpen, so those
+  # requests bypass fairness entirely instead of being actively misallocated.
+  # Briefly unfair beats briefly wrong.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: maas-epp
+  template:
+    metadata:
+      labels:
+        app: maas-epp
+        # The PodMonitor selects on this.
+        kserve.io/component: router-scheduler
+    spec:
+      serviceAccountName: maas-epp
+      containers:
+        - name: main
+          image: image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp:latest
+          imagePullPolicy: Always
+          args:
+            - --pool-name
+            - maas-pool
+            - --pool-namespace
+            - maas-fairness-poc
+            - --pool-group
+            - inference.networking.k8s.io
+            - --config-file
+            - /config/epp
+            - --zap-encoder
+            - json
+            - --grpc-port
+            - "9002"
+            - --grpc-health-port
+            - "9003"
+            # The simulator serves plaintext, so the EPP's own ext_proc server
+            # is plaintext here too. KServe turns this on in production.
+            - --secure-serving=false
+            # Exercises the same compatibility shim the RHOAI preset triggers
+            # (see registerDownstreamCompatFlags in cmd/epp/main.go). Harmless
+            # here, and it means the POC fails if that shim ever regresses.
+            - --model-server-metrics-scheme=http
+          ports:
+            - containerPort: 9002
+              name: grpc
+            - containerPort: 9003
+              name: grpc-health
+            - containerPort: 9090
+              name: metrics
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+          livenessProbe:
+            grpc:
+              port: 9003
+              service: liveness
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            grpc:
+              port: 9003
+              service: readiness
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: config
+          configMap:
+            name: maas-epp-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maas-epp
+  namespace: maas-fairness-poc
+spec:
+  selector:
+    app: maas-epp
+  ports:
+    - name: grpc
+      port: 9002
+      targetPort: 9002
+      appProtocol: http2
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+# The SAME pool, expressed in the legacy alpha group.
+#
+# This duplicate is not redundancy, it is a version mismatch between two
+# controllers that both have to agree on this object:
+#
+#   - The EPP watches inference.networking.k8s.io/v1. Its --pool-group flag
+#     documents that as the only supported value.
+#   - This cluster's gateway controller (openshift.io/gateway-controller/v1)
+#     only resolves InferencePool backendRefs in the OLD x-k8s.io group. Point
+#     an HTTPRoute at the v1 pool and it is rejected outright with
+#     "referencing unsupported backendRef ... kind InferencePool".
+#
+# So the v1 pool above drives endpoint discovery, and this one gives the
+# gateway something it will accept so it wires Envoy's ext_proc filter to our
+# EPP. Both must describe the same backends and the same EPP or traffic and
+# accounting diverge silently.
+#
+# Note the schema differs beyond the group name -- extensionRef rather than
+# endpointPickerRef, a flat selector, and targetPortNumber rather than a
+# targetPorts list. Delete this once the gateway controller supports v1.
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferencePool
+metadata:
+  name: maas-pool
+  namespace: maas-fairness-poc
+spec:
+  selector:
+    app: maas-sim
+  targetPortNumber: 8000
+  extensionRef:
+    name: maas-epp
+    portNumber: 9002
+    failureMode: FailOpen

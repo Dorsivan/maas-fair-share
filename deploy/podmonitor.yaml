@@ -1,0 +1,66 @@
+# Scrapes the EPP's metrics port into OpenShift user-workload monitoring.
+#
+# PREREQUISITE, and it is not optional: user-workload monitoring must be on, or
+# this object is accepted by the API server and then silently ignored forever.
+# Check and enable with:
+#
+#   oc -n openshift-monitoring get cm cluster-monitoring-config \
+#     -o jsonpath='{.data.config\.yaml}' | grep enableUserWorkload
+#
+#   # if absent or false, add to the config.yaml key:
+#   enableUserWorkload: true
+#
+# PodMonitor rather than ServiceMonitor deliberately. KServe's EPP Service
+# exposes only the gRPC port (9002) for Envoy's ext_proc; the metrics port is
+# on the pod and not in the Service, so a ServiceMonitor has nothing to select.
+#
+# Scraping the POD also matters for correctness here: the EPP runs replicas: 1
+# with all fairness state in process, so there is exactly one source of truth.
+# If this is ever scaled out, per-pod series stop being comparable -- each pod
+# would hold its own partial view of every tenant's tab.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: maas-epp
+  namespace: maas-fairness-poc
+  labels:
+    app.kubernetes.io/name: maas-epp
+spec:
+  selector:
+    matchLabels:
+      # KServe labels the scheduler pod with the LLMInferenceService name and
+      # kserve.io/component: router-scheduler. Confirm against the live pod
+      # before trusting this -- a selector that matches nothing produces no
+      # error anywhere, just empty graphs:
+      #   oc get pod -n maas-fairness-poc --show-labels | grep scheduler
+      kserve.io/component: router-scheduler
+  podMetricsEndpoints:
+    - port: metrics          # the name from the scheduler preset's containerPort
+      path: /metrics
+      interval: 15s
+      # THE SCHEME IS DECIDED BY --metrics-cert-dir, AND BY NOTHING ELSE.
+      # Verified in upstream pkg/epp/server/metrics_tls_test.go and
+      # cmd/.../main.go: "Empty serves metrics over HTTP". In particular it is
+      # NOT governed by --secure-serving, which covers only the ext_proc gRPC
+      # server -- an easy and costly conflation, because an EPP can be serving
+      # ext_proc over TLS while its metrics port is plaintext.
+      #
+      # So check the live pod before trusting this line:
+      #   oc get pod -n maas-fairness-poc <scheduler-pod> \
+      #     -o jsonpath='{.spec.containers[0].args}' | tr ',' '\n' | grep metrics-cert
+      # Absent  -> scheme: http, delete the tlsConfig block.
+      # Present -> keep https as below.
+      # Getting this wrong yields connection errors in the Prometheus targets
+      # page and empty graphs everywhere else. deploy/poc/ runs WITHOUT a cert
+      # dir, i.e. plaintext.
+      scheme: https
+      tlsConfig:
+        # Self-signed unless the cert dir is fed by the cluster's service CA.
+        # Replace with a `ca` reference once it is.
+        insecureSkipVerify: true
+      # Satisfies --metrics-endpoint-auth=true. The token is the one minted in
+      # deploy/rbac.yaml; without it every scrape gets 401 and, again, the only
+      # symptom is empty graphs.
+      bearerTokenSecret:
+        name: maas-epp-metrics-reader-token
+        key: token

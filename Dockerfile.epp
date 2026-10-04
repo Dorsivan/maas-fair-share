@@ -1,0 +1,66 @@
+# Builds the stock llm-d Endpoint Picker with one extra fairness policy compiled in.
+#
+# Derived from Dockerfile.epp in github.com/llm-d/llm-d-router @ v0.11.0. Three
+# deliberate differences from upstream:
+#
+#   1. We copy only cmd/ and pkg/ -- upstream also copies apix/, internal/ and
+#      version/, which are directories of ITS module, not ours. They still resolve
+#      as ordinary dependencies out of the module cache, which is why the version
+#      -X ldflags paths below keep working unchanged.
+#   2. `go build ./cmd/epp` (the package) rather than `cmd/epp/main.go` (the file).
+#      Building a file list silently ignores any sibling file in the package.
+#   3. The builder's Go version tracks upstream's, not ours. Keep them in step when
+#      re-pinning llm-d-router -- the toolchain must be >= the `go` directive in
+#      the upstream go.mod or the build fails with a toolchain error.
+#
+# USER 65532:65532 is load-bearing, not cargo cult: KServe sets runAsNonRoot and
+# readOnlyRootFilesystem on the scheduler container, so a root image fails admission
+# under the restricted-v2 SCC. Keeping it means no SCC exception is needed.
+
+ARG BASE_IMAGE=gcr.io/distroless/static:nonroot
+
+FROM --platform=${BUILDPLATFORM} golang:1.26.8 AS go-builder
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+
+COPY go.mod go.mod
+COPY go.sum go.sum
+
+# Cached as long as go.mod/go.sum are unchanged. This is the expensive layer:
+# importing cmd/epp/runner pulls in essentially the whole EPP graph (~400 modules).
+RUN go mod download
+
+COPY cmd/ cmd/
+COPY pkg/ pkg/
+
+# Precompile without version flags so a commit-only change can reuse the compile
+# work from the layer cache.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -o /dev/null ./cmd/epp
+
+ARG COMMIT_SHA=unknown
+ARG BUILD_REF
+ARG LDFLAGS="-s -w"
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+    -ldflags="${LDFLAGS} -X github.com/llm-d/llm-d-router/version.CommitSHA=${COMMIT_SHA} -X github.com/llm-d/llm-d-router/version.BuildRef=${BUILD_REF}" \
+    -o bin/epp ./cmd/epp
+
+FROM ${BASE_IMAGE}
+
+WORKDIR /
+
+COPY --from=go-builder /workspace/bin/epp /app/epp
+
+USER 65532:65532
+
+# gRPC (ext_proc), health, metrics
+EXPOSE 9002
+EXPOSE 9003
+EXPOSE 9090
+# KV-Events ZMQ SUB socket
+EXPOSE 5557
+
+ENTRYPOINT ["/app/epp"]

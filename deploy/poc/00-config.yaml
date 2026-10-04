@@ -1,0 +1,103 @@
+# POC variant of deploy/epp-config.yaml. Kept deliberately terse -- the
+# rationale for every parameter lives in that file and in docs/design.md; only
+# the DIFFERENCES from production are commented here.
+#
+# Differences from deploy/epp-config.yaml:
+#   1. No metrics-data-source override. The simulator serves plaintext, so the
+#      default scheme (http) is correct. Production needs scheme: https.
+#   2. stateLogIntervalSeconds: 5 instead of 30, so the flight-recorder log line
+#      appears quickly enough to watch during a short run.
+#   3. enforce starts false. Flip it to true and re-apply to see the same
+#      traffic reordered -- that A/B is the point of the POC, and it rehearses
+#      the production rollout exactly.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-epp-config
+  namespace: maas-fairness-poc
+data:
+  epp: |
+    apiVersion: llm-d.ai/v1alpha1
+    kind: EndpointPickerConfig
+    featureGates: [flowControl]
+    plugins:
+      - type: maas-weighted-fairness
+        name: maas-fairness
+        parameters:
+          identityHeader: x-maas-subscription-id
+          groups:
+            - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+            - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+            - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+          defaultGroup: { name: unclassified, weight: 5 }
+
+          enforce: false
+          stateLogIntervalSeconds: 5
+
+          halfLifeSeconds: 60
+          observedHalfLivesSeconds: [20, 120]
+
+          costModel: tokens
+          inputTokenWeight: 1.0
+          outputTokenWeight: 2.0       # PLACEHOLDER until calibrated
+          cachedInputTokenWeight: 1.0
+
+          # Left at the production default, but see docs/poc-results.md: in this
+          # POC, turning the clamp ON measurably moved the split AWAY from the
+          # configured weights (end-users 62.8% -> 45.1%), and it did so while
+          # firing only 19 times in 862 dispatches. The highest-weight group is
+          # hit hardest, because it is served fastest, so its queue is the one
+          # that momentarily drains -- and the clamp writes A = floor * w, so
+          # the largest weight loses the most credit per clamp.
+          #
+          # Unresolved: whether the empty -> non-empty edge is simply a poor
+          # proxy for "returning from idle" when a tenant is being served so
+          # well that its queue keeps draining. Do not change the default on
+          # this evidence alone; the closed-loop generator may drain queues in
+          # ways real traffic does not.
+          newcomerClamp: true
+          provisionalCharge: true
+          defaultEstimatedOutputTokens: 512
+          estimatedBytesPerToken: 4
+          agingTokensPerSecond: 0
+
+      - type: single-profile-handler
+      - type: queue-scorer
+      - type: kv-cache-utilization-scorer
+      - type: prefix-cache-scorer
+      - type: max-score-picker
+
+    flowControl:
+      # 300s here, against 60s in deploy/epp-config.yaml, and this is the one
+      # POC deviation that is NOT a simplification.
+      #
+      # The load generator deliberately over-offers ~12x the pool's capacity so
+      # the queues are deep enough for the weights to be expressible. The flip
+      # side is that the throttled group waits a long time by design: at a 10%
+      # share with 32 closed-loop workers, app2's queue wait approaches a
+      # minute. With TTL at 60s those requests would be EVICTED rather than
+      # served late -- and then the shed rate, not the fairness policy, is what
+      # allocates the pool. The measurement would show app2 "receiving" its
+      # share while most of its traffic was quietly dropped.
+      #
+      # Production keeps TTL within ~2x of halfLifeSeconds precisely so that
+      # shedding stays a backstop. Do not copy 300s into a real deployment; it
+      # is compensating for a synthetic over-offer that real traffic will not
+      # reproduce. Watch llm_d_epp_flow_control_requests_evicted_total: if it
+      # is non-zero in a run, that run measured shedding, not fairness.
+      defaultRequestTTL: 300s
+      defaultPriorityBand:
+        fairnessPolicyRef: maas-fairness
+        orderingPolicyRef: fcfs-ordering-policy
+      priorityBands:
+        - priority: 0
+          fairnessPolicyRef: maas-fairness
+          maxRequests: "5000"
+
+    schedulingProfiles:
+      - name: default
+        plugins:
+          - { pluginRef: queue-scorer, weight: 2.0 }
+          - { pluginRef: kv-cache-utilization-scorer, weight: 2.0 }
+          - { pluginRef: prefix-cache-scorer, weight: 3.0 }
+          - { pluginRef: max-score-picker }

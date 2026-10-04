@@ -1,0 +1,165 @@
+# POC results — weighted fair share on a GPU-free cluster
+
+Run 2026-10-04 against OpenShift, namespace `maas-fairness-poc`, using the
+manifests in `deploy/poc/`. No GPUs: the model server is
+`ghcr.io/llm-d/llm-d-inference-sim:v0.11.4`, which speaks the OpenAI API and
+returns real `usage` blocks without doing real inference.
+
+## What was actually proven
+
+The custom EPP image loads the `maas-weighted-fairness` plugin, Envoy's
+ext_proc filter routes live traffic through it, and under genuine contention
+the delivered token split tracks the configured weights.
+
+**Setup.** Three tenants with weights 20 / 10 / 65 (plus an `unclassified`
+catch-all at 5), each driven by 32 closed-loop workers for 240 s against a pool
+of 2 simulator replicas × `--max-num-seqs 4` = 8 concurrent slots — a ~12×
+over-offer. Every run reported `pool_saturation{stage="effective"} ≈ 2.8` and
+HTTP 200 on every request.
+
+| Configuration | app1 (w=20) | app2 (w=10) | end-users (w=65) |
+|---|---|---|---|
+| **Configured target** | **20.0%** | **10.0%** | **65.0%** |
+| Shadow mode (`enforce: false`) | 34.3% | 32.8% | 32.9% |
+| Enforcing, `newcomerClamp: false` — run 1 | 23.9% | 14.1% | 61.9% |
+| Enforcing, `newcomerClamp: false` — run 2 | 23.8% | 13.5% | 62.8% |
+| Enforcing, `newcomerClamp: true` | 35.7% | 19.2% | 45.1% |
+
+Shares are `maas_fairness_contended_service_tokens_total` — the SLI numerator,
+counted only while the group was backlogged and the pool saturated.
+
+Reading across the first three rows: shadow mode delivers equal thirds, which
+is correct FCFS behaviour for three identically-loaded tenants and confirms the
+plugin accounts without reordering. Enforcing moves the split onto the weights,
+reproducibly to within ~1 point across two independent runs.
+
+Also confirmed in every run:
+
+- **Grouping.** Eight distinct `end-user-N` subscription IDs collapsed to a
+  single `end-users` flow. `unmatched_subscriptions_total` stayed at 0. Had the
+  prefix rule failed, end users would have appeared as eight queues each
+  holding weight 65.
+- **True-up.** `requests_without_usage_total` stayed at 0 across ~2,600
+  requests, so every request was reconciled against a real `usage` block rather
+  than left on its provisional estimate.
+- **No shedding.** `flow_control_requests_evicted_total` never incremented, so
+  the measured split is the fairness policy's doing and not the TTL's.
+
+## Residual gap: small-weight groups run ~4 points rich
+
+Even clamp-off, app1 lands at ~23.8% against 20% and app2 at ~13.5% against
+10%, with end-users absorbing the shortfall. The bias is consistently *toward
+the low-weight groups*, which is the signature of warm-up: tabs start empty
+after every EPP restart, and for roughly the first half-life all groups look
+equally unserved, so the early part of each 240 s run is close to FCFS. A
+longer run, or discarding the first 60 s, should shrink it. Not yet measured —
+the metrics were read as cumulative totals rather than as a time series, which
+is the obvious next refinement.
+
+## Open finding: the newcomer clamp hurt here
+
+Enabling `newcomerClamp` moved the split *away* from the weights — end-users
+fell from ~62% to 45% — while firing only **19 times in 862 dispatches**. Of
+those 19, **14 landed on end-users**.
+
+The mechanism is self-reinforcing. The clamp fires on the empty → non-empty
+queue edge. The highest-weight group is served fastest, so it is the group
+whose queue momentarily drains; and the clamp writes `A = floor × w`, so the
+largest weight has the most credit erased per firing. A handful of clamps is
+therefore enough to repeatedly reset the group that the weights most favour.
+
+This is worth taking seriously but **not worth acting on from this evidence
+alone**. The design's rationale for the clamp (`docs/design.md`, and Part 1 of
+the plan) is about a tenant returning after genuine idleness, and it remains
+sound for that case. What this run suggests is narrower: *the empty →
+non-empty edge may be a poor proxy for "returning from idle"* when a tenant is
+being served so well that its queue keeps draining between arrivals. A
+time-based guard — clamp only if the queue has been empty for some meaningful
+fraction of the half-life — would separate the two cases.
+
+The caveat that matters: this is a **closed-loop** generator. Each tenant can
+have at most 32 requests outstanding, so its queue drains whenever all its
+workers are in flight. Open-loop traffic with Poisson arrivals would not drain
+the favoured group's queue the same way, and might never trigger the effect.
+Re-test with an open-loop generator before changing the default.
+
+## Pitfalls hit along the way
+
+Each of these produced a run that looked healthy and measured nothing. They are
+recorded because every one of them is silent by default.
+
+1. **Load that merely saturates is not enough.** At 8 workers per tenant the
+   pool reported saturation and the policy *was* consulted, but queue depths sat
+   at 1–4 items against 8 slots. A weighted queue can only apportion work that
+   is queued, so the split came out at equal thirds — indistinguishable from a
+   broken policy. Raising to 32 workers per tenant (queue depths 17–26) is what
+   made the weights expressible. **Check queue depth, not just saturation.**
+
+2. **`curl` treats HTTP 400 as success.** The simulator defaults to
+   `--max-model-len 1024`; a ~1,200-token prompt overflowed it and every request
+   returned 400 in milliseconds. The generator reported no errors and the run
+   completed suspiciously fast. The plugin's own
+   `requests_without_usage_total` — specified in the design purely as a
+   regression detector for a missing vLLM flag — is what caught it. The
+   generator now tallies status codes itself.
+
+3. **Rollouts that never complete.** This cluster has two `Ready` workers at
+   ~98% of allocatable CPU requested. The default `maxSurge: 25%` creates a pod
+   that can never schedule, so `oc rollout status` hangs while the *old* pods
+   keep serving — which from a client looks exactly like a config change having
+   no effect. Both deployments now pin surge to zero.
+
+4. **The EPP must not roll.** Fixing (3) for the EPP surfaced a real
+   correctness bug rather than a scheduling one: `RollingUpdate` with
+   `maxSurge: 1` briefly runs **two** EPPs, which is precisely the split-brain
+   that `replicas: 1` exists to prevent — each would see part of each tenant's
+   traffic, judge that tenant under its share, and both would over-dispatch.
+   `strategy: Recreate` is now set. A few seconds with *no* EPP is strictly
+   better: `failureMode: FailOpen` means those requests bypass fairness instead
+   of being actively misallocated.
+
+5. **Metrics TLS is decided by `--metrics-cert-dir`, not `--secure-serving`.**
+   Verified against upstream `pkg/epp/server/metrics_tls_test.go`. An EPP can
+   serve ext_proc over TLS while its metrics port is plaintext; assuming
+   otherwise yields connection errors on the Prometheus targets page and empty
+   graphs everywhere else. `deploy/podmonitor.yaml` now documents how to check.
+
+6. **Two InferencePool API groups, and both are needed.** The EPP watches
+   `inference.networking.k8s.io/v1`; this cluster's gateway controller only
+   resolves `inference.networking.x-k8s.io/v1alpha2` backendRefs and rejects the
+   v1 pool outright. `deploy/poc/02-epp.yaml` declares the same pool twice.
+
+## What this POC does *not* show
+
+- **No real saturation.** The simulator has no KV cache and no real compute; it
+  fakes backpressure with sleeps. Scorer behaviour under genuine memory
+  pressure, and the `vramtime` cost model's trigger conditions, are untested.
+- **`cachedInputTokenWeight` is untested.** The simulator reported
+  `cached_tokens: 0` throughout, so `prompt_tokens_cached_ratio` was flat zero
+  and the discount path never executed. On real hardware a flat zero here means
+  a missing `--enable-prompt-tokens-details`; here it is the simulator.
+- **`outputTokenWeight: 2.0` is still the uncalibrated placeholder.** The
+  two-run `guidellm` calibration needs real GPUs.
+- **Open-loop behaviour.** Everything above is closed-loop. See the clamp
+  finding for why that distinction may matter.
+- **Nothing about production KServe wiring.** `deploy/llmisvc.yaml` has not been
+  applied; the POC runs the EPP directly to isolate the plugin from KServe's
+  templating.
+
+## Reproducing
+
+```sh
+oc apply -f deploy/poc/00-config.yaml
+oc apply -f deploy/poc/01-sim-backend.yaml
+oc apply -f deploy/poc/02-epp.yaml      # needs the image built first
+oc apply -f deploy/poc/03-gateway.yaml
+oc apply -f deploy/rbac.yaml            # mints the /metrics reader token
+
+# A/B: run once as shipped (enforce: false), then flip and re-run.
+oc apply -f deploy/poc/04-loadgen.yaml
+oc logs -n maas-fairness-poc job/maas-loadgen --tail=6   # status tally must be ~all 200
+```
+
+Read the result with the metrics-reader token against
+`http://maas-epp:9090/metrics` (plaintext — no `--metrics-cert-dir` in the POC),
+filtering on `llm_d_epp_maas_fairness_`.

@@ -5,7 +5,16 @@ metadata:
   namespace: llm            # set to the serving namespace
 data:
   epp: |
-    apiVersion: llm-d.ai/v1
+    # v1alpha1, NOT v1 -- "llm-d.ai/v1" fails at startup with
+    # `no kind "EndpointPickerConfig" is registered for version "llm-d.ai/v1"`.
+    #
+    # Two groups are accepted. Most examples in the wild still say
+    # `inference.networking.x-k8s.io/v1alpha1` (the Gateway API Inference
+    # Extension group this config was inherited from) and it still loads, but
+    # configloader.go registers it as deprecatedSchemeGroupVersion and logs
+    # "DEPRECATION: ... is deprecated" on every startup. Verified both against
+    # the v0.11.0 binary. Use the llm-d.ai group.
+    apiVersion: llm-d.ai/v1alpha1
     kind: EndpointPickerConfig
     featureGates: [flowControl]
     plugins:
@@ -83,8 +92,14 @@ data:
           estimatedBytesPerToken: 4
 
           agingTokensPerSecond: 0
-          evictionTtlSeconds: 3600
-          evictionSweepSeconds: 300
+
+          # There is deliberately no eviction TTL here. program-aware-fairness needs
+          # a sweeper because it keys state by raw tenant ID, so its map grows with
+          # whatever arrives. We key by GROUP, and the group set is closed by this
+          # file -- every unmatched subscription folds into defaultGroup. The state
+          # map is therefore bounded at len(groups)+1 by construction and there is
+          # nothing to evict. Adding the knob back would only let an operator delete
+          # a live group's tab.
 
       # scheduling profile unchanged from the KServe default
       - type: single-profile-handler
@@ -92,6 +107,28 @@ data:
       - type: kv-cache-utilization-scorer
       - type: prefix-cache-scorer
       - type: max-score-picker
+
+      # REQUIRED when the cluster has enableLLMInferenceServiceTLS: true in
+      # redhat-ods-applications/inferenceservice-config (it does by default on
+      # RHOAI 3.5). The model servers then serve metrics over TLS, and the EPP
+      # scrapes them to feed queue-scorer and kv-cache-utilization-scorer. Get
+      # this wrong and the scrape fails silently: the scorers see no data and
+      # endpoint selection degrades, while FAIRNESS still works -- so it will
+      # not show up in any of the fairness dashboards.
+      #
+      # Red Hat's downstream EPP takes this as --model-server-metrics-scheme,
+      # which upstream does not define; see registerDownstreamCompatFlags in
+      # cmd/epp/main.go. On upstream v0.10.0+ this plugin parameter is the only
+      # mechanism that works. Declaring the plugin explicitly does NOT break
+      # the default data-layer wiring -- core-metrics-extractor is still
+      # attached automatically (verified against the v0.11.0 binary).
+      #
+      # Delete this block if the cluster serves model-server metrics over
+      # plaintext; the default scheme is http.
+      - type: metrics-data-source
+        parameters:
+          scheme: https
+          insecureSkipVerify: true
 
     # Fairness is INTRA-BAND only, so every weighted tenant must share one priority.
     # Both defaultPriorityBand and the explicit band are set so stray traffic on

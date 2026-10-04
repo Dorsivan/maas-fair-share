@@ -1,0 +1,57 @@
+# Grants Prometheus permission to read the EPP's /metrics endpoint.
+#
+# Why this file exists at all: KServe's scheduler preset exposes containerPort
+# 9090 named "metrics" but creates nothing that scrapes it, and the EPP defaults
+# to --metrics-endpoint-auth=true, which puts a TokenReview/SubjectAccessReview
+# in front of /metrics. So the port is open, the metrics are real, and by
+# default absolutely nothing can read them. Every graph in docs/design.md is
+# dark until this and deploy/podmonitor.yaml are applied.
+#
+# Do NOT "fix" this by setting --metrics-endpoint-auth=false. That makes
+# per-tenant token consumption -- who is spending what -- readable by anything
+# that can reach the pod IP.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maas-epp-metrics-reader
+  namespace: maas-fairness-poc
+---
+# nonResourceURLs, not resources: /metrics is served by the EPP's own HTTP
+# server, not by the Kubernetes API, so this is the only rule shape that works.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: maas-epp-metrics-reader
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maas-epp-metrics-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: maas-epp-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: maas-epp-metrics-reader
+    namespace: maas-fairness-poc
+---
+# A non-expiring token for the PodMonitor to present. Since Kubernetes 1.24
+# ServiceAccounts no longer mint these automatically, so it is requested
+# explicitly. The PodMonitor's bearerTokenSecret points at this.
+#
+# The projected-volume route (shorter-lived, auto-rotated tokens) is preferable
+# where the scrape client supports it; Prometheus Operator's bearerTokenSecret
+# does not, which is why this is a long-lived Secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: maas-epp-metrics-reader-token
+  namespace: maas-fairness-poc
+  annotations:
+    kubernetes.io/service-account.name: maas-epp-metrics-reader
+type: kubernetes.io/service-account-token

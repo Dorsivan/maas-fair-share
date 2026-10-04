@@ -1,0 +1,136 @@
+# Production shape: the stock KServe LLMInferenceService, with the scheduler
+# pointed at our EPP image instead of Red Hat's.
+#
+# The guiding rule is to override as little as possible. KServe's controller
+# owns the scheduler Deployment (<name>-kserve-router-scheduler) and reverts
+# manual edits to it, so everything here goes through the LLMInferenceService.
+#
+# Apply order: deploy/epp-config.yaml, then this, then deploy/rbac.yaml and
+# deploy/podmonitor.yaml. Verify metrics actually arrive BEFORE trusting a
+# dashboard -- see the verification block at the bottom.
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: maas-shared-model
+  namespace: maas-fairness-poc
+spec:
+  model:
+    # The shared large model every subscription contends for.
+    uri: hf://meta-llama/Llama-3.1-8B-Instruct
+    name: llama-3-1-8b
+
+  replicas: 2
+
+  # ---------------------------------------------------------------------------
+  # Model server
+  # ---------------------------------------------------------------------------
+  # Only the bits this design depends on are set; everything else comes from the
+  # well-known GPU preset via baseRefs.
+  baseRefs:
+    - name: v3-5-0-kserve-config-llm-template
+  template:
+    containers:
+      - name: main
+        args:
+          # BOTH OF THESE ARE HARD PREREQUISITES AND BOTH DEFAULT TO OFF.
+          # They go on the MODEL SERVER, not the scheduler -- putting them on
+          # the EPP is the most common way to "set" them and have nothing happen.
+          #
+          # Without the first, an OpenAI-streaming client that does not send
+          # stream_options.include_usage never produces a usage block, so the
+          # request never trues up and that tenant is charged the provisional
+          # ESTIMATE forever. Interactive end users are the group most likely
+          # to stream, and they are the largest group here.
+          #
+          # Without the second, usage.prompt_tokens_details is absent,
+          # cached_tokens reads as 0, and cachedInputTokenWeight silently never
+          # applies. Nothing errors; the policy just meters a different cost
+          # model than the one in the ConfigMap.
+          #
+          # Both failures are silent, which is why each has an alarm:
+          # maas_fairness_requests_without_usage_total must be flat zero, and
+          # maas_fairness_prompt_tokens_cached_ratio must not be uniformly zero.
+          - --enable-force-include-usage
+          - --enable-prompt-tokens-details
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+
+  # ---------------------------------------------------------------------------
+  # Router: gateway, route, and the scheduler (EPP) that carries our plugin
+  # ---------------------------------------------------------------------------
+  router:
+    gateway:
+      refs:
+        - name: data-science-gateway
+          namespace: openshift-ingress
+    route: {}
+    scheduler:
+      # ONE replica, and this is load-bearing rather than a cost decision.
+      # Every tab lives in process. Two replicas do not share state, they shard
+      # it: each would see roughly half of each tenant's traffic, conclude that
+      # tenant is under its share, and both would over-dispatch. No distributed
+      # fairness state ships in-tree.
+      #
+      # Consequences accepted: a restart resets all tabs (~2-3 min of roughly
+      # FIFO warm-up, bounded by halfLifeSeconds -- the horizon the guarantee is
+      # defined over anyway), and because the pool's endpointPickerRef uses
+      # failureMode: FailOpen, requests DURING the restart bypass the EPP
+      # entirely. Seconds of no fairness, not minutes of cold fairness.
+      #
+      # Deliberately no PodDisruptionBudget: with one replica, maxUnavailable: 0
+      # would block node drains forever.
+      replicas: 1
+
+      config:
+        ref:
+          name: maas-epp-config
+          key: epp
+
+      template:
+        containers:
+          # The name MUST be "main". KServe merges this into the preset by
+          # container name; any other name appends a second container instead
+          # of overriding the EPP, and the pod comes up running both.
+          - name: main
+            # Only the image is overridden. NOT command/args: KServe templates
+            # --pool-name, --pool-namespace, the ports and the TLS flags into
+            # the preset's command, and replacing it means re-deriving all of
+            # that by hand and re-syncing on every RHOAI bump.
+            #
+            # That is also why cmd/epp/main.go registers a compatibility flag
+            # for --model-server-metrics-scheme, which this cluster's preset
+            # appends but upstream llm-d-router does not define.
+            image: image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp:latest
+            imagePullPolicy: Always
+
+# ---------------------------------------------------------------------------
+# Verification -- do this before reading any dashboard
+# ---------------------------------------------------------------------------
+# 1. The plugin actually loaded (not silently skipped):
+#      oc logs deploy/maas-shared-model-kserve-router-scheduler -n maas-fairness-poc \
+#        | grep maas-weighted-fairness
+#
+# 2. Shadow mode is on and the weights are the ones you think:
+#      oc port-forward deploy/maas-shared-model-kserve-router-scheduler 9090:9090 \
+#        -n maas-fairness-poc
+#      curl -sk https://localhost:9090/debug/plugins/state | jq '.plugins["maas-fairness"]'
+#    enforcing must be false on first deploy.
+#
+# 3. The two vLLM flags took effect. After some real traffic:
+#      maas_fairness_requests_without_usage_total  -> must be 0
+#      maas_fairness_prompt_tokens_cached_ratio    -> must NOT be uniformly 0
+#    A flat zero on the second means --enable-prompt-tokens-details is missing,
+#    not that the cache is cold: llm-d actively routes for prefix affinity
+#    (prefix-cache-scorer carries the highest profile weight, 3.0), so a genuine
+#    0% hit rate would itself be alarming.
+#
+# 4. Gateway header stripping is in place. This lives in Kuadrant/Envoy, NOT in
+#    this file, and it fails open silently if someone adds a route later:
+#      x-llm-d-inference-fairness-id       (would let a client pick its weight)
+#      x-gateway-inference-fairness-id
+#      x-llm-d-inference-objective         (the sneaky one -- sets the PRIORITY
+#                                           BAND, and fairness is intra-band
+#                                           only, so this is a total bypass)
+#    The plugin overwrites the first from the authenticated subscription, so a
+#    spoof that reaches us is ignored. It cannot defend against the third.

@@ -9,7 +9,10 @@ saturated**, and imposes no limit at all when it isn't.
 > The plugin builds into a custom EPP image, loads, and under real contention
 > divides delivered tokens according to the configured weights — measured at
 > 23.8% / 13.5% / 62.8% against a configured 20 / 10 / 65, reproducible across
-> runs, versus equal thirds in shadow mode. Unit tests pass under `-race`.
+> runs, versus equal thirds in shadow mode. Work conservation verified: with
+> one tenant idle the remaining two absorb the whole pool (93% of baseline
+> throughput), and below capacity a second tenant costs the first no latency.
+> Unit tests pass under `-race`.
 >
 > Not yet done: `outputTokenWeight` is still the uncalibrated `2.0` placeholder
 > (the calibration needs GPUs), the cached-token discount path is unexercised

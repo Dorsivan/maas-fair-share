@@ -51,34 +51,55 @@ data:
     OUT=/tmp/codes
     mkdir -p "$OUT"
 
+    # Latency is recorded alongside the status code because the work-conservation
+    # tests are latency tests, not throughput tests. "app1 is not throttled when
+    # the pool is half empty" means its per-request latency matches its solo
+    # baseline; a throughput number alone cannot distinguish "not throttled"
+    # from "throttled but asking for less".
     worker() {
-      local sub="$1" group="$2" code
+      local sub="$1" group="$2" out
       while [ "$(date +%s)" -lt "$END" ]; do
-        code=$(curl -sS -o /dev/null -m 180 -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+        out=$(curl -sS -o /dev/null -m 180 -w '%{http_code} %{time_total}' -X POST "$GW/v1/chat/completions" \
           -H 'Content-Type: application/json' \
           -H "x-maas-subscription-id: $sub" \
           -d "{\"model\":\"llama-3-1-8b\",\"max_tokens\":200,\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" \
-          2>/dev/null) || code=000
-        echo "$code" >> "$OUT/$group"
+          2>/dev/null) || out="000 0"
+        echo "$out" >> "$OUT/$group"
       done
     }
 
-    echo "load: ${WORKERS} workers/tenant for ${DURATION}s"
+    # TENANTS selects WHICH groups generate load, and it is the whole point of
+    # the work-conservation experiments. Running a subset is how you check that
+    # an absent tenant's weight is not being RESERVED: with end-users idle,
+    # app1+app2 must between them receive the FULL pool, not 30% of it.
+    TENANTS="${TENANTS:-app1 app2 end-users}"
+    echo "load: tenants=[${TENANTS}] workers=${WORKERS}/tenant duration=${DURATION}s"
+
     for i in $(seq 1 "$WORKERS"); do
-      worker "app1-production" app1 &
-      worker "app2-batch"      app2 &
-      # Distinct subscription per worker -- all must collapse to `end-users`.
-      worker "end-user-$i"     end-users &
+      for t in $TENANTS; do
+        case "$t" in
+          app1)      worker "app1-production" app1 & ;;
+          app2)      worker "app2-batch"      app2 & ;;
+          # Distinct subscription per worker -- all must collapse to `end-users`.
+          end-users) worker "end-user-$i"     end-users & ;;
+          *) echo "unknown tenant: $t" >&2; exit 1 ;;
+        esac
+      done
     done
     wait
 
-    echo "load: done. HTTP status tally per tenant:"
+    echo "load: done."
+    printf '%-12s %-7s %-9s %-9s %s\n' TENANT TOTAL P50_SEC P95_SEC STATUSES
     for f in "$OUT"/*; do
-      printf '  %-12s total=%-6s ' "$(basename "$f")" "$(wc -l < "$f")"
-      sort "$f" | uniq -c | sort -rn | awk '{printf "%s=%s ", $2, $1}'
-      echo
+      n=$(wc -l < "$f")
+      stats=$(awk '{print $2}' "$f" | sort -n | awk -v n="$n" '
+        {a[NR]=$1}
+        END{ p50=a[int(NR*0.50)+0>0?int(NR*0.50):1]; p95=a[int(NR*0.95)+0>0?int(NR*0.95):1];
+             printf "%.2f %.2f", p50, p95 }')
+      codes=$(awk '{print $1}' "$f" | sort | uniq -c | sort -rn | awk '{printf "%s=%s ", $2, $1}')
+      printf '%-12s %-7s %-9s %-9s %s\n' "$(basename "$f")" "$n" $stats "$codes"
     done
-    echo "A run is only meaningful if these are overwhelmingly 200."
+    echo "A run is only meaningful if the statuses are overwhelmingly 200."
 ---
 apiVersion: batch/v1
 kind: Job
@@ -95,6 +116,14 @@ spec:
           image: registry.access.redhat.com/ubi9/ubi:latest
           command: ["/bin/bash", "/script/run.sh"]
           env:
+            # Which tenants generate load. Override to run the
+            # work-conservation experiments:
+            #   "app1 app2 end-users"  full contention (the weight split)
+            #   "app1 app2"            end-users idle -- their 65% must be
+            #                          absorbed, not reserved
+            #   "app1"                 app1 alone must receive ~100%
+            - name: TENANTS
+              value: "app1 app2 end-users"
             - name: DURATION
               # Several half-lives (halfLifeSeconds: 60). The tabs start empty
               # after every EPP restart, so a run shorter than ~3 half-lives

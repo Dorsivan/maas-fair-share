@@ -45,6 +45,62 @@ Also confirmed in every run:
 - **No shedding.** `flow_control_requests_evicted_total` never incremented, so
   the measured split is the fairness policy's doing and not the TTL's.
 
+## Work conservation: no limits when there is spare capacity
+
+The table above only ever ran all three tenants at once, which measures the
+split and says nothing about the requirement that motivated the whole design:
+nobody is throttled while the pool has room. Four further runs, same config
+(`enforce: true`, `newcomerClamp: false`, `halfLifeSeconds: 60`).
+
+**An absent tenant's share is absorbed, not reserved.** If end-users' 65% were
+held in reserve, app1+app2 would be capped near 35% of the pool and two thirds
+of the GPU would idle.
+
+| Run | Active tenants | Dispatches / 240 s | vs. 3-tenant baseline | Split |
+|---|---|---|---|---|
+| baseline | all three | 851 | — | 23.8 / 13.5 / 62.8% |
+| **E1** | app1 + app2 | **794** | **93%** | 62.7% / 37.3% |
+| **E2** | app1 alone | **1069** | **126%** | 100% |
+
+E1 keeps the pool busy with end-users gone, and the two remaining tenants
+divide it 62.7 / 37.3 — close to the 67 / 33 that weights 20:10 imply, carrying
+the same few points of warm-up bias toward the smaller weight seen everywhere
+else. E2 gives app1 the entire pool; had it been pinned to its nominal 20% it
+would have managed ~170 dispatches, not 1069. Latency tracks the same story:
+app1's P50 falls from 15.97 s under full contention to 7.05 s alone.
+
+**Below capacity, a second tenant costs the first nothing.** Two workers per
+tenant against 8 slots, so the pool is roughly half idle and the policy should
+never meaningfully engage.
+
+| Run | Active tenants | app1 P50 / P95 | app2 P50 / P95 | Queue depth |
+|---|---|---|---|---|
+| **E3** | app1 alone | 1.01 s / 4.28 s | — | 0 |
+| **E4** | app1 + app2 | 0.98 s / 4.29 s | 1.00 s / 4.29 s | 0 |
+
+app1's latency is unchanged to within noise (it was marginally *faster* with
+app2 also running, and completed 149 requests against 138). Queue depth stayed
+at zero throughout. Nothing waits while there is room.
+
+This is structural rather than implemented. `Pick` is handed only non-empty
+queues (`plugin.go:297-302` skips any queue reporting `Len() == 0`), so an idle
+tenant is not a candidate that loses — it is not a candidate at all, and with a
+single backlogged group that group wins every decision by default. Grepping the
+plugin for `capacity|reserve|quota|limit|throttle|budget|entitle` matches
+nothing but the license header: a weight is only ever a divisor in a comparison
+between queues that are *currently competing*. `TestWorkConservation` asserts
+the same property at the unit level (weights 2:1, B idle, A takes all 1000
+picks).
+
+One related detail, verified rather than assumed: in E2
+`contended_service_tokens_total` is absent for app1 entirely. That is
+deliberate — `plugin.go:364` gates contention accounting on
+`len(candidates) > 1`, so the SLI numerator only accrues when at least two
+groups are backlogged simultaneously. With a single tenant there is no
+contention to be fair about, and the metric correctly declines to invent one.
+It is also what keeps the SLI honest: a tenant that ran alone all night does
+not dilute its own contended-share statistic.
+
 ## Residual gap: small-weight groups run ~4 points rich
 
 Even clamp-off, app1 lands at ~23.8% against 20% and app2 at ~13.5% against

@@ -40,7 +40,8 @@ import (
 // define.
 //
 // This is not defensive programming, it is a measured incompatibility. The
-// RHOAI 3.5 preset (LLMInferenceServiceConfig v3-5-0-kserve-config-llm-scheduler)
+// RHOAI 3.4.0 preset (LLMInferenceServiceConfig v3-5-0-kserve-config-llm-scheduler
+// -- the v3-5-0 prefix is the well-known-config name, not the product version)
 // appends --model-server-metrics-scheme=https whenever the cluster's
 // inferenceservice-config has enableLLMInferenceServiceTLS: true. That flag
 // exists only in Red Hat's downstream EPP fork; it is absent from upstream

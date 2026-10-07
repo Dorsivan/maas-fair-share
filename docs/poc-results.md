@@ -69,6 +69,31 @@ else. E2 gives app1 the entire pool; had it been pinned to its nominal 20% it
 would have managed ~170 dispatches, not 1069. Latency tracks the same story:
 app1's P50 falls from 15.97 s under full contention to 7.05 s alone.
 
+**Asymmetric demand: a heavy low-weight tenant is not held to its weight.** The
+strictest of these tests, and the realistic one. app1 (weight **20**) saturates
+with 32 workers while end-users (weight **65**) trickles with 2. Unlike E1,
+end-users always has a non-empty queue, so it remains a live candidate in
+*every* `Pick` decision — a policy that treated weight as a ceiling would pass
+E1 and fail this.
+
+| Run | app1 (w=20) | end-users (w=65) | Total |
+|---|---|---|---|
+| **E6** dispatches | 974 | 97 | **1071** |
+| **E6** token share | **92.8%** | 7.2% | — |
+| **E6** latency P50 | 7.86 s | **5.18 s** | — |
+
+app1 took **92.8% of delivered tokens on a weight of 20**, because end-users
+only asked for 7.2%. The total of 1071 dispatches matches the 1069 that app1
+managed running completely alone (E2), so none of end-users' unclaimed 65% was
+wasted.
+
+And end-users was not punished for being small: it got *better* latency than
+app1 (5.18 s vs 7.86 s P50). That is the intended behaviour, not an accident —
+its large weight keeps `A/w` low so its few requests jump the queue, and once
+its queue drains it stops being a candidate and app1 takes everything else.
+Both halves of the requirement hold at once: the small tenant stays responsive,
+the large tenant is not throttled.
+
 **Below capacity, a second tenant costs the first nothing.** Two workers per
 tenant against 8 slots, so the pool is roughly half idle and the policy should
 never meaningfully engage.
@@ -184,6 +209,57 @@ recorded because every one of them is silent by default.
    `inference.networking.k8s.io/v1`; this cluster's gateway controller only
    resolves `inference.networking.x-k8s.io/v1alpha2` backendRefs and rejects the
    v1 pool outright. `deploy/poc/02-epp.yaml` declares the same pool twice.
+
+## Blocked: the official LLMInferenceService path
+
+`deploy/poc/05-llmisvc-sim.yaml` deploys the same plugin the way it will
+actually ship — a real `LLMInferenceService` whose scheduler is templated by
+RHOAI's own preset, with the GPU model-server preset swapped for the simulator
+(the presets compose cleanly: `-scheduler` supplies `router.scheduler`,
+`-router-route` supplies `router.route`, and only `-template` needs a GPU).
+
+**It cannot be applied on this cluster.** Every `LLMInferenceService` create is
+rejected at admission:
+
+```
+Internal error occurred: failed calling webhook
+"connection-llmisvc-v1alpha2.odh-model-controller.opendatahub.io":
+failed to call webhook: the server could not find the requested resource
+```
+
+This is a pre-existing cluster defect, not anything to do with this plugin — a
+four-line `LLMInferenceService` with nothing but `model.name` is rejected
+identically under `--dry-run=server`. **No `LLMInferenceService` can be created
+on this cluster at all right now.**
+
+Diagnosis: the `MutatingWebhookConfiguration`
+`mutating.odh-model-controller.opendatahub.io` declares two webhooks,
+`connection-llmisvc-v1alpha1/v1alpha2`, pointing at
+`redhat-ods-applications/odh-model-controller-webhook-service` on paths
+`/mutate-serving-kserve-io-v1alpha{1,2}-llminferenceservice`, both with
+`failurePolicy: Fail`. The `odh-model-controller` pod is healthy (Running,
+0 restarts, single endpoint) but registers only these six paths:
+
+```
+/mutate-serving-kserve-io-v1alpha1-inferencegraph
+/mutate-serving-kserve-io-v1beta1-inferenceservice
+/mutate--v1-pod
+/validate-nim-opendatahub-io-v1-account
+/validate-serving-kserve-io-v1alpha1-inferencegraph
+/validate-serving-kserve-io-v1beta1-inferenceservice
+```
+
+Neither llminferenceservice path is among them, so the API server gets a 404
+and `failurePolicy: Fail` turns that into a hard rejection. The webhook
+configuration and the running controller image disagree about what the
+controller serves — consistent with the operator's 3.3.2 → 3.4.0 upgrade
+(`rhods-operator.3.4.0`, replacing `rhods-operator.3.3.2`) having left the two
+out of step.
+
+Unblocking it means either getting the `odh-model-controller` onto a build that
+serves those paths, or removing/neutralising the two stale webhook entries.
+The latter is a cluster-wide change to an RHOAI-managed object on a shared
+cluster and the operator may well revert it, so it is not done here.
 
 ## What this POC does *not* show
 

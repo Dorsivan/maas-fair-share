@@ -38,29 +38,34 @@ spec:
     - port: metrics          # the name from the scheduler preset's containerPort
       path: /metrics
       interval: 15s
-      # THE SCHEME IS DECIDED BY --metrics-cert-dir, AND BY NOTHING ELSE.
-      # Verified in upstream pkg/epp/server/metrics_tls_test.go and
-      # cmd/.../main.go: "Empty serves metrics over HTTP". In particular it is
-      # NOT governed by --secure-serving, which covers only the ext_proc gRPC
-      # server -- an easy and costly conflation, because an EPP can be serving
-      # ext_proc over TLS while its metrics port is plaintext.
+      # http, NOT https -- and this is counter-intuitive enough to be worth the
+      # paragraph, because it is wrong on a TLS-enabled cluster in the way that
+      # looks most obviously right.
       #
-      # So check the live pod before trusting this line:
-      #   oc get pod -n maas-fairness-poc <scheduler-pod> \
-      #     -o jsonpath='{.spec.containers[0].args}' | tr ',' '\n' | grep metrics-cert
-      # Absent  -> scheme: http, delete the tlsConfig block.
-      # Present -> keep https as below.
-      # Getting this wrong yields connection errors in the Prometheus targets
-      # page and empty graphs everywhere else. deploy/poc/ runs WITHOUT a cert
-      # dir, i.e. plaintext.
-      scheme: https
-      tlsConfig:
-        # Self-signed unless the cert dir is fed by the cluster's service CA.
-        # Replace with a `ca` reference once it is.
-        insecureSkipVerify: true
-      # Satisfies --metrics-endpoint-auth=true. The token is the one minted in
-      # deploy/rbac.yaml; without it every scrape gets 401 and, again, the only
-      # symptom is empty graphs.
+      # The metrics scheme is decided by --metrics-cert-dir and by NOTHING
+      # else: upstream documents "Empty serves metrics over HTTP"
+      # (pkg/epp/server/metrics_tls_test.go). It is NOT governed by
+      # --secure-serving, which covers only the ext_proc gRPC server. So an EPP
+      # can be serving ext_proc over TLS while its metrics port is plaintext --
+      # and under KServe that is exactly what happens.
+      #
+      # Verified against the preset this cluster actually runs (RHOAI 3.4.0,
+      # llminferenceserviceconfig/v3-5-0-kserve-config-llm-scheduler): it
+      # templates --secure-serving=true and --cert-path when EnableTLS is set,
+      # but NEVER sets --metrics-cert-dir. Grep it yourself before changing
+      # this:
+      #   oc get llminferenceserviceconfig v3-5-0-kserve-config-llm-scheduler \
+      #     -n redhat-ods-applications -o yaml | grep -c metrics-cert-dir   # 0
+      #
+      # Set this to https and the Prometheus target dies with a TLS handshake
+      # error while every other part of the stack looks healthy.
+      scheme: http
+      # Auth, unlike TLS, IS on: the preset does not pass
+      # --metrics-endpoint-auth either, and it defaults to true. So the scrape
+      # is plaintext but still needs a bearer token -- an unusual combination,
+      # and the reason both of these lines are needed rather than one or the
+      # other. The token is the one minted in deploy/rbac.yaml; without it
+      # every scrape gets 401 and, again, the only symptom is empty graphs.
       bearerTokenSecret:
         name: maas-epp-metrics-reader-token
         key: token

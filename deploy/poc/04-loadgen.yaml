@@ -73,18 +73,27 @@ data:
     # an absent tenant's weight is not being RESERVED: with end-users idle,
     # app1+app2 must between them receive the FULL pool, not 30% of it.
     TENANTS="${TENANTS:-app1 app2 end-users}"
-    echo "load: tenants=[${TENANTS}] workers=${WORKERS}/tenant duration=${DURATION}s"
 
-    for i in $(seq 1 "$WORKERS"); do
-      for t in $TENANTS; do
-        case "$t" in
-          app1)      worker "app1-production" app1 & ;;
-          app2)      worker "app2-batch"      app2 & ;;
-          # Distinct subscription per worker -- all must collapse to `end-users`.
-          end-users) worker "end-user-$i"     end-users & ;;
-          *) echo "unknown tenant: $t" >&2; exit 1 ;;
-        esac
-      done
+    # Per-tenant overrides, defaulting to WORKERS. These exist for the
+    # ASYMMETRIC-DEMAND test, which is the realistic case and a stricter check
+    # than simply removing a tenant: a tenant sending a trickle still has a
+    # non-empty queue, so it stays a live candidate in every Pick decision,
+    # whereas an absent tenant is never a candidate at all. A policy that
+    # wrongly treats weight as a ceiling passes the absent-tenant test and
+    # fails this one.
+    W_APP1="${WORKERS_APP1:-$WORKERS}"
+    W_APP2="${WORKERS_APP2:-$WORKERS}"
+    W_END="${WORKERS_END_USERS:-$WORKERS}"
+    echo "load: tenants=[${TENANTS}] workers app1=${W_APP1} app2=${W_APP2} end-users=${W_END} duration=${DURATION}s"
+
+    for t in $TENANTS; do
+      case "$t" in
+        app1)      for _ in $(seq 1 "$W_APP1"); do worker "app1-production" app1 & done ;;
+        app2)      for _ in $(seq 1 "$W_APP2"); do worker "app2-batch"      app2 & done ;;
+        # Distinct subscription per worker -- all must collapse to `end-users`.
+        end-users) for i in $(seq 1 "$W_END");  do worker "end-user-$i"     end-users & done ;;
+        *) echo "unknown tenant: $t" >&2; exit 1 ;;
+      esac
     done
     wait
 
@@ -124,6 +133,17 @@ spec:
             #   "app1"                 app1 alone must receive ~100%
             - name: TENANTS
               value: "app1 app2 end-users"
+            # Per-tenant worker counts. Unset = use WORKERS for everyone.
+            # The asymmetric-demand run sets WORKERS_APP1=32 with
+            # WORKERS_END_USERS=2: app1 saturating while end-users trickles,
+            # to confirm app1 is not held near its 20% weight when end-users
+            # leaves most of its 65% unused.
+            # - name: WORKERS_APP1
+            #   value: "32"
+            # - name: WORKERS_APP2
+            #   value: "0"
+            # - name: WORKERS_END_USERS
+            #   value: "2"
             - name: DURATION
               # Several half-lives (halfLifeSeconds: 60). The tabs start empty
               # after every EPP restart, so a run shorter than ~3 half-lives

@@ -1,0 +1,153 @@
+# The SAME plugin, deployed the official way: a real LLMInferenceService whose
+# scheduler is templated by RHOAI's own KServe preset.
+#
+# WHY THIS EXISTS ALONGSIDE 02-epp.yaml
+#
+# 02-epp.yaml runs the EPP as a plain Deployment we write by hand. That is the
+# fast test rig: it isolates the fairness policy from KServe's templating, it
+# starts in seconds, and it is what every number in docs/poc-results.md was
+# measured on. Keep it.
+#
+# But it proves nothing about the path this will actually ship on. Under KServe
+# the EPP's command, ports, TLS flags and pool wiring are all TEMPLATED by the
+# preset, not written by us -- and that templating is exactly where a custom
+# image breaks. This file is that path.
+#
+# HOW IT AVOIDS NEEDING A GPU
+#
+# The presets compose cleanly, one concern each:
+#   v3-5-0-kserve-config-llm-scheduler    -> spec.router.scheduler  (the EPP)
+#   v3-5-0-kserve-config-llm-router-route -> spec.router.route      (the HTTPRoute)
+#   v3-5-0-kserve-config-llm-template     -> spec.template          (vLLM on GPU)
+#
+# We take the first two and DELIBERATELY OMIT the third, supplying our own
+# model-server template pointing at the simulator. That is not a workaround for
+# the sake of it: the third preset's command ends in `exec vllm serve
+# /mnt/models`, so it requires real weights staged by a storage initializer and
+# a real accelerator. Omitting it leaves the part we actually need to test --
+# the scheduler templating -- fully intact and running the genuine preset.
+#
+# The production variant is deploy/llmisvc.yaml, which keeps all three presets
+# and the GPU limits. The scheduler stanza should stay in sync between the two.
+---
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: maas-llmisvc
+  namespace: maas-fairness-poc
+spec:
+  baseRefs:
+    - name: v3-5-0-kserve-config-llm-scheduler
+    - name: v3-5-0-kserve-config-llm-router-route
+
+  model:
+    # Empty on purpose. `uri` is a required FIELD, but an empty value is what
+    # the shipped presets themselves use, and a non-empty one would make KServe
+    # stage weights with a storage initializer. The simulator has no weights to
+    # stage. If this is ever rejected by validation, the next thing to try is a
+    # tiny real model rather than a fake URI -- a URI that cannot be fetched
+    # fails in the init container, which is a slow and confusing way to find out.
+    uri: ""
+    # Must match --model on the simulator below and the `model` field clients
+    # send, or requests 404 at the model server.
+    name: llama-3-1-8b
+
+  replicas: 2
+
+  # ---------------------------------------------------------------------------
+  # Model server: the simulator, standing in for vLLM
+  # ---------------------------------------------------------------------------
+  template:
+    containers:
+      - name: main
+        image: ghcr.io/llm-d/llm-d-inference-sim:v0.11.4
+        # No `command`. The image's own entrypoint is correct, and because we
+        # omitted the GPU preset there is no inherited bash wrapper to override
+        # -- which is the whole reason this stays readable.
+        args:
+          - --model
+          - llama-3-1-8b
+          - --port
+          - "8000"
+          - --max-num-seqs
+          - "4"
+          - --max-model-len
+          - "4096"
+          - --mode
+          - random
+          - --time-to-first-token
+          - 200ms
+          - --inter-token-latency
+          - 20ms
+        ports:
+          # The scheduler preset's pool hardcodes targetPorts: [{number: 8000}],
+          # so the model server MUST listen on 8000.
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+
+  # ---------------------------------------------------------------------------
+  # Router: gateway, route, and the scheduler carrying our plugin
+  # ---------------------------------------------------------------------------
+  router:
+    gateway:
+      refs:
+        # Our own POC gateway rather than the shared data-science-gateway in
+        # openshift-ingress, whose listener restricts allowedRoutes to
+        # openshift-ingress and redhat-ods-applications. Attaching there would
+        # mean editing a resource RHOAI owns.
+        - name: maas-poc-gateway
+          namespace: maas-fairness-poc
+    route: {}
+    scheduler:
+      # One replica, always -- all fairness state is in-process. See the long
+      # note in deploy/llmisvc.yaml; it is a correctness constraint, not a cost
+      # decision.
+      replicas: 1
+
+      config:
+        ref:
+          name: maas-epp-config
+          key: epp
+
+      template:
+        containers:
+          # The name MUST be "main" -- KServe merges by container name, and any
+          # other name appends a SECOND container rather than overriding the
+          # EPP, leaving a pod running both.
+          - name: main
+            # The only field that must change from the preset. Notably NOT
+            # command/args: the preset templates --pool-name, --pool-namespace,
+            # the ports and all the TLS flags, and replacing it means
+            # re-deriving every one of those by hand and re-syncing on each
+            # RHOAI bump.
+            #
+            # This is also precisely the configuration that makes
+            # registerDownstreamCompatFlags() in cmd/epp/main.go load-bearing:
+            # when TLS is enabled the preset appends
+            # --model-server-metrics-scheme=https, a flag that exists only in
+            # Red Hat's downstream EPP fork. Upstream pflag treats an unknown
+            # flag as fatal, so without the shim this pod crash-loops
+            # immediately and the failure looks like a bad image rather than a
+            # missing flag.
+            image: image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp:latest
+            imagePullPolicy: Always
+            resources:
+              # The preset asks for cpu: 1 / limits 6 CPU / 16Gi. This cluster
+              # has two Ready workers at ~95-99% of allocatable CPU requested,
+              # so the preset's request alone will not schedule. Overriding
+              # resources is the one further deviation from stock, and it is an
+              # environment constraint rather than anything about the plugin.
+              requests:
+                cpu: 200m
+                memory: 512Mi
+              limits:
+                cpu: "2"
+                memory: 2Gi

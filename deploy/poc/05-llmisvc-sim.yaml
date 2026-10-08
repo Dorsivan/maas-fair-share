@@ -169,14 +169,19 @@ spec:
             # re-deriving every one of those by hand and re-syncing on each
             # RHOAI bump.
             #
-            # This is also precisely the configuration that makes
-            # registerDownstreamCompatFlags() in cmd/epp/main.go load-bearing:
-            # when TLS is enabled the preset appends
-            # --model-server-metrics-scheme=https, a flag that exists only in
-            # Red Hat's downstream EPP fork. Upstream pflag treats an unknown
-            # flag as fatal, so without the shim this pod crash-loops
-            # immediately and the failure looks like a bad image rather than a
-            # missing flag.
+            # On registerDownstreamCompatFlags() in cmd/epp/main.go: this
+            # deployment did NOT exercise it. The preset source contains
+            #   {{ if .GlobalConfig.EnableTLS }}--model-server-metrics-scheme=https{{- end }}
+            # and TLS IS enabled here -- the sibling TLS-gated flags
+            # (--secure-serving=true, --cert-path, --enable-cert-reload) were
+            # all templated -- yet the rendered command omits that one, and the
+            # EPP's flag dump shows it empty. KServe instead injected a
+            # metrics-data-source plugin with scheme: https into the config,
+            # which is the v0.10.0+ mechanism.
+            #
+            # The shim stays as cheap defensive code, since the preset can
+            # clearly emit the flag and an unknown flag is fatal to pflag. But
+            # do not describe it as load-bearing on this evidence.
             image: image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp:latest
             imagePullPolicy: Always
             resources:

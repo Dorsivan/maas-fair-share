@@ -272,9 +272,12 @@ Each one broke the deployment, and none of them is reachable from
    deployment. Instead KServe injected a `metrics-data-source` plugin with
    `scheme: https` into the config, which is the v0.10.0+ mechanism.
 
-### Open: the scheduler Role cannot be created
+### Open: it works, but never reports Ready
 
-`SchedulerWorkloadReady`, `RouterReady` and `Ready` stay `False`:
+`SchedulerWorkloadReady`, `RouterReady` and `Ready` stay `False` on
+`SchedulerReconcileError`, while `InferencePoolReady`, `MainWorkloadReady`,
+`WorkloadsReady` and `PresetsCombined` are all `True` and all three pods are
+`1/1 Running`:
 
 ```
 failed to reconcile scheduler role maas-fairness-poc/maas-llmisvc-epp-role:
@@ -284,15 +287,29 @@ failed to reconcile scheduler role maas-fairness-poc/maas-llmisvc-epp-role:
   {APIGroups:["llm-d.ai"], Resources:["inferenceobjectives"], Verbs:["get" "list" "watch"]}
 ```
 
-Kubernetes' privilege-escalation guard: the llmisvc controller tries to create
-a Role granting permissions its own ServiceAccount does not hold. That is an
-RHOAI packaging gap, not something our manifest causes.
+Kubernetes' privilege-escalation guard: the controller is handling a Role that
+grants permissions its own ServiceAccount does not hold. That is an RHOAI
+packaging gap, not something our manifest causes.
 
-It does **not** stop the plugin working — the EPP pod runs, serves ext_proc,
-classifies and dispatches, and the fairness policy needs neither of those two
-resource types. The cost is that the LLMInferenceService never reports `Ready`.
-Fixing it means granting the `llmisvc-controller-manager` SA those two
-permissions cluster-wide, which is an operator-level change.
+**The Role itself is fine.** `maas-llmisvc-epp-role` was created successfully
+on the first reconcile and the EPP's ServiceAccount has everything it needs —
+`oc auth can-i list` returns `yes` for `inferencepools`, `pods` *and*
+`inferenceobjectives.llm-d.ai`, and the EPP logs zero `forbidden` lines. What
+fails is every *subsequent* reconcile, where the controller re-validates the
+existing Role and trips the escalation check.
+
+So nothing is functionally broken, but the consequences are not purely
+cosmetic:
+
+- Anything gating on `Ready` treats this as a failed deployment — the RHOAI
+  dashboard, `oc wait --for=condition=Ready`, CI, a GitOps sync.
+- The controller is stuck in a failing reconcile loop, so later edits to the
+  LLMInferenceService spec will not be applied cleanly.
+
+Fixing it means granting the `llmisvc-controller-manager` ServiceAccount
+`get/list/watch` on `llm-d.ai` `inferenceobjectives` and
+`inferencemodelrewrites` cluster-wide — an operator-level change, so not done
+here.
 
 ### The stale webhook that blocked all of this
 

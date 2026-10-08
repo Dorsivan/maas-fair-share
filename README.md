@@ -92,6 +92,77 @@ Capacity loss lowers everyone's absolute throughput together — the *ratio* hol
 *floor* does not. A tenant that sends no traffic receives nothing; capacity cannot be
 reserved for requests that have not arrived.
 
+## Platform compatibility
+
+**The short version: RHOAI 3.4 and 3.5 both work. The plugin ships its own EPP
+binary, so the platform's own EPP version does not gate it.**
+
+That is worth stating plainly because the obvious reasoning is wrong. RHOAI 3.4
+ships an EPP with **no flow-control subsystem at all** — no `FairnessPolicy`, no
+`FlowKey`, no queues — which looks like a hard blocker. It isn't, because we
+replace that container.
+
+### Which EPP each release ships
+
+The component was renamed mid-stream, which obscures the picture. `llm-d`'s
+`llm-d-inference-scheduler` **became** `llm-d-router`; the repo redirects. The
+rename happened at **v0.9.0**, the same release that introduced flow control.
+
+| RHOAI | Upstream component | Version | Flow control |
+|---|---|---|---|
+| 3.3, **3.4.x** | `llm-d-inference-scheduler` | v0.7.x | **no** |
+| **3.5**, 3.6 | `llm-d-router` | v0.10.0 | yes |
+| *this plugin builds against* | `llm-d-router` | **v0.11.0** | yes |
+
+Verified three ways: the source trees (`FairnessPolicy` absent at v0.7.1/v0.8.0,
+present from v0.9.0, with positive controls proving the grep); image labels
+(`version`, `url`, `vcs-ref` via `oc image info`, which is the only way to read a
+version off a digest); and Red Hat's per-release branches — `rhoai-3.4` exists
+only in `red-hat-data-services/llm-d-inference-scheduler`, while
+`llm-d-router` starts at `rhoai-3.5`.
+
+### Why 3.4 still works
+
+Plugins are compiled in; there is no dynamic loading. So `Dockerfile.epp` builds
+a **complete, standalone EPP** — the full upstream binary plus one registered
+policy — and lands it at `/app/epp`, the exact path the KServe preset's
+templated command invokes. We override only `image:`, never `command`/`args`.
+Flow control therefore comes from *our* binary, not the platform's.
+
+Both releases provide what that needs, identically:
+
+- the scheduler container is named `main`, so the image override merges;
+- `router.scheduler.config.ref` exists in both APIs (`SchedulerConfigSpec` is
+  unchanged), and the controller appends our YAML as `--config-text`;
+- every flag either release templates is one upstream v0.11.0 accepts.
+
+With one exception, which is why `registerDownstreamCompatFlags()` exists in
+`cmd/epp/main.go`: under TLS, **3.4 templates
+`--model-server-metrics-scheme=https`** — a flag present only in Red Hat's
+downstream fork, in no upstream release. pflag treats an unknown flag as fatal,
+so without the shim the pod crash-loops on every 3.4 cluster and the failure
+looks like a bad image.
+
+Confirmed empirically in `deploy/poc/06-rhoai34-shape.yaml`, which runs our
+image against the scheduler command copied verbatim from the `rhoai-3.4`
+branch: the flag rendered, the binary parsed it
+(`"model-server-metrics-scheme":"https"`), zero flag-parse errors, pod `1/1
+Running` with 0 restarts, `maas-weighted-fairness` instantiated.
+
+### Still unverified on a real 3.4 cluster
+
+The test above used a 3.4-shaped *preset* under a 3.5 *controller*, so three
+things remain open:
+
+1. Whether 3.4's controller validates the `EndpointPickerConfig` before passing
+   it through. The field is a `RawExtension`/ConfigMap ref, which suggests
+   passthrough, but that is inference.
+2. The InferencePool API group 3.4 creates versus what a v0.11.0 EPP watches.
+   3.4's pool uses the same v1 shape (`endpointPickerRef` + `targetPorts`).
+3. **The tokenizer sidecar.** 3.4's preset adds a second container
+   (`llm-d-uds-tokenizer:v0.7.1`) sharing a controller-injected `tokenizer-uds`
+   volume. 3.5 has no such container. Untested, and the most likely surprise.
+
 ## Layout
 
 ```
@@ -99,6 +170,8 @@ cmd/epp/              main: register the plugin, hand off to the upstream runner
 pkg/fairness/weightedlas/
                       the plugin -- policy, state, grouping, cost model, metrics
 deploy/               EndpointPickerConfig, LLMInferenceService, PodMonitor, RBAC
+deploy/poc/           GPU-free rig: direct EPP, LLMInferenceService, 3.4-shape test
+deploy/maas/          Models-as-a-Service install (Kuadrant, TLS, DB, gateway)
 docs/                 design notes
 prototype/            FROZEN Python ext_proc prototype -- provenance, not a dependency
 ```

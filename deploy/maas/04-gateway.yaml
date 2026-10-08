@@ -1,0 +1,48 @@
+# maas-default-gateway -- the ingress point for Models-as-a-Service.
+#
+# The NAME AND NAMESPACE ARE BOTH LOAD-BEARING. RHOAI's MaaS controller looks
+# for exactly `maas-default-gateway` in `openshift-ingress`; it is not a
+# convention you can rename. Both annotations below are required by the guide
+# (section 1.3) and each has a distinct job:
+#
+#   opendatahub.io/managed: "false"
+#       Stops the ODH Model Controller reconciling this Gateway and clobbering
+#       the authorization policies MaaS attaches to it. Without it, MaaS auth
+#       silently stops working whenever the model controller resyncs.
+#
+#   security.opendatahub.io/authorino-tls-bootstrap: "true"
+#       Step 4 of the guide's TLS procedure (the other three steps are in
+#       02-authorino-tls.sh). The MaaS controller watches for this annotation
+#       and creates an EnvoyFilter so Envoy talks TLS to Authorino.
+#
+# No hostname on the listener, deliberately: the upstream install guide warns
+# that hostname filters cause TLS/SNI problems on this Gateway.
+#
+# HTTP rather than HTTPS, and ClusterIP rather than LoadBalancer in practice:
+# this cluster has the MetalLB operator but no IPAddressPool, so every
+# LoadBalancer Service sits at EXTERNAL-IP <pending> forever. That is the same
+# situation the upstream script handles with INGRESS_MODE=clusterip. Requests
+# reach the gateway on its in-cluster Service address, which is how every test
+# in docs/poc-results.md already runs. A mirrored environment with a real LB
+# should add an HTTPS listener and a certificate.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-default-gateway
+  namespace: openshift-ingress
+  annotations:
+    opendatahub.io/managed: "false"
+    security.opendatahub.io/authorino-tls-bootstrap: "true"
+spec:
+  gatewayClassName: data-science-gateway-class
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      # All, so model namespaces (maas-fairness-poc) can attach HTTPRoutes.
+      # The shared data-science-gateway restricts this to a Selector, which is
+      # exactly why deploy/poc/03-gateway.yaml had to create its own Gateway.
+      allowedRoutes:
+        namespaces:
+          from: All

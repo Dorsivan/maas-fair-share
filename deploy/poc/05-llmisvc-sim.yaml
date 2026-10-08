@@ -41,13 +41,20 @@ spec:
     - name: v3-5-0-kserve-config-llm-router-route
 
   model:
-    # Empty on purpose. `uri` is a required FIELD, but an empty value is what
-    # the shipped presets themselves use, and a non-empty one would make KServe
-    # stage weights with a storage initializer. The simulator has no weights to
-    # stage. If this is ever rejected by validation, the next thing to try is a
-    # tiny real model rather than a fake URI -- a URI that cannot be fetched
-    # fails in the init container, which is a slow and confusing way to find out.
-    uri: ""
+    # A deliberately TINY real model, and the simulator never reads it.
+    #
+    # Empty is what the shipped presets use, but a real instance rejects it at
+    # reconcile time with "invalid model URI:" -- the controller requires
+    # something it can attach as model artifacts. A fake URI is worse than no
+    # URI: it is accepted here and then fails slowly inside the
+    # storage-initializer init container, where the error is far less obvious.
+    #
+    # So we give it the smallest public model that will satisfy the artifact
+    # attachment and download in seconds. The simulator serves synthetic
+    # responses and never opens /mnt/models, so the weights are irrelevant --
+    # this exists purely to get past the controller's validation and exercise
+    # the real reconcile path.
+    uri: hf://hf-internal-testing/tiny-random-LlamaForCausalLM
     # Must match --model on the simulator below and the `model` field clients
     # send, or requests 404 at the model server.
     name: llama-3-1-8b
@@ -61,9 +68,22 @@ spec:
     containers:
       - name: main
         image: ghcr.io/llm-d/llm-d-inference-sim:v0.11.4
-        # No `command`. The image's own entrypoint is correct, and because we
-        # omitted the GPU preset there is no inherited bash wrapper to override
-        # -- which is the whole reason this stays readable.
+        # The command MUST be set explicitly, even though this is the image's
+        # own entrypoint and even though the GPU preset is omitted from
+        # baseRefs above.
+        #
+        # Omitting baseRefs does NOT omit the template: the controller merges
+        # the well-known default preset regardless (status shows
+        # PresetsCombined: True), so the container inherits that preset's
+        # command -- a large bash script doing RoCE/NCCL discovery before
+        # `exec vllm serve /mnt/models`. The simulator image is distroless and
+        # has no shell, so the pod dies with:
+        #     container create failed: executable file `/bin/bash` not found
+        # which reads like a broken image rather than an inherited command.
+        #
+        # Setting command here overrides the merged one by strategic merge.
+        # Args survive the merge intact either way.
+        command: ["/app/llm-d-inference-sim"]
         args:
           - --model
           - llama-3-1-8b
@@ -79,6 +99,26 @@ spec:
           - 200ms
           - --inter-token-latency
           - 20ms
+          # TLS, because this cluster has enableLLMInferenceServiceTLS: true.
+          #
+          # KServe templates the health probes as https://:8000/health and
+          # mounts a serving cert at /var/run/kserve/tls (volume `tls-certs`)
+          # for vLLM, which gets --ssl-certfile/--ssl-keyfile from the GPU
+          # preset. Our container replaces that preset's command, so it has the
+          # certs mounted but was still serving plaintext, and every probe
+          # failed with:
+          #     Startup probe failed: http: server gave HTTP response to HTTPS client
+          # while the simulator logged the TLS ClientHello as a garbage HTTP
+          # method. The pod runs, serves fine over http, and never goes Ready.
+          #
+          # deploy/poc/02-epp.yaml does NOT need this: the hand-rolled rig sets
+          # --secure-serving=false and probes over plaintext. This is purely a
+          # consequence of going through KServe on a TLS-enabled cluster, and
+          # it is exactly the sort of difference the direct rig cannot surface.
+          - --ssl-certfile
+          - /var/run/kserve/tls/tls.crt
+          - --ssl-keyfile
+          - /var/run/kserve/tls/tls.key
         ports:
           # The scheduler preset's pool hardcodes targetPorts: [{number: 8000}],
           # so the model server MUST listen on 8000.

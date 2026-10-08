@@ -14,6 +14,10 @@ saturated**, and imposes no limit at all when it isn't.
 > throughput), and below capacity a second tenant costs the first no latency.
 > Unit tests pass under `-race`.
 >
+> Also proven: the plugin runs under a real LLMInferenceService templated by
+> RHOAI's own KServe preset (deploy/poc/05-llmisvc-sim.yaml) &mdash; HTTP 200 and a
+> fairness dispatch recorded.
+>
 > Not yet done: `outputTokenWeight` is still the uncalibrated `2.0` placeholder
 > (the calibration needs GPUs), the cached-token discount path is unexercised
 > (the simulator reports `cached_tokens: 0`), and the production

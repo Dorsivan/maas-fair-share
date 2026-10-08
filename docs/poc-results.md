@@ -210,56 +210,121 @@ recorded because every one of them is silent by default.
    resolves `inference.networking.x-k8s.io/v1alpha2` backendRefs and rejects the
    v1 pool outright. `deploy/poc/02-epp.yaml` declares the same pool twice.
 
-## Blocked: the official LLMInferenceService path
+## The official LLMInferenceService path — working
 
-`deploy/poc/05-llmisvc-sim.yaml` deploys the same plugin the way it will
-actually ship — a real `LLMInferenceService` whose scheduler is templated by
-RHOAI's own preset, with the GPU model-server preset swapped for the simulator
-(the presets compose cleanly: `-scheduler` supplies `router.scheduler`,
-`-router-route` supplies `router.route`, and only `-template` needs a GPU).
+`deploy/poc/05-llmisvc-sim.yaml` runs the same plugin the way it will actually
+ship: a real `LLMInferenceService` whose scheduler is templated by RHOAI's own
+preset, with the GPU model-server preset swapped for the simulator.
 
-**It cannot be applied on this cluster.** Every `LLMInferenceService` create is
-rejected at admission:
-
-```
-Internal error occurred: failed calling webhook
-"connection-llmisvc-v1alpha2.odh-model-controller.opendatahub.io":
-failed to call webhook: the server could not find the requested resource
-```
-
-This is a pre-existing cluster defect, not anything to do with this plugin — a
-four-line `LLMInferenceService` with nothing but `model.name` is rejected
-identically under `--dry-run=server`. **No `LLMInferenceService` can be created
-on this cluster at all right now.**
-
-Diagnosis: the `MutatingWebhookConfiguration`
-`mutating.odh-model-controller.opendatahub.io` declares two webhooks,
-`connection-llmisvc-v1alpha1/v1alpha2`, pointing at
-`redhat-ods-applications/odh-model-controller-webhook-service` on paths
-`/mutate-serving-kserve-io-v1alpha{1,2}-llminferenceservice`, both with
-`failurePolicy: Fail`. The `odh-model-controller` pod is healthy (Running,
-0 restarts, single endpoint) but registers only these six paths:
+Confirmed on 2026-10-08 (RHOAI 3.4.4). KServe created the whole topology —
+`maas-llmisvc-kserve` (2 model servers), `maas-llmisvc-kserve-router-scheduler`
+(the EPP, our image), `maas-llmisvc-inference-pool`,
+`maas-llmisvc-kserve-route`, `maas-llmisvc-epp-service` — and templated the
+EPP's command itself:
 
 ```
-/mutate-serving-kserve-io-v1alpha1-inferencegraph
-/mutate-serving-kserve-io-v1beta1-inferenceservice
-/mutate--v1-pod
-/validate-nim-opendatahub-io-v1-account
-/validate-serving-kserve-io-v1alpha1-inferencegraph
-/validate-serving-kserve-io-v1beta1-inferenceservice
+/app/epp --pool-name maas-llmisvc-inference-pool --pool-namespace maas-fairness-poc
+         --grpc-port 9002 --grpc-health-port 9003
+         --enable-cert-reload=true --secure-serving=true --cert-path=/var/run/kserve/tls
 ```
 
-Neither llminferenceservice path is among them, so the API server gets a 404
-and `failurePolicy: Fail` turns that into a hard rejection. The webhook
-configuration and the running controller image disagree about what the
-controller serves — consistent with the operator's 3.3.2 → 3.4.0 upgrade
-(`rhods-operator.3.4.0`, replacing `rhods-operator.3.3.2`) having left the two
-out of step.
+with our ConfigMap injected as `--config-text`. The EPP log shows
+`maas-weighted-fairness` instantiated with every parameter, and flow control
+wired to `fairnessPolicyRef: maas-fairness`. A request through the gateway at
+`/maas-fairness-poc/maas-llmisvc/v1/chat/completions` returned **HTTP 200**
+with a real usage block, and the EPP reported
+`maas_fairness_dispatch_total{fairness_id="app1"} 1` with
+`maas_fairness_enforcing 1`.
 
-Unblocking it means either getting the `odh-model-controller` onto a build that
-serves those paths, or removing/neutralising the two stale webhook entries.
-The latter is a cluster-wide change to an RHOAI-managed object on a shared
-cluster and the operator may well revert it, so it is not done here.
+### Four things the direct rig could never have caught
+
+Each one broke the deployment, and none of them is reachable from
+`deploy/poc/02-epp.yaml`.
+
+1. **`model.uri: ""` is rejected.** The shipped presets use an empty `uri`, but
+   a real instance fails to reconcile with `invalid model URI:`. The fix is a
+   tiny real model the simulator never reads. A *fake* URI is worse than none:
+   it passes this check and then fails slowly inside the storage-initializer.
+
+2. **Omitting the GPU preset from `baseRefs` does not omit its command.** The
+   controller merges the well-known default template regardless
+   (`PresetsCombined: True`), so the container inherited a large bash script
+   doing RoCE/NCCL discovery before `exec vllm serve /mnt/models`. The
+   simulator image is distroless, so the pod died with
+   `executable file /bin/bash not found` — which reads like a broken image
+   rather than an inherited command. `command` must be set explicitly.
+
+3. **TLS on the model server.** With `enableLLMInferenceServiceTLS: true`,
+   KServe templates the health probes as `https://:8000/health` and mounts a
+   serving cert at `/var/run/kserve/tls`. The simulator served plaintext, so
+   every probe failed with `http: server gave HTTP response to HTTPS client`
+   while the pod ran happily. Fixed with the simulator's own
+   `--ssl-certfile`/`--ssl-keyfile`. The direct rig sets
+   `--secure-serving=false` and never meets this.
+
+4. **`--model-server-metrics-scheme` was *not* templated in this render** —
+   the EPP's flag dump shows it empty, even though the preset source contains
+   `{{ if .GlobalConfig.EnableTLS }}--model-server-metrics-scheme=https{{- end }}`
+   and the other TLS-gated flags *were* templated. So the compatibility shim in
+   `cmd/epp/main.go` was **not** exercised here. It stays as defensive code —
+   the preset can clearly emit that flag, and an unknown flag is fatal to
+   pflag — but we should not claim it is load-bearing on the evidence of this
+   deployment. Instead KServe injected a `metrics-data-source` plugin with
+   `scheme: https` into the config, which is the v0.10.0+ mechanism.
+
+### Open: the scheduler Role cannot be created
+
+`SchedulerWorkloadReady`, `RouterReady` and `Ready` stay `False`:
+
+```
+failed to reconcile scheduler role maas-fairness-poc/maas-llmisvc-epp-role:
+  user "system:serviceaccount:redhat-ods-applications:llmisvc-controller-manager"
+  is attempting to grant RBAC permissions not currently held:
+  {APIGroups:["llm-d.ai"], Resources:["inferencemodelrewrites"], Verbs:["get" "list" "watch"]}
+  {APIGroups:["llm-d.ai"], Resources:["inferenceobjectives"], Verbs:["get" "list" "watch"]}
+```
+
+Kubernetes' privilege-escalation guard: the llmisvc controller tries to create
+a Role granting permissions its own ServiceAccount does not hold. That is an
+RHOAI packaging gap, not something our manifest causes.
+
+It does **not** stop the plugin working — the EPP pod runs, serves ext_proc,
+classifies and dispatches, and the fairness policy needs neither of those two
+resource types. The cost is that the LLMInferenceService never reports `Ready`.
+Fixing it means granting the `llmisvc-controller-manager` SA those two
+permissions cluster-wide, which is an operator-level change.
+
+### The stale webhook that blocked all of this
+
+Before any of the above was reachable, **every** `LLMInferenceService` create on
+this cluster was rejected:
+
+```
+failed calling webhook "connection-llmisvc-v1alpha2.odh-model-controller.opendatahub.io":
+  the server could not find the requested resource
+```
+
+Not specific to us — a four-line LLMInferenceService failed identically under
+`--dry-run=server`, in every namespace tried.
+
+The cause was a stale `MutatingWebhookConfiguration`. The cluster's KServe
+stack was installed 2026-09-07 21:09 and carries `v3-5-0-*` presets, while the
+operator is 3.4.4. That config declared five webhooks including
+`connection-llmisvc-v1alpha{1,2}` with `failurePolicy: Fail`, pointing at paths
+the running `odh-model-controller` never registers — it registers only six
+paths, none of them for llminferenceservice.
+
+It had **no ownerReferences**, so nothing garbage-collected it, and the
+operator could not repair it in place. Deleting it was enough: the 3.4.4
+operator recreated it seconds later with **three** webhooks — exactly the paths
+the controller actually serves, with both `connection-llmisvc` entries gone —
+and admission has worked since.
+
+Worth knowing that the documented uninstall would *not* have fixed this: it
+removes the DSC, DSCI, Auth CR, namespaces and Subscription/CSV, but says
+nothing about webhook configurations or the 20 `LLMInferenceServiceConfig`
+presets, all of which are unowned and survive. A full reinstall would have come
+back up and re-adopted the same broken config.
 
 ## What this POC does *not* show
 
@@ -274,9 +339,12 @@ cluster and the operator may well revert it, so it is not done here.
   two-run `guidellm` calibration needs real GPUs.
 - **Open-loop behaviour.** Everything above is closed-loop. See the clamp
   finding for why that distinction may matter.
-- **Nothing about production KServe wiring.** `deploy/llmisvc.yaml` has not been
-  applied; the POC runs the EPP directly to isolate the plugin from KServe's
-  templating.
+- **The GPU production manifest is still unapplied.** `deploy/llmisvc.yaml`
+  (all three presets, real vLLM, `nvidia.com/gpu`) has not been run. The
+  KServe wiring itself IS now proven, via `deploy/poc/05-llmisvc-sim.yaml`.
+- **No sustained load through the LLMInferenceService path.** The weight-split
+  and work-conservation numbers above were all measured on the direct rig.
+  Through KServe only a single request has been verified end to end.
 
 ## Reproducing
 

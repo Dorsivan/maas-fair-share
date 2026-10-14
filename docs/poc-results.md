@@ -343,15 +343,92 @@ nothing about webhook configurations or the 20 `LLMInferenceServiceConfig`
 presets, all of which are unowned and survive. A full reinstall would have come
 back up and re-adopted the same broken config.
 
+## Real vLLM on CPU — no GPU required
+
+The simulator was never the only GPU-free option. Red Hat ships a supported CPU
+build of vLLM, `registry.redhat.io/rhaii/vllm-cpu-rhel9` ("Red Hat AI Inference
+Server for CPU (AVX2)"), with tags tracking the product (3.4.0, 3.4.1, 3.5.0,
+3.5.1). `deploy/poc/07-vllm-cpu.yaml` runs it against Qwen2.5-0.5B-Instruct,
+two replicas, `VLLM_CPU_KVCACHE_SPACE=4`. Both pods reached `1/1 Running` in
+about five minutes.
+
+This closes three gaps that every earlier result carried as caveats:
+
+| | Simulator | CPU vLLM |
+|---|---|---|
+| `cached_tokens` | always 0 | **1024 of 1110 prompt tokens (92%)** |
+| `--enable-prompt-tokens-details` | never exercised | validated |
+| `--enable-force-include-usage` | never exercised | validated (`requests_without_usage_total` = 0) |
+| Saturation | sleeps | a real KV cache that fills |
+
+`maas_fairness_prompt_tokens_cached_ratio{fairness_id="app1"}` read **0.615**,
+the first non-zero value this project has ever produced — and arithmetically
+exactly right for three requests at 0, 0.92, 0.92. **`cachedInputTokenWeight`
+finally has a real signal**, which the design names as the parameter most
+coupled to the group weights and the headline reading of the shadow period.
+
+What CPU still cannot give us is `outputTokenWeight`. That ratio is prefill
+chunk size over decode batch size — an efficiency property of the hardware — so
+measuring it here would yield a confident, wrong number. The two-run `guidellm`
+calibration still needs GPUs.
+
+## MaaS now governs the gateway, and it validates a design decision
+
+Once MaaS was deployed, unauthenticated requests to the model endpoint began
+returning **401**. That is Authorino enforcing the `maas-poc-gateway-authn`
+AuthPolicy, and it is correct behaviour, not a regression. The progression is
+worth knowing: no token → 401; a token for an unauthorised ServiceAccount →
+**403**; a token whose subject passes the policy's
+`kubernetesSubjectAccessReview` (`get llminferenceservices/<name>` in the
+request-path namespace) → **200**.
+
+More interesting is what the policy *injects* on every authenticated request:
+
+| Header | Value |
+|---|---|
+| `x-gateway-inference-fairness-id` | the **constant** `https://kubernetes.default.svc` |
+| `x-gateway-inference-objective` | the ServiceAccount name, else `authenticated` |
+
+**The first one vindicates the decision to overwrite `FairnessID`
+unconditionally.** The plan chose that over the stock identity plugin, which
+only populates the field when it is *empty*, on spoofing grounds. On a MaaS
+cluster the consequence is sharper than anticipated: the gateway always sets
+that header, and to the *same constant for every caller*. With the stock
+plugin, every tenant would collapse into a single flow named
+`https://kubernetes.default.svc` and the fairness policy would be completely
+inert — one queue, nothing to be fair between, and no error anywhere. Because
+our `RequestHeaderProcessor` overwrites from `x-maas-subscription-id`
+regardless, the constant is harmlessly discarded.
+
+**The second is a latent risk, currently dormant.** `x-gateway-inference-objective`
+selects the priority band, and fairness is intra-band only — the plan called
+this "the sneaky one ... a total bypass". Here the *gateway* sets it per
+ServiceAccount, so different callers could in principle land in different
+bands and never be compared. It is inert today only because the cluster has
+**zero `InferenceObjective` resources**, so every objective name resolves to
+the default band. Creating one with a non-zero priority would silently remove
+that tenant from the weighted comparison. This belongs in the runbook as a
+standing check:
+
+```sh
+oc get inferenceobjectives.llm-d.ai -A    # expect none, or all priority 0
+```
+
 ## What this POC does *not* show
 
-- **No real saturation.** The simulator has no KV cache and no real compute; it
+- **Saturation is now real but small.** deploy/poc/07-vllm-cpu.yaml runs vLLM
+  with a genuine KV cache (VLLM_CPU_KVCACHE_SPACE=4), so backpressure is real.
+  But CPU inference at this scale is not a GPU pool, and the load numbers above
+  were all measured against the simulator. They have NOT been re-run on vLLM.
+- **(superseded) The simulator has no KV cache and no real compute; it
   fakes backpressure with sleeps. Scorer behaviour under genuine memory
   pressure, and the `vramtime` cost model's trigger conditions, are untested.
-- **`cachedInputTokenWeight` is untested.** The simulator reported
-  `cached_tokens: 0` throughout, so `prompt_tokens_cached_ratio` was flat zero
-  and the discount path never executed. On real hardware a flat zero here means
-  a missing `--enable-prompt-tokens-details`; here it is the simulator.
+- **`cachedInputTokenWeight` is no longer untested, but it is uncalibrated.**
+  Real vLLM on CPU produces genuine cache hits (see above), so the discount
+  path now executes and `prompt_tokens_cached_ratio` is non-zero. What is still
+  missing is the per-group traffic-shape table the design calls the real
+  deliverable of the shadow period: hit rates measured per group, over real
+  traffic, which is what decides whether to move the weight off 1.0.
 - **`outputTokenWeight: 2.0` is still the uncalibrated placeholder.** The
   two-run `guidellm` calibration needs real GPUs.
 - **Open-loop behaviour.** Everything above is closed-loop. See the clamp

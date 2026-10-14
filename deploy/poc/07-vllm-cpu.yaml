@@ -1,0 +1,133 @@
+# REAL vLLM, on CPU. The POC backend that replaces the simulator.
+#
+# WHY THIS MATTERS MORE THAN IT LOOKS
+#
+# deploy/poc/05-llmisvc-sim.yaml uses llm-d-inference-sim, which emits correctly
+# shaped usage blocks but does no inference. Three things the fairness plugin
+# depends on were therefore never exercised by ANY test in docs/poc-results.md:
+#
+#   1. cached_tokens was always 0, so cachedInputTokenWeight never ran once. It
+#      is the parameter the design flags as most coupled to the group weights,
+#      and we have zero data on it.
+#   2. Saturation was faked with sleeps. The queues were real, but the
+#      backpressure came from request counts, not from a KV cache filling up.
+#   3. --enable-force-include-usage and --enable-prompt-tokens-details are
+#      documented as HARD PREREQUISITES that fail silently. Neither had ever
+#      been set on a server that actually honours them.
+#
+# This file fixes all three with a genuine vLLM, no accelerator required.
+#
+# Red Hat ships a supported CPU build: registry.redhat.io/rhaii/vllm-cpu-rhel9,
+# "Red Hat AI Inference Server for CPU (AVX2)". Tags track the product (3.4.0,
+# 3.4.1, 3.5.0, 3.5.1 all exist) -- keep the tag aligned with the cluster's
+# KServe artifacts, which are 3.5.0 here.
+#
+# WHAT IT STILL DOES NOT GIVE US
+#
+# outputTokenWeight calibration does NOT transfer from CPU to GPU. That ratio is
+# prefill-chunk-size over decode-batch-size, i.e. an efficiency property of the
+# hardware. Measuring it here would produce a confident, wrong number. The
+# two-run guidellm calibration still needs real GPUs.
+---
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: maas-vllm-cpu
+  namespace: maas-fairness-poc
+spec:
+  baseRefs:
+    - name: v3-5-0-kserve-config-llm-scheduler
+    - name: v3-5-0-kserve-config-llm-router-route
+
+  model:
+    # Small enough to be viable on CPU, real enough to have a genuine tokenizer
+    # and KV cache. A tiny-random model would defeat the purpose: it would give
+    # us cached_tokens, but from meaningless weights.
+    uri: hf://Qwen/Qwen2.5-0.5B-Instruct
+    name: llama-3-1-8b
+
+  # One replica to start. CPU prefill is slow; two replicas double the memory
+  # for KV cache before they double throughput.
+  replicas: 2
+
+  template:
+    nodeSelector:
+      # The RHAII CPU build is x86_64-only (it is an AVX2 image).
+      kubernetes.io/arch: amd64
+    containers:
+      - name: main
+        image: registry.redhat.io/rhaii/vllm-cpu-rhel9:3.5.0
+        # Explicit, for the same reason as the simulator: omitting the GPU
+        # preset from baseRefs does NOT stop the controller merging the default
+        # template, whose command is a bash wrapper ending in
+        # `exec vllm serve /mnt/models` with CUDA/RoCE setup around it.
+        command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+          # The storage-initializer stages spec.model.uri here.
+          - --model
+          - /mnt/models
+          - --served-model-name
+          - llama-3-1-8b
+          - --port
+          - "8000"
+          # THE TWO HARD PREREQUISITES. Both default OFF and both fail
+          # SILENTLY -- without the first, streaming clients never true up and
+          # are charged the estimate forever; without the second,
+          # prompt_tokens_details is absent, cached_tokens reads 0 and
+          # cachedInputTokenWeight quietly never applies.
+          # Alarms: maas_fairness_requests_without_usage_total must stay 0, and
+          # maas_fairness_prompt_tokens_cached_ratio must NOT be uniformly 0.
+          - --enable-force-include-usage
+          - --enable-prompt-tokens-details
+          # Small batch so a modest client load produces a real queue.
+          - --max-num-seqs
+          - "4"
+          - --max-model-len
+          - "4096"
+          # KServe probes https://:8000/health on a TLS-enabled cluster.
+          - --ssl-certfile
+          - /var/run/kserve/tls/tls.crt
+          - --ssl-keyfile
+          - /var/run/kserve/tls/tls.key
+        env:
+          # GiB of host RAM reserved for the KV cache. This is what makes
+          # saturation REAL here: fill it and vLLM queues, exactly as a GPU
+          # would. Raise it to make the pool harder to saturate.
+          - name: VLLM_CPU_KVCACHE_SPACE
+            value: "4"
+          - name: OMP_NUM_THREADS
+            value: "4"
+        ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+        resources:
+          requests:
+            cpu: "2"
+            memory: 8Gi
+          limits:
+            cpu: "4"
+            # Must comfortably exceed VLLM_CPU_KVCACHE_SPACE plus the weights,
+            # or the container is OOMKilled mid-generation.
+            memory: 16Gi
+
+  router:
+    gateway:
+      refs:
+        - name: maas-poc-gateway
+          namespace: maas-fairness-poc
+    route: {}
+    scheduler:
+      replicas: 1
+      config:
+        ref:
+          name: maas-epp-config
+          key: epp
+      template:
+        containers:
+          - name: main
+            image: image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp:latest
+            imagePullPolicy: Always
+            resources:
+              requests: {cpu: 200m, memory: 512Mi}
+              limits: {cpu: "2", memory: 2Gi}

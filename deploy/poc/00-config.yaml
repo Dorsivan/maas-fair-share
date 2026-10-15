@@ -24,7 +24,26 @@ data:
       - type: maas-weighted-fairness
         name: maas-fairness
         parameters:
-          identityHeader: x-maas-subscription-id
+          # x-maas-subscription, NOT x-maas-subscription-id.
+          #
+          # This was wrong for most of the POC and the failure is silent: with
+          # the id suffix the header simply never matches, every request falls
+          # to defaultGroup, and unmatched_subscriptions_total stays at ZERO --
+          # because nothing was mis-matched, the header was absent. The only
+          # symptom is all traffic quietly sharing the `unclassified` weight.
+          #
+          # Verified against the AuthPolicy MaaS generates per model
+          # (maas-auth-<model> in the model namespace), whose success response
+          # injects exactly:
+          #     X-MaaS-Subscription: auth.metadata.apiKeyValidation.subscription
+          # i.e. the MaaSSubscription NAME from the validated sk-oai API key.
+          # It also blanks Authorization before forwarding upstream.
+          #
+          # CONSEQUENCE FOR `groups` BELOW: the match values must be
+          # MaaSSubscription names, not invented tenant strings. Confirm with
+          #     oc get maassubscriptions -A
+          # before trusting any weight in this file.
+          identityHeader: x-maas-subscription
           groups:
             - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
             - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }

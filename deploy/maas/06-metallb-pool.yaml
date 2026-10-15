@@ -1,0 +1,49 @@
+# MetalLB address pool for Gateway VIPs.
+#
+# The MetalLB operator and its MetalLB CR are already installed in
+# metallb-system; only these two objects were missing, which is why every
+# LoadBalancer Service on this cluster sat at EXTERNAL-IP <pending> and every
+# Gateway reported Programmed=False / AddressNotAssigned.
+#
+# WHAT THIS FIXES, AND WHAT IT DOES NOT
+#
+# Fixes: the Gateway gets an address, so Programmed=True, which is what the
+# LLMInferenceService controller gates RouterReady (and therefore Ready) on.
+#
+# Does NOT provide external access. 10.241.0.200-.210 are RFC1918 addresses
+# inside the cluster's IBM Cloud VPC subnet (ocp-subnet, 10.241.0.0/24). They
+# are private by construction. External access to this cluster works through
+# the worker nodes' FLOATING IPs plus the Gateway Service's NodePort -- see
+# docs/poc-results.md; that path is already proven and needs none of this.
+#
+# Further, IBM Cloud VPC is software-defined and the worker NICs have
+# allow_ip_spoofing=false, so an L2/ARP announcement for an address the NIC does
+# not own is unlikely to carry traffic even inside the VPC. Treat these VIPs as
+# an address assignment that satisfies the controller, not as a data path.
+#
+# The addresses are NOT invented here: they are pre-reserved in the VPC as
+# metallb-200 .. metallb-210 on ocp-subnet, deliberately unbound. Verify with:
+#   ibmcloud is subnet-reserved-ips 0757-77f662ca-4ccb-4c96-831b-0ca0447b129c
+# Keep this range and that reservation in step; an address used here but not
+# reserved there could later be handed to a real VPC resource.
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: maas-gateway-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 10.241.0.200-10.241.0.210
+  # Explicit: do not hand out addresses until a Service asks.
+  autoAssign: true
+  avoidBuggyIPs: false
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: maas-gateway-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - maas-gateway-pool

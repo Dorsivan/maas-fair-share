@@ -1,0 +1,75 @@
+# Register the model with MaaS so the gateway will serve it.
+#
+# WHY THIS IS REQUIRED, not optional:
+# maas-default-gateway carries an AuthPolicy `gateway-default-auth` whose only
+# rule is `deny-unconfigured-models` -- a patternMatching rule comparing the
+# HTTP method to the literal "__deny_unconfigured_models__", which can never
+# match, so it always denies. Any model MaaS does not know about gets a flat
+# 403 at the gateway. That is MaaS's safety net, and registering the model is
+# how you get out from under it.
+#
+# The chain is: MaaSModelRef (what the model IS) -> MaaSAuthPolicy (who may
+# reach it) -> MaaSSubscription (how much they may consume).
+#
+# Note the division of labour this creates, which is the whole premise of the
+# fairness plugin: the MaaSSubscription's tokenRateLimits become a Kuadrant
+# TokenRateLimitPolicy -- a hard CEILING that applies always, even on an idle
+# cluster. The EPP fairness policy divides whatever capacity is actually
+# available when tenants contend. Ceiling and queue, not alternatives.
+---
+# A group to own the subscription. MaaS binds subscriptions to OpenShift
+# groups, not individual users; `dorsi` has no group membership by default.
+apiVersion: user.openshift.io/v1
+kind: Group
+metadata:
+  name: maas-poc-users
+users:
+  - dorsi
+---
+# What the model is. MUST live in the same namespace as the backend resource.
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
+metadata:
+  name: maas-vllm-cpu
+  namespace: maas-fairness-poc
+spec:
+  modelRef:
+    kind: LLMInferenceService
+    name: maas-vllm-cpu
+---
+# Who may reach it. Lives in the MaaS namespace, references the modelRef.
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSAuthPolicy
+metadata:
+  name: maas-poc-access
+  namespace: models-as-a-service
+spec:
+  modelRefs:
+    - name: maas-vllm-cpu
+      namespace: maas-fairness-poc
+  subjects:
+    groups:
+      - name: maas-poc-users
+    users: []
+---
+# How much they may consume. Deliberately generous: this is the Kuadrant
+# CEILING, and a tight one here would mask the thing under test. The fairness
+# split must come from the EPP under contention, not from anyone hitting a
+# rate limit -- if requests start getting 429s, the limiter is allocating the
+# pool and the measurement is meaningless.
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata:
+  name: maas-poc-subscription
+  namespace: models-as-a-service
+spec:
+  owner:
+    groups:
+      - name: maas-poc-users
+    users: []
+  modelRefs:
+    - name: maas-vllm-cpu
+      namespace: maas-fairness-poc
+      tokenRateLimits:
+        - limit: 10000000
+          window: 1m

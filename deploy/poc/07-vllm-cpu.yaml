@@ -114,6 +114,27 @@ spec:
   router:
     gateway:
       refs:
+        # The MaaS-owned gateway, not our throwaway POC one. This is the
+        # gateway the Tenant's gatewayRef points at and the one a mirrored
+        # environment will have, so routing through it is what makes this test
+        # representative rather than adjacent.
+        #
+        # Caveat worth carrying: deploy/maas/04-gateway.yaml sets
+        # allowedRoutes.namespaces.from: All so model namespaces can attach.
+        # RHOAI 3.4 known issue RHOAIENG-80360 warns against exactly that on a
+        # shared MaaS gateway -- any namespace can then attach an HTTPRoute and
+        # hijack traffic with an exact-path match. Acceptable for a
+        # single-tenant POC; tighten to a Selector before anything shared.
+        # REVERTED to the POC gateway. Routing through maas-default-gateway is
+        # more faithful, but inference there requires a MaaS API key
+        # (sk-oai-...) and the key-minting endpoint is unreachable on this
+        # cluster: maas-api-route targets Service/maas-api on port 8443, which
+        # serves TLS from an OpenShift service-serving cert, and there is no
+        # BackendTLSPolicy -- the CRD is not even installed -- so Envoy speaks
+        # plaintext to a TLS port and every /maas-api call returns 500.
+        # The upstream setup-gateway.sh presumably wires this; a hand-built
+        # Gateway does not. Revisit when the MaaS gateway is created by the
+        # supported script.
         - name: maas-poc-gateway
           namespace: maas-fairness-poc
     route: {}

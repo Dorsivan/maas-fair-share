@@ -1,0 +1,54 @@
+# An OpenShift Route to the Gateway, modelled on RHOAI's own
+# `data-science-gateway` route (edge TLS, Redirect).
+#
+# WHY THIS BEATS THE NODEPORT PATH
+#
+# External access currently works via a worker's FLOATING IP plus the Gateway
+# Service's NodePort (e.g. http://150.239.108.66:30806). That is fine for a
+# smoke test and terrible as an endpoint: it is pinned to one node, it is
+# plaintext, and the address changes if that instance is replaced.
+#
+# A Route rides the existing ocp-ingress-lb (public 169.63.100.239/.241 ->
+# infra nodes -> OpenShift router), so it needs no MetalLB, no floating IP and
+# no IBM Cloud change at all. It yields a stable DNS name under
+# *.apps.ocp.paladinaura.com with the cluster's wildcard certificate.
+#
+# ON "ARE HTTP PORTS OK FOR CHAT COMPLETIONS"
+#
+# Yes. Chat completions is an ordinary HTTP POST, and with edge termination the
+# client speaks HTTPS to the router while the router speaks HTTP to our
+# Gateway's :80 listener. The scheme is not the risk.
+#
+# THE TIMEOUT IS THE RISK, and it is not cosmetic for this plugin. HAProxy's
+# default route timeout is 30 seconds. A generation that runs longer is cut off
+# mid-stream, so no usage block ever arrives, so the request never trues up --
+# and the tenant stays charged the provisional ESTIMATE forever. That shows up
+# as maas_fairness_requests_without_usage_total climbing, which the design
+# treats as an alarm. CPU inference is slow enough to hit this easily.
+#
+# So the timeout annotation below is load-bearing, and it is deliberately
+# longer than flowControl's defaultRequestTTL (300s in deploy/poc/00-config.yaml)
+# so the EPP's own TTL decides a request's fate rather than the router
+# silently amputating it first.
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: maas-gateway
+  namespace: maas-fairness-poc
+  annotations:
+    haproxy.router.openshift.io/timeout: 600s
+    # Server-sent events must not be buffered, or a streaming client sees
+    # nothing until the generation completes and the whole point of streaming
+    # is lost.
+    haproxy.router.openshift.io/buffer-response: "false"
+spec:
+  to:
+    kind: Service
+    name: maas-poc-gateway-data-science-gateway-class
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

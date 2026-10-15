@@ -14,9 +14,18 @@ saturated**, and imposes no limit at all when it isn't.
 > throughput), and below capacity a second tenant costs the first no latency.
 > Unit tests pass under `-race`.
 >
-> Also proven: the plugin runs under a real LLMInferenceService templated by
-> RHOAI's own KServe preset (deploy/poc/05-llmisvc-sim.yaml) &mdash; HTTP 200 and a
-> fairness dispatch recorded.
+> **Measured on two A100s with real vLLM: 20.5% / 11.6% / 67.9% against a
+> configured 20 / 10 / 65**, with `normalized_service` converged to within 0.1%
+> between app1 and end-users. Shadow mode on the same setup gives equal thirds.
+> Traffic went through a real LLMInferenceService templated by RHOAI's KServe
+> preset, over HTTPS, authenticated with real MaaS `sk-oai` API keys.
+>
+> One caveat that is easy to trip over and is NOT a plugin defect: a weighted
+> split can only be observed if every tenant offers MORE load than its
+> entitlement. With equal per-tenant concurrency the high-weight tenant runs
+> out of work to be favoured with, its queue drains, and the surplus correctly
+> goes to others &mdash; work conservation, which then reads as a broken policy.
+> See docs/poc-results.md.
 >
 > Not yet done: `outputTokenWeight` is still the uncalibrated `2.0` placeholder
 > (the calibration needs GPUs), the cached-token discount path is unexercised

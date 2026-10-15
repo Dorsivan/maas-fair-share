@@ -466,58 +466,73 @@ not be possible at this throughput. **The honest position is that the weighted
 split remains measured only on the simulator, and that real-inference
 confirmation waits for GPUs.**
 
-## On real GPUs: ordering correct, magnitude capped
+## On real GPUs: the weighted split works
 
-Two A100 80GB nodes, Qwen2.5-7B on vLLM, two replicas (one per GPU), traffic
-through the HTTPS Route authenticated with real MaaS `sk-oai` keys. ~3,400
-requests per run, 240s, 32 workers per tenant.
+Two A100 80GB, Qwen2.5-7B on vLLM, two replicas, traffic through the HTTPS
+Route authenticated with real MaaS `sk-oai` keys.
 
-| | control (`enforce:false`) | enforced | target |
+| tenant | weight | **achieved** | target |
 |---|---|---|---|
-| app1 | 33.3% | **39.2%** | 20% |
-| app2 | 33.3% | **21.7%** | 10% |
-| end-users | 33.4% | **39.0%** | 65% |
+| app1 | 20 | **20.5%** | 20% |
+| app2 | 10 | **11.6%** | 10% |
+| end-users | 65 | **67.9%** | 65% |
 
-The control is textbook: 33.3/33.3/33.4 across 3.3M tokens with dispatches
-1121/1121/1120. Enforcing clearly changes the allocation, and
-**app1:app2 lands at 1.81:1 — essentially exactly the 20:10 their weights
-specify.** app2 is correctly throttled to roughly half of app1.
+`normalized_service` (A/w, equal across groups at equilibrium) read
+app1 **14,342**, end-users **14,358** -- equal to within 0.1%. That is weighted
+LAS converged, which is the real proof; the token percentages are its
+consequence.
 
-**But end-users cannot reach 65%, and the policy knows it.** Its own state:
+The shadow-mode control on the same setup gives 33.3 / 33.3 / 33.4 with
+dispatches 1121/1121/1120, so the split is produced by the policy and not by
+the traffic.
 
-```
-normalized_service (A/w; equal across groups when converged)
-  app1        31,406
-  app2        33,971
-  end-users    9,847      <- 31% of app1
-```
+### The detour, and the lesson in it
 
-end-users is by a wide margin the `argmin`, so weighted LAS should select it
-almost every cycle until the values equalise. It does not converge: over the
-run the gap persists.
+Earlier runs on the same hardware produced a ratio stuck near 1.8:1 no matter
+what the weights said -- 2:1 gave 1.81, 3.25:1 gave 1.79, and a deliberately
+extreme 18:1 gave 1.82. It looked exactly like a hard ceiling, and it was
+written up here as one. **That conclusion was wrong.**
 
-This is **not** the tenant failing to ask. Mid-run queue depths were
-app1=19/1/16, app2=15/15/16, **end-users=32/16/32** — end-users repeatedly at
-32, its entire worker pool queued. It is backlogged and still not served
-proportionally.
+What it actually was: **the favoured tenant ran out of work to be favoured
+with.** The load generator is closed-loop with a fixed worker count per
+tenant, so a tenant can never have more than W requests outstanding. Give
+every tenant the same W and the high-weight tenant's queue drains -- it is
+being served faster than its own workers can resubmit. An empty queue is not a
+candidate in `Pick`, so the surplus correctly goes to the other tenant.
 
-Dispatch counts show the shape of the limit: app1=2598, app2=1425,
-end-users=2640. The disfavoured group (app2) is correctly suppressed, but the
-top two saturate near 1:1 rather than the 3.25:1 the weights imply. That is the
-signature of a cap on how much any single flow can be dispatched per cycle,
-not of a broken comparison — the ordering is right, the magnitude is clamped.
+That is **work conservation doing its job**, not a defect. A tenant cannot
+receive more than it asks for, which is the same property proven earlier in
+E1/E2/E6.
 
-**Open question, and the most important one outstanding:** whether the flow
-controller dispatches at most one request per queue per cycle. If so, the
-achievable ratio between two continuously-backlogged flows is bounded near
-1:1 regardless of weight, and weight only decides ordering and which flow gets
-suppressed. That would mean a 65:20 guarantee is not expressible through this
-mechanism as configured, while 20:10 is — consistent with everything measured
-here, on the simulator and on GPUs.
+Proof: with weights 5 vs 90 and demand matched to entitlement (24 workers vs
+256), the achieved ratio was **16.65:1** against a target of 18:1, end-users
+took **94.3%** of tokens against an entitlement of 90/95 = **94.7%**, and
+normalized_service converged to 17,548 vs 14,965.
 
-Worth noting the unit tests do NOT catch this: `TestProportionality` drives
-the policy directly with a simulated band and reaches 2:1 within 2%, because
-it never exercises the real dispatch loop.
+Three things made this hard to see, and all three are worth remembering:
+
+1. **2:1 sits close to what equal-demand load can express**, so
+   `TestProportionality` and the app1:app2 pair both looked healthy while the
+   mechanism was being starved. A passing 2:1 is not evidence the weighting
+   works at larger ratios.
+2. **Deepening the backlog did not help** -- starving the pool to 2 slots made
+   it *worse* (1.34:1), because it throttled the favoured tenant's refill rate
+   as much as anyone's. The lever is per-tenant demand, not total queue depth.
+3. **`normalized_service` was the tell throughout.** It sat 8-10x apart in
+   every failing run, correctly reporting that the policy had identified an
+   imbalance it was not being given the opportunity to correct.
+
+### What this means for a load test, and for an SLA
+
+**To measure a weighted split, every tenant must offer more load than its
+entitlement.** Equal worker counts across tenants cannot demonstrate a ratio
+larger than the generator can sustain, and the result will look like a broken
+policy. Size each tenant's offered concurrency above its share of capacity.
+
+For the SLA the wording in Part 1 of the plan already covers this correctly:
+the guarantee is a floor on *delivered throughput under contention*, and a
+tenant that does not send traffic gets nothing. These runs are the empirical
+confirmation -- end-users reaches 65% only when it actually asks for 65%.
 
 ## What this POC does *not* show
 

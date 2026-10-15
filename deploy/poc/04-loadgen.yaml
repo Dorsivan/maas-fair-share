@@ -75,6 +75,24 @@ data:
     # app1+app2 must between them receive the FULL pool, not 30% of it.
     TENANTS="${TENANTS:-app1 app2 end-users}"
 
+    # SIZE THESE ABOVE EACH TENANT'S ENTITLEMENT, NOT EQUALLY.
+    #
+    # This is the single most important thing about running a fairness test,
+    # and getting it wrong produces a confident wrong answer. The generator is
+    # closed-loop: a tenant can never have more than its worker count
+    # outstanding. Give every tenant the same count and the HIGH-WEIGHT tenant
+    # runs out of work to be favoured with -- it is served faster than its
+    # workers can resubmit, its queue drains, it stops being a candidate in
+    # Pick, and the surplus correctly goes to everyone else.
+    #
+    # The measured result then looks like a hard ceiling around 1.8:1 no matter
+    # what the weights say. It is not. It is work conservation, and it cost a
+    # long detour to diagnose (docs/poc-results.md).
+    #
+    # Rule of thumb: offered concurrency for tenant i should exceed
+    #     (its weight share) x (pool capacity) x (mean latency)
+    # So for 20/10/65 against this pool, 64/64/208 works; 32/32/32 does not.
+    #
     # Per-tenant overrides, defaulting to WORKERS. These exist for the
     # ASYMMETRIC-DEMAND test, which is the realistic case and a stricter check
     # than simply removing a tenant: a tenant sending a trickle still has a

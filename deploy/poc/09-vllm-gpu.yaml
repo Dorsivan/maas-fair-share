@@ -1,0 +1,113 @@
+# Real vLLM on a real GPU, using RHOAI's own GPU preset.
+#
+# This is the production shape: all three presets, no command override, no
+# simulator. The only thing we change about the scheduler is the image.
+#
+# Prerequisite that took three weeks to find: the cluster could not expose a
+# GPU at all. NodeFeatureDiscovery was configured with
+#     pci: { deviceLabelFields: [vendor, device] }
+# which emits feature.node.kubernetes.io/pci-10de_20b5.present, while the
+# NVIDIA GPU operator selects on the VENDOR-ONLY form, pci-10de.present. The
+# operator therefore logged "No GPU node found" indefinitely and created zero
+# daemonsets -- no driver, no device plugin, no nvidia.com/gpu capacity. Adding
+# the vendor-only label to the node fixed it in minutes.
+#
+# The durable fix is to set deviceLabelFields: [vendor] on the
+# NodeFeatureDiscovery CR, so every GPU node is labelled correctly without
+# manual intervention. Until that is done, a NEW GPU node will land in exactly
+# the same state and look like broken hardware.
+#
+# Also: the GPU node joins the cluster only after its CSRs are approved
+# (client cert, then kubelet-serving). UPI clusters do not auto-approve the
+# serving CSR, so a node that has been stopped long enough for certs to rotate
+# sits NotReady until someone runs `oc adm certificate approve`.
+---
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: maas-vllm-gpu
+  namespace: maas-fairness-poc
+spec:
+  baseRefs:
+    - name: v3-5-0-kserve-config-llm-scheduler
+    - name: v3-5-0-kserve-config-llm-router-route
+    # The GPU preset, included this time. Its command is the real
+    # `exec vllm serve /mnt/models` wrapper, so we add args rather than
+    # replacing command.
+    - name: v3-5-0-kserve-config-llm-template
+
+  model:
+    # Open weights, no HF gating. Llama-3.1-8B-Instruct is gated and would
+    # fail in the storage-initializer with an opaque 401.
+    uri: hf://Qwen/Qwen2.5-7B-Instruct
+    name: llama-3-1-8b
+
+  # TWO replicas, one per A100. Two endpoints matter beyond capacity: with a
+  # single pod the endpoint picker is a no-op and any endpoint-selection bug
+  # stays hidden. The scheduling profile (queue-scorer, kv-cache-utilization,
+  # prefix-cache) only does anything when there is a choice to make.
+  replicas: 2
+
+  template:
+    containers:
+      - name: main
+        args:
+          # The two hard prerequisites, finally on a real GPU server. Both
+          # default off and both fail silently -- see deploy/llmisvc.yaml.
+          - --enable-force-include-usage
+          - --enable-prompt-tokens-details
+          # Small batch so a modest client load produces a genuine queue.
+          # Without a backlog IterateQueues sees one non-empty queue and the
+          # fairness policy is a no-op.
+          - --max-num-seqs
+          - "8"
+          - --max-model-len
+          - "8192"
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+
+  router:
+    gateway:
+      refs:
+        - name: maas-poc-gateway
+          namespace: maas-fairness-poc
+    route: {}
+    scheduler:
+      replicas: 1
+      # Keep the EPP OFF the GPU nodes. Two reasons, one of them a real bug:
+      #
+      #  1. It needs no accelerator, and each GPU node here has exactly one
+      #     A100 -- a scheduler sitting there is pure waste.
+      #  2. The freshly-joined GPU nodes cannot reach the internal registry
+      #     service IP (dial tcp 172.30.x:5000: i/o timeout), so the EPP lands
+      #     in ImagePullBackOff there while the model servers, which pull from
+      #     registry.redhat.io over the node's default route, start fine.
+      #     Pod-to-pod traffic works, so this is specific to ClusterIP service
+      #     routing on those nodes and is worth chasing separately -- a node
+      #     that cannot reach a Service IP will bite something else later.
+      #
+      # Failing to pin this is NOT cosmetic: the pool is failureMode FailOpen,
+      # so an EPP stuck in ImagePullBackOff means Envoy silently bypasses the
+      # fairness policy and every request is served unmanaged. A load run in
+      # that state looks completely healthy and measures nothing.
+      template:
+        affinity:
+          nodeAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              nodeSelectorTerms:
+                - matchExpressions:
+                    - key: feature.node.kubernetes.io/pci-10de.present
+                      operator: DoesNotExist
+      config:
+        ref:
+          name: maas-epp-config
+          key: epp
+      template:
+        containers:
+          - name: main
+            image: quay.io/rh-ee-dsivan/maas-fair-share:aef33a5
+            imagePullPolicy: Always
+            resources:
+              requests: {cpu: 200m, memory: 512Mi}
+              limits: {cpu: "2", memory: 2Gi}

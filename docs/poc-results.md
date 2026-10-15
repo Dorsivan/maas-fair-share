@@ -466,6 +466,59 @@ not be possible at this throughput. **The honest position is that the weighted
 split remains measured only on the simulator, and that real-inference
 confirmation waits for GPUs.**
 
+## On real GPUs: ordering correct, magnitude capped
+
+Two A100 80GB nodes, Qwen2.5-7B on vLLM, two replicas (one per GPU), traffic
+through the HTTPS Route authenticated with real MaaS `sk-oai` keys. ~3,400
+requests per run, 240s, 32 workers per tenant.
+
+| | control (`enforce:false`) | enforced | target |
+|---|---|---|---|
+| app1 | 33.3% | **39.2%** | 20% |
+| app2 | 33.3% | **21.7%** | 10% |
+| end-users | 33.4% | **39.0%** | 65% |
+
+The control is textbook: 33.3/33.3/33.4 across 3.3M tokens with dispatches
+1121/1121/1120. Enforcing clearly changes the allocation, and
+**app1:app2 lands at 1.81:1 — essentially exactly the 20:10 their weights
+specify.** app2 is correctly throttled to roughly half of app1.
+
+**But end-users cannot reach 65%, and the policy knows it.** Its own state:
+
+```
+normalized_service (A/w; equal across groups when converged)
+  app1        31,406
+  app2        33,971
+  end-users    9,847      <- 31% of app1
+```
+
+end-users is by a wide margin the `argmin`, so weighted LAS should select it
+almost every cycle until the values equalise. It does not converge: over the
+run the gap persists.
+
+This is **not** the tenant failing to ask. Mid-run queue depths were
+app1=19/1/16, app2=15/15/16, **end-users=32/16/32** — end-users repeatedly at
+32, its entire worker pool queued. It is backlogged and still not served
+proportionally.
+
+Dispatch counts show the shape of the limit: app1=2598, app2=1425,
+end-users=2640. The disfavoured group (app2) is correctly suppressed, but the
+top two saturate near 1:1 rather than the 3.25:1 the weights imply. That is the
+signature of a cap on how much any single flow can be dispatched per cycle,
+not of a broken comparison — the ordering is right, the magnitude is clamped.
+
+**Open question, and the most important one outstanding:** whether the flow
+controller dispatches at most one request per queue per cycle. If so, the
+achievable ratio between two continuously-backlogged flows is bounded near
+1:1 regardless of weight, and weight only decides ordering and which flow gets
+suppressed. That would mean a 65:20 guarantee is not expressible through this
+mechanism as configured, while 20:10 is — consistent with everything measured
+here, on the simulator and on GPUs.
+
+Worth noting the unit tests do NOT catch this: `TestProportionality` drives
+the policy directly with a simulated band and reaches 2:1 within 2%, because
+it never exercises the real dispatch loop.
+
 ## What this POC does *not* show
 
 - **Saturation is now real but small.** deploy/poc/07-vllm-cpu.yaml runs vLLM

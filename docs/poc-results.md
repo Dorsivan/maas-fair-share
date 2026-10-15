@@ -414,6 +414,58 @@ standing check:
 oc get inferenceobjectives.llm-d.ai -A    # expect none, or all priority 0
 ```
 
+## End-to-end on real MaaS auth — plumbing proven, fairness NOT yet measured
+
+Four real `MaaSSubscription`s (`app1-production`, `app2-batch`,
+`end-user-alpha`, `end-user-beta`) with owning groups and one `sk-oai` API key
+each, driving real vLLM through the HTTPS Route. The generator no longer
+asserts its own identity: Authorino validates the key and injects
+`X-MaaS-Subscription`, and the plugin classifies on that.
+
+**What this proved:**
+
+| Check | Result |
+|---|---|
+| Per-subscription classification | app1=1, app2=1, **end-users=2** |
+| Prefix collapse on real names | `end-user-alpha` + `end-user-beta` -> one flow |
+| `unmatched_subscriptions_total` | 0 |
+| Shadow-mode control | 36.6 / 34.1 / 29.3%, dispatches 27/27/26 — equal, correct FCFS |
+| Policy engaging under load | `pool_saturation 7.9`; queue depths app1=22, app2=11, **end-users=0** |
+
+That last row is the mechanism visibly working: the weight-65 tenant is served
+so preferentially its queue drains while the weight-20 and weight-10 tenants
+back up.
+
+**What it did NOT prove, and must not be read as proving:** the weighted split
+on real inference. The enforced run returned 34.4 / 28.8 / 36.8% against a
+20/10/65 target, and that number is **invalid**:
+
+```
+requests_without_usage_total   app1=56  app2=57  end-users=31  = 144
+dispatch_total                 app1=113 app2=101 end-users=120 = 334
+```
+
+**43% of requests never trued up.** At 40 workers per tenant against roughly
+eight effective slots, CPU inference is slow enough that requests hit the
+client timeout before completing. No usage block arrives, so each stays
+charged its provisional ESTIMATE permanently, and every subsequent dispatch
+decision is made against a corrupted tab. The split measured under those
+conditions is noise.
+
+This is the alarm doing its job — the design specifies
+`requests_without_usage_total` as a regression detector that must be flat
+zero, and treating any run with a non-zero value as a measurement would be
+exactly the error it exists to prevent.
+
+**The load window on CPU is narrow.** The ~12x over-offer that made the
+simulator runs work is far too much here, because CPU vLLM is roughly twenty
+times slower; but too little offer leaves the queues shallow and the weights
+inexpressible (see "Pitfalls" above). Finding a load that is simultaneously
+deep enough to express 20/10/65 and light enough that nothing times out may
+not be possible at this throughput. **The honest position is that the weighted
+split remains measured only on the simulator, and that real-inference
+confirmation waits for GPUs.**
+
 ## What this POC does *not* show
 
 - **Saturation is now real but small.** deploy/poc/07-vllm-cpu.yaml runs vLLM

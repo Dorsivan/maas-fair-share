@@ -30,7 +30,8 @@ metadata:
 data:
   run.sh: |
     #!/bin/bash
-    GW="http://maas-poc-gateway-data-science-gateway-class.maas-fairness-poc.svc.cluster.local"
+    GW="${GW:-http://maas-poc-gateway-data-science-gateway-class.maas-fairness-poc.svc.cluster.local}"
+    MODELPATH="${MODELPATH:-/maas-fairness-poc/maas-vllm-cpu}"
     DURATION="${DURATION:-180}"
     WORKERS="${WORKERS:-12}"
     END=$(( $(date +%s) + DURATION ))
@@ -59,10 +60,10 @@ data:
     worker() {
       local sub="$1" group="$2" out
       while [ "$(date +%s)" -lt "$END" ]; do
-        out=$(curl -sS -o /dev/null -m 180 -w '%{http_code} %{time_total}' -X POST "$GW/v1/chat/completions" \
+        out=$(curl -sS -o /dev/null -m 300 -w '%{http_code} %{time_total}' -X POST "$GW$MODELPATH/v1/chat/completions" \
           -H 'Content-Type: application/json' \
-          -H "x-maas-subscription: $sub" \
-          -d "{\"model\":\"llama-3-1-8b\",\"max_tokens\":200,\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" \
+          -H "Authorization: Bearer $(cat /keys/$sub)" \
+          -d "{\"model\":\"llama-3-1-8b\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" \
           2>/dev/null) || out="000 0"
         echo "$out" >> "$OUT/$group"
       done
@@ -91,7 +92,9 @@ data:
         app1)      for _ in $(seq 1 "$W_APP1"); do worker "app1-production" app1 & done ;;
         app2)      for _ in $(seq 1 "$W_APP2"); do worker "app2-batch"      app2 & done ;;
         # Distinct subscription per worker -- all must collapse to `end-users`.
-        end-users) for i in $(seq 1 "$W_END");  do worker "end-user-$i"     end-users & done ;;
+        end-users) for i in $(seq 1 "$W_END");  do
+                     if [ $((i % 2)) -eq 0 ]; then worker end-user-alpha end-users & else worker end-user-beta end-users & fi
+                   done ;;
         *) echo "unknown tenant: $t" >&2; exit 1 ;;
       esac
     done
@@ -170,6 +173,9 @@ spec:
           volumeMounts:
             - name: script
               mountPath: /script
+            - name: keys
+              mountPath: /keys
+              readOnly: true
           resources:
             # Deliberately small. This cluster has two Ready workers at ~98%
             # CPU requested, so anything larger simply never schedules. It is
@@ -194,3 +200,10 @@ spec:
           configMap:
             name: maas-loadgen
             defaultMode: 0755
+        # One MaaS API key per subscription. Authentication is now the REAL
+        # path: Authorino validates the sk-oai key and injects
+        # X-MaaS-Subscription, which is what the plugin classifies on. The
+        # generator no longer asserts its own identity.
+        - name: keys
+          secret:
+            secretName: maas-loadgen-keys

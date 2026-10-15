@@ -1,0 +1,90 @@
+# Four real MaaSSubscriptions standing in for the tenant model.
+#
+# THE NAMES ARE THE IDENTITIES. MaaS injects
+#   X-MaaS-Subscription: <MaaSSubscription name>
+# from the validated API key, and that is what the fairness plugin keys on. So
+# the `groups` match values in the EndpointPickerConfig must be these exact
+# names -- not invented strings. Earlier configs matched `app1-production`
+# because we set the header by hand; under real MaaS auth nothing would have
+# matched and every tenant would have shared the `unclassified` weight.
+#
+# end-user-alpha and end-user-beta exist to exercise the PREFIX rule: two
+# distinct subscriptions that must collapse into the single `end-users` flow.
+# If grouping were broken they would appear as two queues each holding
+# weight 65, and end users would get double their share.
+#
+# tokenRateLimits are deliberately enormous. They are the Kuadrant CEILING; a
+# tight value here would mean the rate limiter, not the fairness policy, is
+# allocating the pool -- and the measurement would be of the wrong thing.
+# Watch for 429s during load: any at all invalidate the run.
+---
+apiVersion: user.openshift.io/v1
+kind: Group
+metadata: {name: maas-app1}
+users: [dorsi]
+---
+apiVersion: user.openshift.io/v1
+kind: Group
+metadata: {name: maas-app2}
+users: [dorsi]
+---
+apiVersion: user.openshift.io/v1
+kind: Group
+metadata: {name: maas-end-users}
+users: [dorsi]
+---
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata: {name: app1-production, namespace: models-as-a-service}
+spec:
+  owner: {groups: [{name: maas-app1}], users: []}
+  modelRefs:
+    - name: maas-vllm-cpu
+      namespace: maas-fairness-poc
+      tokenRateLimits: [{limit: 100000000, window: 1m}]
+---
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata: {name: app2-batch, namespace: models-as-a-service}
+spec:
+  owner: {groups: [{name: maas-app2}], users: []}
+  modelRefs:
+    - name: maas-vllm-cpu
+      namespace: maas-fairness-poc
+      tokenRateLimits: [{limit: 100000000, window: 1m}]
+---
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata: {name: end-user-alpha, namespace: models-as-a-service}
+spec:
+  owner: {groups: [{name: maas-end-users}], users: []}
+  modelRefs:
+    - name: maas-vllm-cpu
+      namespace: maas-fairness-poc
+      tokenRateLimits: [{limit: 100000000, window: 1m}]
+---
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata: {name: end-user-beta, namespace: models-as-a-service}
+spec:
+  owner: {groups: [{name: maas-end-users}], users: []}
+  modelRefs:
+    - name: maas-vllm-cpu
+      namespace: maas-fairness-poc
+      tokenRateLimits: [{limit: 100000000, window: 1m}]
+---
+# All three groups may reach the model.
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSAuthPolicy
+metadata: {name: maas-poc-access, namespace: models-as-a-service}
+spec:
+  modelRefs:
+    - name: maas-vllm-cpu
+      namespace: maas-fairness-poc
+  subjects:
+    groups:
+      - {name: maas-app1}
+      - {name: maas-app2}
+      - {name: maas-end-users}
+      - {name: maas-poc-users}
+    users: []

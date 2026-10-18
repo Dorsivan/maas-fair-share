@@ -724,6 +724,10 @@ Ordered by how much they would change a conclusion.
 | 9 | **Sustained load through the Route** | the 600s timeout and `buffer-response: false` annotations are only proven by single requests | 10 minutes |
 | 10 | **Open-loop load generation** | every result is closed-loop. Poisson arrivals would drain queues differently and are the honest test of the clamp | generator work |
 | 11 | **Verify metrics reach Prometheus** | `deploy/podmonitor.yaml` exists and UWM is enabled, but no dashboard query has ever been confirmed end to end | 15 minutes |
+| 12 | **Red Hat support boundary** | a custom EPP image takes that component outside RHOAI support. The plan calls this the biggest non-technical risk and it has never been raised with the account team. Nothing technical unblocks it | a conversation |
+| 13 | **Version-pin maintenance** | flow-control interfaces are Alpha/Beta on a v0.x module. Budget a quarterly re-pin of `llm-d-router` plus the Dockerfile builder together, re-read the `plugins.go` diff, rerun conformance and the scenario matrix. A Dependabot rule scoped to `llm-d-router` would surface it | process |
+| 14 | **Disconnected / mirrored clusters** | the image must be mirrored with a matching IDMS/ICSP entry. Untested, and the Quay reference assumes egress | an air-gapped target |
+| 15 | **Gateway header stripping** | Kuadrant must strip `x-llm-d-inference-fairness-id`, `x-gateway-inference-fairness-id` and especially `x-llm-d-inference-objective` from *client* traffic. The plugin defends against the first two by overwriting unconditionally; it cannot defend against the third, which selects the priority band. Fails open silently if a route is added later | gateway config + a conformance check |
 
 ## Reproducing
 

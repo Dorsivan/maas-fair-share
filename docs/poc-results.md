@@ -614,6 +614,66 @@ design insists the parameter and the group weights be re-derived together, and
 why 1.0 is the safe default: wrong-high merely under-serves the cacheable
 tenant, wrong-low silently breaks everyone else's floor.
 
+## Scenario matrix — demand patterns and edge cases
+
+All on 2x A100 with the shipped defaults (20/10/65, `enforce: true`,
+`newcomerClamp: true`, `cachedInputTokenWeight: 1.0`), uniform traffic so
+cache effects do not confound, 150s per run.
+
+| # | scenario | result | expected |
+|---|---|---|---|
+| **S1** | app1 HARD, app2 HARD, end-users idle | 59.9% / 38.3% | 66.7 / 33.3 |
+| **S2** | app1 HARD, end-users trickle | **app1 93.3%**, end-users 6.4% | app1 unconstrained |
+| **S3** | app1 HARD, end-users HARD, app2 idle | **23.7% / 75.0%** | 23.5 / 76.5 |
+| **S4** | S3 plus app2 trickling | 24.5% / 2.9% / 71.6% | app2 served, rest redistributed |
+| **S5** | end-users joins COLD after 120s | settles at its share immediately | no monopoly burst |
+
+Every run delivered ~128,000 output tokens, matching the three-tenant baseline
+rate. **No scenario wasted capacity**, whatever the demand shape.
+
+**S2 is the one that answers "is a low-weight tenant throttled when there is
+room".** app1 carries weight 20 and took **93.3%**, because end-users asked
+for only 6.4%. A weight is a floor under contention, never a ceiling.
+
+**S3 is the cleanest proof of proportionality.** With app2 absent the
+remaining two split 23.7 / 75.0 against a predicted 23.5 / 76.5 — the weights
+reproduced almost exactly.
+
+**S4 shows redistribution.** app2 trickled and received exactly the 2.9% it
+asked for; its unused entitlement went to the other two rather than idling.
+
+### S5: the returning-idle tenant does not monopolise
+
+app1 and app2 ran alone for 120s, building tabs, then end-users (weight 65,
+tab fully decayed) joined cold with 208 workers. Dispatches per 15s window,
+end-users as a share of the end-users+app1 traffic:
+
+```
++15s   117   11%   <- ramping up, not seizing
++30s   112   76%
++45s   121   76%
++60s   251   76%
++75s   117   75%
++90s   226   76%
+```
+
+It went straight to ~76%, which against app1 is a 3.2:1 ratio versus the 3.25:1
+its 65:20 weights specify. **There is no monopolisation burst** — the failure
+mode the newcomer clamp exists to prevent. The clamp fired **twice**.
+
+This is the scenario the design worried about most ("a tenant away for 10
+minutes ... monopolizing the pool for tens of seconds while everyone else
+stalls") and it does not occur.
+
+### The one weak result
+
+S1 produced 1.57:1 between app1 and app2 against their 2:1. Every other
+proportionality check landed within a couple of points, so this is the
+outlier. The likely cause is that 150s is short relative to the 60s half-life
+when both tabs start cold — S3 and S5, which involve the much larger 65:20
+ratio, were closer. Worth re-running longer before treating the 20:10 pair as
+reliably exact.
+
 ## What this POC does *not* show
 
 - **Saturation is now real but small.** deploy/poc/07-vllm-cpu.yaml runs vLLM

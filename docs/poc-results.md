@@ -137,7 +137,12 @@ longer run, or discarding the first 60 s, should shrink it. Not yet measured —
 the metrics were read as cumulative totals rather than as a time series, which
 is the obvious next refinement.
 
-## Open finding: the newcomer clamp hurt here
+## SUPERSEDED: "the newcomer clamp hurt here"
+
+> **This finding was refuted on GPUs — see the scenario matrix and the
+> clamp A/B below. The runs described here were demand-starved, which
+> fired the empty -> non-empty edge constantly. Kept for the reasoning
+> trail; do not act on it.**
 
 Enabling `newcomerClamp` moved the split *away* from the weights — end-users
 fell from ~62% to 45% — while firing only **19 times in 862 dispatches**. Of
@@ -690,7 +695,9 @@ reliably exact.
   deliverable of the shadow period: hit rates measured per group, over real
   traffic, which is what decides whether to move the weight off 1.0.
 - **`outputTokenWeight: 2.0` is still the uncalibrated placeholder.** The
-  two-run `guidellm` calibration needs real GPUs.
+  hardware now exists; the procedure is written up in
+  [calibrating-output-token-weight.md](calibrating-output-token-weight.md).
+  This is the largest single piece of outstanding work.
 - **Open-loop behaviour.** Everything above is closed-loop. See the clamp
   finding for why that distinction may matter.
 - **The GPU production manifest is still unapplied.** `deploy/llmisvc.yaml`
@@ -699,6 +706,24 @@ reliably exact.
 - **No sustained load through the LLMInferenceService path.** The weight-split
   and work-conservation numbers above were all measured on the direct rig.
   Through KServe only a single request has been verified end to end.
+
+## Outstanding work
+
+Ordered by how much they would change a conclusion.
+
+| # | item | why it matters | blocked on |
+|---|---|---|---|
+| 1 | **Calibrate `outputTokenWeight`** | the only hardware-measured number; 2.0 has no physical basis and plausible values are 5-20x. Changing it re-denominates every floor, so the group weights must be re-derived with it. Procedure: [calibrating-output-token-weight.md](calibrating-output-token-weight.md) | a decision to run it |
+| 2 | **Decide `cachedInputTokenWeight`** | measured, not theoretical: hit rates span 6.3% to 96.4% across groups, and moving the weight 1.0 -> 0.1 shifted end-users from 56.3% to 70.1% of delivered service while **halving total throughput**. A real lever with a real cost | a policy decision |
+| 3 | **ClusterRole for `llmisvc-controller-manager`** | the LLMInferenceService never reports `Ready`, and the controller is stuck in a failing reconcile so it will not apply future spec edits cleanly. Needs `get/list/watch` on `llm-d.ai` `inferenceobjectives` and `inferencemodelrewrites` | operator-level approval |
+| 4 | **Durable NFD fix** | GPU exposure currently depends on a hand-applied `feature.node.kubernetes.io/pci-10de.present` label per node. Set `deviceLabelFields: [vendor]` on the NodeFeatureDiscovery CR or **every new GPU node will look like broken hardware** | operator-level approval |
+| 5 | **Test on a real RHOAI 3.4 cluster** | three unknowns remain: whether 3.4's controller validates the EndpointPickerConfig, its InferencePool API group, and its tokenizer sidecar (3.5 has no equivalent). The 3.4-shaped preset test covered the flags, not the controller | a 3.4 cluster |
+| 6 | **Fix `contended_service_tokens_total`** | it records the provisional charge and the true-up delta as separate calls, each independently gated by the contention check, so their sum is not guaranteed to equal the charged cost. Use `normalized_service x weight` meanwhile | small code change |
+| 7 | **Re-run S1 longer** | 1.57:1 against a 2:1 target was the only proportionality miss; likely 150s being short against a 60s half-life with cold tabs | 10 minutes |
+| 8 | **`maas-default-gateway` inference path** | returns 500: `maas-api-route` targets a TLS service port with no `BackendTLSPolicy`, and that CRD is not installed. API keys currently require port-forwarding to maas-api | upstream/MaaS |
+| 9 | **Sustained load through the Route** | the 600s timeout and `buffer-response: false` annotations are only proven by single requests | 10 minutes |
+| 10 | **Open-loop load generation** | every result is closed-loop. Poisson arrivals would drain queues differently and are the honest test of the clamp | generator work |
+| 11 | **Verify metrics reach Prometheus** | `deploy/podmonitor.yaml` exists and UWM is enabled, but no dashboard query has ever been confirmed end to end | 15 minutes |
 
 ## Reproducing
 

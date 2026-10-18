@@ -27,11 +27,15 @@ saturated**, and imposes no limit at all when it isn't.
 > goes to others &mdash; work conservation, which then reads as a broken policy.
 > See docs/poc-results.md.
 >
-> Not yet done: `outputTokenWeight` is still the uncalibrated `2.0` placeholder
-> (the calibration needs GPUs), the cached-token discount path is unexercised
-> (the simulator reports `cached_tokens: 0`), and the production
-> `deploy/llmisvc.yaml` path has not been applied. One open question — the
-> newcomer clamp measurably *hurt* the split in this environment.
+> Outstanding: `outputTokenWeight` is still the uncalibrated `2.0` placeholder
+> — see [docs/calibrating-output-token-weight.md](docs/calibrating-output-token-weight.md),
+> which is the largest remaining piece of work. `cachedInputTokenWeight` now has
+> real data behind it (hit rates spanning 6.3%–96.4%) and needs a decision, not
+> a measurement. Full list in
+> [docs/poc-results.md](docs/poc-results.md#outstanding-work).
+>
+> The earlier concern that the newcomer clamp hurt the split was **refuted** on
+> GPUs; those runs were demand-starved.
 >
 > Full write-up, including the pitfalls that produced healthy-looking runs that
 > measured nothing: **[docs/poc-results.md](docs/poc-results.md)**.

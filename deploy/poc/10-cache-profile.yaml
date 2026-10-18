@@ -1,0 +1,98 @@
+# Per-group cache-hit profile.
+#
+# The design calls this the real deliverable of the shadow period: it is the
+# evidence that decides whether cachedInputTokenWeight should move off 1.0,
+# and in whose favour. Every earlier run sent IDENTICAL traffic from every
+# tenant, which makes the hit rates identical by construction and the
+# parameter a no-op -- the measurement has to differentiate the shapes.
+#
+# Three deliberately different workloads, chosen to mirror the design's
+# predictions:
+#
+#   app1      a fixed system prompt plus a short unique tail. The "application
+#             with a system prompt" case: a high but BOUNDED hit rate.
+#   app2      fully unique prompts, no shared prefix. The floor case; should
+#             sit near zero and acts as the control proving the other numbers
+#             are real and not an artefact of the server.
+#   end-users a much longer shared prefix. Stands in for multi-turn chat,
+#             where every turn re-sends the conversation and the cached
+#             fraction approaches (N-1)/N. The design predicts this group has
+#             structurally the highest hit rate, which is exactly why the
+#             discount is coupled to the group weights.
+#
+# If the three come out materially different, cachedInputTokenWeight is a real
+# differential lever and lowering it would re-price end-users against the
+# others. If they come out the same, it is a no-op however it is set.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-cacheprofile
+  namespace: maas-fairness-poc
+data:
+  run.sh: |
+    #!/bin/bash
+    GW="http://maas-poc-gateway-data-science-gateway-class.maas-fairness-poc.svc.cluster.local"
+    MODELPATH="/maas-fairness-poc/maas-vllm-gpu"
+    DURATION="${DURATION:-180}"
+    W="${WORKERS:-8}"
+    END=$(( $(date +%s) + DURATION ))
+
+    mk() { local n=$1 out=""; for _ in $(seq 1 "$n"); do out="${out}the quick brown fox "; done; echo "$out"; }
+    # Shared, byte-identical prefixes -- this is what the prefix cache can hit.
+    APP1_PREFIX=$(mk 40)      # ~800 chars
+    EU_PREFIX=$(mk 110)       # ~2200 chars, deliberately longer
+    OUT=/tmp/codes; mkdir -p "$OUT"
+
+    worker() {
+      local sub="$1" group="$2" shape="$3" p
+      while [ "$(date +%s)" -lt "$END" ]; do
+        case "$shape" in
+          fixed)  p="${APP1_PREFIX} question $RANDOM$RANDOM" ;;
+          # No shared prefix at all: a fresh random body every time.
+          unique) p=""; for _ in $(seq 1 40); do p="${p}w$RANDOM "; done ;;
+          long)   p="${EU_PREFIX} question $RANDOM$RANDOM" ;;
+        esac
+        curl -sS -o /dev/null -m 300 -w '%{http_code}\n' -X POST "$GW$MODELPATH/v1/chat/completions" \
+          -H 'Content-Type: application/json' -H "Authorization: Bearer $(cat /keys/$sub)" \
+          -d "{\"model\":\"llama-3-1-8b\",\"max_tokens\":16,\"temperature\":0,\"messages\":[{\"role\":\"user\",\"content\":\"$p\"}]}" \
+          >> "$OUT/$group" 2>/dev/null || true
+      done
+    }
+
+    for i in $(seq 1 "$W"); do
+      worker app1-production app1      fixed  &
+      worker app2-batch      app2      unique &
+      if [ $((i % 2)) -eq 0 ]; then worker end-user-alpha end-users long & else worker end-user-beta end-users long & fi
+    done
+    wait
+    echo "done:"; for f in "$OUT"/*; do printf '  %-12s %s\n' "$(basename "$f")" "$(sort "$f" | uniq -c | tr '\n' ' ')"; done
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: maas-cacheprofile
+  namespace: maas-fairness-poc
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "/script/run.sh"]
+          env:
+            - {name: DURATION, value: "180"}
+            - {name: WORKERS,  value: "8"}
+          volumeMounts:
+            - {name: script, mountPath: /script}
+            - {name: keys, mountPath: /keys, readOnly: true}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits:   {cpu: "2",  memory: 2Gi}
+      volumes:
+        - name: script
+          configMap: {name: maas-cacheprofile, defaultMode: 0755}
+        - name: keys
+          secret: {secretName: maas-loadgen-keys}

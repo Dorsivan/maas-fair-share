@@ -534,6 +534,86 @@ the guarantee is a floor on *delivered throughput under contention*, and a
 tenant that does not send traffic gets nothing. These runs are the empirical
 confirmation -- end-users reaches 65% only when it actually asks for 65%.
 
+## GPU test suite — four results
+
+All on 2x A100, Qwen2.5-7B, two replicas, real MaaS `sk-oai` auth, weights
+20/10/65 unless stated. Load sized so every tenant over-offers its
+entitlement, per the lesson above.
+
+### 1. Work conservation holds on real inference
+
+| run | active tenants | output tokens | vs 3-tenant baseline |
+|---|---|---|---|
+| baseline | all three | 155,424 | — |
+| **E1** | app1 + app2 | **149,735** | **96.3%** |
+| **E2** | app1 alone | **147,032** | **94.6%** |
+
+app1 alone took 94.6% of the full pool on a weight of 20; capped at its weight
+it would have managed ~31k. Absent tenants' shares are absorbed, not reserved.
+In E1 the two survivors split it 64.7/35.3 — 1.83:1 against their 20:10.
+
+### 2. Below capacity, a second tenant is free
+
+| run | app1 P50 | app1 P95 | queue depth |
+|---|---|---|---|
+| **E3** app1 alone, 6 workers | **0.72 s** | 0.75 s | 0 |
+| **E4** app1+app2, 6 each | **0.75 s** | 0.78 s | 0 |
+
+A 4% difference, inside noise, with queues at zero throughout. Nothing waits
+while there is room.
+
+### 3. The newcomerClamp finding is REFUTED
+
+| | clamp OFF | clamp ON |
+|---|---|---|
+| app1 | 20.9% | 22.0% |
+| app2 | 11.8% | 11.9% |
+| end-users | 67.3% | 66.1% |
+
+Within ~1 point, with `normalized_service` converged either way (14,500 vs
+14,561), and **only 5 clamps fired** across ~2,500 dispatches.
+
+The earlier result — where enabling the clamp appeared to move the split badly
+away from target — was an artefact of demand-starved load. With equal
+per-tenant concurrency the favoured tenant's queue drained constantly, so the
+empty -> non-empty edge fired over and over. At correctly sized load the edge
+is rare and the clamp is effectively inert. **The design default of `true`
+stands; the concern recorded earlier does not reproduce.**
+
+### 4. 40/20/40 also lands
+
+| tenant | weight | achieved |
+|---|---|---|
+| app1 | 40 | **41.3%** |
+| app2 | 20 | **20.7%** |
+| end-users | 40 | **38.0%** |
+
+Within 2 points on all three, and notably a *different shape* from 20/10/65 —
+so the result is not an artefact of one particular weight set.
+
+### 5. Per-group cache-hit profile — the cachedInputTokenWeight evidence
+
+Three deliberately different traffic shapes (`deploy/poc/10-cache-profile.yaml`):
+
+| group | workload | **cached / prompt tokens** |
+|---|---|---|
+| app2 | fully unique prompts (control) | **6.3%** |
+| app1 | fixed system prompt + short tail | **87.7%** |
+| end-users | long shared prefix (multi-turn proxy) | **96.4%** |
+
+This is the table the design calls the real deliverable of the shadow period,
+and it confirms the prediction that drove the parameter's default. The spread
+is enormous — **6.3% to 96.4%** — so `cachedInputTokenWeight` is a genuine
+*differential* lever here, not a no-op.
+
+Concretely: at the default 1.0, end-users pays full price for prompt tokens
+that are 96.4% cache hits. Drop the weight to 0.1 and its effective prompt
+cost falls roughly tenfold while app2's barely moves, re-pricing end-users
+against the others by almost an order of magnitude. That is exactly why the
+design insists the parameter and the group weights be re-derived together, and
+why 1.0 is the safe default: wrong-high merely under-serves the cacheable
+tenant, wrong-low silently breaks everyone else's floor.
+
 ## What this POC does *not* show
 
 - **Saturation is now real but small.** deploy/poc/07-vllm-cpu.yaml runs vLLM

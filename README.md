@@ -27,9 +27,13 @@ saturated**, and imposes no limit at all when it isn't.
 > goes to others &mdash; work conservation, which then reads as a broken policy.
 > See docs/poc-results.md.
 >
-> Outstanding: `outputTokenWeight` is still the uncalibrated `2.0` placeholder
-> — see [docs/calibrating-output-token-weight.md](docs/calibrating-output-token-weight.md),
-> which is the largest remaining piece of work. `cachedInputTokenWeight` now has
+> `outputTokenWeight` ships as `2.0`, a deliberate placeholder: it is an
+> efficiency ratio that moves with GPU, model, quantisation, batch size and
+> vLLM version, so it must be measured **per environment at commissioning**.
+> The procedure is
+> [docs/calibrating-output-token-weight.md](docs/calibrating-output-token-weight.md).
+> Changing it re-denominates the floors, so re-derive the group weights in the
+> same change. `cachedInputTokenWeight` now has
 > real data behind it (hit rates spanning 6.3%–96.4%) and needs a decision, not
 > a measurement. Full list in
 > [docs/poc-results.md](docs/poc-results.md#outstanding-work).

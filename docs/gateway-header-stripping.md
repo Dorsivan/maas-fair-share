@@ -159,8 +159,42 @@ only through a plain `Service` backendRef never passes through the EPP and is
 correctly ignored.
 
 ```sh
-go test ./conformance/...     # the check's own unit tests, offline
+(cd conformance/gatewayheaders && go test ./...)     # the check's own unit tests, offline
 ```
+
+### Building this check air-gapped
+
+`conformance/gatewayheaders` and `cmd/gateway-header-check` are each their
+own Go module, separate from the repository root. The root module compiles
+the EPP against `github.com/llm-d/llm-d-router` and deliberately does not
+vendor it (`docs/version-pinning.md`: "we do not fork upstream and we do not
+vendor it: we compile against it") — that pulls in roughly 400 modules, and
+`go mod vendor` at the root would vendor all of them, reopening a decision
+this repo made on purpose.
+
+This checker's only non-stdlib dependency is `sigs.k8s.io/yaml` (plus
+`testify` in its own tests), so it gets its own small `go.mod` and a
+committed `vendor/` directory instead. The root `.gitignore` excludes
+`vendor/` everywhere, with an explicit carve-out for these two paths — see
+the comment there. Because each module has its own `go.mod`, `go build`
+and `go test` run from inside either directory pick up `vendor/`
+automatically (Go does this whenever `vendor/modules.txt` is present and
+consistent — no flags needed), and need no network or module proxy:
+
+```sh
+(cd conformance/gatewayheaders && GOPROXY=off go test ./...)                              # ok
+(cd cmd/gateway-header-check && GOPROXY=off go build -o ../../bin/gateway-header-check .)  # builds
+```
+
+`GOPROXY=off` above is there to prove the point, not because it is required
+day to day. The nested module boundary is also why this is the one place in
+the repository where `go run ./cmd/gateway-header-check` does **not** work
+from the repository root — `cmd/gateway-header-check` is not part of the
+root module from the root module's point of view. Build the binary once as
+shown above; every other command in this document and the rest of the repo
+runs it as `bin/gateway-header-check` from the repository root (that path is
+git-ignored, same as any other Go build output — rebuild it after a clean
+checkout).
 
 ### Why this has to run against a live snapshot to mean anything here
 
@@ -177,7 +211,7 @@ Run the check against the cluster, not just the repo:
 ```sh
 oc --token="$OPENSHIFT_TOKEN" --server=https://api.ocp.paladinaura.com:6443 \
   get httproute,gateway,authpolicy -n maas-fairness-poc -o yaml \
-  | go run ./cmd/gateway-header-check -
+  | bin/gateway-header-check -
 ```
 
 ### Demonstrated failing, as the ticket requires
@@ -188,7 +222,7 @@ pre-fix shape of `maas-poc-gateway-authn`, overwriting only the deprecated
 alias):
 
 ```
-$ go run ./cmd/gateway-header-check conformance/gatewayheaders/testdata/bad/old-header-only.yaml
+$ bin/gateway-header-check conformance/gatewayheaders/testdata/bad/old-header-only.yaml
 gateway-header-check: FAIL -- 1 route(s) do not overwrite x-llm-d-inference-objective:
   - bad-ns/half-fixed-route: routes to an InferencePool but no AuthPolicy on this route or its parent Gateway overwrites x-llm-d-inference-objective
 exit status 1
@@ -199,7 +233,7 @@ httproute,gateway,authpolicy -n maas-fairness-poc -o yaml` then the same
 again for `-n openshift-ingress`, concatenated with a `---` separator):
 
 ```
-$ go run ./cmd/gateway-header-check live-snapshot.yaml
+$ bin/gateway-header-check live-snapshot.yaml
 gateway-header-check: FAIL -- 3 route(s) do not overwrite x-llm-d-inference-objective:
   - maas-fairness-poc/maas-poc-route: routes to an InferencePool but no AuthPolicy on this route or its parent Gateway overwrites x-llm-d-inference-objective
   - maas-fairness-poc/maas-vllm-cpu-kserve-route: routes to an InferencePool but no AuthPolicy on this route or its parent Gateway overwrites x-llm-d-inference-objective
@@ -217,7 +251,7 @@ covered:
 ```
 $ oc get httproute,gateway,authpolicy -n maas-fairness-poc -o yaml > live-snapshot-after.yaml
 $ oc get httproute,gateway,authpolicy -n openshift-ingress -o yaml >> live-snapshot-after.yaml
-$ go run ./cmd/gateway-header-check live-snapshot-after.yaml
+$ bin/gateway-header-check live-snapshot-after.yaml
 gateway-header-check: OK -- every InferencePool-backed HTTPRoute overwrites x-llm-d-inference-objective
 ```
 

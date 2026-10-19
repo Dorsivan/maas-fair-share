@@ -213,8 +213,10 @@ oc get inferenceobjectives.llm-d.ai -A            # expect none, or all priority
 # A client can still forge the band wholesale: x-llm-d-inference-objective
 # beats the gateway's own x-gateway-inference-objective unless the gateway
 # overwrites it too. See docs/gateway-header-stripping.md.
+# Build the checker once, offline -- see "Building this check air-gapped" there:
+#   (cd cmd/gateway-header-check && go build -o ../../bin/gateway-header-check .)
 oc get httproute,gateway,authpolicy -n maas-fairness-poc -o yaml \
-  | go run ./cmd/gateway-header-check -            # expect "OK", exit 0
+  | bin/gateway-header-check -                     # expect "OK", exit 0
 
 # Every request trued up. Non-zero means requests are charged their ESTIMATE forever.
 ... | grep maas_fairness_requests_without_usage_total      # expect absent or 0

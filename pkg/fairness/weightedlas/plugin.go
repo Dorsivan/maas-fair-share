@@ -471,9 +471,10 @@ func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceReques
 	request.PutAttribute(provisionalChargeKey, provisionalCharge{cost: est, at: now, contended: contended})
 	gs.charge(now, est)
 	gs.addInFlight(1, est)
-	if contended {
-		addContendedService(id, est)
-	}
+	// The SLI numerator is booked once, at completion, against the real cost --
+	// see ResponseBody. Booking the estimate here too would require later
+	// subtracting it out again when the real cost turns out lower, and a
+	// Prometheus counter cannot move backwards.
 	return nil
 }
 
@@ -519,6 +520,12 @@ func (p *Plugin) ResponseBody(
 			log.FromContext(ctx).V(1).Info("response completed with no usage block; check --enable-force-include-usage",
 				"plugin", p.name, "group", id, "requestID", response.RequestID)
 		}
+		// No true-up will ever follow this charge, so the estimate IS the cost
+		// actually charged -- book it now, under the contention decided at
+		// dispatch, or it is never counted at all.
+		if charged && charge.contended {
+			addContendedService(id, charge.cost)
+		}
 		return
 	}
 
@@ -544,13 +551,14 @@ func (p *Plugin) ResponseBody(
 	// accumulated tab dependent on estimator quality rather than on consumption.
 	gs.chargeInflight(now, delta, inflight)
 	truingError.WithLabelValues(boundID(id)).Observe(delta)
-	// Reuse the gate decided at dispatch (see provisionalCharge.contended)
-	// rather than checking contention again at this, later, moment. The
-	// provisional estimate and this correction are one logical charge; gating
-	// them independently at two different times can count only one of the two,
-	// so their sum stops equalling the cost actually charged.
+	// Book the full real cost, not the delta, under the gate decided at dispatch
+	// (see provisionalCharge.contended) rather than re-checking contention at
+	// this, later, moment. Booking only the delta would silently drop an
+	// overestimate -- a negative delta -- since a counter cannot move backwards;
+	// booking the actual cost in one shot keeps the metric equal to the real
+	// cost regardless of which way the estimator missed.
 	if charge.contended {
-		addContendedService(id, delta)
+		addContendedService(id, actual)
 	}
 }
 
@@ -573,8 +581,10 @@ func (p *Plugin) isContended(now time.Time) bool {
 }
 
 // addContendedService is the metric write shared by every gated charge site.
-// Counters cannot move backwards, so a non-positive amount -- a true-up that
-// corrects an overestimate -- is silently dropped rather than recorded.
+// Every caller passes a real, measured cost (never a provisional estimate or a
+// true-up delta -- see PreRequest and ResponseBody), so amount is non-positive
+// only for a degenerate zero-token request; the counter cannot move backwards,
+// so that case is dropped rather than recorded.
 func addContendedService(id string, amount float64) {
 	if amount <= 0 {
 		return

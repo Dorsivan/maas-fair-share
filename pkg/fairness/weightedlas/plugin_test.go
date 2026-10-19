@@ -409,6 +409,52 @@ func TestContendedServiceTokensEqualChargedCost(t *testing.T) {
 		"the SLI numerator must equal the real cost charged for a request contended at dispatch")
 }
 
+// 8d. Same invariant, the other direction: the estimator OVERSHOOTS, so the
+// true-up at completion is a negative delta. A gate that booked the estimate
+// at dispatch and the (now negative) delta separately would have to drop the
+// delta -- a counter cannot move backwards -- leaving the metric stuck at the
+// estimate, permanently overstating the group's real cost. Booking the real
+// cost once, at completion, has no such asymmetry.
+func TestContendedServiceTokensEqualChargedCostOnOverestimate(t *testing.T) {
+	t.Parallel()
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupConfig{
+		{Name: "contend-fix-group-over", Weight: 1, Match: GroupMatch{Exact: []string{"contend-fix-group-over"}}},
+	}
+	cfg.DefaultGroup = DefaultGroupConfig{Name: "contend-fix-fallback-over", Weight: 1}
+	cfg.ProvisionalCharge = true
+	cfg.HalfLifeSeconds = 60
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+
+	p.lastContendedUnixNano.Store(clock.now().UnixNano())
+
+	// RequestSizeBytes=4000 and MaxOutputTokens=1000 put the estimate at
+	// roughly 2x the actual 50-token completion below, so the true-up delta is
+	// negative.
+	maxTokens := int64(1000)
+	req := &fwksched.InferenceRequest{
+		FairnessID:       "contend-fix-group-over",
+		RequestSizeBytes: 4000,
+		Body:             &fwkrh.InferenceRequestBody{MaxOutputTokens: &maxTokens},
+	}
+	require.NoError(t, p.PreRequest(ctx, req, nil))
+
+	clock.advance(2 * maxContendedStep)
+
+	resp := &fwkrc.Response{
+		EndOfStream:      true,
+		TerminationCause: fwkrc.TerminationCauseNatural,
+		Usage:            fwkrh.Usage{PromptTokens: 1000, CompletionTokens: 50, TotalTokens: 1050},
+	}
+	p.ResponseBody(ctx, req, resp, nil)
+
+	actual := p.cost(1000, 0, 50)
+	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues("contend-fix-group-over"))
+	assert.InDelta(t, actual, got, 1e-9,
+		"the SLI numerator must equal the real (lower) cost, not the estimate it overshot")
+}
+
 // 9. Abort. A stream that ends with no usage block keeps its estimate.
 // Refunding would make abort-spam free.
 func TestAbortKeepsTheEstimate(t *testing.T) {
@@ -436,6 +482,36 @@ func TestAbortKeepsTheEstimate(t *testing.T) {
 	// The charge is not permanent: it decays away on its own.
 	clock.advance(10 * time.Minute)
 	assert.Less(t, gs.normalizedService(clock.now()), charged*0.01)
+}
+
+// 9b. An aborted request's estimate is also the cost actually charged to the
+// tab -- no true-up will ever arrive to correct it -- so it must still reach
+// the SLI numerator, under the contention decided at dispatch.
+func TestAbortedRequestStillBooksContendedService(t *testing.T) {
+	t.Parallel()
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupConfig{
+		{Name: "contend-fix-group-abort", Weight: 1, Match: GroupMatch{Exact: []string{"contend-fix-group-abort"}}},
+	}
+	cfg.DefaultGroup = DefaultGroupConfig{Name: "contend-fix-fallback-abort", Weight: 1}
+	cfg.ProvisionalCharge = true
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+
+	p.lastContendedUnixNano.Store(clock.now().UnixNano())
+
+	req := &fwksched.InferenceRequest{FairnessID: "contend-fix-group-abort", RequestSizeBytes: 4000}
+	require.NoError(t, p.PreRequest(ctx, req, nil))
+	est := p.estimateCost(req, p.states["contend-fix-group-abort"])
+
+	p.ResponseBody(ctx, req, &fwkrc.Response{
+		EndOfStream:      true,
+		TerminationCause: fwkrc.TerminationCauseClientDisconnect,
+	}, nil)
+
+	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues("contend-fix-group-abort"))
+	assert.InDelta(t, est, got, 1e-9,
+		"an aborted request's estimate is the cost charged, and must still reach the SLI numerator")
 }
 
 // 10. Non-final chunks must not move the tab.

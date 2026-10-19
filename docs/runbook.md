@@ -277,8 +277,11 @@ aggregation or retention window (see docs/design.md "Production observability").
 
 ## Turn on the V(4) per-request tier
 
-Off by default, and both of the following edits are required — either one alone
-leaves the tier **silently** disabled, with no error and no log line saying why.
+This recipe is for the **POC rig** (`deploy/poc/`). Off by default, and both of the
+following edits are required — either one alone leaves the tier **silently**
+disabled, with no error and no log line saying why. See "On the KServe-managed
+scheduler" below before applying any of this to the GPU/production path — step 2
+does not transfer as written.
 
 **1. Uncomment the two ConfigMap keys** — `deploy/poc/00-config.yaml` for the POC,
 `deploy/epp-config.yaml` for production — under the `maas-weighted-fairness` plugin's
@@ -289,9 +292,8 @@ requestTierV4SampleEvery: 100       # emit 1 line per 100 settlements
 requestTierV4TimeBoxSeconds: 900    # self-disables 15 minutes after the first check
 ```
 
-**2. Add `-v=4` to the EPP container's args** in `deploy/poc/02-epp.yaml` (or the
-production Deployment/LLMInferenceService), alongside the existing `--zap-encoder`
-etc.:
+**2. Add `-v=4` to the EPP container's args** in `deploy/poc/02-epp.yaml`, alongside
+the existing `--zap-encoder` etc.:
 
 ```yaml
 args:
@@ -316,14 +318,37 @@ accepts a plain integer. Today's manifest does not set `--zap-log-level`, so `-v
 governs; if a later change adds `--zap-log-level`, set it to `4` directly instead of
 relying on `-v`.
 
+**On the KServe-managed scheduler (the GPU/production path), step 2 does not
+transfer — do not attempt it.** `maas-vllm-gpu-kserve-router-scheduler` is owned by
+the `LLMInferenceService` controller, which reverts manual edits to the Deployment
+(docs/design.md, "Override **only** `image`... Do not patch the Deployment directly —
+the controller owns `<name>-kserve-router-scheduler` and reverts manual edits.").
+Editing the `LLMInferenceService` itself is no safer: KServe templates
+`--pool-name`, the ports, the TLS flags, and the whole `--config-text` argument (the
+fairness ConfigMap, serialized) into that container's `command`/`args` from the
+preset — `deploy/llmisvc.yaml` says to override **only** `image` for exactly this
+reason. There is no field on either object that adds `-v=4` without re-deriving that
+templated command/args by hand, which this ticket has not attempted and does not
+recommend. Enabling the V(4) tier on the KServe-managed path is an open problem, not
+a documented one.
+
 **3. Apply both and restart** — the Deployment uses `strategy: Recreate`, so an
 `oc apply` on it is enough to cycle the pod, but a ConfigMap-only edit needs an
-explicit nudge:
+explicit nudge. This restart step is also POC-only:
 
 ```sh
 oc apply -f deploy/poc/00-config.yaml -f deploy/poc/02-epp.yaml -n maas-fairness-poc
 oc delete pod -n maas-fairness-poc -l app=maas-epp
 ```
+
+On the KServe-managed path there is no pod to nudge by hand: the `LLMInferenceService`
+controller watches the ConfigMap that `scheduler.config.ref` points at and rolls the
+scheduler itself once it changes (docs/design.md, "the KServe controller watches
+ConfigMaps ... re-resolves `scheduler.config.ref` into the `--config-text` arg, and
+rolls the pod automatically"). Step 1 (the ConfigMap edit) does reach that path —
+`maas-vllm-gpu` resolves `scheduler.config.ref` to the same `{name: maas-epp-config,
+key: epp}` that `deploy/poc/00-config.yaml` ships — only step 2 (the `-v=4` arg) has
+no equivalent there.
 
 Then find a request the same way as "Find a request's story from its response
 header" above — a healthy, matched request can now also produce a `"per-request

@@ -206,14 +206,24 @@ gateway-header-check: FAIL -- 3 route(s) do not overwrite x-llm-d-inference-obje
   - maas-fairness-poc/maas-vllm-gpu-kserve-route: routes to an InferencePool but no AuthPolicy on this route or its parent Gateway overwrites x-llm-d-inference-objective
 ```
 
-Applying the one-key patch above (`sed`-replicated locally into a copy of the
-same snapshot, since this run had no write access to the cluster — see
-"Blocked" below) and re-running flips all three to covered:
+Applying the one-key patch above with
+`oc patch authpolicy maas-poc-gateway-authn -n maas-fairness-poc --type=merge
+--patch-file=deploy/maas/09-objective-header-stripping.patch.yaml` (done live
+on 2026-10-19, once `patch`/`update` on `authpolicies.kuadrant.io` in
+`maas-fairness-poc` was granted — see "Applied and verified live" below) and
+re-running against a fresh snapshot of the real cluster flips all three to
+covered:
 
 ```
-$ go run ./cmd/gateway-header-check live-snapshot-after-fix.yaml
+$ oc get httproute,gateway,authpolicy -n maas-fairness-poc -o yaml > live-snapshot-after.yaml
+$ oc get httproute,gateway,authpolicy -n openshift-ingress -o yaml >> live-snapshot-after.yaml
+$ go run ./cmd/gateway-header-check live-snapshot-after.yaml
 gateway-header-check: OK -- every InferencePool-backed HTTPRoute overwrites x-llm-d-inference-objective
 ```
+
+This is a genuine live re-verification, not a local simulation — `maas-poc-gateway-authn`'s
+`resourceVersion` was confirmed unchanged (no odh-model-controller reconcile reverted it) ten
+seconds after the patch, and `status.conditions` still reads `Accepted=True`, `Enforced=True`.
 
 ### Keeping this from silently regressing
 
@@ -337,32 +347,57 @@ the full reasoning, the exact `EnvoyFilter`, and what remains unverified
 (mainly: the exact route name Istio generates for `maas-poc-route`'s one rule,
 which was not read from a live config dump).
 
-## Blocked: applying the patch and re-verifying live
+## Applied and verified live
 
-This run's ServiceAccount (`system:serviceaccount:paperclip:poc-agent`) has
-**read-only** access to the `maas-fairness-poc` namespace — it did not create
-it, and per the project's access model only the namespace's creator gets
-write access. Confirmed directly:
+On 2026-10-19, `patch`/`update` on `authpolicies.kuadrant.io` in
+`maas-fairness-poc` was granted to the `poc-agent` ServiceAccount (tracked as
+UNI-52). Verified before touching anything, with a `SelfSubjectAccessReview`
+(not just `auth can-i`, for an auditable record):
 
 ```
 $ oc auth can-i patch authpolicies.kuadrant.io -n maas-fairness-poc
-no
-$ oc auth can-i create inferenceobjectives.llm-d.ai -n maas-fairness-poc
-no
+yes
 ```
 
-**Exact unblock needed:** `patch` (or `update`) on
-`authpolicies.kuadrant.io` in namespace `maas-fairness-poc`, to apply
-`deploy/maas/09-objective-header-stripping.patch.yaml` to the live
-`maas-poc-gateway-authn` object and re-run the live conformance check for a
-genuine (not locally-simulated) after-fix result. `create` on the
-cluster-scoped `inferenceobjectives.llm-d.ai` resource would additionally let
-the priority-band bypass itself be demonstrated behaviourally, though that is
-a nice-to-have beyond the ticket's literal "Done when" wording.
+```json
+{"apiVersion":"authorization.k8s.io/v1","kind":"SelfSubjectAccessReview",
+ "spec":{"resourceAttributes":{"namespace":"maas-fairness-poc","verb":"patch",
+ "group":"kuadrant.io","resource":"authpolicies"}}}
+```
+→ `status.allowed: true`, `reason: RBAC: allowed by RoleBinding
+"poc-agent-edit/maas-fairness-poc" of ClusterRole "edit" to ServiceAccount
+"poc-agent/paperclip"`.
 
-Everything else in this document — the mechanism, the before-state live
-proof, the fix, and the conformance check with its failing/passing
-demonstrations — does not depend on that grant and is complete.
+Checked for an in-flight measurement run first (per the ticket's
+coordinate-with-A2-A4 instruction): `oc get jobs -n maas-fairness-poc` showed
+both `maas-latecomer` and `maas-loadgen` `Complete`, the latter having
+finished ~15 minutes earlier — no run in progress.
+
+Applied the patch with the exact command recorded in
+`deploy/maas/09-objective-header-stripping.patch.yaml`, confirmed
+`x-llm-d-inference-objective` now present in
+`spec.rules.response.success.headers` alongside the old alias, and re-ran the
+live conformance check — see the passing output above. Before/after `curl`
+requests against `maas-gateway-maas-fairness-poc.apps.ocp.paladinaura.com`
+both still return `HTTP 200` for baseline and forged-header requests alike,
+with or without the patch: that is expected, not a gap in the fix, because
+there are zero `InferenceObjective` resources on this cluster today (see
+"What this does not cover" below) — nothing currently assigns different
+priority bands for a forged value to jump, so there is no client-observable
+status-code or latency difference to show either way. The fix is proven at
+the level the ticket asks for: the gateway's AuthPolicy, not the client, now
+authors the value the EPP reads, and the conformance check holds the cluster
+to that mechanically.
+
+`create` on the cluster-scoped `inferenceobjectives.llm-d.ai` resource
+remains ungranted and would additionally let the priority-band bypass be
+demonstrated *behaviourally* (an actual queue-jump) rather than
+structurally — a nice-to-have beyond the ticket's literal "Done when"
+wording, not attempted here.
+
+Everything in this document — the mechanism, the before-state live proof,
+the fix, its live application, and the conformance check's
+failing/passing/now-passing-live demonstrations — is complete.
 
 UNI-43 (the direct rig fix above) is blocked separately, on `create`/`update`
 for `envoyfilters.networking.istio.io` in the same namespace plus read access

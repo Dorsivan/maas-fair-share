@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -361,6 +362,51 @@ func TestTrueUpIsIndependentOfEstimatorQuality(t *testing.T) {
 	p, _ := newTestPlugin(t, twoGroupConfig(1, 1))
 	reference := p.cost(actualPrompt, 0, actualCompletion) * math.Exp2(-inflight.Seconds()/halfLife)
 	assert.InDelta(t, reference, over, 1e-6)
+}
+
+// 8c. The SLI numerator must equal the cost actually charged. The provisional
+// estimate and its true-up are one logical charge; gating each independently,
+// at its own later moment, can accept one half and drop the other, so the
+// metric stops equalling what the tab was actually charged.
+func TestContendedServiceTokensEqualChargedCost(t *testing.T) {
+	t.Parallel()
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupConfig{
+		{Name: "contend-fix-group", Weight: 1, Match: GroupMatch{Exact: []string{"contend-fix-group"}}},
+	}
+	cfg.DefaultGroup = DefaultGroupConfig{Name: "contend-fix-fallback", Weight: 1}
+	cfg.ProvisionalCharge = true
+	cfg.HalfLifeSeconds = 60
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+
+	// The band is contended only at dispatch. By the time the response lands,
+	// contention is long gone -- a gate re-checked at completion would see no
+	// contention and drop the true-up, leaving the metric at the estimate
+	// instead of the real cost.
+	p.lastContendedUnixNano.Store(clock.now().UnixNano())
+
+	maxTokens := int64(1000)
+	req := &fwksched.InferenceRequest{
+		FairnessID:       "contend-fix-group",
+		RequestSizeBytes: 4000,
+		Body:             &fwkrh.InferenceRequestBody{MaxOutputTokens: &maxTokens},
+	}
+	require.NoError(t, p.PreRequest(ctx, req, nil))
+
+	clock.advance(2 * maxContendedStep)
+
+	resp := &fwkrc.Response{
+		EndOfStream:      true,
+		TerminationCause: fwkrc.TerminationCauseNatural,
+		Usage:            fwkrh.Usage{PromptTokens: 1000, CompletionTokens: 2000, TotalTokens: 3000},
+	}
+	p.ResponseBody(ctx, req, resp, nil)
+
+	actual := p.cost(1000, 0, 2000)
+	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues("contend-fix-group"))
+	assert.InDelta(t, actual, got, 1e-9,
+		"the SLI numerator must equal the real cost charged for a request contended at dispatch")
 }
 
 // 9. Abort. A stream that ends with no usage block keeps its estimate.

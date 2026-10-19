@@ -75,6 +75,10 @@ var provisionalChargeKey = fwkplugin.NewDataKey("provisional-cost", PluginType)
 type provisionalCharge struct {
 	cost float64
 	at   time.Time
+	// contended is whether the band was contended at dispatch, when the charge
+	// was actually incurred. The true-up at completion reuses this instead of
+	// re-checking contention at its own, later moment -- see recordContendedService.
+	contended bool
 }
 
 var (
@@ -463,10 +467,13 @@ func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceReques
 
 	now := p.now()
 	est := p.estimateCost(request, gs)
-	request.PutAttribute(provisionalChargeKey, provisionalCharge{cost: est, at: now})
+	contended := p.isContended(now)
+	request.PutAttribute(provisionalChargeKey, provisionalCharge{cost: est, at: now, contended: contended})
 	gs.charge(now, est)
 	gs.addInFlight(1, est)
-	p.recordContendedService(id, est)
+	if contended {
+		addContendedService(id, est)
+	}
 	return nil
 }
 
@@ -537,18 +544,39 @@ func (p *Plugin) ResponseBody(
 	// accumulated tab dependent on estimator quality rather than on consumption.
 	gs.chargeInflight(now, delta, inflight)
 	truingError.WithLabelValues(boundID(id)).Observe(delta)
-	p.recordContendedService(id, delta)
+	// Reuse the gate decided at dispatch (see provisionalCharge.contended)
+	// rather than checking contention again at this, later, moment. The
+	// provisional estimate and this correction are one logical charge; gating
+	// them independently at two different times can count only one of the two,
+	// so their sum stops equalling the cost actually charged.
+	if charge.contended {
+		addContendedService(id, delta)
+	}
 }
 
-// recordContendedService books service against the SLI numerator, but only
-// while the band is actually contended -- the share is meaningless outside those
-// windows.
+// recordContendedService books a one-shot charge against the SLI numerator --
+// used only where the charge and the gate decision happen at the same moment
+// (no later true-up follows). Charges that are later corrected must decide
+// contention once, at dispatch, and reuse it; see provisionalCharge.contended.
 func (p *Plugin) recordContendedService(id string, amount float64) {
-	if amount <= 0 {
+	if !p.isContended(p.now()) {
 		return
 	}
+	addContendedService(id, amount)
+}
+
+// isContended reports whether the band was contended recently enough, as of
+// now, to count service toward the SLI numerator.
+func (p *Plugin) isContended(now time.Time) bool {
 	last := p.lastContendedUnixNano.Load()
-	if last == 0 || p.now().Sub(time.Unix(0, last)) > maxContendedStep {
+	return last != 0 && now.Sub(time.Unix(0, last)) <= maxContendedStep
+}
+
+// addContendedService is the metric write shared by every gated charge site.
+// Counters cannot move backwards, so a non-positive amount -- a true-up that
+// corrects an overestimate -- is silently dropped rather than recorded.
+func addContendedService(id string, amount float64) {
+	if amount <= 0 {
 		return
 	}
 	contendedServiceTokens.WithLabelValues(boundID(id)).Add(amount)

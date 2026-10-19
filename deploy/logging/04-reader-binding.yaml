@@ -1,0 +1,31 @@
+# OPTIONAL.  Access-request item 7 in docs/logging-install-spec.md section 8.
+#
+#   oc apply -f deploy/logging/04-reader-binding.yaml
+#
+# This is the only file in deploy/logging/ that grants anything to an agent
+# identity, and it is split out so that declining item 7 means not applying
+# one file rather than editing one.
+#
+# It grants `get` on resource `application`, resourceName `logs`, in
+# loki.grafana.com -- read the POC's own application logs out of the
+# LokiStack gateway -- and nothing else.  No elevation, no write, no other
+# tenant.
+#
+# Declining this is a perfectly good answer: the administrator can run the
+# LogQL query in spec section 7 themselves and the POC records the
+# verification as theirs.
+#
+# Prerequisite: 03-collector.yaml applied (it defines the ClusterRole).
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maas-fairness-application-logs-reader-poc-viewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: maas-fairness-application-logs-reader
+subjects:
+  - kind: ServiceAccount
+    name: poc-viewer
+    namespace: paperclip

@@ -1,0 +1,106 @@
+# Collector: ServiceAccount, RBAC, ClusterLogForwarder.
+# See docs/logging-install-spec.md section 6.
+#
+#   oc apply -f deploy/logging/03-collector.yaml
+#
+# In logging 6.x there is no ClusterLogging CR.  The collector is defined
+# entirely by a ClusterLogForwarder plus a ServiceAccount you create and bind
+# yourself; the operator does not create the bindings for you.  If they are
+# missing the operator's SubjectAccessReview fails and it deploys NO collector
+# DaemonSet at all, setting Authorized=False / ClusterRoleMissing on the
+# ClusterLogForwarder.  Read .status.conditions before hunting for an idle
+# daemon.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maas-log-collector
+  namespace: openshift-logging
+---
+# Read application container logs.  Infrastructure and audit are deliberately
+# left out (spec section 9).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maas-log-collector-application-logs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: collect-application-logs
+subjects:
+  - kind: ServiceAccount
+    name: maas-log-collector
+    namespace: openshift-logging
+---
+# Write into the LokiStack through its gateway as the "application" tenant.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maas-log-collector-logging-application-write
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: logging-collector-logs-writer
+subjects:
+  - kind: ServiceAccount
+    name: maas-log-collector
+    namespace: openshift-logging
+---
+# READ side, for whoever verifies the result (spec section 7).
+#
+# Do NOT substitute `cluster-logging-application-view`.  That ClusterRole is a
+# trap: it is not shipped by either operator.  It is created at runtime by the
+# Cluster Observability Operator's Logging UIPlugin controller, which this
+# spec treats as optional -- so on a cluster without the UIPlugin, a
+# ClusterRoleBinding naming it is accepted by the API server and grants
+# precisely nothing, with no error anywhere.  Hence an explicit role:
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: maas-fairness-application-logs-reader
+rules:
+  - apiGroups: ["loki.grafana.com"]
+    resources: ["application"]
+    resourceNames: ["logs"]
+    verbs: ["get"]
+---
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: maas-fairness
+  namespace: openshift-logging
+spec:
+  managementState: Managed
+  serviceAccount:
+    name: maas-log-collector
+  outputs:
+    - name: default-lokistack
+      type: lokiStack
+      lokiStack:
+        target:
+          name: logging-loki
+          namespace: openshift-logging
+        authentication:
+          token:
+            from: serviceAccount
+      tls:
+        ca:
+          key: service-ca.crt
+          configMapName: openshift-service-ca.crt
+  inputs:
+    # Scoped to maas-fairness-poc: the ticket's stated minimum, and the right
+    # default -- collecting the whole cluster into a 1x.demo stack backed by
+    # NFS is how you find the NFS limit the hard way.  Widening later means
+    # adding namespaces here, or dropping `inputs` for the built-in
+    # `application` input.
+    - name: maas-fairness-app
+      type: application
+      application:
+        includes:
+          - namespace: maas-fairness-poc
+  pipelines:
+    - name: maas-fairness-to-loki
+      inputRefs:
+        - maas-fairness-app
+      outputRefs:
+        - default-lokistack

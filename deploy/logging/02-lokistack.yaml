@@ -1,0 +1,40 @@
+# LokiStack for the fairness POC.  See docs/logging-install-spec.md section 5.
+#
+#   oc apply -f deploy/logging/02-lokistack.yaml
+#
+# Prerequisites: 01-operators.yaml applied, both CSVs Succeeded, and the
+# Secret `logging-loki-s3` present in openshift-logging (spec section 4).
+#
+# Two things here are POC compromises and are NOT a supported production
+# configuration:
+#   * size 1x.demo is documented by Red Hat as demonstration-only.  The
+#     smallest *supported* size is 1x.pico.
+#   * storageClassName: nfs is the only StorageClass on this cluster and is
+#     the wrong backing store for Loki's WAL and index.  Most likely thing
+#     here to fail outright, not merely to be slow.
+#
+# effectiveDate must already be in the past when this is applied -- the
+# validating webhook rejects an all-future schema list.  If applying after
+# 2026-11-01, move it back, never forward.
+---
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: logging-loki          # load-bearing: the ClusterLogForwarder's
+  namespace: openshift-logging #              lokiStack output resolves by name
+spec:
+  size: 1x.demo
+  storage:
+    schemas:
+      - version: v13
+        effectiveDate: "2026-10-01"
+    secret:
+      name: logging-loki-s3
+      type: s3
+  storageClassName: nfs
+  tenants:
+    mode: openshift-logging
+  limits:
+    global:
+      retention:
+        days: 7              # best-effort on 1x.demo; a request, not a contract

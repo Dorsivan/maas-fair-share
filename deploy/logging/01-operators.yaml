@@ -1,0 +1,76 @@
+# OpenShift Logging 6.6 + Loki Operator -- namespaces, operator groups,
+# subscriptions.  See docs/logging-install-spec.md section 4 for why each
+# field is the way it is.
+#
+#   oc apply -f deploy/logging/01-operators.yaml
+#
+# NOT APPLIED on ocp.paladinaura.com as of 2026-10-19: no agent on this POC
+# can create a Subscription.  This is the handover artifact.
+#
+# The object-storage Secret (logging-loki-s3) is deliberately NOT in this
+# repository -- it carries a credential.  Create it by hand; the exact key
+# names are in spec section 4.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-logging
+  labels:
+    openshift.io/cluster-monitoring: "true"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-operators-redhat
+  labels:
+    openshift.io/cluster-monitoring: "true"
+---
+# Logging 6.x uses an AllNamespaces-mode OperatorGroup -- note the absence of
+# targetNamespaces, which is deliberate and is NOT the OwnNamespace group used
+# by logging 5.x.
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-logging
+  namespace: openshift-logging
+spec:
+  upgradeStrategy: Default
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cluster-logging
+  namespace: openshift-logging
+spec:
+  channel: stable-6.6
+  name: cluster-logging
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: cluster-logging.v6.6.1
+  installPlanApproval: Manual        # pin; approve the InstallPlan explicitly
+---
+# Loki Operator. Must go in openshift-operators-redhat, not openshift-operators:
+# the latter is the community/global group and installing here alongside other
+# operators has produced dependency conflicts.
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-operators-redhat
+  namespace: openshift-operators-redhat
+spec: {}
+---
+# source: redhat-operators is load-bearing. Two packagemanifests are named
+# `loki-operator`; the bare name resolves to the Community v0.12.0 build,
+# which is the wrong operator. See spec section 1.
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: loki-operator
+  namespace: openshift-operators-redhat
+spec:
+  channel: stable-6.6
+  name: loki-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  startingCSV: loki-operator.v6.6.1
+  installPlanApproval: Manual

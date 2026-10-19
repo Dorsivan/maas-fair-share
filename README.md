@@ -189,7 +189,9 @@ pkg/fairness/weightedlas/
 deploy/               EndpointPickerConfig, LLMInferenceService, PodMonitor, RBAC
 deploy/poc/           GPU-free rig: direct EPP, LLMInferenceService, 3.4-shape test
 deploy/maas/          Models-as-a-Service install (Kuadrant, TLS, DB, gateway)
-docs/                 design notes, POC results, runbook, calibration procedure
+deploy/logging/       applyable manifests for that install spec (not applied)
+docs/                 design notes, POC results, runbook, calibration procedure,
+                      the Logging/LokiStack install spec
 prototype/            FROZEN Python ext_proc prototype -- provenance, not a dependency
 ```
 

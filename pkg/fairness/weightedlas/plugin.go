@@ -138,11 +138,13 @@ type Plugin struct {
 	// once per group line, so every per-group line from the same tick shares one
 	// id and a consumer can reassemble the table -- see docs/log-field-contract.md.
 	// Also read (never incremented) from the V(4) per-request line as
-	// recorderTick: the most recently completed tick as of that request's
-	// settlement, which is the join the board's "whole story from a response
-	// header" query uses to find the recorder's view of the cluster around the
-	// same time. It is a recency marker, not an exact interval membership test --
-	// a request can settle between two ticks.
+	// recorderTick: the most recently assigned tick id as of that request's
+	// settlement (the counter is incremented before its per-group lines are
+	// emitted, so a request settling mid-emission reads that in-progress tick,
+	// not a completed one). This is the join the board's "whole story from a
+	// response header" query uses to find the recorder's view of the cluster
+	// around the same time. It is a recency marker, not an exact interval
+	// membership test -- a request can settle between two ticks.
 	flightRecorderTick atomic.Uint64
 }
 

@@ -44,9 +44,21 @@ max_over_time(
    kubernetes_pod_name=~"maas-vllm-gpu-kserve-router-scheduler-.*"}
     | json
     | body = "fairness state"
-    | unwrap normalizedService [$__auto]
+    | unwrap normalizedService [5m]
 ) by (group)
 ```
+
+`[5m]` is a literal range, not Grafana's `$__auto` macro — this pack is run
+against the LokiStack gateway's `query_range` with `curl` (line 14 above),
+where `$__auto` is never substituted and the query fails to parse. There is
+also no Grafana in this install to substitute it: `docs/logging-install-spec.md`
+installs no Grafana, and its console `UIPlugin` is explicitly excluded from
+the air-gap mirror set. `5m` is comfortably larger than this config's 30s
+flight-recorder cadence (`stateLogIntervalSeconds` in `deploy/epp-config.yaml`,
+the GPU target's config — the POC rig's `deploy/poc/00-config.yaml` runs 5s),
+so the window holds at least one sample regardless of which config is live.
+If a Grafana datasource is added later, `$__auto` is the equivalent form
+there.
 
 Chart this: a group whose line sits well below the others' while all are
 backlogged (`inFlight > 0` on the same lines, or
@@ -214,6 +226,15 @@ remaining stable context fields.
 Returns the whole group table as of the recorder's most recent pass before
 this request settled — "what the recorder saw around the same time," per
 §3.3's recency caveat, reassembled via the shared `tick` field from §3 above.
+
+**If step 1's `recorderTick` is `0`, step 2 correctly returns no rows — this
+is not a broken collector.** The flight recorder only ticks while contended
+(`docs/log-field-contract.md` §3.1), but V(4) sampling is gated
+independently, on sample rate and time box alone. So a request sampled by
+V(4) on an otherwise-idle, uncontended EPP settles with `recorderTick: 0`,
+because the recorder has not ticked since process start, and no `{tick="0"}`
+line exists to find. Treat `recorderTick: 0` as "no contention observed yet,"
+not a join failure.
 
 **This two-step query is demonstrated against the POC rig
 (`deploy/poc/`), where `-v=4` can be set on the EPP container — it is not

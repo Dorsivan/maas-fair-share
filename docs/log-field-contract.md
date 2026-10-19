@@ -200,13 +200,22 @@ flag). Fields:
 ```
 
 `recorderTick` is new in this ticket: it echoes
-`flightRecorderTick`'s current value at settlement — the most recently
-*completed* flight-recorder tick, read with a single atomic load, never
-written from this path. It is a **recency marker, not an exact interval
+`flightRecorderTick`'s current value at settlement, read with a single atomic
+load, never written from this path. The counter is incremented *before* its
+per-group lines are emitted, so this is the most recently **assigned** tick
+id, not necessarily a completed one — a request settling mid-emission reads
+an in-progress tick. It is a **recency marker, not an exact interval
 join**: a request can settle between two ticks, so the matching
 `{tick="<recorderTick>"}` row is "the recorder's most recent view as of this
 request," not a guarantee the request was in flight for that exact tick. See
 "the whole story" query in `docs/logql-queries.md`.
+
+A `recorderTick` of `0` means the flight recorder has not ticked since
+process start — it only runs while contended (§3.1), so an uncontended EPP
+can legitimately sample V(4) lines all carrying `0`. The "whole story" query's
+step 2 then has no `{tick="0"}` rows to find; that is the correct, expected
+result for an uncontended request, not a broken collector or a missing
+label.
 
 **This is the only line that carries `estimateCharged` and `trueUpDelta`
 together with a correlation id — and it is not available on the GPU EPP
@@ -290,7 +299,8 @@ a backlog idea rather than attempted here.
 
 **Proven:** the flight recorder's wire shape (one line per group, shared
 `tick`), the field names and their stable/debug-only split, and that every
-line this plugin emits now carries `band` and `enforcing` in addition to
+line this plugin emits now carries `enforcing` — and `band` on every
+request-scoped tier, the flight recorder excepted (§3.1) — in addition to
 whatever correlation fields it already had — verified by
 `pkg/fairness/weightedlas/flight_recorder_test.go` and
 `pkg/fairness/weightedlas/log_field_contract_test.go` against the real

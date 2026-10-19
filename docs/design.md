@@ -992,8 +992,9 @@ Every request-scoped log line in this package carries two fields, resolved once 
 
 `Pick` runs on a 1ms ticker, so per-decision logging is out. Three tiers; `requestID`
 (and `traceId`, when present) is attached to every one of them that is request-scoped,
-and `band`/`enforcing` are attached to every tier, request-scoped or not. Full field
-list, stable-vs-debug-only split, and the LogQL query pack:
+`enforcing` is attached to every tier, request-scoped or not, and `band` is attached to
+the request-scoped tiers only — the flight recorder carries no `band` (see below). Full
+field list, stable-vs-debug-only split, and the LogQL query pack:
 `docs/log-field-contract.md` and `docs/logql-queries.md` (UNI-48 / D9).
 
 - **Flight recorder (INFO, every `stateLogIntervalSeconds`)** — **one line per

@@ -597,13 +597,28 @@ $OC logs maas-vllm-gpu-kserve-router-scheduler-d95dcd886-4b6lg -n maas-fairness-
 > the single biggest trap in the query pack and is the main thing this ticket
 > hands to the log field contract / LogQL query pack work (ticket D9).
 
-`runFlightRecorder` calls `log.FromContext(ctx).Info("fairness state", "plugin",
-p.name, "state", p.dump())`, so the emitted line is the same envelope with
-`"body":"fairness state"`, `"severity_text":"INFO"`, a `"plugin"` field holding
-the configured plugin name (`maas-fairness` on this cluster), and a `"state"`
-object carrying the `dumpState` struct: `enforcing`, `halfLifeSeconds`,
-`costModel`, `groups[]`, `unmatchedSubscriptionsTotal`,
-`recentUnmatchedSubscriptions[]`, `truncated`.
+**The shape below is historical.** [UNI-48](/UNI/issues/UNI-48) (D9) found
+that the original single-line-with-a-nested-`groups[]`-array shape does not
+unroll into a time series in Loki or Elasticsearch, and replaced it with one
+`"fairness state"` line per group, sharing a `tick` field. The authoritative
+field contract is now `docs/log-field-contract.md` §3.1, and the matching
+queries are in `docs/logql-queries.md` §3 — **re-run this section's
+verification against that shape, not this one**, before trusting it. The
+original sample is kept below for the parts that are still true (the OTel
+envelope, the `body`-not-`msg` trap, and the contention gate), not as a
+current description of the payload.
+
+`runFlightRecorder` used to call `log.FromContext(ctx).Info("fairness state",
+"plugin", p.name, "state", p.dump())` as one line per tick, with
+`"body":"fairness state"`, `"severity_text":"INFO"`, a `"plugin"` field
+holding the configured plugin name (`maas-fairness` on this cluster), and a
+`"state"` object carrying the `dumpState` struct: `enforcing`,
+`halfLifeSeconds`, `costModel`, `groups[]`, `unmatchedSubscriptionsTotal`,
+`recentUnmatchedSubscriptions[]`, `truncated`. As of UNI-48, `logFlightRecorderTick`
+emits that same `"body":"fairness state"` message once per configured group
+instead, each carrying its own flat `group`/`tick`/`enforcing`/numeric fields
+and no `state` object at all — see `docs/log-field-contract.md` §3.1 for the
+current shape.
 
 ### The recorder is gated — you must create contention to see anything
 
@@ -684,6 +699,13 @@ this procedure fail while looking correct.
 
 ### The query
 
+**Superseded by UNI-48 (D9) — see `docs/logql-queries.md` §3 for the current
+query pack.** The two queries below match the shape this section's title
+still describes (one line with a nested `state.groups` array) and will not
+match the per-group lines `logFlightRecorderTick` emits as of D9. Kept here
+only as the historical record of the `| json` nested-array trap; do not copy
+these into a live verification.
+
 ```logql
 {log_type="application",
  kubernetes_namespace_name="maas-fairness-poc",
@@ -693,7 +715,9 @@ this procedure fail while looking correct.
   | body = "fairness state"
 ```
 
-Narrowed to one group's normalized service, which is the form D9 will want:
+Narrowed to one group's normalized service, which was the form D9 was asked
+to improve on — and did, by making `group` a top-level field instead of
+needing this extraction at all (`docs/logql-queries.md` §1, §3):
 
 ```logql
 {log_type="application",
@@ -709,7 +733,8 @@ Narrowed to one group's normalized service, which is the form D9 will want:
 > *no label at all* for `state.groups`, not a truncated or awkward one. You
 > only get it by naming it explicitly as above, in which case the array is
 > assigned to the label serialized as JSON. Writing
-> `| json | state_groups_0_name="b"` does not work and never will.
+> `| json | state_groups_0_name="b"` does not work and never will. (This whole
+> trap is also why D9 split the line into one-per-group in the first place.)
 
 Run it against the LokiStack gateway. The `application` tenant path is not
 optional in the URL:
@@ -731,10 +756,14 @@ curl -sG --cacert /tmp/ca-bundle.crt \
   --data-urlencode 'limit=5' | jq '.data.result[].values[][1]'
 ```
 
-**Pass condition:** that command returns at least one line whose `body` is
-`fairness state` and whose `state.groups` contains the four configured groups
-(`app1`, `app2`, `end-users`, `unclassified`), with a timestamp inside the load
-window. Paste the query and the returned line into the ticket. A line found by
+**Pass condition (historical, pre-D9 shape):** that command returns at least
+one line whose `body` is `fairness state` and whose `state.groups` contains
+the four configured groups (`app1`, `app2`, `end-users`, `unclassified`), with
+a timestamp inside the load window. **As of UNI-48, re-state this as:** the
+query returns at least four lines whose `body` is `fairness state`, sharing
+one `tick` value, whose `group` fields are exactly `app1`, `app2`,
+`end-users`, and `unclassified` — see `docs/logql-queries.md` §3's second
+query. Paste the query and the returned line(s) into the ticket. A line found by
 `oc logs` does **not** satisfy this — the whole point is that it came back
 through LogQL.
 

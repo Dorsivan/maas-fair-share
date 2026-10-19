@@ -991,21 +991,32 @@ Every request-scoped log line in this package carries two fields, resolved once 
 ### Logs
 
 `Pick` runs on a 1ms ticker, so per-decision logging is out. Three tiers; `requestID`
-(and `traceId`, when present) is attached to every one of them that is request-scoped:
+(and `traceId`, when present) is attached to every one of them that is request-scoped,
+and `band`/`enforcing` are attached to every tier, request-scoped or not. Full field
+list, stable-vs-debug-only split, and the LogQL query pack:
+`docs/log-field-contract.md` and `docs/logql-queries.md` (UNI-48 / D9).
 
-- **Flight recorder (INFO, every `stateLogIntervalSeconds`)** — one structured line
-  with the same table, emitted **only while contended**. Silent on an idle cluster;
-  works with only Loki. Not request-scoped, so no single `requestID` applies.
+- **Flight recorder (INFO, every `stateLogIntervalSeconds`)** — **one line per
+  configured group**, sharing a `tick` id so the lines of one recording pass can be
+  reassembled, emitted **only while contended**. Silent on an idle cluster; works with
+  only Loki. Not request-scoped, so no single `requestID` applies, and no `band` either
+  (`groupState` is not itself scoped to a priority band — see
+  `docs/log-field-contract.md` §3.1). **Changed in UNI-48 (D9)**: previously one line
+  carried the whole table as a nested `groups[]` array, which does not unroll into a
+  time series in Loki or Elasticsearch.
 - **Events, rate-limited** — clamp fired; unmatched subscription (log the value, first
   N then sampled, now carrying the `requestID`/`traceId` of the request whose first
-  sighting triggered the line); active flows on more than one priority band. The
-  no-usage-block warning in `ResponseBody` (V(1)) is the same tier and carries the
-  same fields.
-- **V(4) per-request** — group resolved, estimate charged, true-up delta, and the
+  sighting triggered the line, plus `band` and `enforcing` as of D9); active flows on
+  more than one priority band. The no-usage-block warning in `ResponseBody` (V(1)) is
+  the same tier and carries the same fields.
+- **V(4) per-request** — group resolved, estimate charged, true-up delta, `band`,
+  `enforcing`, a `recorderTick` linking to the nearest flight-recorder tick (D9), and the
   `requestID`/`traceId` identifying which request the pick belongs to. **Implemented**
   (UNI-47) in `ResponseBody`, the one point in the request lifecycle where a group, an
   estimate and a true-up delta all exist together — not in `Pick`, which this tier never
-  touches (see "V(4) is off Pick's hot path" below).
+  touches (see "V(4) is off Pick's hot path" below). **Cannot be enabled on the
+  KServe-managed GPU scheduler today** — see `docs/runbook.md` "On the KServe-managed
+  scheduler" and `docs/log-field-contract.md` §3.3, §5.
 
 ### V(4) is off Pick's hot path
 

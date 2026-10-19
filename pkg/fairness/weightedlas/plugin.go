@@ -133,6 +133,17 @@ type Plugin struct {
 	// completions that already passed the config and verbosity gates, so the
 	// sample rate is relative to eligible lines, not to total traffic.
 	v4Counter atomic.Uint64
+
+	// flightRecorderTick increments once per emitted flight-recorder tick, not
+	// once per group line, so every per-group line from the same tick shares one
+	// id and a consumer can reassemble the table -- see docs/log-field-contract.md.
+	// Also read (never incremented) from the V(4) per-request line as
+	// recorderTick: the most recently completed tick as of that request's
+	// settlement, which is the join the board's "whole story from a response
+	// header" query uses to find the recorder's view of the cluster around the
+	// same time. It is a recency marker, not an exact interval membership test --
+	// a request can settle between two ticks.
+	flightRecorderTick atomic.Uint64
 }
 
 // Factory builds the plugin from its `parameters` block.
@@ -249,7 +260,7 @@ func (p *Plugin) RequestHeader(ctx context.Context, request *fwksched.InferenceR
 
 	if !matched && sub != "" {
 		unmatchedSubscriptions.Inc()
-		p.recordUnmatched(ctx, sub, corr)
+		p.recordUnmatched(ctx, sub, corr, request.Objectives.Priority)
 	}
 	return nil
 }
@@ -271,7 +282,7 @@ func (p *Plugin) subscriptionID(request *fwksched.InferenceRequest) string {
 	return ""
 }
 
-func (p *Plugin) recordUnmatched(ctx context.Context, sub string, corr correlation) {
+func (p *Plugin) recordUnmatched(ctx context.Context, sub string, corr correlation, band int) {
 	p.unmatchedMu.Lock()
 	p.unmatchedCount++
 	first := false
@@ -288,8 +299,8 @@ func (p *Plugin) recordUnmatched(ctx context.Context, sub string, corr correlati
 	// The request id is still this specific request's, even though the
 	// dedup gate is keyed on the subscription string.
 	if first {
-		fields := append([]any{"plugin", p.name, "subscription", sub, "group", p.groups.fallback},
-			corr.logFields()...)
+		fields := append([]any{"plugin", p.name, "subscription", sub, "group", p.groups.fallback,
+			"band", band, "enforcing", p.cfg.Enforce}, corr.logFields()...)
 		log.FromContext(ctx).Info("subscription matched no fairness group; using catch-all", fields...)
 	}
 }
@@ -568,7 +579,8 @@ func (p *Plugin) ResponseBody(
 		// half-lives if the request genuinely never ran.
 		requestsWithoutUsage.WithLabelValues(boundID(id)).Inc()
 		if response.TerminationCause == fwkrc.TerminationCauseNatural {
-			fields := append([]any{"plugin", p.name, "group", id}, corr.logFields()...)
+			fields := append([]any{"plugin", p.name, "group", id,
+				"band", request.Objectives.Priority, "enforcing", p.cfg.Enforce}, corr.logFields()...)
 			log.FromContext(ctx).V(1).Info("response completed with no usage block; check --enable-force-include-usage", fields...)
 		}
 		// No true-up will ever follow this charge, so the estimate IS the cost
@@ -604,7 +616,9 @@ func (p *Plugin) ResponseBody(
 	truingError.WithLabelValues(boundID(id)).Observe(delta)
 	if v4, ok := p.v4Logger(ctx, now); ok {
 		fields := append([]any{"plugin", p.name, "group", id,
-			"estimateCharged", charge.cost, "trueUpDelta", delta}, corr.logFields()...)
+			"band", request.Objectives.Priority, "enforcing", p.cfg.Enforce,
+			"estimateCharged", charge.cost, "trueUpDelta", delta,
+			"recorderTick", p.flightRecorderTick.Load()}, corr.logFields()...)
 		v4.Info("per-request fairness tier", fields...)
 	}
 	// Book the full real cost, not the delta, under the gate decided at dispatch
@@ -790,10 +804,11 @@ func (p *Plugin) v4WithinTimeBox(now time.Time) bool {
 	return now.Before(p.v4Deadline)
 }
 
-// runFlightRecorder emits the same table to the log on a fixed cadence, but only
-// while contention is recent. Pick runs on a ~1ms ticker so per-decision logging
-// is out of the question; this gives a flight recorder in Loki for clusters with
-// no Prometheus, and stays completely silent when nothing is competing.
+// runFlightRecorder emits the group table to the log on a fixed cadence, but
+// only while contention is recent. Pick runs on a ~1ms ticker so per-decision
+// logging is out of the question; this gives a flight recorder in Loki for
+// clusters with no Prometheus, and stays completely silent when nothing is
+// competing.
 func (p *Plugin) runFlightRecorder(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -806,7 +821,62 @@ func (p *Plugin) runFlightRecorder(ctx context.Context, interval time.Duration) 
 			if last == 0 || p.now().Sub(time.Unix(0, last)) > interval {
 				continue
 			}
-			log.FromContext(ctx).Info("fairness state", "plugin", p.name, "state", p.dump())
+			p.logFlightRecorderTick(ctx)
 		}
+	}
+}
+
+// logFlightRecorderTick emits one "fairness state" line per configured group,
+// rather than the whole table as a single line with a nested `groups` array.
+//
+// A JSON array inside one log field does not unroll into a time series: Loki's
+// `| json` only flattens nested *objects* (with `_`) and skips arrays entirely
+// (see docs/logging-install-spec.md §7), and Elasticsearch has the same
+// problem under its default dynamic mapping. Either way, per-group trends --
+// one tenant's normalizedService climbing while another's falls -- were not
+// directly queryable from the old shape; a query first had to pull the whole
+// array out as a string and re-parse it. One line per group makes `group` and
+// the per-group numbers first-class fields a LogQL/Elastic query can select,
+// filter, and chart on without that detour.
+//
+// The shared `tick` field is what lets a consumer reassemble every group's row
+// from the same recording pass -- see docs/log-field-contract.md and the
+// "what did the recorder see at time T" query in docs/logql-queries.md.
+//
+// This intentionally does not include `band`: unlike a request-scoped line,
+// where `band` is read straight off that one request's own
+// InferenceRequest.Objectives.Priority, a group's accounting state
+// (groupState) is shared across whatever priority bands route requests into
+// it -- it is not itself scoped to one band. On this POC's configuration there
+// is exactly one priority band (`priority: 0`, see deploy/poc/00-config.yaml),
+// so every line here is implicitly that band, but asserting a `band` field
+// here would be encoding that single-band assumption into the contract rather
+// than describing what the code actually tracks. A deployment that configures
+// more than one band would need groupState itself split per band before this
+// line could carry the field honestly -- out of scope here, recorded as a gap
+// in docs/log-field-contract.md rather than silently assumed away.
+func (p *Plugin) logFlightRecorderTick(ctx context.Context) {
+	now := p.now()
+	tick := p.flightRecorderTick.Add(1)
+	logger := log.FromContext(ctx)
+	for _, name := range p.groups.names() {
+		gs, ok := p.states[name]
+		if !ok {
+			continue
+		}
+		s := gs.snapshot(now)
+		logger.Info("fairness state",
+			"plugin", p.name,
+			"tick", tick,
+			"group", s.Name,
+			"enforcing", p.cfg.Enforce,
+			"weight", s.Weight,
+			"attainedService", s.AttainedService,
+			"normalizedService", s.NormalizedService,
+			"inFlight", s.InFlight,
+			"provisionalCharge", s.ProvisionalCharge,
+			"ewmaOutputTokens", s.EWMAOutputTokens,
+			"ewmaWarm", s.EWMAWarm,
+		)
 	}
 }

@@ -1242,7 +1242,8 @@ Things that are your call, not the implementation's:
 11. **Version pinning.** Flow-control interfaces are Alpha/Beta on a v0.x module. Budget
    a quarterly re-pin: bump `go.mod` and the Dockerfile builder together, re-read the
    `plugins.go` diff, rerun conformance + load tests. Add a Dependabot rule scoped to
-   `llm-d-router`.
+   `llm-d-router`. See `docs/version-pinning.md` for the authoritative process; the
+   quarterly cadence proposed above has been superseded by a monthly check.
 12. **Disconnected clusters** need the image mirrored with a matching IDMS/ICSP entry.
 13. **Metric label cardinality.** The 1000-ID cap is far above your tenant count, but
     values are admitted first-come and never evicted. Ensure anonymous traffic collapses

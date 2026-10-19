@@ -128,6 +128,45 @@ timeout`) even though pod-to-pod networking works, so an internal reference
 leaves the EPP in `ImagePullBackOff` there. A Quay reference is also the only
 one meaningful on a different cluster.
 
+### Interim in-cluster build used to verify UNI-53 — main does not deploy it
+
+The role that verified UNI-53 does not hold the quay.io push credential above, so the
+image used for that verification was **not** built or published through the steps
+above. It came from an in-cluster `BuildConfig` named `maas-epp` that already exists in
+`maas-fairness-poc` (binary source, `dockerfilePath: Dockerfile.epp`, output to
+`ImageStreamTag maas-epp:latest` — the same mechanism that produced the
+`maas-epp:latest` images `deploy/poc/02-epp.yaml`, `05-llmisvc-sim.yaml`,
+`06-rhoai34-shape.yaml` and `07-vllm-cpu.yaml` already reference). It predates this
+ticket and is not itself checked into this repository — that gap is worth closing, but
+doing so was not part of UNI-53.
+
+```sh
+oc start-build maas-epp --from-dir=. --follow -n maas-fairness-poc
+oc get imagestreamtag maas-epp:latest -n maas-fairness-poc \
+  -o jsonpath='{.image.dockerImageReference}{"\n"}'
+```
+
+Digest produced from `d7e4d58` and used for UNI-53's live verification (2026-10-19):
+
+```
+image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp@sha256:7849fa523ce98e1b01de6864650df86dac123d51264d4fd73e62dbfe27834e2e
+```
+
+**`deploy/poc/09-vllm-gpu.yaml` and `deploy/llmisvc.yaml` do not reference this image,
+and applying them from `main` today does not deploy UNI-53.** Both are still pinned to
+`quay.io/rh-ee-dsivan/maas-fair-share:aef33a5`, 14 commits behind (`git rev-list --count
+aef33a5..d7e4d58`). Closing that gap needs someone holding the quay push credential to
+run "Rebuild and publish the EPP image" above and bump both manifests' `image:` field to
+the resulting digest.
+
+Do **not** "fix" this by repointing those two manifests at the digest above instead:
+that image is reachable only from inside this cluster, and this registry is known to
+time out from some nodes in this pool — the CPU-path EPP deployment
+(`maas-vllm-cpu-kserve-router-scheduler-*`, same internal registry, different tag) is
+sitting in `ImagePullBackOff` against exactly this failure mode as of this writing. The
+digest above exists only to prove the plugin logic end to end from inside the cluster;
+it is not a transferable or deployable artifact, and does not leave this cluster.
+
 ---
 
 ## A load run returned nothing / looks broken
@@ -187,33 +226,43 @@ oc get httproute,gateway,authpolicy -n maas-fairness-poc -o yaml \
 ... | grep maas_fairness_unmatched_subscriptions_total     # expect 0
 ```
 
+And the one that tells you the policy converged, which matters more than the
+token percentages: `normalized_service` should be **equal across backlogged
+groups**. Persistent spread means it has identified an imbalance it is not
+being given the chance to correct — usually under-offered load.
+
 ---
 
 ## Find a request's story from its response header
 
 Every response from the GPU path carries `x-request-id`, `x-maas-fairness-group`
 and `x-maas-fairness-queue-ms` (UNI-53; suppressible via `emitAttributionHeaders`
-in `deploy/poc/00-config.yaml`). Given the `x-request-id` value from a response,
-two commands get that request's own log lines back:
+in `deploy/poc/00-config.yaml`) — **once the EPP image includes `d7e4d58` or later**.
+As committed, `deploy/poc/09-vllm-gpu.yaml` and `deploy/llmisvc.yaml` do not yet pull
+that image; see "Interim in-cluster build used to verify UNI-53" under "Rebuild and
+publish the EPP image" above before assuming a freshly-applied cluster has this.
+
+Given the `x-request-id` value from a response, two commands get that request's own
+log lines back:
 
 ```sh
 POD=$(oc get pods -n maas-fairness-poc \
   -l app.kubernetes.io/name=maas-vllm-gpu,app.kubernetes.io/component=llminferenceservice-router-scheduler \
   -o jsonpath='{.items[0].metadata.name}')
 
-oc logs -n maas-fairness-poc "$POD" | grep '"requestID":"<id>"'
+ID=<the x-request-id value from the response>
+oc logs -n maas-fairness-poc "$POD" | grep "$ID"
 ```
 
-Every request-scoped line this plugin emits -- the unmatched-subscription notice,
-the no-usage-block warning, and (once UNI-47 lands) the V(4) per-request tier --
-carries `requestID` with this exact value, plus `traceId` when the request came
-in with a `traceparent` header. See UNI-48's query pack for the field contract
-those lines use.
+Grep the bare id, not `"requestID":"<id>"` — the llm-d-router framework's own
+request-lifecycle lines key it as `x-request-id` and appear on every request, while
+this plugin's own lines key it as `requestID` and, until UNI-47's V(4) per-request tier
+lands, only appear on the two exception paths (the unmatched-subscription notice and
+the no-usage-block warning). A healthy, matched request today produces zero plugin
+lines, only framework ones — the bare-id grep still finds those; the `"requestID":"`
+form matches nothing for it. `requestID` also carries `traceId` when the request came
+in with a `traceparent` header. See UNI-48's query pack for the field contract those
+lines use.
 
 If the pod has since restarted, that log is gone -- this POC cluster has no log
 aggregation or retention window (see docs/design.md "Production observability").
-
-And the one that tells you the policy converged, which matters more than the
-token percentages: `normalized_service` should be **equal across backlogged
-groups**. Persistent spread means it has identified an imbalance it is not
-being given the chance to correct — usually under-offered load.

@@ -727,7 +727,8 @@ Ordered by how much they would change a conclusion.
 | 12 | **Red Hat support boundary** | a custom EPP image takes that component outside RHOAI support. The plan calls this the biggest non-technical risk and it has never been raised with the account team. Nothing technical unblocks it | a conversation |
 | 13 | **Version-pin maintenance** | flow-control interfaces sit on a module that only reached v1.0.0 on 2026-10-15; we are pinned to v0.11.0. Process, pinned versions and the named interface inventory are now in [version-pinning.md](version-pinning.md). Monthly check, manual — there is no CI runner | process |
 | 14 | **Disconnected / mirrored clusters** | the image must be mirrored with a matching IDMS/ICSP entry. Untested, and the Quay reference assumes egress | an air-gapped target |
-| — | ~~Gateway header stripping~~ | **Fixed and verified live.** The EPP's own header-alias resolution prefers client-settable `x-llm-d-inference-objective` over the gateway-authored `x-gateway-inference-objective`, so a client forging the former won outright regardless of what Authorino set for the latter -- proven live 2026-10-19 (a forged header passed through the gateway untouched, HTTP 200). The one-line patch to `maas-poc-gateway-authn` was applied live on 2026-10-19 once `patch` on `authpolicies.kuadrant.io` in `maas-fairness-poc` was granted, and the conformance check (`cmd/gateway-header-check`) now reports `OK` against the live cluster. Still dormant: zero `InferenceObjective` resources exist, so no behavioural queue-jump has been demonstrated, only the structural fix. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
+| — | ~~Gateway header stripping (MaaS path, UNI-33)~~ | **Fixed and verified live.** The EPP's own header-alias resolution prefers client-settable `x-llm-d-inference-objective` over the gateway-authored `x-gateway-inference-objective`, so a client forging the former won outright regardless of what Authorino set for the latter -- proven live 2026-10-19 (a forged header passed through the gateway untouched, HTTP 200). The one-line patch to `maas-poc-gateway-authn` was applied live on 2026-10-19 once `patch` on `authpolicies.kuadrant.io` in `maas-fairness-poc` was granted, and the conformance check (`cmd/gateway-header-check`) now reports `OK` against the live cluster. Still dormant: zero `InferenceObjective` resources exist, so no behavioural queue-jump has been demonstrated, only the structural fix. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
+| — | ~~Gateway header stripping (direct rig, UNI-43)~~ | **Fixed and verified live.** The direct rig (`02-epp.yaml`/`03-gateway.yaml`) has no Authorino layer, so UNI-33's overwrite mechanism doesn't apply -- fixed instead by removing the header outright, via an Istio `EnvoyFilter` (`envoy.filters.http.header_mutation`, `INSERT_BEFORE` `envoy.filters.http.ext_proc`) scoped to `maas-poc-route` alone so it can't also strip the value UNI-33 set for the authenticated MaaS routes sharing the same Gateway. Applied and verified live 2026-10-19 once `create`/`update` on `envoyfilters.networking.istio.io` and `pods/exec` in `maas-fairness-poc` were granted: the live config dump confirmed `header_mutation` sits immediately before `ext_proc` in the chain, and the per-route override lands on exactly one route (`maas-fairness-poc.maas-poc-route.0`), not on the MaaS routes. `gateway-header-check` still reports this route as uncovered -- a known, documented limitation (it only recognises AuthPolicy-based coverage), not a sign the fix didn't take. Not verified: an end-to-end request proving a forged header doesn't reach the EPP/simulator, since both remain scaled to 0/0. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
 
 ## Reproducing
 
@@ -736,6 +737,16 @@ oc apply -f deploy/poc/00-config.yaml
 oc apply -f deploy/poc/01-sim-backend.yaml
 oc apply -f deploy/poc/02-epp.yaml      # needs the image built first
 oc apply -f deploy/poc/03-gateway.yaml
+
+oc apply -f deploy/poc/11-objective-header-removal.yaml
+  # Closes UNI-43: this rig has no Authorino layer to overwrite a forged
+  # x-llm-d-inference-objective with (contrast UNI-33's patch on the MaaS
+  # path), so the fix here is outright removal before the EPP's ext_proc
+  # call reads it. See docs/gateway-header-stripping.md. Skipping this step
+  # doesn't break the fairness measurement -- the load generator never sends
+  # this header -- but leaves the direct rig open to the same client-forged
+  # priority bypass UNI-33 closed on the MaaS path.
+
 oc apply -f deploy/rbac.yaml            # mints the /metrics reader token
 
 # A/B: run once as shipped (enforce: false), then flip and re-run.

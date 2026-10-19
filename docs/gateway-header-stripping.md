@@ -357,11 +357,14 @@ same request's processing and would still see the client's forged value
 unchanged. This is precisely the risk flagged when this candidate was first
 written down: the filter runs *after* `ext_proc`, not before.
 
-This evidence is source-level (Istio's and Envoy's own code and docs), not a
-live trace — this run had no admin/exec access to the gateway pod's Envoy
-instance to confirm the compiled filter chain directly (see
-`deploy/poc/11-objective-header-removal.yaml`'s "NOT VERIFIED" section for the
-exact commands that would close that gap). The EPP's own request-header
+This evidence was originally source-level only (Istio's and Envoy's own code
+and docs); it has since been confirmed by a live trace. With `pods/exec`
+granted (UNI-52), `oc exec ... -c istio-proxy -- pilot-agent request GET
+config_dump` against the gateway pod's own loopback admin interface showed
+`envoy.filters.http.ext_proc` at a fixed position in listener `0.0.0.0_80`'s
+HTTP filter chain, ahead of `envoy.filters.http.router` — see
+`deploy/poc/11-objective-header-removal.yaml`'s "VERIFIED LIVE" section for the
+full chain order. The EPP's own request-header
 processing offers no alternative seam either: as already established above,
 `director.go:177`'s `getInferenceObjective` resolves the header before any
 configured plugin runs, for every request regardless of authentication, so
@@ -376,10 +379,12 @@ installs Envoy's `envoy.filters.http.header_mutation` filter via an Istio
 itself scoped to `maas-poc-route` alone via a per-route override — not a
 chain-wide removal, because `maas-poc-gateway` is shared with the two
 authenticated MaaS routes, and the same filter instance would otherwise also
-strip the header Authorino just set for them, undoing UNI-33. See that file for
-the full reasoning, the exact `EnvoyFilter`, and what remains unverified
-(mainly: the exact route name Istio generates for `maas-poc-route`'s one rule,
-which was not read from a live config dump).
+strip the header Authorino just set for them, undoing UNI-33. The route-name
+assumption this patch depends on was checked against a live config dump before
+applying — and was wrong (Istio names the generated route
+`maas-fairness-poc.maas-poc-route.0`, not after the HTTPRoute rule's `name`
+field as originally guessed) and corrected. See that file for the full
+reasoning, the exact `EnvoyFilter`, and the live verification evidence.
 
 ## Applied and verified live
 
@@ -433,8 +438,13 @@ Everything in this document — the mechanism, the before-state live proof,
 the fix, its live application, and the conformance check's
 failing/passing/now-passing-live demonstrations — is complete.
 
-UNI-43 (the direct rig fix above) is blocked separately, on `create`/`update`
-for `envoyfilters.networking.istio.io` in the same namespace plus read access
-to the gateway pod's Envoy admin interface — see
-`deploy/poc/11-objective-header-removal.yaml`'s "Blocked" section. The two
-unblocks are independent; granting one does not cover the other.
+UNI-43 (the direct rig fix above) was blocked on a separate grant —
+`create`/`update` for `envoyfilters.networking.istio.io` in the same namespace
+plus `pods/exec` for the gateway's Envoy admin interface — which UNI-52 also
+added. Both were verified with `oc auth can-i` before use, the EnvoyFilter was
+applied, and the live config dump confirmed both the filter-chain position and
+the per-route scoping match what the manifest specifies — see
+`deploy/poc/11-objective-header-removal.yaml`'s "HOW THIS WAS VERIFIED LIVE"
+section. Not verified: an end-to-end request showing the forged header fails
+to reach the EPP or simulator, since both remain scaled to 0/0 on this
+cluster and scaling either up was out of scope for this ticket.

@@ -59,23 +59,30 @@
 # 2026-10-19 (`oc get envoyfilter -n maas-fairness-poc`), not merely documented
 # elsewhere.
 #
-# NOT VERIFIED -- READ BEFORE APPLYING
+# VERIFIED LIVE, 2026-10-19 -- `pilot-agent request GET config_dump` against
+# maas-poc-gateway-data-science-gateway-class-58b4f8c4b4-2zvgw's istio-proxy
+# container (pods/exec; the admin API binds loopback-only, so pods/proxy to the
+# pod IP gets connection-refused regardless of RBAC -- pilot-agent's built-in
+# client is the way in):
 #
-#   - The HTTP_ROUTE match below assumes Istio names the generated Envoy route
-#     after the HTTPRoute rule's `name` field (03-gateway.yaml's rule is named
-#     v1-chat-completions). This run had no `pods/proxy`, `pods/exec`, or
-#     `pods/portforward` access to maas-poc-gateway's Envoy admin interface
-#     (confirmed: `oc auth can-i create pods/exec` -> no, raw proxy GET -> 403),
-#     so the actual generated route name was NOT read from a live config dump.
-#     Before applying, confirm it with:
-#       istioctl proxy-config route <gateway-pod> -n maas-fairness-poc -o json \
-#         | jq '.. | objects | select(.virtualHosts?) | .virtualHosts[].routes[].name'
-#     and update `route.name` below to match if it differs.
-#   - The ext_proc filter's registered name is taken from Istio's source
-#     (pilot/pkg/xds/filters/filters.go, InferencePoolExtProc uses
-#     wellknown.HTTPExternalProcessing, Envoy's standard constant for
-#     "envoy.filters.http.ext_proc") rather than read from this cluster's live
-#     listener config, for the same access reason.
+#   - The route name assumed below was WRONG. Istio does not name the generated
+#     route after the HTTPRoute rule's `name` field -- the live
+#     dynamic_route_configs dump (resource=dynamic_route_configs) shows the
+#     vhost `*:80` route for 03-gateway.yaml's rule is actually named
+#     `maas-fairness-poc.maas-poc-route.0` (pattern: `<namespace>.<HTTPRoute
+#     name>.<rule index>`), not `v1-chat-completions`. Corrected below -- had
+#     this been applied with the original guess, patch 2 would have matched
+#     nothing, and the EnvoyFilter would have been a silent no-op passing every
+#     check that only looks for the resource to exist.
+#   - The ext_proc filter's registered name WAS correct: the live
+#     dynamic_listeners dump (resource=dynamic_listeners) for listener
+#     `0.0.0.0_80` shows the HCM's http_filters in order --
+#     [istio.metadata_exchange, kuadrant wasm, envoy.filters.http.ext_proc,
+#     envoy.filters.http.grpc_stats, istio.alpn, envoy.filters.http.fault,
+#     envoy.filters.http.cors, istio.stats, envoy.filters.http.router] --
+#     confirming both the exact name used as the INSERT_BEFORE anchor and that
+#     ext_proc already runs ahead of Router, consistent with the mechanism
+#     this fix relies on.
 #   - Applying this does NOT demonstrate a behavioural fix by itself -- as already
 #     recorded in docs/poc-results.md, there are zero InferenceObjective resources
 #     on this cluster, so no priority band currently exists to jump. Verification
@@ -85,45 +92,50 @@
 #     ServiceAccount cannot raise the EPP's log verbosity) or, more simply, no
 #     longer reaches the simulator backend at all (visible at any log level).
 #
-# HOW TO APPLY (blocked this run -- see "Blocked" below)
+# HOW TO APPLY
 #
 #   oc --token="$OPENSHIFT_TOKEN" --server=https://api.ocp.paladinaura.com:6443 \
 #     apply -f deploy/poc/11-objective-header-removal.yaml
 #
-# VERIFY
+# HOW THIS WAS VERIFIED LIVE, 2026-10-19
 #
-#   Build the checker once, offline -- see docs/gateway-header-stripping.md,
-#   "Building this check air-gapped":
-#     (cd cmd/gateway-header-check && go build -o ../../bin/gateway-header-check .)
+#   The Envoy admin interface binds loopback-only, so `pods/proxy` to the pod
+#   IP returns connection-refused regardless of RBAC. The way in is `pods/exec`
+#   plus the istio-proxy container's own `pilot-agent request GET <path>`,
+#   which calls back to 127.0.0.1:15000 from inside the pod:
 #
-#   oc get httproute,gateway,envoyfilter -n maas-fairness-poc -o yaml \
-#     | bin/gateway-header-check -
+#     oc exec -n maas-fairness-poc <gateway-pod> -c istio-proxy -- \
+#       pilot-agent request GET config_dump
 #
-#   This will still print FAIL for maas-fairness-poc/maas-poc-route: the
-#   conformance check only recognises AuthPolicy-based overwrite coverage today
-#   (it was written for the authenticated path). Teaching it to recognise this
-#   EnvoyFilter-based removal pattern is legitimate follow-up work, filed as a
-#   backlog idea rather than attempted here -- baking an assumption about this
-#   cluster's generated route names into a regression-prevention tool, before that
-#   assumption has been checked against a live config dump even once, would risk
-#   the checker reporting false confidence instead of none.
+#   Before applying: pulled `resource=dynamic_route_configs` to find the real
+#   route name (corrected above) and `resource=dynamic_listeners` to confirm
+#   the ext_proc filter's exact registered name -- see "VERIFIED LIVE" above.
 #
-# BLOCKED: applying and verifying live
+#   After applying, the same two dumps confirmed:
+#     - Chain order for listener 0.0.0.0_80 is now [..., kuadrant wasm,
+#       envoy.filters.http.header_mutation, envoy.filters.http.ext_proc, ...] --
+#       header_mutation runs immediately before ext_proc, as designed.
+#     - Exactly one route carries the `envoy.filters.http.header_mutation`
+#       per-route override: `maas-fairness-poc.maas-poc-route.0`. No other
+#       route in the dump (including the two MaaS kserve routes sharing this
+#       Gateway) has it -- the scoping holds, UNI-33's production fix is intact.
 #
-# This run's ServiceAccount has read-only access to maas-fairness-poc -- the same
-# constraint recorded on UNI-33 (`oc auth can-i patch authpolicies.kuadrant.io` ->
-# no). Confirmed for this resource type specifically:
+#   Built cmd/gateway-header-check offline (GOPROXY=off, vendored deps -- see
+#   docs/gateway-header-stripping.md, "Building this check air-gapped") and ran
+#   it against the live cluster. It still prints FAIL for
+#   maas-fairness-poc/maas-poc-route, as expected: the checker only recognises
+#   AuthPolicy-based overwrite coverage today (written for the authenticated
+#   path). Teaching it to recognise this EnvoyFilter-based removal pattern is
+#   legitimate follow-up work, filed as a backlog idea rather than attempted
+#   here now that the route-name assumption has been checked against a live
+#   config dump, to keep that scope change deliberate rather than bundled in.
 #
-#   $ oc auth can-i create envoyfilters.networking.istio.io -n maas-fairness-poc
-#   no
-#   $ oc auth can-i patch envoyfilters.networking.istio.io -n maas-fairness-poc
-#   no
-#
-# Exact unblock needed: `create` (or `update`) on `envoyfilters.networking.istio.io`
-# in namespace maas-fairness-poc, plus enough read access to the Envoy admin
-# interface (`pods/proxy` on the gateway pod, or `istioctl` access via the
-# control plane) to confirm the route name assumption above before applying, and
-# to confirm the filter chain order after.
+#   NOT verified: an end-to-end request showing a forged header fails to reach
+#   the EPP or the simulator. maas-epp and maas-sim remain scaled to 0/0 on this
+#   cluster (same state confirmed before starting this work) -- scaling either
+#   up to send a test request was out of scope for this ticket and would touch
+#   a shared rig without a measurement run to justify it. The filter-chain and
+#   per-route evidence above is config-level, not traffic-level.
 ---
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
@@ -155,14 +167,14 @@ spec:
             "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
             mutations: {}
     # 2. Turn the removal on, scoped to maas-poc-route's one rule by name --
-    #    NOT verified against a live route dump, see "NOT VERIFIED" above.
+    #    confirmed live, 2026-10-19, see "VERIFIED LIVE" above.
     - applyTo: HTTP_ROUTE
       match:
         context: GATEWAY
         routeConfiguration:
           vhost:
             route:
-              name: v1-chat-completions
+              name: maas-fairness-poc.maas-poc-route.0
       patch:
         operation: MERGE
         value:

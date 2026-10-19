@@ -171,6 +171,12 @@ run is only meaningful if they are overwhelmingly 200.
 # and MaaS sets x-gateway-inference-objective per ServiceAccount.
 oc get inferenceobjectives.llm-d.ai -A            # expect none, or all priority 0
 
+# A client can still forge the band wholesale: x-llm-d-inference-objective
+# beats the gateway's own x-gateway-inference-objective unless the gateway
+# overwrites it too. See docs/gateway-header-stripping.md.
+oc get httproute,gateway,authpolicy -n maas-fairness-poc -o yaml \
+  | go run ./cmd/gateway-header-check -            # expect "OK", exit 0
+
 # Every request trued up. Non-zero means requests are charged their ESTIMATE forever.
 ... | grep maas_fairness_requests_without_usage_total      # expect absent or 0
 

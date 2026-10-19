@@ -1,0 +1,45 @@
+# The real pre-fix shape of maas-poc-gateway-authn: it overwrites the
+# deprecated x-gateway-inference-objective alias but never the canonical
+# x-llm-d-inference-objective, which the EPP's header-alias resolution
+# prefers whenever a client sets it. This must still be flagged.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: half-fixed-gateway
+  namespace: bad-ns
+spec:
+  gatewayClassName: data-science-gateway-class
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: half-fixed-route
+  namespace: bad-ns
+spec:
+  parentRefs:
+    - kind: Gateway
+      name: half-fixed-gateway
+  rules:
+    - backendRefs:
+        - group: inference.networking.k8s.io
+          kind: InferencePool
+          name: half-fixed-pool
+          port: 8000
+---
+apiVersion: kuadrant.io/v1
+kind: AuthPolicy
+metadata:
+  name: half-fixed-gateway-authn
+  namespace: bad-ns
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: Gateway
+    name: half-fixed-gateway
+  rules:
+    response:
+      success:
+        headers:
+          x-gateway-inference-objective:
+            plain:
+              expression: auth.identity.objective

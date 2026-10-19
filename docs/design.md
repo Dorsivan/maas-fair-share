@@ -341,6 +341,8 @@ Two defenses, both needed:
   **`x-llm-d-inference-objective`**. That last one is the sneaky one: it sets the
   request's *priority band*, and tenants in a higher band are served ahead of our
   weighted band entirely rather than weighted within it. Total bypass. Easiest to miss.
+  See [gateway-header-stripping.md](gateway-header-stripping.md) for the fix and the
+  conformance check that keeps a later route addition from reopening it silently.
 
 ---
 

@@ -241,13 +241,13 @@ run the live-snapshot command above:
   fairness-algorithm testing (per the ticket's instruction to coordinate with
   A2-A4 before touching gateway config mid-measurement-run), so it was left
   unchanged rather than bolting on authentication machinery as a side effect
-  of this ticket. If it needs to keep accepting unauthenticated traffic, the
-  available control there is a `RequestHeaderModifier` `remove` filter on the
-  `HTTPRoute`, stripping the header outright rather than overwriting it
-  (there is no trusted value to substitute) — filed as a backlog idea rather
-  than done here, since whether that filter runs before or after the
-  inference extension's `ext_proc` filter in this cluster's filter chain was
-  not verified and changing this rig was out of scope.
+  of this ticket. The candidate control named here originally — a
+  `RequestHeaderModifier` `remove` filter on the `HTTPRoute` — was filed as a
+  backlog idea rather than built, since whether that filter runs before or
+  after the inference extension's `ext_proc` filter in this cluster's filter
+  chain was not verified. **UNI-43 verified it: it runs after, so that
+  candidate does not work.** See the next section for the evidence and the
+  corrected fix.
 - **The priority-band bypass is still dormant on this cluster.** As recorded
   in `docs/poc-results.md`, there are zero `InferenceObjective` resources, so
   every objective name — forged or not — resolves to the default priority.
@@ -258,6 +258,84 @@ run the live-snapshot command above:
   "Blocked" below). What was verified instead is the mechanism: the header
   alias precedence in the vendored dependency, and that nothing in the
   request path currently inspects or strips the header (both proven above).
+
+## UNI-43: the `RequestHeaderModifier` candidate does not protect the EPP's read
+
+The direct rig (`deploy/poc/02-epp.yaml` / `03-gateway.yaml`) has no trusted
+identity to overwrite the header with, so the UNI-33 mechanism (Authorino
+overwriting a response header via `ext_authz`) doesn't apply here. The only
+option is to remove the header outright, and the candidate named when this gap
+was first recorded was a Gateway API `RequestHeaderModifier` `remove` filter on
+the `HTTPRoute`. This does not work, and applying it would have been worse than
+doing nothing: it would make the conformance posture *look* fixed while leaving
+the actual exploit (a client picking its own priority band) intact.
+
+### Why: Envoy applies route-level header removal in the Router filter, which runs last
+
+A Gateway API `RequestHeaderModifier` compiles, on Istio, to Envoy's native
+route-level `request_headers_to_add` / `request_headers_to_remove` fields —
+confirmed directly in Istio's route builder
+(`pilot/pkg/networking/core/route/route.go`, `TranslateHeadersOperations` /
+`TranslateRoute`), which is a *different* mechanism from a registered HTTP
+filter with a position in the chain. Envoy's own `header_mutation` filter docs
+(`envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/header_mutation_filter`)
+recommend it over the route-level fields specifically because it "provides
+complete control over the position and ordering of mutations" — implying the
+route-level fields do not.
+
+Confirmed in Envoy's source (`source/common/router/router.cc`,
+`Router::Filter::decodeHeaders`): the route-level header mutations are applied
+by `route_entry_->finalizeRequestHeaders(...)`, called from inside the
+**Router** filter, immediately before host selection and dispatch to the
+upstream connection pool. The Router filter is always the last filter in the
+HTTP decoder chain — it is the filter that forwards the request upstream, by
+definition nothing else in the chain runs after it. So route-level
+`request_headers_to_remove` only ever changes what the *upstream backend*
+receives; every decoder filter positioned earlier in the chain already saw —
+and, for `ext_proc`, already acted on — the original, un-stripped headers.
+
+The inference extension's `ext_proc` filter is exactly such an earlier filter.
+Istio registers it under Envoy's well-known name
+`envoy.filters.http.ext_proc` (`pilot/pkg/xds/filters/filters.go`,
+`InferencePoolExtProc`, via `wellknown.HTTPExternalProcessing`) as an ordinary
+HTTP filter in the chain — it is not, and cannot be, positioned after Router.
+And Istio explicitly turns on request-header processing for InferencePool
+routes: `buildExtProcPerRoute` (`route.go`) sets
+`ProcessingMode.RequestHeaderMode: SEND`, so the EPP receives the full,
+original request headers via `ext_proc` before Router ever gets a chance to
+apply the route's removal rule.
+
+Putting those two facts together: a `RequestHeaderModifier` `remove` filter on
+`maas-poc-route` would strip `x-llm-d-inference-objective` from the copy of the
+request Envoy forwards to the simulator backend, but the EPP's `ext_proc` call
+— which is what actually resolves the priority band — happens earlier in the
+same request's processing and would still see the client's forged value
+unchanged. This is precisely the risk flagged when this candidate was first
+written down: the filter runs *after* `ext_proc`, not before.
+
+This evidence is source-level (Istio's and Envoy's own code and docs), not a
+live trace — this run had no admin/exec access to the gateway pod's Envoy
+instance to confirm the compiled filter chain directly (see
+`deploy/poc/11-objective-header-removal.yaml`'s "NOT VERIFIED" section for the
+exact commands that would close that gap). The EPP's own request-header
+processing offers no alternative seam either: as already established above,
+`director.go:177`'s `getInferenceObjective` resolves the header before any
+configured plugin runs, for every request regardless of authentication, so
+there is nothing inside the EPP's own plugin chain to intervene on. The fix has
+to be upstream of `ext_proc`, in Envoy's filter chain.
+
+### The corrected fix
+
+[`deploy/poc/11-objective-header-removal.yaml`](../deploy/poc/11-objective-header-removal.yaml)
+installs Envoy's `envoy.filters.http.header_mutation` filter via an Istio
+`EnvoyFilter`, `INSERT_BEFORE` `envoy.filters.http.ext_proc`, with the removal
+itself scoped to `maas-poc-route` alone via a per-route override — not a
+chain-wide removal, because `maas-poc-gateway` is shared with the two
+authenticated MaaS routes, and the same filter instance would otherwise also
+strip the header Authorino just set for them, undoing UNI-33. See that file for
+the full reasoning, the exact `EnvoyFilter`, and what remains unverified
+(mainly: the exact route name Istio generates for `maas-poc-route`'s one rule,
+which was not read from a live config dump).
 
 ## Blocked: applying the patch and re-verifying live
 
@@ -285,3 +363,9 @@ a nice-to-have beyond the ticket's literal "Done when" wording.
 Everything else in this document — the mechanism, the before-state live
 proof, the fix, and the conformance check with its failing/passing
 demonstrations — does not depend on that grant and is complete.
+
+UNI-43 (the direct rig fix above) is blocked separately, on `create`/`update`
+for `envoyfilters.networking.istio.io` in the same namespace plus read access
+to the gateway pod's Envoy admin interface — see
+`deploy/poc/11-objective-header-removal.yaml`'s "Blocked" section. The two
+unblocks are independent; granting one does not cover the other.

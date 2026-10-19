@@ -1,0 +1,170 @@
+# UNI-43: strip x-llm-d-inference-objective on the direct rig (deploy/poc/02-epp.yaml
+# + deploy/poc/03-gateway.yaml), which has no Authorino/Kuadrant layer and therefore
+# no trusted identity to overwrite the header with (contrast deploy/maas/09-...,
+# which overwrites it from auth.identity.objective on the MaaS path).
+#
+# THIS FILE REPLACES THE "RequestHeaderModifier remove" CANDIDATE NAMED IN THE TICKET.
+#
+# That candidate does not work. See docs/gateway-header-stripping.md, "UNI-43: the
+# RequestHeaderModifier candidate does not protect the EPP's read" for the full
+# evidence. Short version: a Gateway API RequestHeaderModifier `remove` filter
+# compiles to Envoy's route-level `request_headers_to_remove`, which the Router
+# filter applies in `finalizeRequestHeaders` -- the Router filter is always the
+# LAST filter in the HTTP filter chain (it is what dispatches upstream). The
+# Gateway API Inference Extension's `ext_proc` filter (the EPP) is an ordinary
+# decoder filter positioned BEFORE Router, with RequestHeaderMode: SEND
+# (pilot/pkg/networking/core/route/route.go's buildExtProcPerRoute). So ext_proc
+# always sees the client's original header before Router ever removes it for the
+# upstream-bound copy. The route-level filter would have hidden the forged header
+# from the simulator backend while leaving the EPP's priority decision exploited --
+# strictly worse than doing nothing, because it would look fixed.
+#
+# THE MECHANISM THAT ACTUALLY RUNS BEFORE ext_proc
+#
+# Envoy's `envoy.filters.http.header_mutation` filter is a real HTTP filter with a
+# chain position, not a Router-applied route field -- Envoy's own docs recommend it
+# specifically because "it provides complete control over the position and ordering
+# of mutations" (envoyproxy.io, configuration/http/http_filters/header_mutation_filter).
+# Installed via Istio's EnvoyFilter CRD with INSERT_BEFORE targeting
+# envoy.filters.http.ext_proc (Istio's registered name for the EPP filter --
+# pilot/pkg/xds/filters/filters.go's InferencePoolExtProc uses Envoy's well-known
+# constant, which is literally "envoy.filters.http.ext_proc"), its decodeHeaders
+# runs ahead of ext_proc's, so the removal is visible to the EPP, not just to the
+# upstream simulator.
+#
+# WHY TWO PATCHES, NOT ONE, AND WHY THE FIRST ONE IS A DELIBERATE NO-OP
+#
+# maas-poc-gateway is shared: maas-poc-route (this rig, unauthenticated) AND
+# maas-vllm-cpu-kserve-route / maas-vllm-gpu-kserve-route (the MaaS path,
+# authenticated, already fixed by deploy/maas/09-...) are all parented to it. The
+# HTTP filter CHAIN is a listener-wide concept -- there is one http_filters list
+# per Gateway, shared by every route on it. If the header_mutation filter actually
+# removed the header unconditionally, it would ALSO strip the value Authorino just
+# set for the authenticated routes, undoing UNI-33 for production traffic on this
+# cluster. So:
+#
+#   1. HTTP_FILTER patch: installs header_mutation into the chain, INSERT_BEFORE
+#      ext_proc, with an EMPTY mutations block. Inert by itself -- a filter with no
+#      configured mutation does nothing, for any route.
+#   2. HTTP_ROUTE patch: merges a per-route override (HeaderMutationPerRoute) onto
+#      ONLY the route matched by name below, turning the removal on for that route
+#      alone. A route that doesn't match this patch is unaffected, by construction,
+#      not by convention -- if the name match in patch 2 is wrong, the net effect is
+#      "nothing happens" (fails closed on the fix, not open on production), not
+#      "removes the header everywhere."
+#
+# This targetRefs shape (Gateway, by name) mirrors the kuadrant-auth-maas-poc-gateway
+# and kuadrant-ratelimiting-maas-poc-gateway EnvoyFilters odh-model-controller/Kuadrant
+# already run on this exact Gateway in this namespace -- confirmed live,
+# 2026-10-19 (`oc get envoyfilter -n maas-fairness-poc`), not merely documented
+# elsewhere.
+#
+# NOT VERIFIED -- READ BEFORE APPLYING
+#
+#   - The HTTP_ROUTE match below assumes Istio names the generated Envoy route
+#     after the HTTPRoute rule's `name` field (03-gateway.yaml's rule is named
+#     v1-chat-completions). This run had no `pods/proxy`, `pods/exec`, or
+#     `pods/portforward` access to maas-poc-gateway's Envoy admin interface
+#     (confirmed: `oc auth can-i create pods/exec` -> no, raw proxy GET -> 403),
+#     so the actual generated route name was NOT read from a live config dump.
+#     Before applying, confirm it with:
+#       istioctl proxy-config route <gateway-pod> -n maas-fairness-poc -o json \
+#         | jq '.. | objects | select(.virtualHosts?) | .virtualHosts[].routes[].name'
+#     and update `route.name` below to match if it differs.
+#   - The ext_proc filter's registered name is taken from Istio's source
+#     (pilot/pkg/xds/filters/filters.go, InferencePoolExtProc uses
+#     wellknown.HTTPExternalProcessing, Envoy's standard constant for
+#     "envoy.filters.http.ext_proc") rather than read from this cluster's live
+#     listener config, for the same access reason.
+#   - Applying this does NOT demonstrate a behavioural fix by itself -- as already
+#     recorded in docs/poc-results.md, there are zero InferenceObjective resources
+#     on this cluster, so no priority band currently exists to jump. Verification
+#     here means: a forged x-llm-d-inference-objective header no longer reaches the
+#     EPP's ext_proc call (observable via the EPP's DEBUG-level "LLM request
+#     assembled" log line, director.go:237, same constraint UNI-33 hit: this
+#     ServiceAccount cannot raise the EPP's log verbosity) or, more simply, no
+#     longer reaches the simulator backend at all (visible at any log level).
+#
+# HOW TO APPLY (blocked this run -- see "Blocked" below)
+#
+#   oc --token="$OPENSHIFT_TOKEN" --server=https://api.ocp.paladinaura.com:6443 \
+#     apply -f deploy/poc/11-objective-header-removal.yaml
+#
+# VERIFY
+#
+#   oc get httproute,gateway,envoyfilter -n maas-fairness-poc -o yaml \
+#     | go run ./cmd/gateway-header-check -
+#
+#   This will still print FAIL for maas-fairness-poc/maas-poc-route: the
+#   conformance check only recognises AuthPolicy-based overwrite coverage today
+#   (it was written for the authenticated path). Teaching it to recognise this
+#   EnvoyFilter-based removal pattern is legitimate follow-up work, filed as a
+#   backlog idea rather than attempted here -- baking an assumption about this
+#   cluster's generated route names into a regression-prevention tool, before that
+#   assumption has been checked against a live config dump even once, would risk
+#   the checker reporting false confidence instead of none.
+#
+# BLOCKED: applying and verifying live
+#
+# This run's ServiceAccount has read-only access to maas-fairness-poc -- the same
+# constraint recorded on UNI-33 (`oc auth can-i patch authpolicies.kuadrant.io` ->
+# no). Confirmed for this resource type specifically:
+#
+#   $ oc auth can-i create envoyfilters.networking.istio.io -n maas-fairness-poc
+#   no
+#   $ oc auth can-i patch envoyfilters.networking.istio.io -n maas-fairness-poc
+#   no
+#
+# Exact unblock needed: `create` (or `update`) on `envoyfilters.networking.istio.io`
+# in namespace maas-fairness-poc, plus enough read access to the Envoy admin
+# interface (`pods/proxy` on the gateway pod, or `istioctl` access via the
+# control plane) to confirm the route name assumption above before applying, and
+# to confirm the filter chain order after.
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: maas-poc-route-objective-header-removal
+  namespace: maas-fairness-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: maas-poc-gateway
+  configPatches:
+    # 1. Install header_mutation into the chain, inert until patch 2 enables it
+    #    for a specific route.
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.ext_proc
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.header_mutation
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+            mutations: {}
+    # 2. Turn the removal on, scoped to maas-poc-route's one rule by name --
+    #    NOT verified against a live route dump, see "NOT VERIFIED" above.
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            route:
+              name: v1-chat-completions
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.header_mutation:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutationPerRoute
+              mutations:
+                request_mutations:
+                  - remove: x-llm-d-inference-objective

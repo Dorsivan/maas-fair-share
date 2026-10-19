@@ -106,6 +106,13 @@ type Config struct {
 	// AgingTokensPerSecond subtracts head-of-line wait from the score in raw
 	// units. 0 is pure proportional ordering.
 	AgingTokensPerSecond float64 `json:"agingTokensPerSecond,omitempty"`
+
+	// EmitAttributionHeaders controls whether x-request-id, x-maas-fairness-group
+	// and x-maas-fairness-queue-ms are set on the response. It is a tenant's own
+	// classification at zero log volume and no cluster access, but it is also
+	// internal detail some deployments may not want to expose -- see
+	// docs/design.md "Per-request attribution".
+	EmitAttributionHeaders bool `json:"emitAttributionHeaders"`
 }
 
 // DefaultConfig is what the plugin does with an empty parameters block: shadow
@@ -129,6 +136,7 @@ func DefaultConfig() Config {
 		DefaultEstimatedOutputTokens: 512,
 		EstimatedBytesPerToken:       4,
 		AgingTokensPerSecond:         0,
+		EmitAttributionHeaders:       true,
 	}
 }
 

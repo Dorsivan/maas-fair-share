@@ -971,23 +971,65 @@ Equal `normalizedService` across backlogged groups is the whole policy working, 
 at a glance. `docs/plugin_debug.md` requires dumps to exclude credentials and payloads
 and stay bounded — cap the group list, include `truncated`, cap the unmatched list.
 
+### Correlation
+
+Every request-scoped log line in this package carries two fields, resolved once in
+`RequestHeader` and reused by every later hook (`PreRequest`, `ResponseBody`,
+`ResponseHeader`) rather than re-derived — see `pkg/fairness/weightedlas/correlation.go`:
+
+- **`requestID`** — `x-request-id` from the inbound request. The llm-d-router ext_proc
+  server already extracts this header and backfills a generated uuid if the client sent
+  none (`pkg/epp/handlers/server.go`); this plugin re-derives it from the header
+  independently rather than depending on that upstream detail — falling back to the
+  upstream-populated `InferenceRequest.RequestID`, then to its own generated id, in that
+  order. Never empty: a request-scoped line with no key is a line nobody can find.
+- **`traceId`** — the trace-id field of an inbound `traceparent` header, included only
+  when present. Never generated — a fabricated trace id would not correlate with
+  anything, and this POC runs no collector to send spans to anyway (see "Explicitly out
+  of scope" in UNI-53; a malformed or absent header simply omits the field).
+
 ### Logs
 
-`Pick` runs on a 1ms ticker, so per-decision logging is out. Three tiers:
+`Pick` runs on a 1ms ticker, so per-decision logging is out. Three tiers; `requestID`
+(and `traceId`, when present) is attached to every one of them that is request-scoped:
 
 - **Flight recorder (INFO, every `stateLogIntervalSeconds`)** — one structured line
   with the same table, emitted **only while contended**. Silent on an idle cluster;
-  works with only Loki.
+  works with only Loki. Not request-scoped, so no single `requestID` applies.
 - **Events, rate-limited** — clamp fired; unmatched subscription (log the value, first
-  N then sampled); active flows on more than one priority band.
-- **V(4) per-request** — group resolved, estimate charged, true-up delta. Off in prod.
+  N then sampled, now carrying the `requestID`/`traceId` of the request whose first
+  sighting triggered the line); active flows on more than one priority band. The
+  no-usage-block warning in `ResponseBody` (V(1)) is the same tier and carries the
+  same fields.
+- **V(4) per-request** — group resolved, estimate charged, true-up delta. Off in prod,
+  and not yet implemented (UNI-47); the correlation fields above are ready for it.
 
 ### Per-request attribution
 
-Emit `x-maas-fairness-group` and `x-maas-fairness-queue-ms` on the response so a tenant
-sees its own classification in a trace without cluster access. **Verify the mechanism
-first** — the response-header path needs checking against the requestcontrol interfaces
-— and make it suppressible in case it's considered internal detail leakage.
+**Implemented** (UNI-53): `x-request-id`, `x-maas-fairness-group` and
+`x-maas-fairness-queue-ms` are set on the response in `Plugin.ResponseHeader`
+(`pkg/fairness/weightedlas/plugin.go`), a `requestcontrol.ResponseHeaderProcessor`. A
+tenant reads its own classification from a response header at zero log volume and with
+no cluster access.
+
+The mechanism this doc previously flagged **unverified** is confirmed working on
+llm-d-router v0.11.0: `response.Headers`, as seen inside `ResponseHeader`, is the same
+map as `reqCtx.Response.Headers`, which the director writes unconditionally into the
+ext_proc `HeaderMutation` for any key not matched by `request.IsSystemOwnedHeader`
+(`pkg/epp/util/request/headers.go`) — none of the three keys below are on that list.
+The session-affinity plugin shipped with llm-d-router
+(`pkg/epp/framework/plugins/scheduling/util/sessionaffinity/header.go`) already relies
+on the identical path to set its own response header, so this is a supported extension
+point, not an undocumented side channel.
+
+| Header | Value | Meaning |
+|---|---|---|
+| `x-request-id` | the resolved correlation id (see "Correlation" above) | ties the response to the matching EPP log line for this request |
+| `x-maas-fairness-group` | `request.FairnessID` after classification | the group this request was billed against |
+| `x-maas-fairness-queue-ms` | elapsed time between `RequestHeader` and `PreRequest`, in ms | an **approximation** of time spent under flow-control admission — measured end to end across this plugin's own hooks, not read from flow-control's internal clock. Omitted if the request never reached dispatch (e.g. rejected at admission) |
+
+Suppressible: `emitAttributionHeaders: false` in the plugin's `parameters` block turns
+all three off in one switch. Default is `true`.
 
 ### Alerts
 

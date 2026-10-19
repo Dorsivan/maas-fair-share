@@ -82,11 +82,12 @@ type provisionalCharge struct {
 }
 
 var (
-	_ flowcontrol.FairnessPolicy   = &Plugin{}
-	_ fwkrc.RequestHeaderProcessor = &Plugin{}
-	_ fwkrc.PreRequest             = &Plugin{}
-	_ fwkrc.ResponseBodyProcessor  = &Plugin{}
-	_ fwkplugin.StateDumper        = &Plugin{}
+	_ flowcontrol.FairnessPolicy    = &Plugin{}
+	_ fwkrc.RequestHeaderProcessor  = &Plugin{}
+	_ fwkrc.PreRequest              = &Plugin{}
+	_ fwkrc.ResponseHeaderProcessor = &Plugin{}
+	_ fwkrc.ResponseBodyProcessor   = &Plugin{}
+	_ fwkplugin.StateDumper         = &Plugin{}
 )
 
 // Plugin is a singleton shared across every priority band. All band-scoped
@@ -108,6 +109,11 @@ type Plugin struct {
 
 	// now is injected so decay tests can advance time instead of sleeping.
 	now func() time.Time
+
+	// genID mints a fallback correlation id when a request carries neither an
+	// x-request-id header nor an upstream-populated InferenceRequest.RequestID.
+	// Injected so tests get a deterministic value instead of a random one.
+	genID func() string
 
 	unmatchedMu     sync.Mutex
 	unmatchedSample map[string]struct{}
@@ -164,6 +170,7 @@ func newPlugin(name string, cfg Config) (*Plugin, error) {
 		states:          make(map[string]*groupState, len(table.names())),
 		identityHeader:  strings.ToLower(cfg.IdentityHeader),
 		now:             time.Now,
+		genID:           generateFallbackID,
 		unmatchedSample: make(map[string]struct{}, maxLoggedUnmatched),
 	}
 	for _, gname := range table.names() {
@@ -222,9 +229,16 @@ func (p *Plugin) RequestHeader(ctx context.Context, request *fwksched.InferenceR
 	name, matched := p.groups.resolve(sub)
 	request.FairnessID = name
 
+	// Resolved once, here, and stored on the request so every later hook --
+	// PreRequest, ResponseBody, ResponseHeader -- logs and surfaces the same
+	// id rather than re-deriving (and potentially re-generating) it. See
+	// docs/design.md "Per-request attribution".
+	corr := resolveCorrelation(request, p.now(), p.genID)
+	request.PutAttribute(correlationKey, corr)
+
 	if !matched && sub != "" {
 		unmatchedSubscriptions.Inc()
-		p.recordUnmatched(ctx, sub)
+		p.recordUnmatched(ctx, sub, corr)
 	}
 	return nil
 }
@@ -246,7 +260,7 @@ func (p *Plugin) subscriptionID(request *fwksched.InferenceRequest) string {
 	return ""
 }
 
-func (p *Plugin) recordUnmatched(ctx context.Context, sub string) {
+func (p *Plugin) recordUnmatched(ctx context.Context, sub string, corr correlation) {
 	p.unmatchedMu.Lock()
 	p.unmatchedCount++
 	first := false
@@ -260,9 +274,12 @@ func (p *Plugin) recordUnmatched(ctx context.Context, sub string) {
 
 	// Only the first sighting of each distinct value is logged: the value is
 	// client-controlled, so logging every occurrence is a log-flood primitive.
+	// The request id is still this specific request's, even though the
+	// dedup gate is keyed on the subscription string.
 	if first {
-		log.FromContext(ctx).Info("subscription matched no fairness group; using catch-all",
-			"plugin", p.name, "subscription", sub, "group", p.groups.fallback)
+		fields := append([]any{"plugin", p.name, "subscription", sub, "group", p.groups.fallback},
+			corr.logFields()...)
+		log.FromContext(ctx).Info("subscription matched no fairness group; using catch-all", fields...)
 	}
 }
 
@@ -456,16 +473,17 @@ func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceReques
 	if request == nil {
 		return nil
 	}
+	now := p.now()
 	id := p.fairnessIDFor(request)
 	gs := p.stateFor(id)
 	dispatchTotal.WithLabelValues(boundID(id)).Inc()
+	p.recordQueueWait(request, now)
 
 	if !p.cfg.ProvisionalCharge {
 		gs.addInFlight(1, 0)
 		return nil
 	}
 
-	now := p.now()
 	est := p.estimateCost(request, gs)
 	contended := p.isContended(now)
 	request.PutAttribute(provisionalChargeKey, provisionalCharge{cost: est, at: now, contended: contended})
@@ -476,6 +494,24 @@ func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceReques
 	// subtracting it out again when the real cost turns out lower, and a
 	// Prometheus counter cannot move backwards.
 	return nil
+}
+
+// recordQueueWait finishes the correlation attribute RequestHeader started,
+// recording the time between classification and dispatch -- the
+// x-maas-fairness-queue-ms value ResponseHeader surfaces to the caller. It is
+// an approximation of time spent under flow-control admission, not that
+// subsystem's own internal clock; see docs/design.md "Per-request attribution".
+func (p *Plugin) recordQueueWait(request *fwksched.InferenceRequest, now time.Time) {
+	corr, ok := fwksched.ReadRequestAttribute[correlation](request, correlationKey)
+	if !ok {
+		// PreRequest without a preceding RequestHeader call -- a direct unit
+		// test, or a future change to extension-point ordering. Derive a fresh
+		// correlation rather than silently skipping the field.
+		corr = resolveCorrelation(request, now, p.genID)
+	}
+	corr.queueMs = now.Sub(corr.arrivedAt).Seconds() * 1000
+	corr.haveQueueMs = true
+	request.PutAttribute(correlationKey, corr)
 }
 
 // ResponseBody settles the hold against the real usage block.
@@ -494,6 +530,10 @@ func (p *Plugin) ResponseBody(
 	id := p.fairnessIDFor(request)
 	gs := p.stateFor(id)
 	now := p.now()
+	corr, haveCorr := fwksched.ReadRequestAttribute[correlation](request, correlationKey)
+	if !haveCorr {
+		corr = resolveCorrelation(request, now, p.genID)
+	}
 
 	charge, charged := fwksched.ReadRequestAttribute[provisionalCharge](request, provisionalChargeKey)
 	if charged {
@@ -517,8 +557,8 @@ func (p *Plugin) ResponseBody(
 		// half-lives if the request genuinely never ran.
 		requestsWithoutUsage.WithLabelValues(boundID(id)).Inc()
 		if response.TerminationCause == fwkrc.TerminationCauseNatural {
-			log.FromContext(ctx).V(1).Info("response completed with no usage block; check --enable-force-include-usage",
-				"plugin", p.name, "group", id, "requestID", response.RequestID)
+			fields := append([]any{"plugin", p.name, "group", id}, corr.logFields()...)
+			log.FromContext(ctx).V(1).Info("response completed with no usage block; check --enable-force-include-usage", fields...)
 		}
 		// No true-up will ever follow this charge, so the estimate IS the cost
 		// actually charged -- book it now, under the contention decided at
@@ -559,6 +599,45 @@ func (p *Plugin) ResponseBody(
 	// cost regardless of which way the estimator missed.
 	if charge.contended {
 		addContendedService(id, actual)
+	}
+}
+
+// ResponseHeader surfaces the request's own classification back to the caller
+// -- item D6 of docs/design.md's plan: a tenant's own fairness group and
+// queue wait, plus the id that ties it to the EPP's own log line, at zero log
+// volume and no cluster access.
+//
+// Verified against this extension point on llm-d-router v0.11.0: response.Headers
+// is the same map reqCtx.Response.Headers, and the director writes it into the
+// ext_proc HeaderMutation unconditionally for any key that is not in
+// request.IsSystemOwnedHeader -- none of the three keys here are. The session
+// affinity plugin that ships with llm-d-router relies on the same mechanism
+// to set its own response header, which is why the design doc's "unverified"
+// note is resolved rather than carried forward.
+//
+// Suppressible via cfg.EmitAttributionHeaders: this is a tenant's own
+// classification, but it is also internal detail some deployments may not
+// want on the wire.
+func (p *Plugin) ResponseHeader(
+	_ context.Context,
+	request *fwksched.InferenceRequest,
+	response *fwkrc.Response,
+	_ *datalayer.EndpointMetadata,
+) {
+	if !p.cfg.EmitAttributionHeaders || request == nil || response == nil {
+		return
+	}
+	corr, ok := fwksched.ReadRequestAttribute[correlation](request, correlationKey)
+	if !ok {
+		corr = resolveCorrelation(request, p.now(), p.genID)
+	}
+	if response.Headers == nil {
+		response.Headers = make(map[string]string)
+	}
+	response.Headers[requestIDHeader] = corr.requestID
+	response.Headers[fairnessGroupHeader] = p.fairnessIDFor(request)
+	if corr.haveQueueMs {
+		response.Headers[fairnessQueueMsHeader] = strconv.FormatFloat(corr.queueMs, 'f', 1, 64)
 	}
 }
 

@@ -187,6 +187,32 @@ oc get httproute,gateway,authpolicy -n maas-fairness-poc -o yaml \
 ... | grep maas_fairness_unmatched_subscriptions_total     # expect 0
 ```
 
+---
+
+## Find a request's story from its response header
+
+Every response from the GPU path carries `x-request-id`, `x-maas-fairness-group`
+and `x-maas-fairness-queue-ms` (UNI-53; suppressible via `emitAttributionHeaders`
+in `deploy/poc/00-config.yaml`). Given the `x-request-id` value from a response,
+two commands get that request's own log lines back:
+
+```sh
+POD=$(oc get pods -n maas-fairness-poc \
+  -l app.kubernetes.io/name=maas-vllm-gpu,app.kubernetes.io/component=llminferenceservice-router-scheduler \
+  -o jsonpath='{.items[0].metadata.name}')
+
+oc logs -n maas-fairness-poc "$POD" | grep '"requestID":"<id>"'
+```
+
+Every request-scoped line this plugin emits -- the unmatched-subscription notice,
+the no-usage-block warning, and (once UNI-47 lands) the V(4) per-request tier --
+carries `requestID` with this exact value, plus `traceId` when the request came
+in with a `traceparent` header. See UNI-48's query pack for the field contract
+those lines use.
+
+If the pod has since restarted, that log is gone -- this POC cluster has no log
+aggregation or retention window (see docs/design.md "Production observability").
+
 And the one that tells you the policy converged, which matters more than the
 token percentages: `normalized_service` should be **equal across backlogged
 groups**. Persistent spread means it has identified an imbalance it is not

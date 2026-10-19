@@ -69,7 +69,7 @@ which is the authoritative source for alerting.
 | `requestID` | **Stable, required API** (board direction 2026-10-19, see [UNI-53](/UNI/issues/UNI-53)) | every request-scoped line |
 | `traceId` | Stable, optional (present only when the inbound `traceparent` parsed) | every request-scoped line, when available |
 | `group` | Stable | every line |
-| `band` | Stable | every request-scoped line (see §4's caveat for why the flight recorder does not carry it) |
+| `band` | Stable | every request-scoped line (see §3.1's caveat for why the flight recorder does not carry it) |
 | `enforcing` | Stable | every line |
 | `tick` | Stable | flight-recorder lines only |
 | `recorderTick` | Stable | V(4) per-request tier line only |

@@ -53,10 +53,11 @@ against the LokiStack gateway's `query_range` with `curl` (line 14 above),
 where `$__auto` is never substituted and the query fails to parse. There is
 also no Grafana in this install to substitute it: `docs/logging-install-spec.md`
 installs no Grafana, and its console `UIPlugin` is explicitly excluded from
-the air-gap mirror set. `5m` is comfortably larger than this config's 30s
-flight-recorder cadence (`stateLogIntervalSeconds` in `deploy/epp-config.yaml`,
-the GPU target's config — the POC rig's `deploy/poc/00-config.yaml` runs 5s),
-so the window holds at least one sample regardless of which config is live.
+the air-gap mirror set. `5m` is comfortably larger than this config's 5s
+flight-recorder cadence (`stateLogIntervalSeconds` in `deploy/poc/00-config.yaml`,
+the in-scope GPU target's live config — the undeployed production template
+`deploy/epp-config.yaml` runs 30s), so the window holds at least one sample
+regardless of which config is live.
 If a Grafana datasource is added later, `$__auto` is the equivalent form
 there.
 

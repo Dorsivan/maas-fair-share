@@ -258,13 +258,80 @@ oc logs -n maas-fairness-poc "$POD" | grep "$ID"
 
 Grep the bare id, not `"requestID":"<id>"` — the llm-d-router framework's own
 request-lifecycle lines key it as `x-request-id` and appear on every request, while
-this plugin's own lines key it as `requestID` and, until UNI-47's V(4) per-request tier
-lands, only appear on the two exception paths (the unmatched-subscription notice and
-the no-usage-block warning). A healthy, matched request today produces zero plugin
-lines, only framework ones — the bare-id grep still finds those; the `"requestID":"`
-form matches nothing for it. `requestID` also carries `traceId` when the request came
-in with a `traceparent` header. See UNI-48's query pack for the field contract those
+this plugin's own lines key it as `requestID` and, **in the default configuration**,
+only appear on the two exception paths (the unmatched-subscription notice and the
+no-usage-block warning). A healthy, matched request today produces zero plugin lines,
+only framework ones — the bare-id grep still finds those; the `"requestID":"` form
+matches nothing for it. `requestID` also carries `traceId` when the request came in
+with a `traceparent` header. See UNI-48's query pack for the field contract those
 lines use.
+
+UNI-47's V(4) per-request tier adds a third case — a sampled line on every settled
+request, healthy or not — but it ships off by default and needs two separate edits to
+turn on; see "Turn on the V(4) per-request tier" below before assuming it is available.
 
 If the pod has since restarted, that log is gone -- this POC cluster has no log
 aggregation or retention window (see docs/design.md "Production observability").
+
+---
+
+## Turn on the V(4) per-request tier
+
+Off by default, and both of the following edits are required — either one alone
+leaves the tier **silently** disabled, with no error and no log line saying why.
+
+**1. Uncomment the two ConfigMap keys** — `deploy/poc/00-config.yaml` for the POC,
+`deploy/epp-config.yaml` for production — under the `maas-weighted-fairness` plugin's
+`parameters`:
+
+```yaml
+requestTierV4SampleEvery: 100       # emit 1 line per 100 settlements
+requestTierV4TimeBoxSeconds: 900    # self-disables 15 minutes after the first check
+```
+
+**2. Add `-v=4` to the EPP container's args** in `deploy/poc/02-epp.yaml` (or the
+production Deployment/LLMInferenceService), alongside the existing `--zap-encoder`
+etc.:
+
+```yaml
+args:
+  - --pool-name
+  - maas-pool
+  # ... existing args unchanged ...
+  - -v
+  - "4"
+```
+
+This step is the one that's easy to skip, and skipping it is invisible: the plugin's
+own gate (`cfg.RequestTierV4SampleEvery`) only gets you halfway — emission also
+requires `log.FromContext(ctx).V(4).Enabled()` to be true, and the EPP's default
+verbosity is V(2) (`logging.DEFAULT` in
+`llm-d-router@v0.11.0/pkg/common/observability/logging/const.go`). Uncomment only the
+ConfigMap keys and the tier stays silent, with nothing in the logs to say why.
+
+**If `--zap-log-level` is ever added to this args list, it silently overrides `-v`,**
+and the tier goes dark again — `Complete()` in the same module only derives the zap
+level from `-v` when `--zap-log-level` was not explicitly set, and that flag also
+accepts a plain integer. Today's manifest does not set `--zap-log-level`, so `-v`
+governs; if a later change adds `--zap-log-level`, set it to `4` directly instead of
+relying on `-v`.
+
+**3. Apply both and restart** — the Deployment uses `strategy: Recreate`, so an
+`oc apply` on it is enough to cycle the pod, but a ConfigMap-only edit needs an
+explicit nudge:
+
+```sh
+oc apply -f deploy/poc/00-config.yaml -f deploy/poc/02-epp.yaml -n maas-fairness-poc
+oc delete pod -n maas-fairness-poc -l app=maas-epp
+```
+
+Then find a request the same way as "Find a request's story from its response
+header" above — a healthy, matched request can now also produce a `"per-request
+fairness tier"` line, not just the two exception paths.
+
+**Turn it back off** by reverting either edit — re-commenting the two ConfigMap keys,
+or dropping `-v`/`"4"` from the args — and re-applying. Note that the time box
+re-arms on every EPP restart: a crashlooping or rescheduled pod keeps re-emitting for
+up to `requestTierV4TimeBoxSeconds` after each restart even if nobody touched the
+config, so reverting the ConfigMap (not just waiting out the box once) is what
+actually ends it.

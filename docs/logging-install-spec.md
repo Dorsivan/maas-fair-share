@@ -842,7 +842,7 @@ even without Prometheus") actually tested rather than asserted.
 
 **Air-gap deltas** (feeds the transfer report):
 
-### Mirror set — complete, nine images
+### Mirror set — nine images, plus the catalog
 
 Enumerated from the packagemanifests on **2026-10-19**, *before* install.
 This matters: on this ticket the install is the thing most likely never to
@@ -892,6 +892,52 @@ oc image info --filter-by-os=linux/amd64 <image>            # prints "Image Size
 skopeo inspect --raw docker://<image> | jq '[.layers[].size] | add'
 ```
 
+### Tenth image: the catalog itself
+
+The nine images above are what the operator and operand **pods** pull. They are
+not sufficient on their own: OLM resolves both Subscriptions against a
+**CatalogSource**, whose index image must also be mirrored.
+
+| # | Image (digest-pinned) | Role | Compressed size |
+|---|---|---|---|
+| 10 | `registry.redhat.io/redhat/redhat-operator-index@sha256:12cffb23d6519909c78a175bc862cbdeae521ff6032099f3628457936c6f4119` | the `redhat-operators` catalog both Subscriptions resolve against (§4) | unknown — obtain at mirror time |
+
+The CatalogSource on this cluster references it **by tag**, so the digest is
+read from the running catalog pod instead (2026-10-19):
+
+```sh
+$OC get catalogsource redhat-operators -n openshift-marketplace -o jsonpath='{.spec.image}{"\n"}'
+# registry.redhat.io/redhat/redhat-operator-index:v4.20      <- a tag, not a digest
+
+$OC get pods -n openshift-marketplace -l olm.catalogSource=redhat-operators -o json \
+  | jq -r '.items[].status.initContainerStatuses[] | select(.name=="extract-content") | .imageID'
+# registry.redhat.io/redhat/redhat-operator-index@sha256:12cffb23d6519909c78a175bc862cbdeae521ff6032099f3628457936c6f4119
+```
+
+Mirroring the whole v4.20 index is far larger than the nine images above.
+Prefer a filtered catalog (`oc-mirror` with an `ImageSetConfiguration` listing
+only `cluster-logging` and `loki-operator`, channel `stable-6.6`), which
+carries exactly those nine plus a small rebuilt index.
+
+> **`source: redhat-operators` is a destination-local name.** Both Subscriptions
+> in `deploy/logging/01-operators.yaml` name it, and it is correct *here*. A
+> disconnected cluster normally has the default catalogs disabled
+> (`OperatorHub.spec.disableAllDefaultSources: true`) and a mirror-generated
+> CatalogSource under a different name — `oc-mirror` derives it from the index
+> image, e.g. `cs-redhat-operator-index-v4-20`. Check it at the destination
+> before applying:
+>
+> ```sh
+> oc get catalogsource -n openshift-marketplace
+> ```
+>
+> and edit `spec.source` in both Subscriptions if it differs. A Subscription
+> naming a CatalogSource that does not exist does not fail loudly — it simply
+> never resolves, and `oc get sub -n openshift-logging` shows no `installedCSV`.
+> Because the index is mirrored by tag, redirect it with an
+> **`ImageTagMirrorSet`** (an `ImageDigestMirrorSet` will not match it); the
+> nine digest-pinned images above are the `ImageDigestMirrorSet` case.
+
 ### The rest of the air-gap deltas
 
 - **The optional console UIPlugin (§6) is excluded from the mirror set above,
@@ -913,6 +959,3 @@ skopeo inspect --raw docker://<image> | jq '[.layers[].size] | add'
   `quay.io/minio/minio:latest` tag and is not a transferable artifact; the
   destination supplies its own S3 (ODF/NooBaa or equivalent) and only the
   `logging-loki-s3` Secret contents change.
-- A disconnected cluster needs the `redhat-operators` catalog mirrored, or an
-  `ImageDigestMirrorSet` pointing `registry.redhat.io/openshift-logging/*` at
-  the local mirror.

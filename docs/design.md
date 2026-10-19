@@ -1001,8 +1001,41 @@ Every request-scoped log line in this package carries two fields, resolved once 
   sighting triggered the line); active flows on more than one priority band. The
   no-usage-block warning in `ResponseBody` (V(1)) is the same tier and carries the
   same fields.
-- **V(4) per-request** — group resolved, estimate charged, true-up delta. Off in prod,
-  and not yet implemented (UNI-47); the correlation fields above are ready for it.
+- **V(4) per-request** — group resolved, estimate charged, true-up delta, and the
+  `requestID`/`traceId` identifying which request the pick belongs to. **Implemented**
+  (UNI-47) in `ResponseBody`, the one point in the request lifecycle where a group, an
+  estimate and a true-up delta all exist together — not in `Pick`, which this tier never
+  touches (see "V(4) is off Pick's hot path" below).
+
+### V(4) is off Pick's hot path
+
+The per-request tier is gated by three independent config/runtime switches, all of which
+default to off:
+
+- `requestTierV4SampleEvery` (plugin config) — 0 disables the tier outright; N emits one
+  line per N eligible settlements.
+- `requestTierV4TimeBoxSeconds` (plugin config) — required once sampling is on. The
+  window opens on this plugin's first eligible check (in practice, pod start) and the
+  tier goes silent once it elapses, even if the two other switches are still open — so
+  raising verbosity for a debugging session cannot be left on by accident.
+- The EPP process's own `-v` flag — the tier additionally requires `log.V(4).Enabled()`
+  from the ambient logger.
+
+This plugin's `parameters` block is decoded once at construction (`Factory`) with no
+watch or reload, and `-v` is parsed once at process start with no exposed dynamic
+endpoint (`pkg/common/observability/logging.Options` in llm-d-router v0.11.0) — so
+**neither switch can be changed without a redeploy**. Per the ticket, the fallback for
+"no live-reload path" is to gate on the existing verbosity flag plus the sample rate,
+which is exactly what the three switches above do.
+
+`Pick` runs on a ~1ms ticker and is unconditionally out of scope for unsampled
+per-request logging (see "Logs" above). This tier's code reads none of `Pick`'s state and
+adds nothing to its call path: the only edits this ticket makes to `plugin.go` are the
+`Plugin` struct, `ResponseBody`, and two new unexported methods declared after `dump()`.
+`Pick` itself is byte-for-byte unmodified, so the cost of the disabled (and the enabled)
+V(4) path on `Pick` is exactly zero, not merely small — see `BenchmarkPick` in
+`pkg/fairness/weightedlas/pick_bench_test.go` for the regression guard and
+UNI-47's closing comment for the measured numbers.
 
 ### Per-request attribution
 

@@ -113,6 +113,26 @@ type Config struct {
 	// internal detail some deployments may not want to expose -- see
 	// docs/design.md "Per-request attribution".
 	EmitAttributionHeaders bool `json:"emitAttributionHeaders"`
+
+	// RequestTierV4SampleEvery turns on the V(4) per-request tier (group
+	// resolved, estimate charged, true-up delta -- see docs/design.md "V(4)
+	// per-request tier") and sets its sample rate: one line is emitted for
+	// every RequestTierV4SampleEvery-th settlement, the rest are skipped
+	// entirely. 0 (the default) means the tier never emits, regardless of
+	// process verbosity -- Pick runs on a ~1ms ticker and unsampled per-request
+	// logging is out of scope for this plugin, always. This field is read once
+	// from the static `parameters` block at plugin construction (see Factory)
+	// and cannot be changed without a redeploy; the line still requires `-v=4`
+	// or higher on the EPP process, which is set the same, redeploy-only way.
+	RequestTierV4SampleEvery uint64 `json:"requestTierV4SampleEvery,omitempty"`
+
+	// RequestTierV4TimeBoxSeconds bounds how long after this plugin starts
+	// sampling the V(4) tier may keep emitting at all. Once the window
+	// elapses the tier goes silent on its own -- even if RequestTierV4SampleEvery
+	// and -v=4 are both still set -- so raising verbosity for one debugging
+	// session cannot be left on by accident indefinitely. Required (> 0) when
+	// RequestTierV4SampleEvery is set.
+	RequestTierV4TimeBoxSeconds float64 `json:"requestTierV4TimeBoxSeconds,omitempty"`
 }
 
 // DefaultConfig is what the plugin does with an empty parameters block: shadow
@@ -212,6 +232,13 @@ func (c *Config) validate() error {
 	}
 	if c.AgingTokensPerSecond < 0 {
 		return fmt.Errorf("agingTokensPerSecond must be >= 0, got %v", c.AgingTokensPerSecond)
+	}
+	if c.RequestTierV4TimeBoxSeconds < 0 {
+		return fmt.Errorf("requestTierV4TimeBoxSeconds must be >= 0, got %v", c.RequestTierV4TimeBoxSeconds)
+	}
+	if c.RequestTierV4SampleEvery > 0 && c.RequestTierV4TimeBoxSeconds <= 0 {
+		return fmt.Errorf("requestTierV4TimeBoxSeconds must be > 0 when requestTierV4SampleEvery is set, got %v",
+			c.RequestTierV4TimeBoxSeconds)
 	}
 	return nil
 }

@@ -44,6 +44,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -122,6 +123,16 @@ type Plugin struct {
 	// lastContendedUnixNano gates the flight recorder: it logs only while
 	// contention is recent, so an idle cluster produces no output at all.
 	lastContendedUnixNano atomic.Int64
+
+	// v4Once starts the V(4) per-request tier's time box on the first eligible
+	// completion this plugin ever evaluates, rather than at construction --
+	// see v4WithinTimeBox.
+	v4Once     sync.Once
+	v4Deadline time.Time
+	// v4Counter drives the 1-in-N sample: it is incremented only for
+	// completions that already passed the config and verbosity gates, so the
+	// sample rate is relative to eligible lines, not to total traffic.
+	v4Counter atomic.Uint64
 }
 
 // Factory builds the plugin from its `parameters` block.
@@ -591,6 +602,11 @@ func (p *Plugin) ResponseBody(
 	// accumulated tab dependent on estimator quality rather than on consumption.
 	gs.chargeInflight(now, delta, inflight)
 	truingError.WithLabelValues(boundID(id)).Observe(delta)
+	if v4, ok := p.v4Logger(ctx, now); ok {
+		fields := append([]any{"plugin", p.name, "group", id,
+			"estimateCharged", charge.cost, "trueUpDelta", delta}, corr.logFields()...)
+		v4.Info("per-request fairness tier", fields...)
+	}
 	// Book the full real cost, not the delta, under the gate decided at dispatch
 	// (see provisionalCharge.contended) rather than re-checking contention at
 	// this, later, moment. Booking only the delta would silently drop an
@@ -723,6 +739,55 @@ func (p *Plugin) dump() dumpState {
 	p.unmatchedMu.Unlock()
 	sort.Strings(d.UnmatchedSample)
 	return d
+}
+
+// v4Logger reports whether this particular settlement should emit the V(4)
+// per-request tier line, and the logger to emit it with if so.
+//
+// See docs/design.md "V(4) per-request tier": the tier is off by default,
+// sampled, and time-boxed because Pick runs on a ~1ms ticker and unsampled
+// per-request logging is out of scope for this plugin's hot path, always.
+// This plugin's `parameters` block has no live-reload path (Factory decodes
+// it once, at construction) and the EPP process's own -v flag is parsed once
+// at startup with no exposed dynamic endpoint either (see
+// github.com/llm-d/llm-d-router/pkg/common/observability/logging.Options) --
+// so neither knob can be changed without a redeploy, and this gates on both
+// rather than on a dynamically reloadable path: cfg.RequestTierV4SampleEvery
+// (this plugin's own switch and sample rate) AND the process's existing V(4)
+// verbosity flag.
+//
+// Cheapest checks first: the config gate and the logr level check are a field
+// load and an interface call, so a disabled tier (the default) never reaches
+// the atomic counter this method also updates.
+func (p *Plugin) v4Logger(ctx context.Context, now time.Time) (logr.Logger, bool) {
+	if p.cfg.RequestTierV4SampleEvery == 0 {
+		return logr.Logger{}, false
+	}
+	l := log.FromContext(ctx).V(4)
+	if !l.Enabled() {
+		return logr.Logger{}, false
+	}
+	if !p.v4WithinTimeBox(now) {
+		return logr.Logger{}, false
+	}
+	if p.v4Counter.Add(1)%p.cfg.RequestTierV4SampleEvery != 0 {
+		return logr.Logger{}, false
+	}
+	return l, true
+}
+
+// v4WithinTimeBox reports whether the V(4) tier's self-disable window is
+// still open. The window starts at the first call -- effectively pod start
+// for a live EPP, since real traffic arrives immediately -- rather than at
+// plugin construction, so tests can control "now" before any window begins.
+// Once cfg.RequestTierV4TimeBoxSeconds has elapsed since that first call, the
+// tier stays silent even if the config and verbosity gates are still open,
+// which is what makes it impossible to leave on by accident past a redeploy.
+func (p *Plugin) v4WithinTimeBox(now time.Time) bool {
+	p.v4Once.Do(func() {
+		p.v4Deadline = now.Add(time.Duration(p.cfg.RequestTierV4TimeBoxSeconds * float64(time.Second)))
+	})
+	return now.Before(p.v4Deadline)
 }
 
 // runFlightRecorder emits the same table to the log on a fixed cadence, but only

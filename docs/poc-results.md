@@ -703,9 +703,11 @@ reliably exact.
 - **The GPU production manifest is still unapplied.** `deploy/llmisvc.yaml`
   (all three presets, real vLLM, `nvidia.com/gpu`) has not been run. The
   KServe wiring itself IS now proven, via `deploy/poc/05-llmisvc-sim.yaml`.
-- **No sustained load through the LLMInferenceService path.** The weight-split
-  and work-conservation numbers above were all measured on the direct rig.
-  Through KServe only a single request has been verified end to end.
+- **(resolved, UNI-27) Sustained load through the LLMInferenceService path and
+  the Route was, until now, only proven by single requests.** Closed-loop load
+  against both paths is now measured — see Outstanding work #9 below and the
+  UNI-27 ticket comments for the full status tally and `normalized_service`
+  convergence data.
 
 ## Outstanding work
 
@@ -721,7 +723,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Fix `contended_service_tokens_total`~~ | **Fixed.** The gate decision (is the band contended) is now made once, at dispatch, and reused at completion instead of being re-checked independently at each of the two charge sites. The metric also now books the real, measured cost once at completion rather than the dispatch estimate plus a separately-gated correction, so an estimator overshoot no longer gets silently dropped (a Prometheus counter cannot move backwards on a negative delta). `TestContendedServiceTokensEqualChargedCost`, `TestContendedServiceTokensEqualChargedCostOnOverestimate`, and `TestAbortedRequestStillBooksContendedService` cover under-estimate, over-estimate, and abort respectively | — |
 | 7 | **Re-run S1 longer** | 1.57:1 against a 2:1 target was the only proportionality miss; likely 150s being short against a 60s half-life with cold tabs | 10 minutes |
 | 8 | **`maas-default-gateway` inference path** | returns 500: `maas-api-route` targets a TLS service port with no `BackendTLSPolicy`, and that CRD is not installed. API keys currently require port-forwarding to maas-api | upstream/MaaS |
-| 9 | **Sustained load through the Route** | the 600s timeout and `buffer-response: false` annotations are only proven by single requests | 10 minutes |
+| — | ~~Sustained load through the LLMInferenceService path and the Route (UNI-27)~~ | **Done.** 240s closed-loop runs (32 workers/tenant, `app1`/`app2`/`end-users`) against both the in-cluster gateway Service and the public Route landed 94.7% and 97.9% HTTP 200 respectively, with the non-200s traced via the gateway access log to a ~2s connection/endpoint-pool warm-up burst at request-storm start (zero thereafter), not a sustained-load or fairness defect. `normalized_service` converged to within ~7% across the three backlogged groups on both paths, confirmed at multiple flight-recorder ticks through each run. Script: `deploy/poc/12-loadgen-route.sh` (Route path); `deploy/poc/04-loadgen.yaml` unchanged (LLMInferenceService path) | N/A -- closed |
 | 10 | **Open-loop load generation** | every result is closed-loop. Poisson arrivals would drain queues differently and are the honest test of the clamp | generator work |
 | 11 | **Verify metrics reach Prometheus** | `deploy/podmonitor.yaml` exists and UWM is enabled, but no dashboard query has ever been confirmed end to end | 15 minutes |
 | 12 | **Red Hat support boundary** | a custom EPP image takes that component outside RHOAI support. The plan calls this the biggest non-technical risk and it has never been raised with the account team. Nothing technical unblocks it | a conversation |

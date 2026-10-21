@@ -28,12 +28,18 @@ metadata:
 spec:
   selector:
     matchLabels:
-      # KServe labels the scheduler pod with the LLMInferenceService name and
-      # kserve.io/component: router-scheduler. Confirm against the live pod
-      # before trusting this -- a selector that matches nothing produces no
-      # error anywhere, just empty graphs:
+      # Checked against the live GPU scheduler pod on 2026-10-21
+      # (maas-vllm-gpu-kserve-router-scheduler-78bd7b75bd-4btk6): this cluster's
+      # KServe preset does NOT set kserve.io/component as an earlier draft of
+      # this file assumed -- that selector matched zero pods and would have
+      # produced empty graphs with no error anywhere. The actual labels are:
       #   oc get pod -n maas-fairness-poc --show-labels | grep scheduler
-      kserve.io/component: router-scheduler
+      # app.kubernetes.io/name scopes this to the GPU LLMInferenceService only
+      # -- the CPU router-scheduler carries the same component label with
+      # app.kubernetes.io/name: maas-vllm-cpu, and A1/UNI-75 scoped this work
+      # to the GPU path.
+      app.kubernetes.io/component: llminferenceservice-router-scheduler
+      app.kubernetes.io/name: maas-vllm-gpu
   podMetricsEndpoints:
     - port: metrics          # the name from the scheduler preset's containerPort
       path: /metrics

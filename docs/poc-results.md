@@ -679,6 +679,175 @@ when both tabs start cold — S3 and S5, which involve the much larger 65:20
 ratio, were closer. Worth re-running longer before treating the 20:10 pair as
 reliably exact.
 
+## Open-loop (Poisson) load generation (UNI-34) — the clamp finding, revisited
+
+Every result above is closed-loop: a fixed worker pool per tenant, each worker
+blocking on one request before issuing its next. `deploy/poc/13-loadgen-poisson.py`
+(wrapped by `13-loadgen-poisson.sh`) is the open-loop counterpart this
+document's own "Outstanding work #10" called for: independent per-tenant
+Poisson arrival processes at a fixed mean rate, dispatched fire-and-forget to
+a thread pool so the offered rate never depends on how fast — or slowly — the
+backend answers. This is the honest test flagged in the SUPERSEDED section:
+"Open-loop traffic with Poisson arrivals would not drain the favoured group's
+queue the same way, and might never trigger the [clamp] effect."
+
+**Setup.** Same GPU backend as the rest of this document (2×A100, Qwen2.5-7B,
+2 replicas, `--max-num-seqs 8` ⇒ 16 concurrent slots), same live config
+(`enforce: true`, `newcomerClamp: true`, weights 20/10/65, `halfLifeSeconds:
+60`) — nothing about the plugin or its deployment was changed for this test.
+Per the established methodology ("every tenant must offer more load than its
+entitlement... size load so demand, not asymmetry, decides the split"), all
+three tenants were given the **same** Poisson rate per level, so any split
+away from equal thirds is the policy's doing, not the traffic's. Traffic
+through the public Route, same prompt and `max_tokens: 64` as every other load
+generator in this repo.
+
+**Pool capacity, measured.** A quick single-tenant calibration (app1 alone,
+30 s bursts) found the knee: 20 req/s held (p50 0.82 s, p95 1.31 s, p99
+1.78 s, all 200), 35 req/s collapsed within the same 30 s window (p50 20.8 s,
+p95 44.3 s, p99 46.7 s, still all 200 but queueing badly). The three-tenant
+runs below bracket that knee at 18 req/s aggregate (stable) and 24 req/s
+aggregate (collapsing).
+
+| level | rate/tenant | aggregate | duration | client-observed status | EPP `newcomer_clamps_total` per dispatch | delivered share, app1/app2/end-users | vs 20/10/65 target |
+|---|---|---|---|---|---|---|---|
+| below saturation | 4 req/s | 12 req/s | 240 s | 994/962/928 sent, all HTTP 200, p50 0.75 s | **65–68%** of dispatches | 34.5/33.4/32.1% (client `completion_tokens`)† | flat — pool not contended |
+| below saturation | 6 req/s | 18 req/s | 90 s | 588/541/531 sent, all HTTP 200, p50 0.77 s | **64–70%** of dispatches | 35.6/32.5/32.0% (client `completion_tokens`)† | flat — pool not contended |
+| **above saturation** | 8 req/s | 24 req/s | 90 s‡ | EPP dispatched 731/641/543; client saw sustained 20–50 s latencies and timeouts on a large fraction of app2/end-users requests | app1 4.9%, app2 5.3%, **end-users 8.3%** | **40.4% / 34.1% / 25.5%** (EPP `contended_service_tokens_total`) | **inverted** — lowest weight (app1, 20) delivered the most; highest weight (end-users, 65) delivered the least |
+
+† `contended_service_tokens_total` and `contended_seconds_total` — the SLI
+this document uses everywhere else — stayed at **exactly zero delta** for
+both below-saturation rows: with the pool this lightly loaded, no two groups
+were ever backlogged at the same instant, so the metric correctly declined to
+invent a contended share (same behaviour as E2's solo-tenant run, "## Below
+capacity, a second tenant costs the first nothing"). The share quoted here is
+therefore the client-side `usage.completion_tokens` total per group instead —
+a demand-driven number, not a policy-driven one, and unremarkable precisely
+because it tracks the near-equal 4/4/4 and 6/6/6 req/s offered equally.
+
+‡ Shortened from this document's usual 240 s specifically to bound the
+backlog an overload run produces (see "a killed open-loop client does not
+relieve the backend" below). The 24 req/s level was first attempted at the
+usual 240 s and aborted at the 90 s mark, by which point client-observed
+in-flight requests had grown 20→36→52→180→360→560 with no sign of levelling
+off; it was killed there rather than let run to completion, both to avoid
+exhausting the generator's own thread pool and to keep the eventual drain
+tractable. After confirming the backend had fully recovered (see below), the
+level was re-run cleanly — shortened to 90 s and given more worker headroom —
+and is the run reported in the table. Even that clean, shortened run ended
+its 90 s arrival window with in-flight still at 876 and still climbing, so
+the table is a deliberately early snapshot of the *onset* of collapse, not a
+converged steady state. A longer run would show a larger backlog, not a
+smaller one, so this table likely **understates** the eventual severity of
+the inversion rather than overstating it. `dispatch_total` and
+`contended_service_tokens_total` are EPP-internal counters and do not depend
+on the client receiving a response, so they are reported as the authoritative
+numbers; the client's own completion log additionally showed many requests
+failing after ~50 s with no response body, which was not root-caused to a
+specific hop (Route/HAProxy edge, KServe, or vLLM) and is not relied on here.
+
+### The clamp fires constantly under genuine arrivals — far more than closed-loop ever showed
+
+At both below-saturation levels, the newcomer clamp fired on roughly
+**two-thirds of all dispatches**. Every closed-loop run in this document fired
+it far more rarely: 19 times in 862 dispatches (2.2%) in the original
+CPU/simulator run that first raised the concern, and only 5 times in ~2,500
+dispatches (0.2%) in the GPU A/B that refuted it (`## 3. The newcomerClamp
+finding is REFUTED`, above). That refutation's own caveat said why: "this is a
+closed-loop generator... open-loop traffic... might never trigger the effect."
+It is now measured, and the opposite happened — open-loop arrivals trigger the
+empty→non-empty edge on most requests, not rarely, because a Poisson process
+leaves genuine idle gaps between one tenant's own requests even when nothing
+is wrong, and a lightly-loaded pool answers fast enough that the queue is
+routinely empty again before the next arrival. A closed-loop worker can never
+produce this signal — it resubmits the instant its previous request completes,
+so its queue is only ever empty when it is winning so hard there is no more
+of its own work queued, which is rare by construction.
+
+At these two levels the high clamp rate is **harmless**, because the pool
+is not contended (near-zero `contended_seconds_total`) — there is nothing for
+the clamp's reset to take away from anyone. This matches "Below capacity, a
+second tenant costs the first nothing": with no real competition, the policy
+mechanism is mostly inert regardless of how often it fires.
+
+### Push past saturation, and the clamp's cost becomes visible — and it inverts the split
+
+The above-saturation row is where it stops being harmless. The clamp fires
+less often per dispatch here (4.9–8.3%, because the queue is now usually
+non-empty, so there are fewer empty→non-empty edges to catch) but the firings
+that do happen land disproportionately on **end-users**, the highest-weight
+group, at nearly double app1's rate (8.3% vs 4.9%). That tracks the mechanism
+this document already identified and set aside as unproven on closed-loop
+evidence: the clamp writes `A = floor × w` (`plugin.go:379-396`), so the
+credit erased scales with the clamped group's *own* weight — the larger the
+weight, the more a single clamp firing cuts off a group that was behind and
+trying to catch up.
+
+The measured consequence: **end-users (weight 65) delivered only 25.5% of
+contended service**, against a target of 65%, while **app1 (weight 20)
+delivered 40.4%** — the ordering is not just off by a few points, as in the
+closed-loop demand-starved artefact this document already diagnosed and
+dismissed; it is **inverted**. The lowest-weight tenant outperformed the
+highest-weight tenant by a wide margin, under genuine Poisson arrivals, on the
+same backend and the same unmodified config this document used to claim the
+split "works" (`## On real GPUs: the weighted split works`, 20.5/11.6/67.9%
+achieved against 20/10/65 target — that result was closed-loop).
+
+### A killed open-loop client does not relieve the backend
+
+A side observation worth recording because closed-loop testing structurally
+cannot produce it: when the first (240 s) attempt at the 24 req/s level was
+aborted by killing the generator process, a trivial unrelated probe request
+(`max_tokens: 16`, no contention) still took **14.0 s**, then **8.8 s** on a
+retry 60 s later, and did not return to the ~0.2 s baseline until roughly
+**4 minutes** after the client stopped sending anything. Requests the EPP had
+already dispatched kept consuming GPU slots regardless of whether the client
+that originated them was still running. A closed-loop generator cannot
+demonstrate this because it stops submitting new work the moment its own
+workers block — there is no analogue of a client disappearing while a real
+backlog it created keeps draining on its own.
+
+### What was not tested here
+
+- **No open-loop clamp on/off A/B.** The closed-loop clamp finding was
+  confirmed by toggling `newcomerClamp` and re-running (`## 3`, above); the
+  same A/B was not attempted open-loop. The live value is baked into the
+  Deployment's `--config-text` args by the `LLMInferenceService` CR's KServe
+  reconcile — the exact mechanism that silently reverted the image fix in
+  [UNI-75](/UNI/issues/UNI-75) — so a safe toggle-and-revert needs the same
+  CR-level care that fix required, and [UNI-29](/UNI/issues/UNI-29) was
+  concurrently `in_progress` against this same live GPU deployment while this
+  test ran. Editing the CR to flip a plugin parameter for this ticket risked
+  disrupting that concurrent work for a confirmation this document's
+  mechanistic read (`A = floor × w`, scaled by the clamped group's own weight)
+  already explains with reasonable confidence. Flagged as follow-up, not
+  attempted.
+- **Single scenario only.** Weights 20/10/65, `halfLifeSeconds: 60`, the
+  headline fairness scenario — not the full scenario matrix (S1–S5), not a
+  CPU-backend repeat.
+- **The above-saturation run is short (90 s, 1.5 half-lives)** by deliberate
+  design (see above) and captures the onset of collapse, not a converged
+  state.
+
+### Conclusion: open-loop CONTRADICTS the "clamp is inert" finding
+
+Stated plainly, per this ticket's done-when criteria: **open-loop arrivals
+contradict** `## 3. The newcomerClamp finding is REFUTED` and its closed-loop
+"only 5 clamps fired... effectively inert" conclusion, and they **confirm —
+more strongly than originally observed —** the SUPERSEDED section's narrower
+concern. The empty→non-empty edge is not a rare artefact of demand-starved
+closed-loop testing; under a real arrival process it is the common case, and
+once the pool is genuinely saturated it drives a severe, measured inversion of
+the configured weights (end-users 65%→25.5%, app1 20%→40.4%). The GPU
+closed-loop A/B's "effectively inert" reading holds only because a closed-loop
+generator structurally cannot produce the idle-queue edge at any meaningful
+rate — it was measuring the clamp in a traffic shape that happens to be
+blind to it. **The design default of `newcomerClamp: true` should be
+reconsidered for any workload expecting genuine open-loop or bursty client
+traffic**, pending the time-based guard ("clamp only if the queue has been
+empty for some meaningful fraction of the half-life") the SUPERSEDED section
+already proposed and this result now gives a concrete reason to build.
+
 ## What this POC does *not* show
 
 - **Saturation is now real but small.** deploy/poc/07-vllm-cpu.yaml runs vLLM
@@ -698,8 +867,14 @@ reliably exact.
   hardware now exists; the procedure is written up in
   [calibrating-output-token-weight.md](calibrating-output-token-weight.md).
   This is the largest single piece of outstanding work.
-- **Open-loop behaviour.** Everything above is closed-loop. See the clamp
-  finding for why that distinction may matter.
+- **(resolved, UNI-34) Open-loop behaviour.** Was: everything above is
+  closed-loop. Now measured — see "Open-loop (Poisson) load generation" above.
+  The result is not reassuring: under genuine Poisson arrivals the newcomer
+  clamp fires on ~65% of dispatches (vs 0.2–2.2% closed-loop) and, once the
+  pool is pushed past saturation, measurably **inverts** the configured
+  20/10/65 split (end-users down to 25.5%, app1 up to 40.4%). Open-loop
+  contradicts this document's closed-loop "clamp is inert" conclusion; no
+  open-loop clamp on/off A/B was run (see that section for why).
 - **The GPU production manifest is still unapplied.** `deploy/llmisvc.yaml`
   (all three presets, real vLLM, `nvidia.com/gpu`) has not been run. The
   KServe wiring itself IS now proven, via `deploy/poc/05-llmisvc-sim.yaml`.
@@ -732,7 +907,7 @@ Ordered by how much they would change a conclusion.
 | 7 | **Re-run S1 longer** | 1.57:1 against a 2:1 target was the only proportionality miss; likely 150s being short against a 60s half-life with cold tabs | 10 minutes |
 | 8 | **`maas-default-gateway` inference path** | returns 500: `maas-api-route` targets a TLS service port with no `BackendTLSPolicy`, and that CRD is not installed. API keys currently require port-forwarding to maas-api | upstream/MaaS |
 | — | ~~Sustained load through the LLMInferenceService path and the Route (UNI-27)~~ | **Done for status tally and fairness.** 240s closed-loop runs (32 workers/tenant, `app1`/`app2`/`end-users`) against both the in-cluster gateway Service and the public Route landed 94.7% and 97.9% HTTP 200 respectively. `normalized_service` converged to within ~7% across the three backlogged groups on both paths, confirmed at multiple flight-recorder ticks through each run. On the non-200s: the Route path's are directly traced via the gateway access log to a ~2s connection/endpoint-pool warm-up burst at request-storm start (zero thereafter), not a sustained-load or fairness defect. The LLMInferenceService path's (5.3% error rate) are **inferred to be the same mechanism by analogy, not log-verified** — this cluster has no log aggregation and the gateway's own access-log buffer had already rotated past the run window by the time it was checked. Script: `deploy/poc/12-loadgen-route.sh` (Route path); `deploy/poc/04-loadgen.yaml` unchanged (LLMInferenceService path). Does **not** cover the 600s timeout / `buffer-response: false` annotations — see item 15 | N/A -- closed for status tally + fairness scope |
-| 10 | **Open-loop load generation** | every result is closed-loop. Poisson arrivals would drain queues differently and are the honest test of the clamp | generator work |
+| — | ~~Open-loop load generation (UNI-34)~~ | **Done, and the clamp finding flips.** `deploy/poc/13-loadgen-poisson.{py,sh}` adds open-loop Poisson arrivals. Below saturation the clamp fires on ~65% of dispatches (vs 0.2–2.2% closed-loop) but is harmless (pool uncontended). Above saturation (24 req/s aggregate vs a measured ~20-22 req/s pool ceiling) it measurably **inverts** the 20/10/65 split: end-users (w=65) delivered 25.5%, app1 (w=20) delivered 40.4%. This **contradicts** the GPU closed-loop "clamp is inert" finding (`## 3`) and confirms the SUPERSEDED section's concern more strongly than originally observed. See "Open-loop (Poisson) load generation (UNI-34)" above for the full data, including what was not tested (no clamp on/off A/B — see that section for why) | **newcomerClamp default should be revisited** — a policy decision, same owner as item 2 |
 | 11 | **Verify metrics reach Prometheus** | `deploy/podmonitor.yaml` exists and UWM is enabled, but no dashboard query has ever been confirmed end to end | 15 minutes |
 | 12 | **Red Hat support boundary** | a custom EPP image takes that component outside RHOAI support. The plan calls this the biggest non-technical risk and it has never been raised with the account team. Nothing technical unblocks it | a conversation |
 | 13 | **Version-pin maintenance** | flow-control interfaces sit on a module that only reached v1.0.0 on 2026-10-15; we are pinned to v0.11.0. Process, pinned versions and the named interface inventory are now in [version-pinning.md](version-pinning.md). Monthly check, manual — there is no CI runner | process |
@@ -768,3 +943,36 @@ oc logs -n maas-fairness-poc job/maas-loadgen --tail=6   # status tally must be 
 Read the result with the metrics-reader token against
 `http://maas-epp:9090/metrics` (plaintext — no `--metrics-cert-dir` in the POC),
 filtering on `llm_d_epp_maas_fairness_`.
+
+### Reproducing the open-loop (Poisson) runs, on the GPU rig
+
+Requires the GPU manifests already applied (`deploy/poc/09-vllm-gpu.yaml` and
+friends — see the GPU test suite above) and `deploy/rbac.yaml` for the
+metrics-reader token. Run from any host that can reach the public Route, same
+as `12-loadgen-route.sh`:
+
+```sh
+# Below saturation, demand-driven, confirms the clamp fires constantly but is
+# harmless when the pool isn't contended:
+OPENSHIFT_TOKEN=... DURATION=240 RATE_APP1=4 RATE_APP2=4 RATE_END_USERS=4 \
+  SEED=101 OUT=/tmp/run-below ./deploy/poc/13-loadgen-poisson.sh
+
+# Above saturation (pool ceiling is ~20-22 req/s aggregate on this rig --
+# calibrate with a single tenant first if the hardware changes). Expect a
+# multi-minute run: the arrival window is intentionally short (90s) but
+# drain of the resulting backlog can take nearly as long again:
+OPENSHIFT_TOKEN=... DURATION=90 RATE_APP1=8 RATE_APP2=8 RATE_END_USERS=8 \
+  SEED=104 OUT=/tmp/run-above MAX_WORKERS=3000 DRAIN_TIMEOUT=180 \
+  ./deploy/poc/13-loadgen-poisson.sh
+```
+
+Each invocation prints a before/after `llm_d_epp_maas_fairness_*` metrics
+snapshot and their delta, plus per-tenant client-side latency percentiles and
+status-code tallies; per-request rows land in `$OUT/<group>.log` as
+`arrival_epoch send_epoch latency_s http_code completion_tokens`.
+
+**Do not Ctrl-C an overload-level run and immediately start another.**
+Requests the EPP has already dispatched keep running on the backend after the
+client that sent them is gone — confirm recovery with a trivial single probe
+request before reusing the rig (see "a killed open-loop client does not
+relieve the backend" above).

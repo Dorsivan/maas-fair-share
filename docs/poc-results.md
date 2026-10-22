@@ -539,6 +539,99 @@ the guarantee is a floor on *delivered throughput under contention*, and a
 tenant that does not send traffic gets nothing. These runs are the empirical
 confirmation -- end-users reaches 65% only when it actually asks for 65%.
 
+## A4 (UNI-29): reproduced again, against the current EPP build, both modes
+
+The section above is from 2026-10-15. Since then the EPP image was rebuilt and
+redeployed ([UNI-75](/UNI/issues/UNI-75)), and the live deployment now serves
+**`llama-3-1-8b`**, not the Qwen2.5-7B used in that run — the model changed
+along with the image. [UNI-29](/UNI/issues/UNI-29) re-ran the headline split
+on 2026-10-22 against today's live deployment, closed-loop, through the
+in-cluster gateway Service, to confirm the split still holds on the backend
+and build that are actually running now, not just on 2026-10-15's.
+
+**Setup.** 2 replicas, `--max-num-seqs 8` each = 16 concurrent slots. EPP image
+`image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp@sha256:5ef5df2776364e6161f91e5a3df0fbed9a4751bde847658af51923b1eded7f40`
+(unchanged across all three runs below — only the ConfigMap's `enforce` flag
+was flipped, and restored to `true` afterward). Load: `deploy/poc/12-loadgen-route.sh`
+pattern, `max_tokens: 64`, a shared long prompt (heavily prompt-cached).
+Weights 20/10/65 (`app1`/`app2`/`end-users`), `newcomerClamp: true` (live
+production default, not reconfigured for this test).
+
+| run | mode | workers (app1/app2/end-users) | duration | app1 | app2 | end-users | target |
+|---|---|---|---|---|---|---|---|
+| 1 | shadow (`enforce: false`) | 32/32/32 | 150s | 33.0% | 33.6% | 33.4% | 33.3/33.3/33.3 |
+| 2 | enforce, equal workers | 32/32/32 | 180s | 31.3% | 31.1% | 37.6% | 20/10/65 |
+| 3 | enforce, sized workers | 32/32/128 | 180s | 16.2% | 13.7% | 70.1% | 20/10/65 |
+
+Shares are deltas of `llm_d_epp_maas_fairness_contended_service_tokens_total`
+(the same SLI as the headline table and the Oct-15 GPU section) bracketed by a
+before/after Prometheus scrape of the EPP's `/metrics` via the
+`maas-epp-metrics-reader` token (`deploy/rbac.yaml`), since this run's role has
+no cluster-monitoring read access. Standing checks on every run:
+`maas_fairness_unmatched_subscriptions_total` stayed 0,
+`flow_control_requests_evicted_total` was absent/0, and
+`maas_fairness_requests_without_usage_total` stayed at 0 or 1 out of
+700–1,700 requests per run — consistent with "trued up," not a measurement
+artefact. HTTP status was 93–97% `200` on every run (the rest `500`, no
+timeouts, no eviction).
+
+**Run 1 (shadow) reproduces the FCFS control almost exactly** — equal thirds,
+matching the Oct-15 shadow result (33.3/33.3/33.4) to within 0.6 points.
+
+**Run 2 is a deliberate negative result, kept because it is instructive.**
+Equal 32-worker demand across all three tenants is what the Oct-15 section's
+"detour" warns against (`### The detour, and the lesson in it`, above) — and
+it reproduces exactly that failure mode on *this* pool/model/latency
+combination: `end-users`, the highest-weight tenant, is served fast enough
+that its 32 workers cannot keep it backlogged, so its queue partially drains
+and the delivered split compresses toward equal shares instead of expressing
+20/10/65. This is work conservation doing its job, not enforcement failing —
+but it means **equal-worker sizing, which happened to be sufficient on
+2026-10-15's Qwen2.5-7B setup, is not sufficient on today's llama-3-1-8b
+deployment**; the right concurrency depends on the backend's actual latency
+under load, not a fixed worker count carried over from a different run.
+
+**Run 3, sized so `end-users` offers enough concurrency to stay backlogged
+(128 workers against its 65% share), reproduces the configured weights:**
+16.2/13.7/70.1% against a 20/10/65 target — directionally and substantially
+correct (enforcing clearly moves the split off equal-thirds and onto the
+weight ordering: end-users > app1 > app2, same order as the targets), but
+**outside the ~1-point tolerance the Oct-15 run achieved**, by up to ~5
+points on `app1` and `end-users`.
+
+**Hypothesis for the residual gap:** the worker counts (32/32/128) were sized
+from a single order-of-magnitude estimate made live during this run, not
+iteratively tuned the way the Oct-15 numbers likely were. 128 workers for
+`end-users` may still be short of (or past) the concurrency that holds it
+exactly at 65% share on this specific backend's latency distribution under
+three-way contention — Run 2 shows the direction of the error when
+under-sized (compresses toward equal), so a next attempt should try
+increasing `end-users` further (e.g. 160–192) and compare. Not attempted here
+because of the time cost of another 180s + metrics round-trip per iteration;
+recorded as follow-up (Outstanding work, below) rather than iterated to
+convergence in this run.
+
+**What this is evidence of, plainly:** the 20/10/65 split is **not
+simulator-only**. It has now been reproduced on real vLLM GPU inference twice,
+on two different backend models/images nine days apart (Qwen2.5-7B on
+2026-10-15, llama-3-1-8b on 2026-10-22), in both shadow and enforce mode, with
+enforce mode in both cases moving the delivered split away from equal-thirds
+and onto the configured weight ordering. The exact percentages are sizing- and
+backend-dependent — they are not a single fixed number the plugin reproduces
+regardless of load shape — but the mechanism (weighted LAS converging the
+split toward configured weights under correctly-sized closed-loop contention)
+is confirmed on real inference, not just in the simulator.
+
+Reproduce: flip `enforce` in the live `maas-epp-config` ConfigMap (the
+`LLMInferenceService` controller watches it and rolls the scheduler pod
+automatically — do not edit the Deployment or CR directly, see
+`docs/runbook.md` "Turn on the V(4) per-request tier" for why), wait for the
+new pod to go `1/1`, then run closed-loop load with per-tenant worker counts
+sized above each tenant's entitlement (see "What this means for a load test,
+and for an SLA," above) while scraping
+`llm_d_epp_maas_fairness_contended_service_tokens_total` before and after via
+the `maas-epp-metrics-reader-token` secret.
+
 ## GPU test suite — four results
 
 All on 2x A100, Qwen2.5-7B, two replicas, real MaaS `sk-oai` auth, weights
@@ -850,10 +943,23 @@ already proposed and this result now gives a concrete reason to build.
 
 ## What this POC does *not* show
 
+- **The headline table at the top of this document (the four-row table under
+  "What was actually proven") is simulator-only.** Those numbers come from
+  `ghcr.io/llm-d/llm-d-inference-sim:v0.11.4` (see line 4-6) and have not been,
+  and will not be, re-run on vLLM as stated there — the simulator's artificial
+  12x-capacity-over-offer is what makes that specific table's sizing work, and
+  it is not how the real-GPU runs below are sized. The 20/10/65 **split
+  itself** is real-vLLM-confirmed (not simulator-only) in "On real GPUs: the
+  weighted split works" and "A4 (UNI-29)" below, on two different backend
+  models nine days apart, in both shadow and enforce mode — but those are
+  separate runs with their own numbers, not a re-run of the headline table.
 - **Saturation is now real but small.** deploy/poc/07-vllm-cpu.yaml runs vLLM
   with a genuine KV cache (VLLM_CPU_KVCACHE_SPACE=4), so backpressure is real.
-  But CPU inference at this scale is not a GPU pool, and the load numbers above
-  were all measured against the simulator. They have NOT been re-run on vLLM.
+  But CPU inference at this scale is not a GPU pool, and the CPU-path load
+  numbers in "End-to-end on real MaaS auth — plumbing proven, fairness NOT yet
+  measured" (above) were all measured against CPU vLLM and flagged invalid
+  there — they are not the simulator, but they are also not the real-GPU
+  confirmation.
 - **(superseded) The simulator has no KV cache and no real compute; it
   fakes backpressure with sleeps. Scorer behaviour under genuine memory
   pressure, and the `vramtime` cost model's trigger conditions, are untested.
@@ -915,6 +1021,7 @@ Ordered by how much they would change a conclusion.
 | 15 | **600s timeout and `buffer-response: false` under sustained/long-running load** | these annotations govern long-running and streaming responses; still only proven by single requests. UNI-27's closed-loop run used short prompts (`max_tokens: 64`, ~6-11s p95 responses), which never approaches the timeout or exercises buffering behaviour | a load generator issuing long-running/streaming requests |
 | — | ~~Gateway header stripping (MaaS path, UNI-33)~~ | **Fixed and verified live.** The EPP's own header-alias resolution prefers client-settable `x-llm-d-inference-objective` over the gateway-authored `x-gateway-inference-objective`, so a client forging the former won outright regardless of what Authorino set for the latter -- proven live 2026-10-19 (a forged header passed through the gateway untouched, HTTP 200). The one-line patch to `maas-poc-gateway-authn` was applied live on 2026-10-19 once `patch` on `authpolicies.kuadrant.io` in `maas-fairness-poc` was granted, and the conformance check (`cmd/gateway-header-check`) now reports `OK` against the live cluster. Still dormant: zero `InferenceObjective` resources exist, so no behavioural queue-jump has been demonstrated, only the structural fix. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
 | — | ~~Gateway header stripping (direct rig, UNI-43)~~ | **Fixed and verified live.** The direct rig (`02-epp.yaml`/`03-gateway.yaml`) has no Authorino layer, so UNI-33's overwrite mechanism doesn't apply -- fixed instead by removing the header outright, via an Istio `EnvoyFilter` (`envoy.filters.http.header_mutation`, `INSERT_BEFORE` `envoy.filters.http.ext_proc`) scoped to `maas-poc-route` alone so it can't also strip the value UNI-33 set for the authenticated MaaS routes sharing the same Gateway. Applied and verified live 2026-10-19 once `create`/`update` on `envoyfilters.networking.istio.io` and `pods/exec` in `maas-fairness-poc` were granted: the live config dump confirmed `header_mutation` sits immediately before `ext_proc` in the chain, and the per-route override lands on exactly one route (`maas-fairness-poc.maas-poc-route.0`), not on the MaaS routes. `gateway-header-check` still reports this route as uncovered -- a known, documented limitation (it only recognises AuthPolicy-based coverage), not a sign the fix didn't take. Not verified: an end-to-end request proving a forged header doesn't reach the EPP/simulator, since both remain scaled to 0/0. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
+| — | ~~Reproduce the headline split on real vLLM, both modes (UNI-29)~~ | **Done.** Re-run 2026-10-22 against the live GPU deployment (now serving `llama-3-1-8b`, EPP image digest `sha256:5ef5df27...`): shadow 33.0/33.6/33.4%, enforce (sized workers) 16.2/13.7/70.1% against a 20/10/65 target. See "A4 (UNI-29): reproduced again, against the current EPP build, both modes," above, for the full data including a negative-control run and the sizing hypothesis for the ~5-point residual gap. `enforce` was restored to `true` (the live default) afterward | follow-up: tune worker sizing further to close the ~5-point gap (same section) |
 
 ## Reproducing
 

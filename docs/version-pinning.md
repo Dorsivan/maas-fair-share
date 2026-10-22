@@ -121,8 +121,8 @@ Every image reference in the repository, and whether it satisfies the digest rul
 | `deploy/poc/05-llmisvc-sim.yaml:185` | same `maas-epp:latest` | **violates** |
 | `deploy/poc/06-rhoai34-shape.yaml:79` | same `maas-epp:latest` | **violates** |
 | `deploy/poc/07-vllm-cpu.yaml:150` | same `maas-epp:latest` | **violates** |
-| `deploy/llmisvc.yaml:104` | `quay.io/rh-ee-dsivan/maas-fair-share:aef33a5` | **violates** — a commit-named tag is still a mutable tag |
-| `deploy/poc/09-vllm-gpu.yaml:109` | `quay.io/rh-ee-dsivan/maas-fair-share:aef33a5` | **violates** |
+| `deploy/llmisvc.yaml:104` | `quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a7...` | **satisfies** — fixed for UNI-29; see `docs/runbook.md`'s "Publishing to Quay without a local podman" note for how this one was built |
+| `deploy/poc/09-vllm-gpu.yaml:109` | same digest | **satisfies** |
 | `deploy/poc/01-sim-backend.yaml:45` | `ghcr.io/llm-d/llm-d-inference-sim:v0.11.4` | version tag, not a digest — **violates**, lower risk |
 | `deploy/poc/05-llmisvc-sim.yaml:70`, `deploy/poc/06-rhoai34-shape.yaml:152` | same inference-sim tag | **violates**, lower risk |
 | `deploy/poc/07-vllm-cpu.yaml:59` | `registry.redhat.io/rhaii/vllm-cpu-rhel9:3.5.0` | **violates**, lower risk |

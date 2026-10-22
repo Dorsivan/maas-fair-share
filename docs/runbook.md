@@ -128,7 +128,64 @@ timeout`) even though pod-to-pod networking works, so an internal reference
 leaves the EPP in `ImagePullBackOff` there. A Quay reference is also the only
 one meaningful on a different cluster.
 
-### Interim in-cluster build used to verify UNI-53 — main does not deploy it
+### Publishing to Quay without a local podman (used for UNI-29)
+
+The steps above assume a workstation with `podman` and a container-capable kernel. An
+agent session on this cluster may have neither. An OpenShift `BuildConfig` can do the
+same push: it runs the Docker-strategy build server-side and can emit straight to an
+external registry with `output.to.kind: DockerImage` plus a `pushSecret`, so no local
+build tool is needed at all.
+
+```sh
+# one-time: a push credential for the robot account, in the namespace holding the build
+oc create secret docker-registry quay-maas-push -n maas-fairness-poc \
+  --docker-server=quay.io --docker-username="$QUAY_USERNAME" --docker-password="$QUAY_TOKEN"
+
+SHA=$(git rev-parse --short HEAD)
+cat <<YAML | oc apply -n maas-fairness-poc -f -
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: maas-epp-quay-publish
+spec:
+  runPolicy: Serial
+  source:
+    binary: {}
+    type: Binary
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile.epp
+      buildArgs:
+        - {name: COMMIT_SHA, value: "$(git rev-parse HEAD)"}
+        - {name: BUILD_REF, value: "$SHA"}
+  output:
+    to: {kind: DockerImage, name: "quay.io/rh-ee-dsivan/maas-fair-share:$SHA"}
+    pushSecret: {name: quay-maas-push}
+YAML
+
+oc start-build maas-epp-quay-publish --from-dir=. -n maas-fairness-poc   # no --follow; poll instead
+# poll oc get build <name> -n maas-fairness-poc -o jsonpath='{.status.phase}' until Complete
+oc get build <name> -n maas-fairness-poc -o jsonpath='{.status.output.imageDigest}{"\n"}'
+```
+
+The pushed digest still needs the same `quay-maas-pull` secret on the consuming
+service account as above — this only replaces the build/push step, not the pull side.
+`maas-vllm-gpu-epp-sa` already carries it, so an image pushed this way to the same
+repository needs no further pull-secret work.
+
+Digest produced from `fc27130` and now referenced by `deploy/llmisvc.yaml` and
+`deploy/poc/09-vllm-gpu.yaml` (UNI-29, 2026-10-22):
+
+```
+quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135
+```
+
+This closes the drift described in the next section: `main`, checked out clean, now
+deploys an image built from its own `HEAD`, published somewhere a different cluster
+could also reach it from (subject to the private-repo pull-secret note above).
+
+### Interim in-cluster build used to verify UNI-53 — superseded by UNI-29's Quay publish
 
 The role that verified UNI-53 does not hold the quay.io push credential above, so the
 image used for that verification was **not** built or published through the steps
@@ -152,14 +209,20 @@ Digest produced from `d7e4d58` and used for UNI-53's live verification (2026-10-
 image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp@sha256:7849fa523ce98e1b01de6864650df86dac123d51264d4fd73e62dbfe27834e2e
 ```
 
-**`deploy/poc/09-vllm-gpu.yaml` and `deploy/llmisvc.yaml` do not reference this image,
-and applying them from `main` today does not deploy UNI-53.** Both are still pinned to
-`quay.io/rh-ee-dsivan/maas-fair-share:aef33a5`, 14 commits behind (`git rev-list --count
-aef33a5..d7e4d58`). Closing that gap needs someone holding the quay push credential to
-run "Rebuild and publish the EPP image" above and bump both manifests' `image:` field to
-the resulting digest.
+**`deploy/poc/09-vllm-gpu.yaml` and `deploy/llmisvc.yaml` did not reference this image,
+and applying them from `main` at the time did not deploy UNI-53.** They were pinned to
+`quay.io/rh-ee-dsivan/maas-fair-share:aef33a5`, which fell further behind with every
+commit that touched the EPP (14 commits as of UNI-53, 31 by the time UNI-29 caught it).
 
-Do **not** "fix" this by repointing those two manifests at the digest above instead:
+That gap is now closed, but not by publishing *this* digest — see "Publishing to Quay
+without a local podman" above. UNI-29 rebuilt from a later `HEAD` (`fc27130`, after
+UNI-75's EPP rebuild) and pushed *that* to Quay instead, since a current build is more
+useful to pin than this now-stale one. Both manifests reference the UNI-29 digest as of
+2026-10-22. If the EPP changes again, re-run that procedure and bump both manifests in
+the same commit — do not let the pin drift a third time.
+
+Do **not** "fix" a future drift like this by repointing those two manifests at an
+in-cluster-registry digest like the one above instead:
 that image is reachable only from inside this cluster, and this registry is known to
 time out from some nodes in this pool — the CPU-path EPP deployment
 (`maas-vllm-cpu-kserve-router-scheduler-*`, same internal registry, different tag) is

@@ -632,6 +632,62 @@ and for an SLA," above) while scraping
 `llm_d_epp_maas_fairness_contended_service_tokens_total` before and after via
 the `maas-epp-metrics-reader-token` secret.
 
+### The EPP image above was not transferable, and `main` didn't deploy it — now fixed
+
+The digest the three runs above used,
+`...@sha256:5ef5df2776364e6161f91e5a3df0fbed9a4751bde847658af51923b1eded7f40`, is an
+`image-registry.openshift-image-registry.svc:5000/...` reference: an in-cluster
+`ImageStreamTag`, produced by [UNI-75](/UNI/issues/UNI-75)'s rebuild. To be explicit about
+the question that matters for air-gap transfer: **this digest was never pushed to
+`quay.io/rh-ee-dsivan/maas-fair-share`.** It is exactly the same situation `docs/runbook.md`
+already documents for UNI-53's verification image — a real, correctly-built artifact that
+proves the plugin logic on this cluster, but one that "does not leave this cluster," is
+unmirrorable, and cannot be named by any `IDMS`/`ICSP` entry in a disconnected destination.
+
+Separately, and independent of that: `deploy/llmisvc.yaml` and `deploy/poc/09-vllm-gpu.yaml`
+on `main` were still pinned to `quay.io/rh-ee-dsivan/maas-fair-share:aef33a5`, a tag 31
+commits behind `HEAD` (`git rev-list --count aef33a5..fc27130`). A clean checkout of `main`,
+applied as documented, deployed neither the image the three runs above tested nor anything
+close to current `HEAD` — it deployed a 31-commit-old binary. The percentages above are real,
+but until this was fixed, nobody following this repository from a clean checkout could have
+reproduced the deployment that produced them.
+
+**Fixed in this same change.** The EPP plugin source, `go.mod`/`go.sum`, and `Dockerfile.epp`
+are unchanged between UNI-75's `e86c3ee` and current `HEAD` (`fc27130` — confirmed with
+`git log --oneline e86c3ee..HEAD -- pkg/ cmd/ Dockerfile.epp go.mod go.sum`, empty). So a
+rebuild from `HEAD` is the same plugin logic as what these three runs tested, not a different
+build. Rebuilt it (via an OpenShift `BuildConfig` with `output.to.kind: DockerImage` straight
+to Quay — no local `podman` was available in this session; see `docs/runbook.md`,
+"Publishing to Quay without a local podman") and pushed:
+
+```
+quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135
+```
+
+`deploy/llmisvc.yaml:104` and `deploy/poc/09-vllm-gpu.yaml:109` now pin this digest (not the
+`:aef33a5` tag). The repository is **private** (confirmed: an anonymous registry-token pull
+returns 401 even for the pre-existing `:aef33a5` tag), consistent with `docs/runbook.md`
+already requiring the `quay-maas-pull` secret linked to `maas-vllm-gpu-epp-sa` — that secret
+already covers `quay.io` cluster-wide, so no new pull-secret work was needed for this push.
+
+**Verified, with a caveat on scope.** A throwaway pod in `maas-fairness-poc`, using
+`maas-vllm-gpu-epp-sa` and no other configuration, pulled this exact digest and ran it; the
+binary's own startup log confirms `commit-sha: fc27130f0703b8228127a4040eb160567000bc27`,
+matching `HEAD` exactly. That proves the digest is genuinely pullable from outside the
+cluster's internal registry, by the same credential path the live deployment already uses.
+
+**What was not re-verified: the fairness split against this exact digest, live.** Rolling
+the change out to the actual `LLMInferenceService` (`oc apply` or `oc patch`, either one) is
+blocked right now by the same stale `MutatingWebhookConfiguration` described above in "The
+stale webhook that blocked all of this" — it currently rejects every create *and* update to
+any `LLMInferenceService` in the cluster, not something specific to this change, and deleting
+it is a cluster-scoped action outside what this role can even read
+(`mutatingwebhookconfigurations` is not namespace-scoped; `auth can-i` returns `no`). Since
+the plugin source is byte-for-byte unchanged from what Run 1–3 tested, there is no reason to
+expect a different split — but that is an inference from unchanged source, not a repeated
+measurement, and the next person who can clear that webhook should re-run at least the
+sized-worker enforce case against the now-committed digest to close that inference out.
+
 ## GPU test suite — four results
 
 All on 2x A100, Qwen2.5-7B, two replicas, real MaaS `sk-oai` auth, weights
@@ -1022,6 +1078,8 @@ Ordered by how much they would change a conclusion.
 | — | ~~Gateway header stripping (MaaS path, UNI-33)~~ | **Fixed and verified live.** The EPP's own header-alias resolution prefers client-settable `x-llm-d-inference-objective` over the gateway-authored `x-gateway-inference-objective`, so a client forging the former won outright regardless of what Authorino set for the latter -- proven live 2026-10-19 (a forged header passed through the gateway untouched, HTTP 200). The one-line patch to `maas-poc-gateway-authn` was applied live on 2026-10-19 once `patch` on `authpolicies.kuadrant.io` in `maas-fairness-poc` was granted, and the conformance check (`cmd/gateway-header-check`) now reports `OK` against the live cluster. Still dormant: zero `InferenceObjective` resources exist, so no behavioural queue-jump has been demonstrated, only the structural fix. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
 | — | ~~Gateway header stripping (direct rig, UNI-43)~~ | **Fixed and verified live.** The direct rig (`02-epp.yaml`/`03-gateway.yaml`) has no Authorino layer, so UNI-33's overwrite mechanism doesn't apply -- fixed instead by removing the header outright, via an Istio `EnvoyFilter` (`envoy.filters.http.header_mutation`, `INSERT_BEFORE` `envoy.filters.http.ext_proc`) scoped to `maas-poc-route` alone so it can't also strip the value UNI-33 set for the authenticated MaaS routes sharing the same Gateway. Applied and verified live 2026-10-19 once `create`/`update` on `envoyfilters.networking.istio.io` and `pods/exec` in `maas-fairness-poc` were granted: the live config dump confirmed `header_mutation` sits immediately before `ext_proc` in the chain, and the per-route override lands on exactly one route (`maas-fairness-poc.maas-poc-route.0`), not on the MaaS routes. `gateway-header-check` still reports this route as uncovered -- a known, documented limitation (it only recognises AuthPolicy-based coverage), not a sign the fix didn't take. Not verified: an end-to-end request proving a forged header doesn't reach the EPP/simulator, since both remain scaled to 0/0. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
 | — | ~~Reproduce the headline split on real vLLM, both modes (UNI-29)~~ | **Done.** Re-run 2026-10-22 against the live GPU deployment (now serving `llama-3-1-8b`, EPP image digest `sha256:5ef5df27...`): shadow 33.0/33.6/33.4%, enforce (sized workers) 16.2/13.7/70.1% against a 20/10/65 target. See "A4 (UNI-29): reproduced again, against the current EPP build, both modes," above, for the full data including a negative-control run and the sizing hypothesis for the ~5-point residual gap. `enforce` was restored to `true` (the live default) afterward | follow-up: tune worker sizing further to close the ~5-point gap (same section) |
+| — | ~~`main` didn't deploy the image these numbers came from~~ | **Done.** That digest was in-cluster-BuildConfig-only (never pushed to Quay, not transferable), and the committed manifests were separately 31 commits stale on top of that. Rebuilt from unchanged source at `HEAD`, pushed to `quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a7...`, and repinned both manifests to that digest. See "The EPP image above was not transferable, and `main` didn't deploy it — now fixed," above | — |
+| 1b | **Re-run the sized-worker enforce case against the now-committed Quay digest, live** | the digest above was verified to pull and run correctly (startup log confirms the commit SHA), and the plugin source is unchanged from what was tested, but the split itself was not re-measured against this exact artifact | the stale `MutatingWebhookConfiguration` on `LLMInferenceService` admission (see "The stale webhook that blocked all of this") — needs someone who can delete a cluster-scoped `MutatingWebhookConfiguration`, which this role cannot even read |
 
 ## Reproducing
 

@@ -828,6 +828,78 @@ when both tabs start cold — S3 and S5, which involve the much larger 65:20
 ratio, were closer. Worth re-running longer before treating the 20:10 pair as
 reliably exact.
 
+**Update ([UNI-28](/UNI/issues/UNI-28)): the duration hypothesis above is
+REFUTED.** See "A3 (UNI-28): S1 re-run at 600s — duration was not the cause,"
+below.
+
+### A3 (UNI-28): S1 re-run at 600s — duration was not the cause
+
+Re-ran S1 (`app1`/`app2` both HARD, `end-users` idle, 32 workers/tenant each
+— identical to the original) at **600s**, 10 half-lives instead of 2.5, to
+test the hypothesis above directly. Everything about the loadgen
+configuration (`TENANTS="app1 app2"`, `WORKERS=32`) was kept identical to the
+original S1 run; the only deliberate change was duration.
+
+**Result: 50.3% / 49.7% (app1/app2) — essentially an equal split, further
+from the 2:1 target than the original 150s run's 1.57:1, not closer.**
+
+| run | duration | app1 | app2 | ratio (app1:app2) | vs 2:1 target |
+|---|---|---|---|---|---|
+| original S1 (2026-10-18) | 150s | 59.9% | 38.3% | 1.57:1 | miss |
+| S1 re-run (2026-10-22) | 600s | 50.3% | 49.7% | 1.01:1 | bigger miss |
+
+Measured as deltas of `llm_d_epp_maas_fairness_contended_service_tokens_total`
+(app1 +6,432,286 / app2 +6,366,000) between before/after scrapes of the GPU
+EPP's `/metrics` via the `maas-epp-metrics-reader` token
+(`deploy/rbac.yaml`), same methodology as the UNI-29 section above. Standing
+health checks: `llm_d_epp_maas_fairness_unmatched_subscriptions_total` stayed
+at 0 throughout; no `flow_control_requests_evicted_total` or
+`*_requests_without_usage_total` series appeared (consistent with zero, same
+"trued up" reading as other runs). Client-side HTTP status: app1 4847/4917
+(98.6%) and app2 4853/4890 (99.2%) `200`, the rest `500` — in line with every
+other run in this document, not a confound.
+
+**The longer run makes the result worse, which rules out "not enough time to
+converge" as the explanation.** If 150s were simply too short relative to the
+60s half-life, more time should move the split *toward* 2:1, not *away* from
+it toward exactly even. Instead, 10 half-lives of runway landed almost
+exactly at the equal-split outcome this document already has a name for:
+**work conservation under under-sized demand** — the same mechanism identified
+one day earlier in "A4 (UNI-29) ... Run 2," on this exact live deployment.
+
+**What actually changed between the original S1 run and this one, and why
+that matters more than duration:** the original S1 (2026-10-18) ran against
+the Qwen2.5-7B backend. [UNI-75](/UNI/issues/UNI-75) rebuilt and redeployed
+the EPP (2026-10-21), and the live deployment now serves **llama-3-1-8b** —
+a different backend with a different latency profile under load. Per-run
+"HARD" worker counts (32/tenant) that kept both tenants backlogged enough to
+express the 20:10 weight ordering on the old backend are, per UNI-29's Run 2
+finding earlier in this document, **not automatically sufficient on the new
+one**: if 32 workers can't keep the higher-weight tenant's queue backlogged
+against this backend's actual response latency, its queue partially drains,
+work conservation kicks in, and the delivered split compresses toward equal
+thirds regardless of configured weight — more so the longer the run gives
+that draining process to operate, which is exactly the direction this result
+moved.
+
+**This ticket's done-when criterion is satisfied by the negative result,
+properly explained, not by tuning workers until the number looks right**
+(explicitly out of scope per the ticket). The original hypothesis (duration)
+is now evidenced-false. The real lever is worker sizing relative to the
+*current* backend's latency — already flagged as follow-up work in the UNI-29
+section above ("tune worker sizing further to close the ~5-point residual
+gap") — and re-sizing the 20:10 pair specifically for llama-3-1-8b is natural
+follow-up work, not part of this ticket's scope.
+
+Reproduce: `TENANTS="app1 app2" DURATION=600 WORKERS=32` against
+`deploy/poc/04-loadgen.yaml`'s script/ConfigMap (`maas-loadgen`), scraping
+`llm_d_epp_maas_fairness_contended_service_tokens_total` before and after via
+the `maas-epp-metrics-reader-token` secret, same as the UNI-29 reproduction
+steps above. The MaaS loadgen subscription keys (`maas-loadgen-keys`) expire
+7 days after minting (`docs/runbook.md`, "Mint a MaaS API key") — check they
+are still valid before a run; this run's keys had expired within the hour and
+had to be re-minted first.
+
 ## Open-loop (Poisson) load generation (UNI-34) — the clamp finding, revisited
 
 Every result above is closed-loop: a fixed worker pool per tenant, each worker
@@ -1066,7 +1138,7 @@ Ordered by how much they would change a conclusion.
 | 4 | **Durable NFD fix** | GPU exposure currently depends on a hand-applied `feature.node.kubernetes.io/pci-10de.present` label per node. Set `deviceLabelFields: [vendor]` on the NodeFeatureDiscovery CR or **every new GPU node will look like broken hardware** | operator-level approval |
 | 5 | **Test on a real RHOAI 3.4 cluster** | three unknowns remain: whether 3.4's controller validates the EndpointPickerConfig, its InferencePool API group, and its tokenizer sidecar (3.5 has no equivalent). The 3.4-shaped preset test covered the flags, not the controller | a 3.4 cluster |
 | — | ~~Fix `contended_service_tokens_total`~~ | **Fixed.** The gate decision (is the band contended) is now made once, at dispatch, and reused at completion instead of being re-checked independently at each of the two charge sites. The metric also now books the real, measured cost once at completion rather than the dispatch estimate plus a separately-gated correction, so an estimator overshoot no longer gets silently dropped (a Prometheus counter cannot move backwards on a negative delta). `TestContendedServiceTokensEqualChargedCost`, `TestContendedServiceTokensEqualChargedCostOnOverestimate`, and `TestAbortedRequestStillBooksContendedService` cover under-estimate, over-estimate, and abort respectively | — |
-| 7 | **Re-run S1 longer** | 1.57:1 against a 2:1 target was the only proportionality miss; likely 150s being short against a 60s half-life with cold tabs | 10 minutes |
+| — | ~~Re-run S1 longer~~ | **Done, negative result.** Re-ran at 600s (10 half-lives, vs the original 150s): the split moved to 50.3/49.7%, *further* from 2:1 than the original 1.57:1, which refutes the duration hypothesis — see "A3 (UNI-28): S1 re-run at 600s," above. Root cause is the same worker-sizing-vs-backend-latency mechanism UNI-29's Run 2 identified on this same current (llama-3-1-8b) deployment, not warm-up time | follow-up: re-size the 20:10 pair's workers for the current backend (same owner as the UNI-29 residual-gap follow-up) |
 | 8 | **`maas-default-gateway` inference path** | returns 500: `maas-api-route` targets a TLS service port with no `BackendTLSPolicy`, and that CRD is not installed. API keys currently require port-forwarding to maas-api | upstream/MaaS |
 | — | ~~Sustained load through the LLMInferenceService path and the Route (UNI-27)~~ | **Done for status tally and fairness.** 240s closed-loop runs (32 workers/tenant, `app1`/`app2`/`end-users`) against both the in-cluster gateway Service and the public Route landed 94.7% and 97.9% HTTP 200 respectively. `normalized_service` converged to within ~7% across the three backlogged groups on both paths, confirmed at multiple flight-recorder ticks through each run. On the non-200s: the Route path's are directly traced via the gateway access log to a ~2s connection/endpoint-pool warm-up burst at request-storm start (zero thereafter), not a sustained-load or fairness defect. The LLMInferenceService path's (5.3% error rate) are **inferred to be the same mechanism by analogy, not log-verified** — this cluster has no log aggregation and the gateway's own access-log buffer had already rotated past the run window by the time it was checked. Script: `deploy/poc/12-loadgen-route.sh` (Route path); `deploy/poc/04-loadgen.yaml` unchanged (LLMInferenceService path). Does **not** cover the 600s timeout / `buffer-response: false` annotations — see item 15 | N/A -- closed for status tally + fairness scope |
 | — | ~~Open-loop load generation (UNI-34)~~ | **Done, and the clamp finding flips.** `deploy/poc/13-loadgen-poisson.{py,sh}` adds open-loop Poisson arrivals. Below saturation the clamp fires on ~65% of dispatches (vs 0.2–2.2% closed-loop) but is harmless (pool uncontended). Above saturation (24 req/s aggregate vs a measured ~20-22 req/s pool ceiling) it measurably **inverts** the 20/10/65 split: end-users (w=65) delivered 25.5%, app1 (w=20) delivered 40.4%. This **contradicts** the GPU closed-loop "clamp is inert" finding (`## 3`) and confirms the SUPERSEDED section's concern more strongly than originally observed. See "Open-loop (Poisson) load generation (UNI-34)" above for the full data, including what was not tested (no clamp on/off A/B — see that section for why) | **newcomerClamp default should be revisited** — a policy decision, same owner as item 2 |

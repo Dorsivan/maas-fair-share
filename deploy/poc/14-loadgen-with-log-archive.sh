@@ -62,7 +62,7 @@ import sys, re
 path, var, val = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(path).read()
 pattern = re.compile(
-    r'(- name: ' + re.escape(var) + r'\n\s*value: ")[^"]*(")'
+    r'(- name: ' + re.escape(var) + r'\n(?:\s*#[^\n]*\n)*\s*value: ")[^"]*(")'
 )
 new_text, n = pattern.subn(lambda m: m.group(1) + val + m.group(2), text, count=1)
 if n == 0:

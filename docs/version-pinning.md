@@ -38,7 +38,7 @@ interface. `pkg/epp/framework/interface/plugin/stability.go` defines
 
 `cmd/epp/runner/runner.go` is upstream's single source of truth for in-tree plugin
 stability. **We** register `maas-weighted-fairness` at `StabilityBeta`
-(`cmd/epp/main.go`, in `main`) because `ValidatePluginStability` rejects Alpha plugins unless
+(`cmd/epp/main.go`, in `run`) because `ValidatePluginStability` rejects Alpha plugins unless
 `--allow-experimental-plugins` is passed, and the RHOAI KServe scheduler preset does not
 pass it.
 
@@ -234,8 +234,8 @@ these uses.
 | `StateDumper` | `plugins.go:67` | implement | `plugin.go` — `DumpState` |
 | `TypedName` | `typedname.go:24` | consume | `plugin.go` — `TypedName` |
 | `Handle` | `handle.go:28` | consume | factory |
-| `Register` | `registry.go:52` | consume | `cmd/epp/main.go` — `main` |
-| `StabilityBeta` | `stability.go:26` | consume | `cmd/epp/main.go` — `main` |
+| `Register` | `registry.go:52` | consume | `cmd/epp/main.go` — `run` |
+| `StabilityBeta` | `stability.go:26` | consume | `cmd/epp/main.go` — `run` |
 | `StrictDecoder` | `registry.go:42` | consume | factory |
 | `NewDataKey` | `datakey.go:29` | consume | `plugin.go` — package-level data keys |
 
@@ -257,7 +257,7 @@ behind them at all. Treat any change here as expected rather than exceptional.
 
 | Symbol | Upstream file | Side | Used at |
 |---|---|---|---|
-| `runner.NewRunner` | `cmd/epp/runner/runner.go:168` | consume | `cmd/epp/main.go` — `main` |
+| `runner.NewRunner` | `cmd/epp/runner/runner.go:168` | consume | `cmd/epp/main.go` — `run` |
 | `metricsutil.HelpMsgWithStability` | `pkg/common/observability/metrics/metrics.go:32` | consume | `metrics.go` — `help` |
 | `metricsutil.BoundFairnessID` | `pkg/common/observability/metrics/cardinality.go:124` | consume | `metrics.go` — `boundID` |
 | `eppmetrics.LLMDRouterEndpointPickerSubsystem` | `pkg/epp/metrics/llm_d_router_metrics.go:28` | consume | `metrics.go` — all 12 collectors |

@@ -953,6 +953,18 @@ defaults to `true` (TokenReview/SubjectAccessReview). Required:
 Resist `--metrics-endpoint-auth=false` — it makes per-tenant token consumption readable
 by anything that can reach the pod IP.
 
+### No log retention yet — the load harness captures its own (UNI-46)
+
+This cluster has no log aggregation or retention window, so a flight-recorder line
+(above) that scrolled off the pod's own buffer before anyone looked is gone — there is
+nothing else holding it. Until a retention window exists, `deploy/poc/13-loadgen-poisson.sh`
+closes that gap per-run rather than per-cluster: it follows the GPU EPP container's log
+for exactly the run's duration into the same output directory as its metrics snapshots,
+and records the byte count and any mid-run restart in a manifest next to it. See
+docs/runbook.md "Per-run EPP log capture" for the mechanics. This is a stopgap scoped to
+measured load-test runs, not a substitute for real retention (Loki, per "Then:" above) —
+it captures nothing about traffic outside a harness invocation.
+
 ### Live state via `StateDumper`
 
 ```json

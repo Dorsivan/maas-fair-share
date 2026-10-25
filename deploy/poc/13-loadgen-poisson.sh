@@ -19,6 +19,17 @@
 #
 # Overrides: GW, MODELPATH, DURATION, RATE_APP1, RATE_APP2, RATE_END_USERS,
 # SEED, OUT, NAMESPACE.
+#
+# EPP container log (UNI-46): for the duration of the run, the GPU EPP
+# container log is followed into $OUT/epp-container.log, bounded to start
+# when the generator starts and stop when it exits -- this POC cluster has no
+# log retention (docs/design.md "Production observability"), so a run that
+# doesn't capture its own evidence loses it the moment the pod recycles.
+# $OUT/epp-container-log-manifest.txt records the byte count and whether the
+# pod/container restarted mid-capture, so a truncated or oversized log is
+# visible instead of silently trusted. Override EPP_POD_LABEL_SELECTOR /
+# EPP_CONTAINER for a different target, or set CAPTURE_EPP_LOG=0 to disable
+# (e.g. a CPU-path or simulator run, which is out of this harness's scope).
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -33,12 +44,24 @@ OUT="${OUT:-/tmp/poisson-codes-$(date +%s)}"
 MAX_WORKERS="${MAX_WORKERS:-1000}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-100}"
 EPP_METRICS_SVC_IP="${EPP_METRICS_SVC_IP:-}"
+CAPTURE_EPP_LOG="${CAPTURE_EPP_LOG:-1}"
+EPP_POD_LABEL_SELECTOR="${EPP_POD_LABEL_SELECTOR:-app.kubernetes.io/name=maas-vllm-gpu,app.kubernetes.io/component=llminferenceservice-router-scheduler}"
+EPP_CONTAINER="${EPP_CONTAINER:-main}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OC="oc --token=${OPENSHIFT_TOKEN:?set OPENSHIFT_TOKEN} --server=${OPENSHIFT_SERVER:-https://api.ocp.paladinaura.com:6443}"
 
+EPP_LOG_PID=""
+cleanup() {
+  rm -rf "$KEYS"
+  if [ -n "$EPP_LOG_PID" ] && kill -0 "$EPP_LOG_PID" 2>/dev/null; then
+    kill "$EPP_LOG_PID" 2>/dev/null || true
+    wait "$EPP_LOG_PID" 2>/dev/null || true
+  fi
+}
+
 KEYS="$(mktemp -d)"
-trap 'rm -rf "$KEYS"' EXIT
+trap cleanup EXIT
 for k in app1-production app2-batch end-user-alpha end-user-beta; do
   $OC get secret maas-loadgen-keys -n "$NAMESPACE" -o jsonpath="{.data.$k}" | base64 -d > "$KEYS/$k"
 done
@@ -56,17 +79,121 @@ snapshot_metrics() {
     | grep '^llm_d_epp_maas_fairness_' | grep -v '^#'
 }
 
+EPP_LOG_FILE="$OUT/epp-container.log"
+EPP_LOG_MANIFEST="$OUT/epp-container-log-manifest.txt"
+EPP_POD=""
+EPP_POD_UID=""
+EPP_POD_RESTARTS_BEFORE=""
+EPP_LOG_START_TIME=""
+
+# Starts `oc logs -f` on the GPU EPP container in the background, writing
+# straight to $OUT. Must run after `mkdir -p "$OUT"`.
+start_epp_log_capture() {
+  if [ "$CAPTURE_EPP_LOG" != "1" ]; then
+    echo "=== EPP log capture disabled (CAPTURE_EPP_LOG=$CAPTURE_EPP_LOG) ==="
+    return
+  fi
+  EPP_POD="$($OC get pods -n "$NAMESPACE" -l "$EPP_POD_LABEL_SELECTOR" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [ -z "$EPP_POD" ]; then
+    echo "WARNING: no pod matched selector '$EPP_POD_LABEL_SELECTOR' in $NAMESPACE -- EPP log capture skipped" \
+      | tee "$EPP_LOG_MANIFEST" >&2
+    CAPTURE_EPP_LOG=0
+    return
+  fi
+  EPP_POD_UID="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}')"
+  EPP_POD_RESTARTS_BEFORE="$($OC get pod "$EPP_POD" -n "$NAMESPACE" \
+    -o jsonpath="{.status.containerStatuses[?(@.name==\"$EPP_CONTAINER\")].restartCount}")"
+  EPP_LOG_START_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "=== capturing EPP container log: pod=$EPP_POD container=$EPP_CONTAINER -> $EPP_LOG_FILE ==="
+  : > "$EPP_LOG_FILE"
+  $OC logs -f "$EPP_POD" -c "$EPP_CONTAINER" -n "$NAMESPACE" --timestamps >>"$EPP_LOG_FILE" 2>&1 &
+  EPP_LOG_PID=$!
+}
+
+# Stops the follow, detects a mid-run restart, recovers what it can of a
+# crashed or replaced instance's log, and writes the byte-count manifest.
+stop_epp_log_capture() {
+  [ "$CAPTURE_EPP_LOG" = "1" ] || return
+  [ -n "$EPP_POD" ] || return
+  local end_time follow_died_early uid_after restarts_after restarted reason
+  end_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  follow_died_early=0
+  if [ -n "$EPP_LOG_PID" ] && kill -0 "$EPP_LOG_PID" 2>/dev/null; then
+    kill "$EPP_LOG_PID" 2>/dev/null || true
+    wait "$EPP_LOG_PID" 2>/dev/null || true
+  else
+    follow_died_early=1   # the stream ended on its own -- almost always a restart
+  fi
+  EPP_LOG_PID=""
+
+  uid_after="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+  restarts_after="$($OC get pod "$EPP_POD" -n "$NAMESPACE" \
+    -o jsonpath="{.status.containerStatuses[?(@.name==\"$EPP_CONTAINER\")].restartCount}" 2>/dev/null || true)"
+
+  restarted="no"
+  if [ "$follow_died_early" = "1" ] || [ "$uid_after" != "$EPP_POD_UID" ] \
+     || [ "${restarts_after:-0}" != "${EPP_POD_RESTARTS_BEFORE:-0}" ]; then
+    restarted="yes"
+    {
+      echo "### RUN-HARNESS NOTICE: EPP pod/container restarted during the capture window ($EPP_LOG_START_TIME .. $end_time)."
+      echo "### before: pod=$EPP_POD uid=$EPP_POD_UID restartCount=${EPP_POD_RESTARTS_BEFORE:-0}"
+      echo "### after:  pod=$EPP_POD uid=${uid_after:-<gone>} restartCount=${restarts_after:-unknown}"
+      echo "### log lines emitted around the restart may be missing from the stream above -- recovery attempt follows."
+    } >>"$EPP_LOG_FILE"
+
+    if [ "$uid_after" = "$EPP_POD_UID" ] && [ -n "${restarts_after:-}" ] \
+       && [ "$restarts_after" -gt "${EPP_POD_RESTARTS_BEFORE:-0}" ] 2>/dev/null; then
+      echo "### same pod, container restarted -- appending the crashed instance's log via --previous:" >>"$EPP_LOG_FILE"
+      $OC logs "$EPP_POD" -c "$EPP_CONTAINER" -n "$NAMESPACE" --previous --timestamps >>"$EPP_LOG_FILE" 2>&1 \
+        || echo "### --previous log unavailable (already evicted)" >>"$EPP_LOG_FILE"
+    elif [ -n "$uid_after" ] && [ "$uid_after" != "$EPP_POD_UID" ]; then
+      echo "### pod was recreated (new pod uid) -- appending a tail from the replacement so recent context isn't silently lost:" >>"$EPP_LOG_FILE"
+      $OC logs "$EPP_POD" -c "$EPP_CONTAINER" -n "$NAMESPACE" --timestamps --tail=1000 >>"$EPP_LOG_FILE" 2>&1 \
+        || echo "### replacement pod log unavailable" >>"$EPP_LOG_FILE"
+    else
+      echo "### pod is gone -- no replacement found to recover a tail from." >>"$EPP_LOG_FILE"
+    fi
+  fi
+
+  local bytes
+  bytes="$(wc -c <"$EPP_LOG_FILE" | tr -d ' ')"
+  {
+    echo "pod: $EPP_POD"
+    echo "container: $EPP_CONTAINER"
+    echo "namespace: $NAMESPACE"
+    echo "capture_start: $EPP_LOG_START_TIME"
+    echo "capture_end: $end_time"
+    echo "pod_restarted_during_run: $restarted"
+    echo "bytes_captured: $bytes"
+    echo "file: $(basename "$EPP_LOG_FILE")"
+  } | tee "$EPP_LOG_MANIFEST"
+}
+
 echo "=== metrics snapshot: before ==="
 BEFORE="$(snapshot_metrics)"
 echo "$BEFORE"
 
 mkdir -p "$OUT"
+start_epp_log_capture
+
+set +e
 python3 "$SCRIPT_DIR/13-loadgen-poisson.py" \
   --gw "$GW" --modelpath "$MODELPATH" --duration "$DURATION" \
   --rate-app1 "$RATE_APP1" --rate-app2 "$RATE_APP2" --rate-end-users "$RATE_END_USERS" \
   --key-app1 "$KEYS/app1-production" --key-app2 "$KEYS/app2-batch" \
   --key-end-alpha "$KEYS/end-user-alpha" --key-end-beta "$KEYS/end-user-beta" \
   --out "$OUT" --seed "$SEED" --max-workers "$MAX_WORKERS" --drain-timeout "$DRAIN_TIMEOUT"
+GEN_STATUS=$?
+set -e
+
+echo "=== EPP log capture summary ==="
+stop_epp_log_capture
+
+if [ "$GEN_STATUS" -ne 0 ]; then
+  echo "load generator exited $GEN_STATUS -- EPP log above still reflects the attempted run" >&2
+  exit "$GEN_STATUS"
+fi
 
 echo "=== metrics snapshot: after ==="
 AFTER="$(snapshot_metrics)"

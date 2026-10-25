@@ -518,6 +518,52 @@ turn on; see "Turn on the V(4) per-request tier" below before assuming it is ava
 
 If the pod has since restarted, that log is gone -- this POC cluster has no log
 aggregation or retention window (see docs/design.md "Production observability").
+**`deploy/poc/13-loadgen-poisson.sh` captures this container's log itself now**
+(UNI-46) — see "Per-run EPP log capture" below — so a load-test run no longer
+depends on the pod surviving until someone thinks to look.
+
+---
+
+## Per-run EPP log capture (UNI-46)
+
+There is still no log retention on this cluster (docs/design.md "Production
+observability"), so `deploy/poc/13-loadgen-poisson.sh` captures the GPU EPP
+container's own log for the duration of each run instead of depending on one.
+No extra flags needed — it is on by default:
+
+```sh
+OPENSHIFT_TOKEN=... DURATION=90 RATE_APP1=8 RATE_APP2=8 RATE_END_USERS=8 \
+  SEED=104 OUT=/tmp/run-above MAX_WORKERS=3000 DRAIN_TIMEOUT=180 \
+  ./deploy/poc/13-loadgen-poisson.sh
+```
+
+produces, alongside the existing `metrics-before.txt` / `metrics-after.txt` / `delta.txt`:
+
+- `$OUT/epp-container.log` — `oc logs -f` on
+  `maas-vllm-gpu-kserve-router-scheduler`'s `main` container, started right
+  before the generator and stopped right after it exits (including on a
+  generator failure — the log is stopped and the manifest below is still
+  written before the script re-raises the exit code).
+- `$OUT/epp-container-log-manifest.txt` — pod name, container, capture
+  start/end timestamps, **byte count**, and `pod_restarted_during_run:
+  yes|no`. Check the byte count before assuming the file is complete; a
+  multi-GB log for a short run is a sign the pod is unusually chatty
+  (`-v` level, a crash loop, or a different workload sharing the pod), not
+  something this harness tries to cap.
+- If the pod or container restarts mid-run, `epp-container.log` gets an
+  inline `### RUN-HARNESS NOTICE` block instead of silently truncating: it
+  records the before/after pod UID and restart count, then appends what it
+  can recover — `oc logs --previous` for a same-pod container restart, or a
+  1000-line tail from the replacement pod if the pod itself was recreated.
+  Either way, `pod_restarted_during_run: yes` in the manifest is the signal
+  to treat the log as possibly incomplete around that point, not the log's
+  absence.
+
+Override `EPP_POD_LABEL_SELECTOR` / `EPP_CONTAINER` to point at a different
+pod, or set `CAPTURE_EPP_LOG=0` to disable (e.g. a CPU-path or simulator run —
+both out of this harness's GPU-only scope). A run where no pod matches the
+selector logs a warning and continues without a log artifact rather than
+failing the whole run.
 
 ---
 

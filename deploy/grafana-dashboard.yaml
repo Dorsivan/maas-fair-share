@@ -1,0 +1,460 @@
+# Grafana dashboard for the GPU EPP (maas-vllm-gpu-kserve-router-scheduler),
+# scoped to job="maas-vllm-gpu-epp-service" per the board's 2026-10-19 GPU-only
+# direction (same scoping as deploy/prometheusrule.yaml). The CPU-served EPP
+# (job="maas-vllm-cpu-epp-service") is out of scope and never selected below.
+#
+# TARGET CONFIRMED, NOT ASSUMED: this cluster runs a single standalone Grafana
+# 11.6.0 (namespace `grafana`, Deployment `grafana`, image
+# docker.io/grafana/grafana:11.6.0 -- image floats by tag upstream, out of
+# this repo's control to pin) with exactly one Prometheus-type datasource,
+# named "Prometheus", provisioned from that namespace's own
+# `grafana-datasources` ConfigMap:
+#     url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+# i.e. the same UWM Thanos Querier every other observability asset in this
+# repo (deploy/prometheusrule.yaml, UNI-30/UNI-49) already reads from. Panels
+# below use a `datasource` template variable (type: datasource, query:
+# prometheus) rather than a hardcoded UID, so the dashboard resolves against
+# whatever single Prometheus-type datasource is present/default -- portable
+# across a cluster where that datasource's auto-generated UID differs.
+#
+# METRIC NAME CHOICE: this namespace's EPP Service is scraped by two of
+# KServe's auto-created ServiceMonitors (`kserve-llm-isvc-scheduler` and
+# `-default`; see UNI-30), which land the same twelve series under two
+# different name prefixes -- `llm_d_epp_maas_fairness_*` and
+# `kserve_llm_d_epp_maas_fairness_*`, both carrying identical values (UNI-49
+# confirmed live, 2026-10-25). Every query below uses the unprefixed
+# `llm_d_epp_maas_fairness_*` family, matching the convention
+# deploy/prometheusrule.yaml already established, so the repo's observability
+# assets do not disagree with each other over which of two duplicate series
+# is "the" metric.
+#
+# KNOWN GAP -- this ConfigMap does not auto-load into the live Grafana.
+# `oc get deployment grafana -n grafana -o yaml` shows the dashboards volume
+# is a single ConfigMap named exactly `kueue-dashboard` in the `grafana`
+# namespace (`optional: true`; that ConfigMap does not currently exist, so
+# the live instance loads zero file-provisioned dashboards right now) -- not
+# a label-selector sidecar that would pick up a ConfigMap from any
+# namespace. The Engineer role has edit access to `maas-fairness-poc` only
+# (openshift-conventions skill), not to the `grafana` namespace, so applying
+# this manifest here is the portable, air-gap-transferable artifact the
+# ticket asks for, but a human with write access to the `grafana` namespace
+# still has to either (a) copy this JSON into a ConfigMap literally named
+# `kueue-dashboard` there, or (b) patch the `grafana` Deployment to mount an
+# additional volume from this ConfigMap -- cross-namespace ConfigMap volume
+# mounts are not supported by Kubernetes, so some copy/sync step is
+# unavoidable either way. Verified instead, for this ticket's done-when bar,
+# by importing this exact JSON into the live instance via
+# `POST /api/dashboards/db` and querying its panels through Grafana's own
+# `/api/ds/query` pipeline (not a raw Thanos query) -- see the UNI-50 ticket
+# comment for the pasted queries, real output, and scrape timestamps.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-fairness-dashboard
+  namespace: maas-fairness-poc
+  labels:
+    app.kubernetes.io/name: maas-fairness-dashboard
+    # Conventional grafana-sidecar discovery label. Harmless here (this
+    # Grafana runs no such sidecar -- see "KNOWN GAP" above) and is what a
+    # cluster running the usual kube-prometheus-stack/grafana-operator
+    # sidecar would need to pick this ConfigMap up automatically, so it
+    # costs nothing to carry for a less constrained destination.
+    grafana_dashboard: "1"
+data:
+  maas-fairness-gpu-epp.json: |
+    {
+      "title": "MaaS Fairness - GPU EPP (maas-vllm-gpu-kserve-router-scheduler)",
+      "uid": "maas-fairness-gpu-epp",
+      "tags": [
+        "maas-fairness",
+        "gpu",
+        "epp"
+      ],
+      "timezone": "utc",
+      "schemaVersion": 39,
+      "version": 1,
+      "editable": true,
+      "refresh": "30s",
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "label": "Datasource",
+            "query": "prometheus",
+            "current": {},
+            "hide": 0,
+            "refresh": 1
+          }
+        ]
+      },
+      "panels": [
+        {
+          "id": 1,
+          "type": "table",
+          "title": "Expected vs observed delivered share per group (GPU EPP, selected time range)",
+          "description": "Expected % is computed live from llm_d_epp_maas_fairness_configured_weight (the ConfigMap's weight, echoed as a metric) so this panel never needs a human to remember deploy/poc/00-config.yaml. Observed % is each group's share of llm_d_epp_maas_fairness_contended_service_tokens_total delivered over the selected time range -- the SLI this POC's design doc defines as the real measure of delivered share (only counted while a group was actually contending, per docs/design.md). A group with no contention in this window shows no row, not a 0 -- it was not competing for anything.",
+          "gridPos": {
+            "h": 10,
+            "w": 24,
+            "x": 0,
+            "y": 0
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "format": "table",
+              "instant": true,
+              "expr": "100 * llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"} / scalar(sum(llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}))",
+              "legendFormat": "__auto"
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "format": "table",
+              "instant": true,
+              "expr": "100 * sum by (fairness_id) (increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])) / scalar(sum(increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])))",
+              "legendFormat": "__auto"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "joinByField",
+              "options": {
+                "byField": "fairness_id",
+                "mode": "outer"
+              }
+            },
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time 1": true,
+                  "Time 2": true
+                },
+                "indexByName": {},
+                "renameByName": {
+                  "fairness_id": "Group",
+                  "Value #A": "Expected %",
+                  "Value #B": "Observed %"
+                }
+              }
+            },
+            {
+              "id": "calculateField",
+              "options": {
+                "mode": "binary",
+                "binary": {
+                  "left": "Expected %",
+                  "operator": "-",
+                  "right": "Observed %"
+                },
+                "alias": "Gap (expected - observed, pts)",
+                "replaceFields": false
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "decimals": 1,
+              "custom": {
+                "align": "auto",
+                "cellOptions": {
+                  "type": "auto"
+                }
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "Expected %|Observed %"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "percent"
+                  },
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "gauge",
+                      "mode": "gradient"
+                    }
+                  },
+                  {
+                    "id": "min",
+                    "value": 0
+                  },
+                  {
+                    "id": "max",
+                    "value": 100
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Gap (expected - observed, pts)"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "none"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": 2,
+          "type": "timeseries",
+          "title": "normalized_service convergence across backlogged groups",
+          "description": "attainedService/weight per group (docs/design.md). Equal across every group that is actually backlogged means the weighted-fairness policy has converged; a persistent outlier is being starved or is monopolizing. A flat, unmoving line is a group the Pick loop has not touched recently (this gauge only updates lazily, on dispatch) -- not evidence of a leak by itself.",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 10
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "llm_d_epp_maas_fairness_normalized_service{job=\"maas-vllm-gpu-epp-service\"}",
+              "legendFormat": "{{fairness_id}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none"
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 3,
+          "type": "gauge",
+          "title": "prompt_tokens_cached_ratio per group",
+          "description": "Cumulative cached prompt tokens / total prompt tokens, per group -- the headline shadow-mode reading for whether cachedInputTokenWeight is a real lever. A flat zero across every group means --enable-prompt-tokens-details is missing from the vLLM flags, not that the cache is cold (docs/design.md).",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 10
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "llm_d_epp_maas_fairness_prompt_tokens_cached_ratio{job=\"maas-vllm-gpu-epp-service\"}",
+              "legendFormat": "{{fairness_id}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "requests_without_usage_total (regression detector -- expect flat zero)",
+          "description": "Completed requests whose response carried no usage block, per group, over the selected range. With --enable-force-include-usage set on every model server this must be flat zero; non-zero means a server shipped without the flag and that group's tab is an estimate, not a measurement (docs/design.md -- 'Alert on > 0').",
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 0,
+            "y": 18
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (increase(llm_d_epp_maas_fairness_requests_without_usage_total{job=\"maas-vllm-gpu-epp-service\"}[$__range]))",
+              "legendFormat": "{{fairness_id}}",
+              "instant": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            },
+            "textMode": "value_and_name"
+          }
+        },
+        {
+          "id": 5,
+          "type": "stat",
+          "title": "unmatched_subscriptions_total (expect flat zero)",
+          "description": "Requests whose subscription ID matched no configured group and fell through to the catch-all. Deliberately unlabelled by subscription value (cardinality guard, docs/design.md) -- a nonzero count means a typo or stale mapping in the ConfigMap's groups[].match, and the offending values are in the rate-limited log line and the state dump, not here.",
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 8,
+            "y": 18
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "increase(llm_d_epp_maas_fairness_unmatched_subscriptions_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])",
+              "instant": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            },
+            "textMode": "value"
+          }
+        },
+        {
+          "id": 6,
+          "type": "stat",
+          "title": "Enforcement status (GPU EPP)",
+          "description": "llm_d_epp_maas_fairness_enforcing: 1 when the weighted-fairness policy's pick is actually honoured, 0 when the plugin is only accounting in shadow mode and FCFS is deciding dispatch order. Read this before trusting the headline panel above -- in shadow mode, 'observed' share is not expected to track 'expected' share at all.",
+          "gridPos": {
+            "h": 6,
+            "w": 8,
+            "x": 16,
+            "y": 18
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "llm_d_epp_maas_fairness_enforcing{job=\"maas-vllm-gpu-epp-service\"}",
+              "instant": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "SHADOW MODE",
+                      "color": "blue"
+                    },
+                    "1": {
+                      "text": "ENFORCING",
+                      "color": "green"
+                    }
+                  }
+                }
+              ]
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            },
+            "textMode": "value"
+          }
+        }
+      ]
+    }

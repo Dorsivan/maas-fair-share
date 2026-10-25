@@ -1,0 +1,243 @@
+# The five alerts docs/design.md "Production observability" > "Alerts" specifies,
+# scoped to the GPU LLMInferenceService path only (maas-vllm-gpu-kserve and its
+# EPP maas-vllm-gpu-kserve-router-scheduler) per the board's 2026-10-19 GPU-only
+# direction. The CPU-served EPP (job="maas-vllm-cpu-epp-service") is out of
+# scope and deliberately excluded from every selector below.
+#
+# All five rules query metric names and label sets confirmed live against this
+# cluster's Thanos Querier on 2026-10-25 (see UNI-49 ticket comment for the
+# exact queries and output). None of the thresholds below are guessed without
+# a load-bearing reason; each alert's annotations explain the number next to
+# the condition it backs. Two implementation notes that shaped more than one
+# rule:
+#
+#   - `normalized_service` is a *lazily* decayed gauge: its value only changes
+#     when the plugin next touches that fairness_id (Pick/dispatch). Confirmed
+#     empirically: it sat bit-for-bit constant for a full hour of zero traffic
+#     on this cluster. So "is it currently > 0" can never distinguish a stuck
+#     leak from a perfectly healthy group that simply hasn't been touched in a
+#     while -- any alert built on this metric has to test for a *forbidden
+#     transition* (a change that is not supposed to be possible), never for a
+#     raw level, or it free-fires on every idle period.
+#   - All five rules select job="maas-vllm-gpu-epp-service", the stable label
+#     KServe's auto-created ServiceMonitor attaches to this EPP's Service. It
+#     survives pod rollouts (unlike matching on the pod name suffix) and is
+#     already scoped to the GPU EPP specifically.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: maas-fairness-alerts
+  namespace: maas-fairness-poc
+  labels:
+    app.kubernetes.io/name: maas-fairness-alerts
+spec:
+  groups:
+    - name: maas-fairness-poc.rules
+      rules:
+        # design.md: "spread of normalized_service across groups with
+        # increasing contended_seconds exceeds a threshold for 10 min while
+        # saturation >= 1."
+        #
+        # normalized_service is already attainedService/weight, so a converged
+        # policy makes it equal across every backlogged group regardless of
+        # their weight (metrics.go: "Equal across backlogged groups means the
+        # policy is converged") -- a *ratio* is therefore the right form, not
+        # an absolute gap, since it stays meaningful no matter the configured
+        # weights or the traffic volume. Live baseline on this cluster right
+        # now (idle, two groups with weights 20 and 10): max/min = 657467 /
+        # 630666 = 1.04 -- comfortably converged. 1.5x gives ~44% headroom
+        # above that healthy baseline before firing, which is still a clear,
+        # visible unfairness (one group getting 50% more of its fair share
+        # than another) rather than noise.  `unclassified` is excluded: it is
+        # the catch-all bucket, not a configured tenant, and its own breakage
+        # is covered by MaasFairnessClassificationBroken below.
+        # `for: 10m` and `saturation >= 1` are both taken directly from
+        # design.md's own wording for this alert.
+        - alert: MaasFairnessNotConverging
+          expr: |
+            (
+              max(llm_d_epp_maas_fairness_normalized_service{job="maas-vllm-gpu-epp-service", fairness_id!="unclassified"})
+              /
+              min(llm_d_epp_maas_fairness_normalized_service{job="maas-vllm-gpu-epp-service", fairness_id!="unclassified"} > 0)
+            ) > 1.5
+            and
+            llm_d_epp_flow_control_pool_saturation{job="maas-vllm-gpu-epp-service", stage="effective"} >= 1
+            and
+            sum(rate(llm_d_epp_maas_fairness_contended_seconds_total{job="maas-vllm-gpu-epp-service"}[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            poc: maas-fairness
+          annotations:
+            summary: "GPU EPP fairness policy is not converging under contention"
+            description: >-
+              The spread between the most- and least-served configured group's
+              normalized_service has exceeded 1.5x for 10 minutes while the
+              scheduler is saturated (pool_saturation >= 1) and groups are
+              actively contending. One group is getting materially more than
+              its configured share of service; see docs/design.md "Alerts" >
+              "Not converging" and the state dump
+              (pkg/fairness/weightedlas/plugin.go DumpState) for per-group
+              attainedService/weight.
+
+        # design.md: "unclassified share > 5%, or unmatched_subscriptions_total
+        # increasing at all (should be flat zero)."
+        #
+        # Both halves of design.md's "or" are kept as one alert, matching its
+        # one bullet. unmatched_subscriptions_total is deliberately unlabelled
+        # (metrics.go: cardinality concern) so it cannot be scoped by job --
+        # it is process-global, but this EPP is the only process this rule's
+        # namespace runs with that subscription-matching logic in scope today.
+        # 5% and the unmatched counter's own "any increase" bar are both
+        # design.md's literal numbers, not a guess. `for: 5m` smooths a single
+        # scrape's sampling noise on the ratio without masking a real
+        # misconfiguration for long.
+        - alert: MaasFairnessClassificationBroken
+          expr: |
+            (
+              sum(rate(llm_d_epp_request_total{job="maas-vllm-gpu-epp-service", fairness_id="unclassified"}[10m]))
+              /
+              sum(rate(llm_d_epp_request_total{job="maas-vllm-gpu-epp-service"}[10m]))
+            ) > 0.05
+            or
+            increase(llm_d_epp_maas_fairness_unmatched_subscriptions_total{job="maas-vllm-gpu-epp-service"}[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            poc: maas-fairness
+          annotations:
+            summary: "GPU EPP is failing to classify requests into fairness groups"
+            description: >-
+              Either more than 5% of requests are landing in the
+              fairness_id="unclassified" catch-all, or
+              unmatched_subscriptions_total (expected flat zero) is
+              increasing. Both mean the subscription-to-group mapping is
+              wrong or stale -- traffic is being billed to the wrong tenant's
+              tab, or to nobody's. See docs/design.md "Alerts" >
+              "Classification broken".
+
+        # design.md: "more than one priority band has active flows
+        # (objective header leak)."
+        #
+        # This POC's configuration runs exactly one priority band (priority:
+        # 0, deploy/poc/00-config.yaml); plugin.go's own comment says every
+        # groupState line is "implicitly that band" for the same reason. So
+        # the correct count of bands with dispatched traffic is exactly 1, and
+        # "more than 1" is a binary correctness check, not a tuned threshold --
+        # there's no legitimate reason for a second band to ever have traffic
+        # on this deployment. outcome="Dispatched" scopes to admitted traffic
+        # specifically (not every queueing outcome) per design.md's own
+        # phrase "active flows". `for: 5m` only absorbs scrape/rollout jitter;
+        # a genuine objective-header leak should be visible well inside that
+        # window.
+        - alert: MaasFairnessBandSplit
+          expr: |
+            count(
+              sum by (priority) (rate(llm_d_epp_flow_control_requests_total{job="maas-vllm-gpu-epp-service", outcome="Dispatched"}[5m])) > 0
+            ) > 1
+          for: 5m
+          labels:
+            severity: critical
+            poc: maas-fairness
+          annotations:
+            summary: "GPU EPP is dispatching traffic on more than one priority band"
+            description: >-
+              This deployment is configured with exactly one priority band
+              (priority 0). Traffic landing on a second band means a caller's
+              objective/priority header reached the scheduler instead of
+              being stripped at the gateway -- see docs/design.md "Alerts" >
+              "Band split" and "Gateway header stripping is a hard
+              prerequisite" in Part 3. This also bypasses the configured
+              fairness weights for whatever lands on the other band.
+
+        # design.md: "sustained evictions on the queue-duration metric."
+        #
+        # No `*_queue_duration_seconds` metric carrying an eviction outcome is
+        # actually exported by this build (checked the live __name__ list on
+        # 2026-10-25 -- only flow_control_dispatch_cycle_duration_seconds
+        # exists, which times dispatch cycles, not per-request queue waits).
+        # The live, outcome-labelled equivalent is
+        # flow_control_requests_total{outcome=~"Evicted.*"} -- the same
+        # queueing subsystem's own counter for exactly the four eviction
+        # outcomes (TTL, NoEndpoints, ContextCancelled, Other; see
+        # llm-d-router pkg/epp/flowcontrol/types/outcomes.go). Using it here
+        # instead of a nonexistent metric name is a substitution, not a typo;
+        # recorded explicitly because design.md was written before any of
+        # this was live-verified (per UNI-30).
+        # Any sustained eviction rate is the alert condition, not a tuned
+        # rate threshold: an eviction means a request left the queue without
+        # ever being charged or dispatched through the fairness policy at
+        # all -- queue-wait budget (shedding) decided the outcome instead of
+        # weighted service, which is exactly design.md's "shedding is the
+        # real allocator" failure mode. `for: 10m` matches the "sustained"
+        # wording in design.md's own bullet.
+        - alert: MaasFairnessSheddingIsRealAllocator
+          expr: |
+            sum(rate(llm_d_epp_flow_control_requests_total{job="maas-vllm-gpu-epp-service", outcome=~"Evicted.*"}[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+            poc: maas-fairness
+          annotations:
+            summary: "GPU EPP is shedding load via queue eviction, not the fairness policy"
+            description: >-
+              Requests have been evicted from the flow-control queue
+              (TTL/no-endpoints/context-cancelled/other) continuously for 10
+              minutes. Evicted requests never reach the weighted-fairness
+              policy, so whoever gets evicted first -- not the configured
+              weights -- is deciding who is actually served under this load.
+              See docs/design.md "Alerts" > "Shedding is the real allocator".
+
+        # design.md: "provisional tokens nonzero while traffic is zero."
+        #
+        # Read literally ("is normalized_service > 0 while request rate is
+        # 0") this alert fires permanently on a healthy system: confirmed live
+        # that normalized_service does not decay in real time while idle --
+        # it is a lazily-evaluated gauge that only changes value on the next
+        # touch (Pick/dispatch) for that fairness_id, so any group that was
+        # ever charged stays at a nonzero reading indefinitely during a quiet
+        # period. That is normal lazy-decay behaviour, not a leak, and is the
+        # expected steady state of this cluster right now.
+        #
+        # The literal bug design.md is naming -- "a request that never
+        # completes... leaves its charge on the tab to decay away... caught
+        # by the accounting-leak alert" (Part 2, cost-model worked trace) --
+        # is a charge that grows or persists for a group with no matching
+        # dispatch, not merely a nonzero reading. normalized_service only
+        # legitimately moves in two ways: down (decay) or up by exactly the
+        # amount of a charge recorded in dispatch_total for that same
+        # fairness_id. So the real, false-positive-resistant test is: did a
+        # group's normalized_service *increase* over a window where
+        # dispatch_total recorded zero new dispatches for that group? That is
+        # impossible under correct accounting and immune to the frozen-gauge
+        # problem above, since a frozen value produces a zero delta, not a
+        # positive one. `for: 15m` is 15 of this deployment's configured
+        # 60-second half-lives (docs/design.md Part 3 item 7): any legitimate
+        # residual charge would be decayed to ~2^-15 (0.003%) of its original
+        # size well inside that window, so a *sustained* measured increase
+        # over 15m with zero recorded dispatches cannot be explained by decay
+        # lag.
+        - alert: MaasFairnessAccountingLeak
+          expr: |
+            (
+              llm_d_epp_maas_fairness_normalized_service{job="maas-vllm-gpu-epp-service"}
+              -
+              (llm_d_epp_maas_fairness_normalized_service{job="maas-vllm-gpu-epp-service"} offset 15m)
+            ) > 0
+            and
+            increase(llm_d_epp_maas_fairness_dispatch_total{job="maas-vllm-gpu-epp-service"}[15m]) == 0
+          for: 15m
+          labels:
+            severity: warning
+            poc: maas-fairness
+          annotations:
+            summary: "GPU EPP fairness tab grew for a group with no recorded dispatch"
+            description: >-
+              normalized_service for a fairness group has been rising for 15
+              minutes (15 configured half-lives) while dispatch_total
+              recorded zero dispatches for that same group. Accounting can
+              only legitimately move a tab down (decay) or up in lockstep
+              with a recorded dispatch -- an increase with no matching
+              dispatch means tokens are being charged somewhere they were
+              not earned. See docs/design.md "Alerts" > "Accounting leak" and
+              the cost-model worked trace in Part 2.

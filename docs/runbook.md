@@ -266,6 +266,59 @@ run is only meaningful if they are overwhelmingly 200.
 
 ---
 
+## Load the fairness dashboard into the live Grafana
+
+`deploy/grafana-dashboard.yaml` ships the dashboard JSON as a ConfigMap
+(`maas-fairness-dashboard`, namespace `maas-fairness-poc`) because that is the
+only namespace the Engineer role can write to. It does **not** auto-load into
+the live Grafana from there — Kubernetes `configMap` volume sources cannot
+cross namespaces, and the live Grafana Deployment (`grafana`, namespace
+`grafana`) mounts exactly one file-provisioned dashboards ConfigMap, by name:
+
+```sh
+oc get deployment grafana -n grafana -o yaml | grep -A3 'name: kueue-dashboard'
+#   configMap:
+#     defaultMode: 420
+#     name: kueue-dashboard     <- must be this literal name
+#     optional: true            <- true, so it's silently absent, not an error, when missing
+#   name: dashboards
+```
+
+mounted at `/var/lib/grafana/dashboards`, which `grafana-dashboards-provider`
+(the `dashboards-provider` ConfigMap, type `file`) scans for any `*.json` file
+and loads into the "Kueue" folder. So making this dashboard render requires a
+**second object, with a different name, in a different namespace**, copied
+from the one in this repo. Someone with write access to the `grafana`
+namespace needs to run:
+
+```sh
+OC="oc --token=$OPENSHIFT_TOKEN --server=https://api.ocp.paladinaura.com:6443"
+
+# 1. Pull the JSON out of the repo's ConfigMap (already applied in maas-fairness-poc).
+$OC get configmap maas-fairness-dashboard -n maas-fairness-poc \
+  -o jsonpath='{.data.maas-fairness-gpu-epp\.json}' > /tmp/maas-fairness-gpu-epp.json
+
+# 2. Create/update the ConfigMap the grafana Deployment actually mounts.
+$OC create configmap kueue-dashboard -n grafana \
+  --from-file=maas-fairness-gpu-epp.json=/tmp/maas-fairness-gpu-epp.json \
+  --dry-run=client -o yaml | $OC apply -f -
+
+# 3. The volume was optional and absent when the pod last started, so confirm
+#    it actually attaches rather than trusting kubelet's periodic resync —
+#    restart the pod and recheck the dashboard list in the "Kueue" folder.
+$OC delete pod -n grafana -l app=grafana
+```
+
+As of 2026-10-25 the Engineer role has `edit` on `maas-fairness-poc` only —
+`oc auth can-i create configmaps -n grafana` and
+`oc auth can-i update configmaps -n grafana` both return `no`. This is the
+same shape of access gap as the `maas-fairness-poc` grant itself, but on a
+namespace no agent here has ever been granted. Re-run step 1 and re-apply
+step 2 any time `deploy/grafana-dashboard.yaml` changes — there is no
+automatic sync between the two ConfigMaps.
+
+---
+
 ## Standing checks before trusting any result
 
 ```sh

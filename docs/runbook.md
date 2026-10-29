@@ -266,6 +266,136 @@ run is only meaningful if they are overwhelmingly 200.
 
 ---
 
+## Run the fairness benchmark (UNI-54)
+
+Before this, "delivered share" was a number a human produced by reading two
+Prometheus scrapes and doing the division by hand — see the 1.57:1-against-2:1
+detour in `docs/poc-results.md`. `deploy/poc/15-fairness-benchmark.sh` makes a
+named scenario, run against the live GPU EPP, produce that number itself.
+
+```sh
+OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh <scenario> [label]
+```
+
+### Scenarios
+
+These are the four work-conservation experiments already described in the
+comments of `deploy/poc/04-loadgen.yaml` — read those comments before
+touching worker counts, the sizing reasoning there is load-bearing.
+
+| scenario | what it sets | what it proves |
+|---|---|---|
+| `full-contention` | `TENANTS="app1 app2 end-users"`, equal `WORKERS` | the headline weight split: 20/10/65 delivered under genuine three-way contention |
+| `end-users-idle` | `TENANTS="app1 app2"` | end-users' 65% is **absorbed** by app1/app2, not reserved while idle |
+| `app1-alone` | `TENANTS="app1"` | a single tenant receives ~100% of the pool, not capped near its 20% weight |
+| `asymmetric-demand` | `WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2` | app1 is not held near its weight when the highest-weight tenant (end-users) sends only a trickle — this is the YAML's own commented-out example, which also idles app2; the ticket's prose names only APP1/END_USERS but the YAML it points to is the source of truth |
+
+### What it produces
+
+Everything lands in `results/<timestamp>-<label>/`, the same per-run artifact
+directory `14-loadgen-with-log-archive.sh` (UNI-46) writes the EPP container
+log into:
+
+- `fairness-report.json`, `fairness-report.md` — one row per group: configured
+  weight, offered workers, delivered requests/status tally/p50/p95 (from the
+  generator), delivered tokens and observed share (from the EPP's own
+  `llm_d_epp_maas_fairness_contended_service_tokens_total`, scraped directly
+  off its `/metrics` immediately before and after the run — **not** a Thanos
+  query over a range, so there is no scrape-alignment or duplicate-replica
+  concern to correct for), deviation in points, and run metadata (scenario,
+  `enforce`, duration, EPP image **digest**, backend, start/end timestamps).
+- `metrics-before.txt` / `metrics-after.txt` — the raw snapshots the report
+  was computed from, so a reviewer can redo the arithmetic by hand.
+- `epp-container.log`, `loadgen.log`, `04-loadgen.patched.yaml` — same as
+  UNI-46, for the same reason (archived evidence, not a log-retention bet).
+
+The script's own exit code is the report's verdict: 0 on PASS, 1 on FAIL —
+wire it into anything that should break a pipeline on a regression.
+
+### Expected share, and why it is not just "the configured weight"
+
+The report's "expected %" divides each **offered** group's weight by the sum
+of weight over offered groups only — not by the sum of every configured
+weight (which includes the never-offered `unclassified` catch-all, weight 5).
+For `end-users-idle`, that means app1/app2's target is 66.7%/33.3% (their 2:1
+ratio over the whole pool), not 20%/10% with the remaining 65% unaccounted
+for. Scoring against the full-weight denominator would flag a policy that is
+correctly absorbing idle capacity as a large deviation, which is backwards.
+This differs by a few points from the "20/10/65" shorthand used loosely
+elsewhere in this repo's prose for the full-contention case — those are the
+raw ConfigMap numbers, not divided by anything (they happen to sum to 95, not
+100, because `unclassified` is excluded).
+
+"Delivered tokens" and "observed share" are both the same SLI
+`deploy/grafana-dashboard.yaml`'s headline panel already uses (UNI-50) — this
+benchmark does not invent a second definition of delivered share.
+
+### Two scenarios get a different verdict rule, not the symmetric threshold
+
+`app1-alone` and `asymmetric-demand` found a real gap in the first version of
+this logic, live against the GPU EPP on 2026-10-29 — see the "UNI-54" section
+of `docs/poc-results.md` for the full before/after numbers:
+
+- **`app1-alone`** has nobody for the single offered group to be *contended*
+  against, and `contended_service_tokens_total` (`pkg/fairness/weightedlas/metrics.go`)
+  is specifically defined to accrue only under contention. A solo run
+  therefore scrapes a correct, flat-zero delta — not starvation. The report
+  does not compute a share or deviation for a solo group at all; instead it
+  checks the thing this scenario actually names ("must receive ~100% of the
+  pool") as a request-success-rate bar: 90%+ HTTP 200, the same
+  "overwhelmingly 200" bar this runbook's standing checks already use.
+- **`asymmetric-demand`** deliberately demand-caps `end-users` to 2 workers
+  (the YAML's own commented-out example), so it cannot reach a
+  weight-proportional share no matter how well the policy behaves — scoring
+  that as a symmetric deviation would fail the scenario's own success case
+  (app1 correctly taking far more than its nominal weight while end-users'
+  unused share goes to it, not reserved). This scenario instead gets a
+  one-sided check: FAIL only if the saturating, highest-worker-count offered
+  group is held *at or below* its own nominal weight share — i.e. only if
+  weight acted as a ceiling, which is the actual defect this scenario exists
+  to catch.
+
+`full-contention` and `end-users-idle` are not special-cased — every group
+they offer is genuinely able to compete for the pool, so the symmetric
+`|observed % − expected %| ≤ threshold` check applies to both as described
+above.
+
+### The PASS/FAIL threshold: 10 points, on evidence
+
+`THRESHOLD_POINTS` (default 10) is the maximum allowed `|observed % -
+expected %|` for any offered group. Chosen from this repo's own real-GPU
+results in `docs/poc-results.md`:
+
+- A correctly-sized run landed within **~1 point** of target.
+- A run sized close but not iteratively tuned still called "directionally and
+  substantially correct" reached **~5 points**.
+- The under-offered equal-worker artifact (work conservation draining a
+  high-weight tenant's queue, not enforcement failing) produced **~20–28
+  points** of compression toward equal thirds.
+- The open-loop newcomer-clamp finding that **inverted** the weight ordering
+  reached **~40 points**.
+
+10 points sits above realistic sizing noise and below anything that is
+actually broken, misconfigured, or inverted. It is a starting point, not a
+law — if a future well-tuned run on different hardware lands outside it for a
+reason that is not a regression, revise the number here and say why, rather
+than silently loosening it in the script.
+
+### Testing the FAIL path without a cluster
+
+`deploy/poc/15-fairness-report.py` (the report/verdict logic) takes no
+cluster access — it is a pure function of two metrics snapshots and a loadgen
+log. `deploy/poc/15-fairness-report-test.py` exercises it against synthetic
+data, including a deliberately skewed input that must FAIL with a non-zero
+exit, and an EPP-mid-run-restart case that must also FAIL rather than
+silently clamp the negative delta to zero and pass:
+
+```sh
+python3 -I deploy/poc/15-fairness-report-test.py
+```
+
+---
+
 ## Load the fairness dashboard into the live Grafana
 
 `deploy/grafana-dashboard.yaml` ships the dashboard JSON as a ConfigMap

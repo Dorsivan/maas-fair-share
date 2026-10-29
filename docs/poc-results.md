@@ -1126,6 +1126,112 @@ already proposed and this result now gives a concrete reason to build.
   prompts (`max_tokens: 64`, ~6-11s p95 responses) that never approach that
   timeout or exercise streaming/buffering behaviour.
 
+## UNI-54: an automated fairness benchmark, instead of a human doing the division
+
+Every delivered-share number in this document up to this point was produced
+by hand: read `llm_d_epp_maas_fairness_contended_service_tokens_total` before
+and after a run, subtract, divide, and write the percentage into a table. The
+1.57:1-against-2:1 detour above exists because that manual step is also where
+a mistake is easiest to make. `deploy/poc/15-fairness-benchmark.sh` and
+`deploy/poc/15-fairness-report.py` close that gap: a named scenario run
+against the live GPU EPP now produces its own verdict, not a number a human
+has to interpret.
+
+The share and token numbers reuse `llm_d_epp_maas_fairness_contended_service_tokens_total`
+unchanged — the same SLI `deploy/grafana-dashboard.yaml`'s headline panel
+(UNI-50) already uses — scraped directly off the EPP's own `/metrics`
+immediately before and after the run (same mechanism as
+`deploy/poc/13-loadgen-poisson.sh`), not a Thanos range query, so there is no
+scrape-alignment or duplicate-UWM-replica correction to get wrong. See
+`docs/runbook.md`, "Run the fairness benchmark (UNI-54)," for the scenario
+list, the exact artifact layout, and how the 10-point PASS/FAIL threshold was
+chosen from the deviation sizes already recorded elsewhere in this document.
+
+### Four named scenarios, run live against the GPU EPP, 2026-10-29
+
+EPP image digest for all four runs (unchanged from the A4/UNI-29 section
+above — the live deployment is still four commits behind `HEAD`, which is
+exactly the drift this report's digest field exists to catch, not to fix):
+`...@sha256:5ef5df2776364e6161f91e5a3df0fbed9a4751bde847658af51923b1eded7f40`.
+`enforce: true` on all four. Full reports (JSON + markdown, plus the raw
+metrics snapshots and EPP/loadgen logs) are in
+`results/<timestamp>-uni54-<scenario>/` in the workspace this run used;
+the headline numbers:
+
+| scenario | result | observed (app1/app2/end-users) | target | verdict |
+|---|---|---|---|---|
+| `full-contention` | 32/32/32 workers | 31.0/30.7/38.3% | 21.1/10.5/68.4% | **FAIL** — end-users −30.1 pts |
+| `end-users-idle` | 32/32/— workers | 51.0/49.0/— % | 66.7/33.3/— | **FAIL** — app1 −15.7 pts |
+| `app1-alone` | 32/—/— workers | 5391/5400 = 99.8% HTTP 200 | n/a (solo) | **PASS** |
+| `asymmetric-demand` | 32/0/2 workers | 94.2/—/5.8% | n/a (demand-capped, see below) | **PASS** |
+
+**`full-contention` and `end-users-idle` both FAIL, and both fail for the
+same already-documented reason, not a new one.** Equal `WORKERS=32` across
+every offered tenant is the exact equal-worker sizing artifact `## A4
+(UNI-29)`'s Run 2 already found on this same backend/model
+(llama-3-1-8b): 32 workers/tenant lets the highest-weight tenant's queue
+periodically drain, which compresses the split toward equal shares no
+matter what the weights say — work conservation doing its job on an
+under-offered load, not the policy failing. `end-users-idle`'s 51.0/49.0%
+split is the cleanest illustration: end-users' 65% was correctly **absorbed**
+(app1+app2 jointly took 100%, not ~30%), but the 2:1 ratio between app1 and
+app2 compressed toward 1:1 for the identical reason. The fix is the same
+one already tracked as a follow-up on A4/UNI-29 (Outstanding work, "Reproduce
+the headline split on real vLLM, both modes") —
+size `end-users` well above 32 workers for these two scenarios on this
+backend — and is deliberately **not** done in this ticket: retuning
+`04-loadgen.yaml`'s checked-in default sizing is a separate, already-owned
+piece of work, not something to fold in silently here. The benchmark
+correctly caught a real, known issue; that is the tool working, not a defect
+in it.
+
+**`app1-alone` needed a fix to the verdict logic, not just a run.** The first
+pass through this scenario produced a nonsense FAIL ("100-point deviation")
+because `contended_service_tokens_total` is defined (`metrics.go`) to accrue
+only while a group is backlogged *alongside another group* — with nobody
+else offered, it is correctly a flat zero, not evidence of starvation. The
+report now special-cases a single offered group: no share/deviation is
+computed at all, and the verdict instead asks the question this scenario
+actually names ("must receive ~100% of the pool") as a request-success-rate
+bar — 90%+ HTTP 200, matching this repo's own standing "overwhelmingly 200"
+check. 5391/5400 (99.8%) clears it.
+
+**`asymmetric-demand` needed the same kind of fix, for a different reason.**
+`end-users` here is deliberately demand-capped — the scenario's own
+definition (the commented-out block in `04-loadgen.yaml`) gives it only 2
+workers — so it cannot reach a weight-proportional 76.5% share regardless of
+how the policy behaves. The first pass scored that as a 70.6-point FAIL, but
+94.2%/5.8% is exactly this scenario's stated success criterion: "app1 is not
+held near its 20% weight when end-users leaves most of its 65% unused." The
+report now gives this scenario a one-sided check instead of the symmetric
+threshold: it fails only if the saturating, highest-worker-count group (app1)
+is held *at or below* its own nominal weight share while another offered
+group's capacity sits unused — i.e. only if weight is acting as a ceiling,
+which is the actual defect this scenario exists to catch. 94.2% vs. a 23.5%
+nominal weight share passes that check outright.
+
+### What this does and does not prove
+
+Proven: the benchmark runs end-to-end against the live GPU EPP for all four
+named scenarios, produces both JSON and markdown next to the EPP/loadgen
+evidence UNI-46 already archives, computes delivered share from the EPP's
+own accounting (never the generator), and its FAIL path is real — it fired
+correctly on two live runs for an already-understood reason, not a
+synthetic one. `deploy/poc/15-fairness-report-test.py` additionally proves
+the FAIL path against synthetic data with a real non-zero process exit,
+independent of cluster/GPU access, per this ticket's own done-when bar.
+
+Not proven here: that `full-contention`/`end-users-idle` pass with
+correctly-sized workers on this backend — that is the pre-existing,
+separately-owned worker-sizing follow-up (A4/UNI-29's Outstanding-work row,
+"Reproduce the headline split on real vLLM, both modes"), not
+re-litigated by this benchmark. Also not proven: open-loop behaviour (UNI-34
+is closed-loop-only by construction, same as every other number in this
+document) and multi-group demand-capped scenarios beyond the two-group case
+tested here — `asymmetric-demand`'s one-sided check picks the single
+highest-worker offered group, which is correct for this scenario's own
+definition but is not a general solution for an N-way mixed-demand run.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -1154,6 +1260,7 @@ Ordered by how much they would change a conclusion.
 | 1b | **Re-run the sized-worker enforce case against the now-committed Quay digest, live** | the digest above was verified to pull and run correctly (startup log confirms the commit SHA), and the plugin source is unchanged from what was tested, but the split itself was not re-measured against this exact artifact | the stale `MutatingWebhookConfiguration` on `LLMInferenceService` admission (see "The stale webhook that blocked all of this") — needs someone who can delete a cluster-scoped `MutatingWebhookConfiguration`, which this role cannot even read |
 | — | ~~Archive the EPP log as a per-run artifact (UNI-46, D5)~~ | **Done.** `deploy/poc/14-loadgen-with-log-archive.sh` wraps `04-loadgen.yaml` unchanged -- it captures the GPU EPP's own container log (targeting `maas-vllm-gpu-kserve-router-scheduler` via `oc logs -f`) into `results/<timestamp>-<label>/epp-container.log` for exactly the run's duration, records the byte count and flight-recorder line count in a per-run `manifest.json` alongside the loadgen's own status/latency table, and detects a mid-run container restart (reattaches `-f`, notes it in the manifest) instead of silently losing the earlier log. Verified live 2026-10-25 against a 240s full-contention run: 3,954,571 bytes captured, 196 `"fairness state"` flight-recorder lines, no restart. That run also surfaced an unrelated problem -- `end-users` got HTTP 403 on 87% of its requests -- tracked separately as [UNI-82](/UNI/issues/UNI-82) so it doesn't quietly corrupt a future fairness benchmark's numbers | N/A -- closed |
 | 16 | **Wire the D3 dashboard into the live Grafana (UNI-50)** | The ConfigMap `deploy/grafana-dashboard.yaml` is on `main`, but the live Grafana's `dashboards` volume mounts a ConfigMap literally named `kueue-dashboard` in the `grafana` namespace -- not `maas-fairness-dashboard` in `maas-fairness-poc`, where this repo has write access. Cross-namespace `configMap` volume sources don't exist, so some copy step is unavoidable. The exact commands are documented in [runbook.md](runbook.md#load-the-fairness-dashboard-into-the-live-grafana) and confirmed correct against the live `grafana-dashboards-provider` provisioner config, but not run: `oc auth can-i create/update configmaps -n grafana` and `patch deployments -n grafana` all return `no`. Until someone with that access runs them, the live instance loads zero file-provisioned dashboards -- the dashboard content itself was verified by a separate, non-durable `/api/dashboards/db` import, not by this ConfigMap rendering anywhere | operator-level approval (namespace write on `grafana`) |
+| — | ~~Per-run fairness benchmark with a PASS/FAIL verdict (UNI-54)~~ | **Done.** `deploy/poc/15-fairness-benchmark.sh` + `15-fairness-report.py` turn a named scenario run into its own verdict -- JSON + markdown, delivered share from the EPP's own `contended_service_tokens_total` (reusing UNI-50's SLI unchanged), run metadata including the EPP image digest, a documented 10-point threshold, and an exit code a pipeline can gate on. All four scenarios run live against the GPU EPP 2026-10-29: see "UNI-54: an automated fairness benchmark," above, for the full table. Two scenarios (`full-contention`, `end-users-idle`) correctly FAIL on the pre-existing equal-worker-sizing artifact (same mechanism as A4/UNI-29's Run 2, above -- not a new defect; follow-up tracked on that same Outstanding-work row); two (`app1-alone`, `asymmetric-demand`) PASS once the verdict logic was fixed to stop scoring a structurally-zero or structurally-demand-capped share as a failure. `15-fairness-report-test.py` proves the FAIL path against synthetic data with a real non-zero exit, independent of cluster access | N/A -- closed |
 
 ## Reproducing
 

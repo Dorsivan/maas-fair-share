@@ -119,9 +119,11 @@ case "$SCENARIO" in
     # app2's 33.3%), so it needs to over-offer relative to app2 for the same
     # reason end-users over-offers relative to app1/app2 in full-contention
     # above -- see docs/runbook.md "Per-tenant worker sizing and the
-    # saturation check".
+    # saturation check". UNI-104: the 4:1 ratio copied from full-contention's
+    # end-users overshot (82.4% vs a 66.7% target); try a ratio closer to the
+    # actual 2:1 app1:app2 target instead.
     TENANTS="app1 app2"
-    PER_TENANT_OVERRIDES=(WORKERS_APP1=128 WORKERS_APP2=32)
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=64 WORKERS_APP2=32)
     ;;
   equal-workers-control)
     # UNI-103: the ORIGINAL full-contention shape (equal WORKERS for every

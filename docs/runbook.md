@@ -287,7 +287,7 @@ reasoning there is load-bearing.
 | scenario | what it sets | what it proves |
 |---|---|---|
 | `full-contention` | `TENANTS="app1 app2 end-users"`, per-tenant `WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128` | the headline weight split: 20/10/65 delivered under genuine three-way contention, with every tenant over-offering relative to its entitlement |
-| `end-users-idle` | `TENANTS="app1 app2"`, per-tenant `WORKERS_APP1=128 WORKERS_APP2=32` | end-users' 65% is **absorbed** by app1/app2, not reserved while idle, with app1 over-offering relative to app2 to express their 2:1 (66.7/33.3 renormalized) ratio |
+| `end-users-idle` | `TENANTS="app1 app2"`, per-tenant `WORKERS_APP1=64 WORKERS_APP2=32` (UNI-104; was `128/32` under UNI-103) | end-users' 65% is **absorbed** by app1/app2, not reserved while idle, with app1 over-offering relative to app2 to express their 2:1 (66.7/33.3 renormalized) ratio |
 | `equal-workers-control` | `TENANTS="app1 app2 end-users"`, equal `WORKERS` (the **original** full-contention shape) | **negative control, not scored.** Kept to show what an under-offered load looks like on this backend — expected to compress toward equal thirds, not 20/10/65. See "Per-tenant worker sizing and the saturation check" below |
 | `app1-alone` | `TENANTS="app1"` | a single tenant receives ~100% of the pool, not capped near its 20% weight |
 | `asymmetric-demand` | `WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2` | app1 is not held near its weight when the highest-weight tenant (end-users) sends only a trickle — this is the YAML's own commented-out example, which also idles app2; the ticket's prose names only APP1/END_USERS but the YAML it points to is the source of truth |
@@ -404,11 +404,15 @@ tenant drained its queue and the split compressed toward equal. The fix
 - `full-contention`: `WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128`
   — copied from A4 Run 3 (`docs/poc-results.md`, UNI-29), the first config
   that reproduced the weight ordering on this exact backend/model.
-- `end-users-idle`: `WORKERS_APP1=128 WORKERS_APP2=32` — app1 is this
+- `end-users-idle`: `WORKERS_APP1=64 WORKERS_APP2=32` — app1 is this
   scenario's highest-share tenant once end-users is excluded (66.7% vs
   33.3%, the same 2:1 ratio as their raw 20:10 weights), so it gets the same
   treatment end-users got above: over-offer well past app1's own
-  entitlement so its queue cannot drain mid-run.
+  entitlement so its queue cannot drain mid-run. The initial UNI-103 value
+  here, `128`, copied `full-contention`'s 4:1 dominant-tenant ratio and
+  overshot (82.4% vs a 66.7% target); UNI-104 retuned it to a 2:1 worker
+  ratio matching the pair's actual target ratio, which passes (68.4/31.6%
+  vs 66.7/33.3%) — see `docs/poc-results.md`'s UNI-104 section.
 - `equal-workers-control` keeps the ORIGINAL equal-`WORKERS=32` shape on
   purpose, as a named, permanent negative control — see the scenario table
   above. Its own report says plainly that it is not scored, so a future
@@ -459,19 +463,24 @@ The comparison that IS reliable is relative, within the same run:
   definition, not a saturation problem.
 
 **This check's limit, also from a live number rather than a guess:**
-`end-users-idle`'s FAIL (below) is a worked example of what it does *not*
-catch. app1 (1.50s) and app2 (1.54s) came out almost identical despite a
-4:1 worker-count difference and a 4.7:1 delivered-share gap (82.4% vs
-17.6%, against a 66.7/33.3 target) — so two groups landing close on this
-metric does not mean their delivered shares will land close. It catches an
-UNDER-contended group reliably (the thing it is built to detect); it is not
-a predictor of where a correctly-contending group's exact share will fall.
-Closing that residual gap further is out of this ticket's scope — see
-`docs/poc-results.md`'s 2026-10-29 UNI-103 section and the follow-up ticket
-it opens. A future backend/model change (new GPU, new model, different
-`--max-num-seqs`) will shift the dispatch cadence this check depends on, so
-re-run it rather than assuming the worker counts above still saturate every
-tenant on a different backend.
+`end-users-idle`'s original UNI-103 FAIL (128/32 workers) is a worked example
+of what it does *not* catch. app1 (1.50s) and app2 (1.54s) came out almost
+identical despite a 4:1 worker-count difference and a 4.7:1 delivered-share
+gap (82.4% vs 17.6%, against a 66.7/33.3 target) — so two groups landing
+close on this metric does not mean their delivered shares will land close.
+It catches an UNDER-contended group reliably (the thing it is built to
+detect); it is not a predictor of where a correctly-contending group's exact
+share will fall. UNI-104 retuned the worker ratio itself (64/32) to pass,
+but the two configs' near-identical `contended_seconds_total` deltas (1.46s
+and 1.50s at 64/32, vs 1.50s and 1.54s at 128/32) mean this check still
+can't explain *why* one worker ratio overshoots so much more than the other
+undershoots — that sensitivity is unexplained, pending
+[UNI-100](/UNI/issues/UNI-100)'s scope decision on root-causing it. See
+`docs/poc-results.md`'s UNI-103 and UNI-104 sections. A future
+backend/model change (new GPU, new model, different `--max-num-seqs`) will
+shift the dispatch cadence this check depends on, so re-run it rather than
+assuming the worker counts above still saturate every tenant on a different
+backend.
 
 ### The PASS/FAIL threshold: 10 points, on evidence
 

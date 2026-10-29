@@ -1301,6 +1301,102 @@ tested here — `asymmetric-demand`'s one-sided check picks the single
 highest-worker offered group, which is correct for this scenario's own
 definition but is not a general solution for an N-way mixed-demand run.
 
+## UNI-103: resize to over-offer per tenant, re-run all four plus a named control
+
+[UNI-100](/UNI/issues/UNI-100) traced the "UNI-54: an automated fairness
+benchmark" section's two FAILs (above) to the test, not the plugin:
+`15-fairness-benchmark.sh:140` set a single global `WORKERS=32` for every
+tenant in `full-contention` and `end-users-idle`, which is not enough to keep
+the highest-weight tenant in each scenario backlogged on the current
+(`llama-3-1-8b`) backend -- the exact mechanism `## A4 (UNI-29)` Run 2 (above)
+already found, reproduced here on two more scenarios rather than newly
+discovered. The board authorized the resize on UNI-100
+([comment](/UNI/issues/UNI-100#comment-26e3a385-9905-416b-adfa-e4b49fd60c1c)).
+
+**What changed.** Both scenarios now set per-tenant `WORKERS_APP1`/
+`WORKERS_APP2`/`WORKERS_END_USERS` instead of one global `WORKERS`:
+
+- `full-contention`: `32/32/128`, copied from A4 Run 3 (the first config that
+  reproduced the weight ordering on this backend/model).
+- `end-users-idle`: `128/32` (app1/app2) -- app1 is the higher-share tenant
+  once end-users is excluded (66.7% vs 33.3%), so it got the same
+  over-offer treatment end-users got in `full-contention`.
+
+The original equal-`WORKERS=32` shape was **not deleted** -- it is kept as a
+fifth, permanently-named scenario, `equal-workers-control`, which
+`15-fairness-report.py` now scores `INFO` instead of PASS/FAIL (a `--control`
+flag) so its large, expected deviation can never be mistaken for a
+regression or break a pipeline gating on this script's exit code. See
+`docs/runbook.md`, "Per-tenant worker sizing and the saturation check," for
+the full sizing method and a documented, evidence-corrected answer to "how
+do you check a tenant is actually saturated."
+
+### Five scenarios, run live against the GPU EPP, 2026-10-29
+
+Same EPP image digest as every run since A4/UNI-29
+(`...@sha256:5ef5df2776364e6161f91e5a3df0fbed9a4751bde847658af51923b1eded7f40`
+-- still the drift this report's digest field exists to catch, see
+[UNI-97](/UNI/issues/UNI-97)), `enforce: true` on all five. Full reports
+(JSON + markdown, raw metrics snapshots, EPP/loadgen logs) are in
+`results/<timestamp>-uni103-<scenario>/`:
+
+| scenario | workers (app1/app2/end-users) | observed | target | verdict |
+|---|---|---|---|---|
+| `full-contention` | 32/32/128 | 16.2/12.8/71.0% | 21.1/10.5/68.4% | **PASS** |
+| `end-users-idle` | 128/32/— | 82.4/17.6/—% | 66.7/33.3/— | **FAIL** -- app1 +15.8 pts |
+| `equal-workers-control` | 32/32/32 | 30.7/30.7/38.7% | 21.1/10.5/68.4% | **INFO** (not scored, 29.7pt max deviation) |
+| `app1-alone` | 32/—/— | 5415/5421 = 99.9% HTTP 200 | n/a (solo) | **PASS** |
+| `asymmetric-demand` | 32/0/2 | 94.0/—/6.0% | n/a (demand-capped) | **PASS** |
+
+**`full-contention` is fixed.** Sizing `end-users` to 128 workers (from A4
+Run 3, unchanged) reproduced the weight ordering end-users > app1 > app2
+within 5 points of the contention-adjusted target, matching A4 Run 3's own
+16.2/13.7/70.1% almost exactly (this run: 16.2/12.8/71.0%) -- strong evidence
+this is the same, reproducible mechanism, not a one-off.
+
+**`equal-workers-control` reproduces the original artifact on demand, as
+designed.** 30.7/30.7/38.7% against a 21.1/10.5/68.4% target (29.7pt max
+deviation) is close to the original UNI-54 `full-contention` FAIL this
+scenario is modeled on (31.0/30.7/38.3%) -- the same equal-worker-sizing
+compression toward thirds, now available as a repeatable, named, correctly
+non-scored comparison point rather than something that has to be
+re-discovered by accident.
+
+**`end-users-idle` still FAILs, but the failure mode inverted.** Before the
+resize: 51.0/49.0% against 66.7/33.3 (compressed toward equal -- the
+under-offer artifact). After sizing app1 to 128 workers against app2's 32:
+**82.4/17.6%** -- app1 now *overshoots* its own 66.7% target by 15.8 points
+while app2 is pushed 15.8 points below its 33.3% floor. Copying
+`full-contention`'s dominant-tenant ratio (128 vs 32, a 4:1 worker ratio)
+onto a pair whose actual target ratio is only 2:1 (20:10) overshot badly.
+`llm_d_epp_maas_fairness_contended_seconds_total` deltas for app1 (1.50s)
+and app2 (1.54s) came out nearly identical despite the 4:1 worker gap and
+the 4.7:1 delivered-share gap, which rules out "app2 simply wasn't
+contended" as the explanation and is itself evidence this pair's dynamics
+are not fully understood yet. **Per this ticket's own scope, finding that
+root cause is explicitly out of bounds here** -- see
+[UNI-104](/UNI/issues/UNI-104), opened as the assigned, open follow-up.
+
+**`app1-alone` and `asymmetric-demand` are unaffected by this ticket's
+changes and PASS exactly as they did on UNI-54**, confirming those two
+verdict-logic fixes hold under a re-run, not just the original one.
+
+### What this does and does not prove
+
+Proven: a weighted-split fairness result can be *measured* on this backend
+only when every active tenant over-offers its entitlement -- demonstrated
+positively (`full-contention` moved from FAIL to PASS purely by resizing,
+no plugin change) and negatively (`equal-workers-control` reliably
+reproduces the broken-looking equal-thirds result on demand). The named
+control means that comparison no longer depends on remembering an old
+number from a different ticket.
+
+Not proven: that the `app1:app2` 2:1 pair can be sized to pass on this
+backend at all, or what governs its sensitivity to the over-offer ratio
+specifically (as opposed to simply "more load than entitlement," which was
+sufficient for the 3-way case). That is [UNI-104](/UNI/issues/UNI-104)'s
+scope, not this ticket's.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -1313,7 +1409,7 @@ Ordered by how much they would change a conclusion.
 | 4 | **Durable NFD fix** | GPU exposure currently depends on a hand-applied `feature.node.kubernetes.io/pci-10de.present` label per node. Set `deviceLabelFields: [vendor]` on the NodeFeatureDiscovery CR or **every new GPU node will look like broken hardware** | operator-level approval |
 | 5 | **Test on a real RHOAI 3.4 cluster** | three unknowns remain: whether 3.4's controller validates the EndpointPickerConfig, its InferencePool API group, and its tokenizer sidecar (3.5 has no equivalent). The 3.4-shaped preset test covered the flags, not the controller | a 3.4 cluster |
 | — | ~~Fix `contended_service_tokens_total`~~ | **Fixed.** The gate decision (is the band contended) is now made once, at dispatch, and reused at completion instead of being re-checked independently at each of the two charge sites. The metric also now books the real, measured cost once at completion rather than the dispatch estimate plus a separately-gated correction, so an estimator overshoot no longer gets silently dropped (a Prometheus counter cannot move backwards on a negative delta). `TestContendedServiceTokensEqualChargedCost`, `TestContendedServiceTokensEqualChargedCostOnOverestimate`, and `TestAbortedRequestStillBooksContendedService` cover under-estimate, over-estimate, and abort respectively | — |
-| — | ~~Re-run S1 longer~~ | **Done, negative result.** Re-ran at 600s (10 half-lives, vs the original 150s): the split moved to 50.3/49.7%, *further* from 2:1 than the original 1.57:1, which refutes the duration hypothesis — see "A3 (UNI-28): S1 re-run at 600s," above. Root cause is the same worker-sizing-vs-backend-latency mechanism UNI-29's Run 2 identified on this same current (llama-3-1-8b) deployment, not warm-up time | follow-up: re-size the 20:10 pair's workers for the current backend (same owner as the UNI-29 residual-gap follow-up) |
+| — | ~~Re-run S1 longer~~ | **Done, negative result.** Re-ran at 600s (10 half-lives, vs the original 150s): the split moved to 50.3/49.7%, *further* from 2:1 than the original 1.57:1, which refutes the duration hypothesis — see "A3 (UNI-28): S1 re-run at 600s," above. Root cause is the same worker-sizing-vs-backend-latency mechanism UNI-29's Run 2 identified on this same current (llama-3-1-8b) deployment, not warm-up time. The resize itself is now done — [UNI-103](/UNI/issues/UNI-103), below — but the 20:10 pair still does not land inside the threshold on this backend, just for a different reason (over-offer ratio, not under-offer) | follow-up: [UNI-104](/UNI/issues/UNI-104), tune the app1:app2 over-offer ratio itself |
 | 8 | **`maas-default-gateway` inference path** | returns 500: `maas-api-route` targets a TLS service port with no `BackendTLSPolicy`, and that CRD is not installed. API keys currently require port-forwarding to maas-api | upstream/MaaS |
 | — | ~~Sustained load through the LLMInferenceService path and the Route (UNI-27)~~ | **Done for status tally and fairness.** 240s closed-loop runs (32 workers/tenant, `app1`/`app2`/`end-users`) against both the in-cluster gateway Service and the public Route landed 94.7% and 97.9% HTTP 200 respectively. `normalized_service` converged to within ~7% across the three backlogged groups on both paths, confirmed at multiple flight-recorder ticks through each run. On the non-200s: the Route path's are directly traced via the gateway access log to a ~2s connection/endpoint-pool warm-up burst at request-storm start (zero thereafter), not a sustained-load or fairness defect. The LLMInferenceService path's (5.3% error rate) are **inferred to be the same mechanism by analogy, not log-verified** — this cluster has no log aggregation and the gateway's own access-log buffer had already rotated past the run window by the time it was checked. Script: `deploy/poc/12-loadgen-route.sh` (Route path); `deploy/poc/04-loadgen.yaml` unchanged (LLMInferenceService path). Does **not** cover the 600s timeout / `buffer-response: false` annotations — see item 15 | N/A -- closed for status tally + fairness scope |
 | — | ~~Open-loop load generation (UNI-34)~~ | **Done, and the clamp finding flips.** `deploy/poc/13-loadgen-poisson.{py,sh}` adds open-loop Poisson arrivals. Below saturation the clamp fires on ~65% of dispatches (vs 0.2–2.2% closed-loop) but is harmless (pool uncontended). Above saturation (24 req/s aggregate vs a measured ~20-22 req/s pool ceiling) it measurably **inverts** the 20/10/65 split: end-users (w=65) delivered 25.5%, app1 (w=20) delivered 40.4%. This **contradicts** the GPU closed-loop "clamp is inert" finding (`## 3`) and confirms the SUPERSEDED section's concern more strongly than originally observed. See "Open-loop (Poisson) load generation (UNI-34)" above for the full data, including what was not tested (no clamp on/off A/B — see that section for why) | **newcomerClamp default should be revisited** — a policy decision, same owner as item 2 |
@@ -1330,6 +1426,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Archive the EPP log as a per-run artifact (UNI-46, D5)~~ | **Done.** `deploy/poc/14-loadgen-with-log-archive.sh` wraps `04-loadgen.yaml` unchanged -- it captures the GPU EPP's own container log (targeting `maas-vllm-gpu-kserve-router-scheduler` via `oc logs -f`) into `results/<timestamp>-<label>/epp-container.log` for exactly the run's duration, records the byte count and flight-recorder line count in a per-run `manifest.json` alongside the loadgen's own status/latency table, and detects a mid-run container restart (reattaches `-f`, notes it in the manifest) instead of silently losing the earlier log. Verified live 2026-10-25 against a 240s full-contention run: 3,954,571 bytes captured, 196 `"fairness state"` flight-recorder lines, no restart. That run also surfaced an unrelated problem -- `end-users` got HTTP 403 on 87% of its requests -- tracked separately as [UNI-82](/UNI/issues/UNI-82) so it doesn't quietly corrupt a future fairness benchmark's numbers | N/A -- closed |
 | 16 | **Wire the D3 dashboard into the live Grafana (UNI-50)** | The ConfigMap `deploy/grafana-dashboard.yaml` is on `main`, but the live Grafana's `dashboards` volume mounts a ConfigMap literally named `kueue-dashboard` in the `grafana` namespace -- not `maas-fairness-dashboard` in `maas-fairness-poc`, where this repo has write access. Cross-namespace `configMap` volume sources don't exist, so some copy step is unavoidable. The exact commands are documented in [runbook.md](runbook.md#load-the-fairness-dashboard-into-the-live-grafana) and confirmed correct against the live `grafana-dashboards-provider` provisioner config, but not run: `oc auth can-i create/update configmaps -n grafana` and `patch deployments -n grafana` all return `no`. Until someone with that access runs them, the live instance loads zero file-provisioned dashboards -- the dashboard content itself was verified by a separate, non-durable `/api/dashboards/db` import, not by this ConfigMap rendering anywhere | operator-level approval (namespace write on `grafana`) |
 | — | ~~Per-run fairness benchmark with a PASS/FAIL verdict (UNI-54)~~ | **Done.** `deploy/poc/15-fairness-benchmark.sh` + `15-fairness-report.py` turn a named scenario run into its own verdict -- JSON + markdown, delivered share from the EPP's own `contended_service_tokens_total` (reusing UNI-50's SLI unchanged), run metadata including the EPP image digest, a documented 10-point threshold, and an exit code a pipeline can gate on. All four scenarios run live against the GPU EPP 2026-10-29: see "UNI-54: an automated fairness benchmark," above, for the full table. Two scenarios (`full-contention`, `end-users-idle`) correctly FAIL on the pre-existing equal-worker-sizing artifact (same mechanism as A4/UNI-29's Run 2, above -- not a new defect; follow-up tracked on that same Outstanding-work row); two (`app1-alone`, `asymmetric-demand`) PASS once the verdict logic was fixed to stop scoring a structurally-zero or structurally-demand-capped share as a failure. `15-fairness-report-test.py` proves the FAIL path against synthetic data with a real non-zero exit, independent of cluster access | N/A -- closed |
+| — | ~~Resize `full-contention`/`end-users-idle` to over-offer per tenant, re-run all four + a named control (UNI-103)~~ | **Done, 4/5 green.** Per-tenant `WORKERS_APP1`/`WORKERS_APP2`/`WORKERS_END_USERS` replace the single global `WORKERS` in both scenarios; `equal-workers-control` keeps the original equal-worker shape alive as a permanent, explicitly-unscored negative control (`--control`, verdict `INFO`). Live re-run 2026-10-29: `full-contention` now PASSES (16.2/12.8/71.0% vs 21.1/10.5/68.4%), `app1-alone` and `asymmetric-demand` still PASS, `equal-workers-control` reproduces the original artifact as expected (INFO, 29.7pt max deviation). `end-users-idle` still FAILs, now in the opposite direction (app1 82.4% vs a 66.7% target) -- see "UNI-103," below, for the full table and the suspected cause | follow-up: [UNI-104](/UNI/issues/UNI-104), tune the app1:app2 over-offer ratio |
 
 ## Reproducing
 

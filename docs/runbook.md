@@ -431,18 +431,47 @@ after=$(awk -F'[{} ]+'  '/contended_seconds_total.*fairness_id="app1"/ {print $N
 echo "app1 backlogged ${after:-0} - ${before:-0} of the run's DURATION seconds"
 ```
 
-If that delta is close to the run's `DURATION` (240s by default), the
-tenant was backlogged essentially the whole run — genuinely saturated, and
-its measured share means what it claims to mean. If it is meaningfully
-short of `DURATION`, the tenant's queue drained for part of the run: its
-workers are undersized for this backend's latency under this contention
-mix, resize it up and re-run before trusting the share number. This is the
-same check, made mechanical, that `docs/poc-results.md`'s "detour" section
-did by reading `normalized_service` and queue-depth logs by hand; a future
-backend/model change (new GPU, new model, different `--max-num-seqs`) will
-shift the latency this calculation depends on, so re-run this check — do
-not assume the worker counts above still saturate every tenant on a
-different backend.
+**What the delta means — corrected against this ticket's own live numbers,
+not assumed.** The first draft of this section claimed a delta close to the
+run's `DURATION` means "backlogged the whole run." That is wrong, and the
+live re-run (UNI-103, 2026-10-29) caught it before it shipped: even
+`full-contention`'s clean PASS (16.2/12.8/71.0% against a 21.1/10.5/68.4%
+target) credited each of its three genuinely-offered, genuinely-contending
+tenants only ~9 of the run's 240 seconds (app1 9.3s, app2 8.8s, end-users
+9.5s) — nowhere near `DURATION`. The metric only accrues per dispatch event,
+and only while *that candidate's own priority band* holds more than one
+backlogged flow at that exact instant (`plugin.go`'s `maxContendedStep`
+additionally caps each such credit at 1 second) — a far narrower window
+than "queue non-empty for the whole run." Do not compare the delta to
+`DURATION`.
+
+The comparison that IS reliable is relative, within the same run:
+
+- Tenants that are genuinely offered and contending land in the same order
+  of magnitude as each other — `full-contention`'s ~9s/~9s/~9s above is the
+  reference point.
+- An offered tenant whose delta sits near zero, or an order of magnitude
+  below its simultaneously-offered peers, was rarely found backlogged
+  alongside anyone else — distrust its measured share; resize it up and
+  re-run.
+- A tenant this scenario did not offer correctly shows a flat `0.0` delta
+  (`end-users` in `end-users-idle`, above) — that is the scenario
+  definition, not a saturation problem.
+
+**This check's limit, also from a live number rather than a guess:**
+`end-users-idle`'s FAIL (below) is a worked example of what it does *not*
+catch. app1 (1.50s) and app2 (1.54s) came out almost identical despite a
+4:1 worker-count difference and a 4.7:1 delivered-share gap (82.4% vs
+17.6%, against a 66.7/33.3 target) — so two groups landing close on this
+metric does not mean their delivered shares will land close. It catches an
+UNDER-contended group reliably (the thing it is built to detect); it is not
+a predictor of where a correctly-contending group's exact share will fall.
+Closing that residual gap further is out of this ticket's scope — see
+`docs/poc-results.md`'s 2026-10-29 UNI-103 section and the follow-up ticket
+it opens. A future backend/model change (new GPU, new model, different
+`--max-num-seqs`) will shift the dispatch cadence this check depends on, so
+re-run it rather than assuming the worker counts above still saturate every
+tenant on a different backend.
 
 ### The PASS/FAIL threshold: 10 points, on evidence
 

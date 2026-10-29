@@ -688,6 +688,75 @@ expect a different split — but that is an inference from unchanged source, not
 measurement, and the next person who can clear that webhook should re-run at least the
 sized-worker enforce case against the now-committed digest to close that inference out.
 
+### UNI-97: the webhook regressed, so the live repoint is still not done
+
+Picked up the item above on 2026-10-29. Progress and a new blocker, same shape as before:
+
+**Digest/commit bookkeeping (done).** `bc/maas-epp` build 4 (2026-10-20, the build behind the
+live digest `sha256:5ef5df2776364e6161f91e5a3df0fbed9a4751bde847658af51923b1eded7f40`) built
+commit `e86c3ee4e411d663ac207df66579372bdae7a114`. `bc/maas-epp-quay-publish-1` (2026-10-22,
+behind the Quay digest `sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135`)
+built `fc27130f0703b8228127a4040eb160567000bc27`. `e86c3ee` is an ancestor of `fc27130`
+(confirmed with `git merge-base --is-ancestor`), and `git log e86c3ee..fc27130 -- cmd/ pkg/
+Dockerfile.epp go.mod go.sum` is empty — so the two digests differ only because `bc/maas-epp`
+built with the Dockerfile's default `COMMIT_SHA=unknown`/`BUILD_REF=` ldflags while
+`bc/maas-epp-quay-publish` stamps `COMMIT_SHA=fc27130f07...`/`BUILD_REF=fc27130`, not because
+of any source drift. **No rebuild was needed**; the already-published Quay digest is the same
+plugin logic as what's running.
+
+**Pull secret (confirmed, already provisioned).** Re-verified today that
+`quay.io/rh-ee-dsivan/maas-fair-share` is private (anonymous `/v2/.../manifests/...` returns
+401; the `quay-maas-pull` secret's own credential returns 200 for this exact digest). That
+secret is already attached to `maas-vllm-gpu-epp-sa`'s `imagePullSecrets`, so nothing new was
+needed on this front either — matches the "no new pull-secret work" finding above.
+
+**Baseline captured against the current (pre-repoint) config.** `full-contention` scenario,
+`enforce: true`, `WORKERS=32` (equal across tenants), 240s, against the live in-cluster-registry
+digest:
+
+| group | weight | requests | expected % | observed % | deviation (pts) |
+|---|---|---|---|---|---|
+| app1 | 20.0 | 1081 | 21.1% | 30.1% | +9.1 |
+| app2 | 10.0 | 1127 | 10.5% | 31.5% | +21.0 |
+| end-users | 65.0 | 1350 | 68.4% | 38.3% | **-30.1** |
+
+Verdict: **FAIL** (end-users exceeds the 10-point threshold). This is the known equal-worker
+shape, not a new problem — see "What this means for a load test, and for an SLA" above: equal
+`WORKERS` across tenants doesn't size end-users' queue depth enough to pull its full 65% share.
+It is a baseline to diff against, not a target to hit. Full report:
+`results/20261029T162814Z-uni97-baseline/fairness-report.md` (gitignored, not committed —
+numbers reproduced here per repo convention).
+
+**Blocked again: the stale-webhook fix from UNI-29 didn't stick.** Attempted the repoint —
+`oc patch` (both JSON-patch and merge-patch) and `oc apply --dry-run=server` against
+`llminferenceservice/maas-vllm-gpu`, changing only the scheduler image to the Quay digest.
+All three rejected with the exact same error UNI-29 already diagnosed and fixed once:
+
+```
+failed calling webhook "connection-llmisvc-v1alpha2.odh-model-controller.opendatahub.io":
+  the server could not find the requested resource
+```
+
+Reproduced identically against `maas-vllm-cpu` too (a one-field annotation patch, unrelated to
+this change), and the `odh-model-controller` pod now running (`redhat-ods-applications`,
+started 2026-10-29T15:16:37Z) is healthy and reconciling normally — this is the admission
+webhook, not the controller being down. Per "The stale webhook that blocked all of this"
+above, deleting the stale `MutatingWebhookConfiguration` fixed this exact failure on
+2026-10-22, and the 3.4.4 operator recreated a correct 3-webhook version automatically within
+seconds. Either that fix didn't survive (operator/CSV reconcile re-applied the 3.5.0-era
+5-webhook config), or a separate installation path recreated the same stale object. This
+role's token still cannot `get`/`list`/`delete`
+`mutatingwebhookconfigurations.admissionregistration.k8s.io` at the cluster scope (confirmed
+again today) — same boundary as before, needs the same kind of one-time cluster-scoped
+intervention to clear.
+
+**Net state: still not repointed live.** The repo manifests (`deploy/llmisvc.yaml`,
+`deploy/poc/09-vllm-gpu.yaml`) already pin the Quay digest from UNI-29 and need no further
+edit. `llminferenceservice/maas-vllm-gpu` itself is still running the in-cluster-registry
+digest. Once the webhook is cleared, the remaining work is: apply the image change, confirm
+the scheduler pod pulls via `quay-maas-pull` and goes `1/1`, then re-run `full-contention`
+with `LABEL` distinguishing it from the baseline above and diff the two reports.
+
 ## GPU test suite — four results
 
 All on 2x A100, Qwen2.5-7B, two replicas, real MaaS `sk-oai` auth, weights
@@ -1257,7 +1326,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Gateway header stripping (direct rig, UNI-43)~~ | **Fixed and verified live.** The direct rig (`02-epp.yaml`/`03-gateway.yaml`) has no Authorino layer, so UNI-33's overwrite mechanism doesn't apply -- fixed instead by removing the header outright, via an Istio `EnvoyFilter` (`envoy.filters.http.header_mutation`, `INSERT_BEFORE` `envoy.filters.http.ext_proc`) scoped to `maas-poc-route` alone so it can't also strip the value UNI-33 set for the authenticated MaaS routes sharing the same Gateway. Applied and verified live 2026-10-19 once `create`/`update` on `envoyfilters.networking.istio.io` and `pods/exec` in `maas-fairness-poc` were granted: the live config dump confirmed `header_mutation` sits immediately before `ext_proc` in the chain, and the per-route override lands on exactly one route (`maas-fairness-poc.maas-poc-route.0`), not on the MaaS routes. `gateway-header-check` still reports this route as uncovered -- a known, documented limitation (it only recognises AuthPolicy-based coverage), not a sign the fix didn't take. Not verified: an end-to-end request proving a forged header doesn't reach the EPP/simulator, since both remain scaled to 0/0. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
 | — | ~~Reproduce the headline split on real vLLM, both modes (UNI-29)~~ | **Done.** Re-run 2026-10-22 against the live GPU deployment (now serving `llama-3-1-8b`, EPP image digest `sha256:5ef5df27...`): shadow 33.0/33.6/33.4%, enforce (sized workers) 16.2/13.7/70.1% against a 20/10/65 target. See "A4 (UNI-29): reproduced again, against the current EPP build, both modes," above, for the full data including a negative-control run and the sizing hypothesis for the ~5-point residual gap. `enforce` was restored to `true` (the live default) afterward | follow-up: tune worker sizing further to close the ~5-point gap (same section) |
 | — | ~~`main` didn't deploy the image these numbers came from~~ | **Done.** That digest was in-cluster-BuildConfig-only (never pushed to Quay, not transferable), and the committed manifests were separately 31 commits stale on top of that. Rebuilt from unchanged source at `HEAD`, pushed to `quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a7...`, and repinned both manifests to that digest. See "The EPP image above was not transferable, and `main` didn't deploy it — now fixed," above | — |
-| 1b | **Re-run the sized-worker enforce case against the now-committed Quay digest, live** | the digest above was verified to pull and run correctly (startup log confirms the commit SHA), and the plugin source is unchanged from what was tested, but the split itself was not re-measured against this exact artifact | the stale `MutatingWebhookConfiguration` on `LLMInferenceService` admission (see "The stale webhook that blocked all of this") — needs someone who can delete a cluster-scoped `MutatingWebhookConfiguration`, which this role cannot even read |
+| 1b | **Re-run the sized-worker enforce case against the now-committed Quay digest, live** | still open as of [UNI-97](/UNI/issues/UNI-97) (2026-10-29): the digest/commit comparison, pull-secret check, and a fresh `full-contention` baseline are all done (see "UNI-97: the webhook regressed, so the live repoint is still not done," above), but the live `oc patch`/`oc apply` repoint of `llminferenceservice/maas-vllm-gpu` itself is still rejected by the same admission webhook UNI-29 hit | the stale `MutatingWebhookConfiguration` on `LLMInferenceService` admission regressed again (see "The stale webhook that blocked all of this" and the UNI-97 update) — needs someone who can delete a cluster-scoped `MutatingWebhookConfiguration`, which this role cannot even read |
 | — | ~~Archive the EPP log as a per-run artifact (UNI-46, D5)~~ | **Done.** `deploy/poc/14-loadgen-with-log-archive.sh` wraps `04-loadgen.yaml` unchanged -- it captures the GPU EPP's own container log (targeting `maas-vllm-gpu-kserve-router-scheduler` via `oc logs -f`) into `results/<timestamp>-<label>/epp-container.log` for exactly the run's duration, records the byte count and flight-recorder line count in a per-run `manifest.json` alongside the loadgen's own status/latency table, and detects a mid-run container restart (reattaches `-f`, notes it in the manifest) instead of silently losing the earlier log. Verified live 2026-10-25 against a 240s full-contention run: 3,954,571 bytes captured, 196 `"fairness state"` flight-recorder lines, no restart. That run also surfaced an unrelated problem -- `end-users` got HTTP 403 on 87% of its requests -- tracked separately as [UNI-82](/UNI/issues/UNI-82) so it doesn't quietly corrupt a future fairness benchmark's numbers | N/A -- closed |
 | 16 | **Wire the D3 dashboard into the live Grafana (UNI-50)** | The ConfigMap `deploy/grafana-dashboard.yaml` is on `main`, but the live Grafana's `dashboards` volume mounts a ConfigMap literally named `kueue-dashboard` in the `grafana` namespace -- not `maas-fairness-dashboard` in `maas-fairness-poc`, where this repo has write access. Cross-namespace `configMap` volume sources don't exist, so some copy step is unavoidable. The exact commands are documented in [runbook.md](runbook.md#load-the-fairness-dashboard-into-the-live-grafana) and confirmed correct against the live `grafana-dashboards-provider` provisioner config, but not run: `oc auth can-i create/update configmaps -n grafana` and `patch deployments -n grafana` all return `no`. Until someone with that access runs them, the live instance loads zero file-provisioned dashboards -- the dashboard content itself was verified by a separate, non-durable `/api/dashboards/db` import, not by this ConfigMap rendering anywhere | operator-level approval (namespace write on `grafana`) |
 | — | ~~Per-run fairness benchmark with a PASS/FAIL verdict (UNI-54)~~ | **Done.** `deploy/poc/15-fairness-benchmark.sh` + `15-fairness-report.py` turn a named scenario run into its own verdict -- JSON + markdown, delivered share from the EPP's own `contended_service_tokens_total` (reusing UNI-50's SLI unchanged), run metadata including the EPP image digest, a documented 10-point threshold, and an exit code a pipeline can gate on. All four scenarios run live against the GPU EPP 2026-10-29: see "UNI-54: an automated fairness benchmark," above, for the full table. Two scenarios (`full-contention`, `end-users-idle`) correctly FAIL on the pre-existing equal-worker-sizing artifact (same mechanism as A4/UNI-29's Run 2, above -- not a new defect; follow-up tracked on that same Outstanding-work row); two (`app1-alone`, `asymmetric-demand`) PASS once the verdict logic was fixed to stop scoring a structurally-zero or structurally-demand-capped share as a failure. `15-fairness-report-test.py` proves the FAIL path against synthetic data with a real non-zero exit, independent of cluster access | N/A -- closed |

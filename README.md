@@ -114,6 +114,49 @@ reserved for requests that have not arrived.
 **The short version: RHOAI 3.4 and 3.5 both work. The plugin ships its own EPP
 binary, so the platform's own EPP version does not gate it.**
 
+### What the dev cluster actually is (read this before citing a version)
+
+Both "3.4.4" and "3.5" are true of this cluster, which is why the two numbers
+keep colliding in our notes. It is **not** a clean 3.4.4 install:
+
+| Layer | Version | Evidence (2026-10-29) |
+|---|---|---|
+| Operator / platform | **3.4.4** | CSV `rhods-operator.3.4.4`, subscription channel `stable-3.4`, `DataScienceCluster.status.release` and `DSCInitialization.status.release` both `3.4.4` |
+| KServe + LLMISVC control plane | **3.5.0 artifacts** | presets named `v3-5-0-kserve-config-*`; scheduler preset image `odh-llm-d-router-endpoint-picker-rhel9` annotated `app.kubernetes.io/version: 0.10.0`; running `kserve-controller-manager` / `llmisvc-controller-manager` digests do **not** match the 3.4.4 CSV's `relatedImages` |
+
+The 3.4.4 bundle ships `odh_llm_d_inference_scheduler_image` and carries **no**
+`llm-d-router` endpoint-picker image at all, so those presets are not its work.
+The KServe objects were created **2026-09-07 21:08–21:11**, before the OLM
+install plans for `rhods-operator.3.4.0` and `.3.4.4` (both `2026-09-08 07:58`),
+and they still carry `internal.config.kubernetes.io/previousNamespaces:
+opendatahub`. They are leftovers from an earlier 3.5.0 stack.
+
+They persist because the 3.4.4 operator **cannot overwrite them**.
+`DataScienceCluster/default-dsc` reports `KserveReady: False` and
+`ModelControllerReady: False`, with reconcile errors that are structurally
+unfixable in place:
+
+- `odh-model-controller`: `spec.selector … field is immutable`
+- `leader-election-role`: two owner references with `controller: true`
+  (`Kserve/default-kserve` and `ModelController/default-modelcontroller`)
+
+So the 3.5.0 KServe objects stay, and every `LLMInferenceService` here —
+including both of ours, `maas-vllm-cpu` and `maas-vllm-gpu` — resolves its
+`baseRefs` to `v3-5-0-kserve-config-llm-scheduler`. (A `rhods-operator.3.4.5`
+install plan has been sitting unapproved since 2026-10-19; approving it will not
+clear this, because the blocker is the immutable field, not the operator version.)
+
+**Consequence for this POC: every result in [docs/poc-results.md](docs/poc-results.md)
+was produced against a 3.5.0 KServe data plane.** Where that document says
+"RHOAI 3.4.4" it means the operator CSV, not the controller that templated the
+scheduler. The 3.4 compatibility claim below rests on the flag-level test in
+`deploy/poc/06-rhoai34-shape.yaml` plus source and image-label inspection — not
+on a run against a coherent 3.4 KServe stack, which we have never had. The three
+open unknowns in "Still unverified on a real 3.4 cluster" are therefore still
+open, and item 5 of the Outstanding work ledger still needs a real 3.4 cluster.
+
+### Why the versions diverge in the first place
+
 That is worth stating plainly because the obvious reasoning is wrong. RHOAI 3.4
 ships an EPP with **no flow-control subsystem at all** — no `FairnessPolicy`, no
 `FlowKey`, no queues — which looks like a hard blocker. It isn't, because we

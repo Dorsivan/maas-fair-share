@@ -280,15 +280,25 @@ OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh <scenario> [label]
 ### Scenarios
 
 These are the four work-conservation experiments already described in the
-comments of `deploy/poc/04-loadgen.yaml` — read those comments before
-touching worker counts, the sizing reasoning there is load-bearing.
+comments of `deploy/poc/04-loadgen.yaml`, plus one named negative control
+(UNI-103) — read those comments before touching worker counts, the sizing
+reasoning there is load-bearing.
 
 | scenario | what it sets | what it proves |
 |---|---|---|
-| `full-contention` | `TENANTS="app1 app2 end-users"`, equal `WORKERS` | the headline weight split: 20/10/65 delivered under genuine three-way contention |
-| `end-users-idle` | `TENANTS="app1 app2"` | end-users' 65% is **absorbed** by app1/app2, not reserved while idle |
+| `full-contention` | `TENANTS="app1 app2 end-users"`, per-tenant `WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128` | the headline weight split: 20/10/65 delivered under genuine three-way contention, with every tenant over-offering relative to its entitlement |
+| `end-users-idle` | `TENANTS="app1 app2"`, per-tenant `WORKERS_APP1=128 WORKERS_APP2=32` | end-users' 65% is **absorbed** by app1/app2, not reserved while idle, with app1 over-offering relative to app2 to express their 2:1 (66.7/33.3 renormalized) ratio |
+| `equal-workers-control` | `TENANTS="app1 app2 end-users"`, equal `WORKERS` (the **original** full-contention shape) | **negative control, not scored.** Kept to show what an under-offered load looks like on this backend — expected to compress toward equal thirds, not 20/10/65. See "Per-tenant worker sizing and the saturation check" below |
 | `app1-alone` | `TENANTS="app1"` | a single tenant receives ~100% of the pool, not capped near its 20% weight |
 | `asymmetric-demand` | `WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2` | app1 is not held near its weight when the highest-weight tenant (end-users) sends only a trickle — this is the YAML's own commented-out example, which also idles app2; the ticket's prose names only APP1/END_USERS but the YAML it points to is the source of truth |
+
+`full-contention` and `end-users-idle` used to set a single global `WORKERS`
+for every tenant. UNI-100 traced both scenarios' FAILs on the live
+`llama-3-1-8b` backend to exactly that: equal worker counts cannot express a
+weighted split once the weights differ (see below), so UNI-103 resized both
+to per-tenant worker counts and kept the original equal-worker shape alive
+under a new name, `equal-workers-control`, as a deliberate, documented
+negative control rather than deleting the evidence of the failure mode.
 
 ### What it produces
 
@@ -311,6 +321,10 @@ log into:
 
 The script's own exit code is the report's verdict: 0 on PASS, 1 on FAIL —
 wire it into anything that should break a pipeline on a regression.
+`equal-workers-control` (run with `--control`, which `15-fairness-benchmark.sh`
+sets automatically for that scenario) gets a third verdict, INFO, which also
+exits 0: a control is expected to show a large deviation, and failing a
+pipeline on that would be reporting the control for doing its job.
 
 ### Expected share, and why it is not just "the configured weight"
 
@@ -358,7 +372,77 @@ of `docs/poc-results.md` for the full before/after numbers:
 `full-contention` and `end-users-idle` are not special-cased — every group
 they offer is genuinely able to compete for the pool, so the symmetric
 `|observed % − expected %| ≤ threshold` check applies to both as described
-above.
+above. `equal-workers-control` is a third kind of special case: it offers
+every group a genuine chance to compete too, but is deliberately sized so
+that chance cannot be taken (see below) — so its verdict is INFO, not a PASS
+or a FAIL against the symmetric threshold (`--control`; see "The PASS/FAIL
+threshold" above this section for the exit-code consequence).
+
+### Per-tenant worker sizing and the saturation check (UNI-103)
+
+**The rule, from `deploy/poc/04-loadgen.yaml`'s own comments and
+`docs/poc-results.md`'s "detour" section:** a weighted split can only be
+measured if every ACTIVE tenant offers more concurrency than its
+entitlement. The load generator is closed-loop — a tenant can never have
+more than its configured `WORKERS_*` requests outstanding — so if a
+tenant's workers are too few, the scheduler serves it faster than it can
+resubmit, its queue periodically empties, and an empty queue is not a
+candidate in `Pick`. The measured split then compresses toward equal shares
+regardless of what the weights say, and that looks exactly like a broken
+policy. It is not; it is work conservation correctly giving away capacity
+nobody is asking for at that instant.
+
+**This is exactly what broke `full-contention` and `end-users-idle` on the
+`llama-3-1-8b` backend (UNI-100):** `15-fairness-benchmark.sh` set
+`WORKERS=32` for every tenant in both scenarios. On this backend that is
+enough to saturate the LOWEST-weight tenants but not the highest-weight one
+in each scenario (`end-users` at 65% in `full-contention`, `app1` at a
+renormalized 66.7% in `end-users-idle`), so both scenarios' highest-share
+tenant drained its queue and the split compressed toward equal. The fix
+(this ticket) is per-tenant worker counts, not a bigger single `WORKERS`:
+
+- `full-contention`: `WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128`
+  — copied from A4 Run 3 (`docs/poc-results.md`, UNI-29), the first config
+  that reproduced the weight ordering on this exact backend/model.
+- `end-users-idle`: `WORKERS_APP1=128 WORKERS_APP2=32` — app1 is this
+  scenario's highest-share tenant once end-users is excluded (66.7% vs
+  33.3%, the same 2:1 ratio as their raw 20:10 weights), so it gets the same
+  treatment end-users got above: over-offer well past app1's own
+  entitlement so its queue cannot drain mid-run.
+- `equal-workers-control` keeps the ORIGINAL equal-`WORKERS=32` shape on
+  purpose, as a named, permanent negative control — see the scenario table
+  above. Its own report says plainly that it is not scored, so a future
+  reader does not mistake its large deviation for a regression.
+
+**How to check a tenant was actually saturated, so a future backend change
+doesn't silently break this again:** the EPP's own
+`llm_d_epp_maas_fairness_contended_seconds_total` (per `fairness_id`,
+`pkg/fairness/weightedlas/metrics.go`) counts seconds during which a group
+was backlogged while at least one other group in its band was too. Both
+`metrics-before.txt` and `metrics-after.txt` already capture it — the
+benchmark's `snapshot_metrics` greps every `llm_d_epp_maas_fairness_*`
+series, not just the tokens counter used for the share calculation — so no
+extra scrape is needed:
+
+```sh
+# delta for a group, from the two snapshots a run already produced
+before=$(awk -F'[{} ]+' '/contended_seconds_total.*fairness_id="app1"/ {print $NF}' metrics-before.txt)
+after=$(awk -F'[{} ]+'  '/contended_seconds_total.*fairness_id="app1"/ {print $NF}' metrics-after.txt)
+echo "app1 backlogged ${after:-0} - ${before:-0} of the run's DURATION seconds"
+```
+
+If that delta is close to the run's `DURATION` (240s by default), the
+tenant was backlogged essentially the whole run — genuinely saturated, and
+its measured share means what it claims to mean. If it is meaningfully
+short of `DURATION`, the tenant's queue drained for part of the run: its
+workers are undersized for this backend's latency under this contention
+mix, resize it up and re-run before trusting the share number. This is the
+same check, made mechanical, that `docs/poc-results.md`'s "detour" section
+did by reading `normalized_service` and queue-depth logs by hand; a future
+backend/model change (new GPU, new model, different `--max-num-seqs`) will
+shift the latency this calculation depends on, so re-run this check — do
+not assume the worker counts above still saturate every tenant on a
+different backend.
 
 ### The PASS/FAIL threshold: 10 points, on evidence
 

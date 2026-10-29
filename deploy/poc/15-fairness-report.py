@@ -123,7 +123,7 @@ def parse_loadgen_log(path):
 def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_digest,
                   namespace, epp_pod, run_start, run_end, threshold_points,
                   metrics_before_path, metrics_after_path, loadgen_log_path,
-                  label=None):
+                  label=None, control=False):
     before = parse_metrics(metrics_before_path)
     after = parse_metrics(metrics_after_path)
     offered_workers, loadgen_rows, logged_duration = parse_loadgen_log(loadgen_log_path)
@@ -268,6 +268,27 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                 + " -- its configured weight appears to be acting as a ceiling, not a floor, "
                 "while another offered group's capacity went unused"
             )
+    elif control:
+        # UNI-103: a named negative control (e.g. equal-workers-control) is
+        # run deliberately WITHOUT per-tenant over-offered sizing, so a large
+        # deviation from the weighted split is the expected, correct result
+        # -- work conservation draining the highest-weight tenant's queue,
+        # not the policy failing. Scoring that against the symmetric
+        # threshold would FAIL a run that is behaving exactly as designed, so
+        # a control never reaches FAIL/PASS on the deviation check; it still
+        # fails above on structural problems (no load offered, EPP restart,
+        # zero tokens accounted) because those indicate the run itself was
+        # invalid, control or not.
+        if verdict != "FAIL":
+            verdict = "INFO"
+        if max_abs_dev is not None:
+            reasons.append(
+                f"negative control, not scored against the {threshold_points:g}-point "
+                f"threshold: max deviation was {max_abs_dev:.1f} points. This scenario is "
+                "expected to compress toward equal shares, not reproduce the configured "
+                "weights -- see docs/runbook.md's 'Per-tenant worker sizing and the "
+                "saturation check'"
+            )
     elif max_abs_dev is not None and max_abs_dev > threshold_points:
         verdict = "FAIL"
         worst = max(deviations_for_verdict, key=lambda kv: abs(kv[1]))
@@ -281,6 +302,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         "run": {
             "scenario": scenario,
             "label": label,
+            "control": control,
             "namespace": namespace,
             "enforce": enforce,
             "duration_seconds": duration_seconds if duration_seconds is not None else logged_duration,
@@ -330,7 +352,14 @@ def render_markdown(report):
     lines = []
     lines.append(f"# Fairness benchmark: {r['scenario']}" + (f" ({r['label']})" if r.get('label') else ""))
     lines.append("")
-    lines.append(f"**Verdict: {v['result']}** (threshold: {v['threshold_points']:g} points)")
+    if r.get("control"):
+        lines.append(
+            f"**Verdict: {v['result']}** -- named negative control, not scored against the "
+            f"{v['threshold_points']:g}-point threshold. Expected to NOT reproduce the "
+            "configured weights; see docs/runbook.md."
+        )
+    else:
+        lines.append(f"**Verdict: {v['result']}** (threshold: {v['threshold_points']:g} points)")
     if v["reasons"]:
         lines.append("")
         for reason in v["reasons"]:
@@ -392,6 +421,13 @@ def main():
     p.add_argument("--loadgen-log", required=True)
     p.add_argument("--out-json", required=True)
     p.add_argument("--out-md", required=True)
+    p.add_argument(
+        "--control", action="store_true",
+        help="Named negative control (UNI-103): report the numbers but never score the "
+             "weighted-split deviation as PASS/FAIL -- verdict is INFO instead, and the exit "
+             "code stays 0 unless a structural problem (no load, EPP restart, zero tokens "
+             "accounted) makes the run itself invalid.",
+    )
     args = p.parse_args()
 
     report = build_report(
@@ -409,6 +445,7 @@ def main():
         metrics_before_path=args.metrics_before,
         metrics_after_path=args.metrics_after,
         loadgen_log_path=args.loadgen_log,
+        control=args.control,
     )
 
     with open(args.out_json, "w") as f:
@@ -420,7 +457,7 @@ def main():
     print(f"verdict: {report['verdict']['result']}")
     for reason in report["verdict"]["reasons"]:
         print(f"  - {reason}")
-    return 0 if report["verdict"]["result"] == "PASS" else 1
+    return 0 if report["verdict"]["result"] in ("PASS", "INFO") else 1
 
 
 if __name__ == "__main__":

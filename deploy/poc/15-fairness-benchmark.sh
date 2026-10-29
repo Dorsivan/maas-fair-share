@@ -37,19 +37,49 @@
 #   OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh <scenario> [label]
 #
 # Scenarios (named per the four experiments already described in the
-# comments of 04-loadgen.yaml):
-#   full-contention     TENANTS="app1 app2 end-users", equal WORKERS (the
-#                        weight-split headline test).
-#   end-users-idle      TENANTS="app1 app2" -- end-users' 65% must be
-#                        absorbed by app1/app2, not reserved.
-#   app1-alone          TENANTS="app1" -- must receive ~100% of the pool.
-#   asymmetric-demand   WORKERS_APP1=32, WORKERS_APP2=0, WORKERS_END_USERS=2
-#                        -- the exact commented-out example in
-#                        04-loadgen.yaml's per-tenant-override block. Note
-#                        this sets app2 idle too (0 workers), which is that
-#                        block's own documented example; the ticket prose
-#                        only names APP1/END_USERS but the YAML comment it
-#                        points to is the source of truth here.
+# comments of 04-loadgen.yaml, plus one negative control -- UNI-103):
+#   full-contention        TENANTS="app1 app2 end-users", per-tenant workers
+#                          32/32/128 (app1/app2/end-users) -- the weight-split
+#                          headline test. Sized, not equal: see "Per-tenant
+#                          worker sizing" below for why equal WORKERS=32
+#                          failed on this backend (UNI-100/UNI-103) and where
+#                          32/32/128 comes from (A4 Run 3, UNI-29).
+#   end-users-idle         TENANTS="app1 app2", per-tenant workers 128/32
+#                          (app1/app2) -- end-users' 65% must be absorbed by
+#                          app1/app2, not reserved. app1 over-offers relative
+#                          to app2 for the same reason end-users does in
+#                          full-contention: app1 is the higher-share tenant
+#                          once end-users is out of the pool (66.7% vs 33.3%),
+#                          so it needs more concurrency to stay backlogged.
+#   equal-workers-control  TENANTS="app1 app2 end-users", equal WORKERS (the
+#                          ORIGINAL full-contention shape, kept as a named
+#                          negative control -- UNI-103). Expected to NOT show
+#                          the weighted split on this backend (work
+#                          conservation drains the high-weight tenant's
+#                          queue); the report marks it INFO, not PASS/FAIL,
+#                          and it does not count toward this script's exit
+#                          code or the suite's pass/fail bar.
+#   app1-alone             TENANTS="app1" -- must receive ~100% of the pool.
+#   asymmetric-demand      WORKERS_APP1=32, WORKERS_APP2=0,
+#                          WORKERS_END_USERS=2 -- the exact commented-out
+#                          example in 04-loadgen.yaml's per-tenant-override
+#                          block. Note this sets app2 idle too (0 workers),
+#                          which is that block's own documented example; the
+#                          ticket prose only names APP1/END_USERS but the
+#                          YAML comment it points to is the source of truth
+#                          here.
+#
+# Per-tenant worker sizing (see docs/runbook.md "Per-tenant worker sizing
+# and the saturation check" for the full method): every ACTIVE tenant in a
+# scored scenario must offer more concurrency than its entitlement, or its
+# queue periodically drains and the measured split compresses toward equal
+# shares no matter what the weights say (docs/poc-results.md, "The detour,
+# and the lesson in it", and the 2026-10-29 UNI-100 finding that reproduced
+# it on full-contention/end-users-idle). That is why full-contention and
+# end-users-idle now set PER_TENANT_OVERRIDES instead of relying on a single
+# global WORKERS for every tenant -- WORKERS alone cannot express "this
+# tenant needs more offered load than that one," which is exactly what a
+# weighted split requires once the weights differ.
 #
 # Overrides: WORKERS, DURATION, NAMESPACE, OPENSHIFT_SERVER, EPP_SELECTOR,
 # EPP_CONTAINER, BACKEND, THRESHOLD_POINTS (default 10 -- see
@@ -57,7 +87,7 @@
 # chosen).
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle app1-alone asymmetric-demand}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone asymmetric-demand}"
 LABEL="${2:-$SCENARIO}"
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -69,14 +99,40 @@ THRESHOLD_POINTS="${THRESHOLD_POINTS:-10}"
 JOB_NAME="maas-loadgen"
 DURATION="${DURATION:-240}"
 
+# UNI-103: is this scenario scored, or a named negative control that is
+# expected not to show the weighted split? Read by the report step below --
+# a control still runs for real and still produces a report, it just isn't
+# held to the symmetric PASS/FAIL threshold or counted in this script's exit
+# code.
+IS_CONTROL="false"
+
 case "$SCENARIO" in
   full-contention)
+    # Sized from A4 Run 3 (docs/poc-results.md, UNI-29), the first config on
+    # this backend/model (llama-3-1-8b) that put every tenant above its
+    # entitlement and reproduced the weight ordering end-users > app1 > app2.
     TENANTS="app1 app2 end-users"
-    PER_TENANT_OVERRIDES=()
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128)
     ;;
   end-users-idle)
+    # app1 is the higher-share tenant once end-users is excluded (66.7% vs
+    # app2's 33.3%), so it needs to over-offer relative to app2 for the same
+    # reason end-users over-offers relative to app1/app2 in full-contention
+    # above -- see docs/runbook.md "Per-tenant worker sizing and the
+    # saturation check".
     TENANTS="app1 app2"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=128 WORKERS_APP2=32)
+    ;;
+  equal-workers-control)
+    # UNI-103: the ORIGINAL full-contention shape (equal WORKERS for every
+    # tenant), kept on purpose as a named negative control -- it is expected
+    # to compress toward equal thirds on this backend (work conservation
+    # draining end-users' queue, the same mechanism docs/poc-results.md's
+    # "detour" section documents), not to show 20/10/65. See
+    # docs/runbook.md for why this is scored INFO, not PASS/FAIL.
+    TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=()
+    IS_CONTROL="true"
     ;;
   app1-alone)
     TENANTS="app1"
@@ -87,7 +143,7 @@ case "$SCENARIO" in
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2)
     ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle app1-alone asymmetric-demand)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone asymmetric-demand)" >&2
     exit 1
     ;;
 esac
@@ -226,13 +282,18 @@ RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # --- Build the report; its exit code becomes this script's exit code -------
 set +e
-python3 -I "$(dirname "$0")/15-fairness-report.py" \
-  --scenario "$SCENARIO" --label "$LABEL" --enforce "$ENFORCE" \
-  --duration-seconds "$DURATION" --backend "$BACKEND" \
-  --epp-image-digest "$EPP_IMAGE_DIGEST" --namespace "$NAMESPACE" --epp-pod "$EPP_POD" \
-  --run-start "$RUN_START" --run-end "$RUN_END" --threshold-points "$THRESHOLD_POINTS" \
-  --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" --loadgen-log "$LOADGEN_LOG" \
+REPORT_ARGS=(
+  --scenario "$SCENARIO" --label "$LABEL" --enforce "$ENFORCE"
+  --duration-seconds "$DURATION" --backend "$BACKEND"
+  --epp-image-digest "$EPP_IMAGE_DIGEST" --namespace "$NAMESPACE" --epp-pod "$EPP_POD"
+  --run-start "$RUN_START" --run-end "$RUN_END" --threshold-points "$THRESHOLD_POINTS"
+  --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" --loadgen-log "$LOADGEN_LOG"
   --out-json "$REPORT_JSON" --out-md "$REPORT_MD"
+)
+if [ "$IS_CONTROL" = "true" ]; then
+  REPORT_ARGS+=(--control)
+fi
+python3 -I "$(dirname "$0")/15-fairness-report.py" "${REPORT_ARGS[@]}"
 REPORT_EXIT=$?
 set -e
 

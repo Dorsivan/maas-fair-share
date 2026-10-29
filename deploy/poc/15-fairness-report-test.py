@@ -45,7 +45,8 @@ def loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows):
 
 
 def run_build(tmp, *, tokens_before, tokens_after, tenants, w_app1, w_app2, w_end,
-              rows, threshold_points=10.0, duration=240, scenario="test-scenario"):
+              rows, threshold_points=10.0, duration=240, scenario="test-scenario",
+              control=False):
     before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_before)
     after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_after)
     log = write(tmp, "loadgen.log", loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows))
@@ -63,6 +64,7 @@ def run_build(tmp, *, tokens_before, tokens_after, tenants, w_app1, w_app2, w_en
         metrics_before_path=before,
         metrics_after_path=after,
         loadgen_log_path=log,
+        control=control,
     )
 
 
@@ -280,6 +282,60 @@ def test_asymmetric_demand_saturating_group_capped_fails():
         )
         assert report["verdict"]["result"] == "FAIL", report["verdict"]
         assert report["verdict"]["reasons"]
+
+
+def test_control_scenario_reports_info_not_scored():
+    # UNI-103: equal-workers-control reuses the exact equal-worker shape that
+    # produced the pre-resize FAIL (31/30.7/38.3 against 20/10/65 on this
+    # backend -- docs/poc-results.md). Run as --control, that large deviation
+    # must NOT become a FAIL or a PASS -- it is the control's expected,
+    # correct-for-its-purpose result, so the verdict is INFO and the reasons
+    # say so without claiming the weighted split held.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 3100\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 3070\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 3830\n'
+        )
+        rows = [
+            ("app1", 500, "1.20", "2.40", "200=500"),
+            ("app2", 490, "1.30", "2.50", "200=490"),
+            ("end-users", 510, "1.10", "2.30", "200=510"),
+        ]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 app2 end-users", w_app1=32, w_app2=32, w_end=32, rows=rows,
+            scenario="equal-workers-control", control=True,
+        )
+        assert report["verdict"]["result"] == "INFO", report["verdict"]
+        assert report["verdict"]["max_abs_deviation_points"] > 10
+        assert any("not scored" in r for r in report["verdict"]["reasons"]), report["verdict"]["reasons"]
+
+        # The CLI must exit 0 for a control even though the deviation would
+        # FAIL a scored scenario -- it must not break a pipeline gating on
+        # this script's exit code.
+        before = write(tmp, "before2.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_before)
+        after = write(tmp, "after2.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_after)
+        log = write(tmp, "loadgen2.log", loadgen_log("app1 app2 end-users", 32, 32, 32, 240, rows))
+        out_json = os.path.join(tmp, "control-report.json")
+        out_md = os.path.join(tmp, "control-report.md")
+        proc = subprocess.run(
+            [sys.executable, "-I", os.path.join(HERE, "15-fairness-report.py"),
+             "--scenario", "equal-workers-control", "--enforce", "true", "--control",
+             "--backend", "vllm-gpu", "--epp-image-digest", "sha256:deadbeef",
+             "--namespace", "maas-fairness-poc", "--epp-pod", "test-pod",
+             "--run-start", "2026-10-29T00:00:00Z", "--run-end", "2026-10-29T00:04:00Z",
+             "--metrics-before", before, "--metrics-after", after, "--loadgen-log", log,
+             "--out-json", out_json, "--out-md", out_md],
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, f"expected zero exit for a control, got {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        assert "INFO" in proc.stdout
 
 
 def test_epp_restart_mid_run_fails():

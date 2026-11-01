@@ -997,3 +997,42 @@ and `$?` are actually checked or the pre-flight above is run first.
 [UNI-119](/UNI/issues/UNI-119), the parent of this ticket, is the pending
 cluster-admin delete of `inferencepools.v1alpha2.inference.networking.x-k8s.io/maas-pool`
 that this same blind spot applies to.
+
+**UNI-124: "which group is the object in" was the wrong question — the repo
+creates one in each.** The section above (UNI-123) establishes that a
+Forbidden error only names the group you asked about, and corrects an earlier
+assumption that `maas-pool` lived in `inference.networking.k8s.io` rather than
+`inference.networking.x-k8s.io`. That correction is right as far as it goes,
+but it still implies a single live pool with one wrong guess and one right
+answer. It is not single. `deploy/poc/02-epp.yaml` declares `maas-pool`
+**twice, deliberately**: `inference.networking.k8s.io/v1` at line 88 and
+`inference.networking.x-k8s.io/v1alpha2` at line 254. `docs/poc-results.md`,
+pitfall 6 ("Two InferencePool API groups, and both are needed"), records why
+both have to exist: the EPP watches only the `v1` group, and this cluster's
+gateway controller resolves only `x-k8s.io/v1alpha2` backendRefs and rejects a
+`v1` pool outright. So the earlier "empty, alphabetically-first
+`inference.networking.k8s.io` pool" framing that `deploy/poc/cleanup-dead-objects.sh`
+carried before this ticket was wrong on the fact, not just imprecise about it:
+that group is not empty, this repo's own manifest puts a real `maas-pool`
+there. A cleanup that deletes only the `x-k8s.io` pool (the UNI-123 fix)
+leaves the `k8s.io` one behind, silently, every time.
+
+**The two pools also have a detection asymmetry worth keeping, independent of
+the RBAC boundary above:**
+
+- The **`x-k8s.io/v1alpha2`** pool is indirectly observable even while
+  `get`/`list` on it are Forbidden: the gateway controller resolves it, mints
+  `svc/maas-pool-ip-73df004c`, and sets an `ownerReference` back to the pool
+  (quoted earlier on this page). That Service is a permitted kind, so its
+  continued existence — or its disappearance — is a readable proxy for
+  whether the pool it is owned by still exists.
+- The **`k8s.io/v1`** pool has no such proxy. This cluster's gateway
+  controller never resolves it, so it mints no Service, sets no
+  ownerReference, and leaves nothing behind that a permitted kind can
+  reflect. There is no garbage-collection signal and nothing to infer
+  presence or absence from. Its existence in the cleanup script rests on
+  `02-epp.yaml` declaring it, not on anything read from the cluster — and
+  absence of evidence is not evidence of absence here: a cluster-admin run
+  of the cleanup script that correctly deletes this pool and a run that
+  silently no-ops on it would look identical from any token available to an
+  agent.

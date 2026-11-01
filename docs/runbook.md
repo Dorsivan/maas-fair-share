@@ -579,9 +579,15 @@ namespace needs to run:
 ```sh
 OC="oc --token=$OPENSHIFT_TOKEN --server=https://api.ocp.paladinaura.com:6443"
 
-# 1. Pull the JSON out of the repo's ConfigMap (already applied in maas-fairness-poc).
-$OC get configmap maas-fairness-dashboard -n maas-fairness-poc \
-  -o jsonpath='{.data.maas-fairness-gpu-epp\.json}' > /tmp/maas-fairness-gpu-epp.json
+# 1. Pull the JSON out of this repo's manifest. Do not read it from the
+#    maas-fairness-poc ConfigMap -- see the note below this block for why.
+python3 -I - deploy/grafana-dashboard.yaml > /tmp/maas-fairness-gpu-epp.json << 'PYEOF'
+import re, sys
+text = open(sys.argv[1]).read()
+_, block = text.split('  maas-fairness-gpu-epp.json: |\n', 1)
+lines = [l[4:] if l.startswith('    ') else l for l in block.splitlines(keepends=True)]
+sys.stdout.write(''.join(lines))
+PYEOF
 
 # 2. Create/update the ConfigMap the grafana Deployment actually mounts.
 $OC create configmap kueue-dashboard -n grafana \
@@ -592,6 +598,25 @@ $OC create configmap kueue-dashboard -n grafana \
 #    it actually attaches rather than trusting kubelet's periodic resync —
 #    restart the pod and recheck the dashboard list in the "Kueue" folder.
 $OC delete pod -n grafana -l app=grafana
+```
+
+**The `maas-fairness-poc` copy of this ConfigMap must not be assumed
+present.** `deploy/poc/cleanup-dead-objects.sh` section 5 deletes
+`configmap/maas-fairness-dashboard` in `maas-fairness-poc` by design — the
+dashboard JSON's source of truth is this repo, not the cluster — and as of
+2026-11-01 it is in fact gone: a named `get` in that namespace returns
+`configmaps "maas-fairness-dashboard" not found`. Step 1 above reads
+`deploy/grafana-dashboard.yaml` directly so the procedure does not depend on
+that object existing. If something else needs the cluster copy back,
+`oc apply -f deploy/grafana-dashboard.yaml` recreates it byte-for-byte, but
+this procedure does not require that.
+
+Fallback, only if the cluster copy happens to exist and reading it directly
+is more convenient than step 1:
+
+```sh
+$OC get configmap maas-fairness-dashboard -n maas-fairness-poc \
+  -o jsonpath='{.data.maas-fairness-gpu-epp\.json}' > /tmp/maas-fairness-gpu-epp.json
 ```
 
 As of 2026-10-25 the Engineer role has `edit` on `maas-fairness-poc` only —

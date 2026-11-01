@@ -229,6 +229,13 @@ echo "--- 5. inert Grafana dashboard ConfigMap ---"
 # The dashboard JSON already lives in this repo at deploy/grafana-dashboard.yaml
 # (confirmed byte-for-byte match of the panel titles on 2026-10-29), so
 # deleting the cluster copy loses no unfinished work.
+#
+# This is also the object docs/runbook.md's "Load the fairness dashboard into
+# the live Grafana" procedure names as its step-1 input (UNI-126). That
+# procedure now reads deploy/grafana-dashboard.yaml directly instead, so this
+# delete does not break it -- but keep that coupling in mind before changing
+# this line. If the cluster copy is ever needed back for some other reason,
+# `oc apply -f deploy/grafana-dashboard.yaml` recreates it byte-for-byte.
 del configmap maas-fairness-dashboard
 
 if [ "$FAILURES" -gt 0 ]; then

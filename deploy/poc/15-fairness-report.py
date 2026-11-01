@@ -103,6 +103,23 @@ TENANTS_LINE = re.compile(
 TABLE_ROW = re.compile(r'^(\S+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(.+)$')
 STATUS_PAIR = re.compile(r'(\d+)=(\d+)')
 
+# UNI-137 (B5): deploy/poc/13-loadgen-poisson.py is a second, OPEN-LOOP
+# generator (Poisson arrivals at a fixed rate, run as a local process, not a
+# Job) with its own log shape -- a rate, not a worker count, and a per-group
+# summary line instead of the TENANT/TOTAL/P50/P95/STATUSES table. Recognized
+# as an alternative to TENANTS_LINE/TABLE_ROW, never instead of them: a
+# closed-loop log that matches TENANTS_LINE is tried first (see
+# parse_loadgen_log), so every scenario before this ticket is byte-for-byte
+# unaffected.
+OPEN_LOOP_TENANTS_LINE = re.compile(
+    r'load: open-loop Poisson arrivals rate app1=(?P<app1>[\d.]+)/s app2=(?P<app2>[\d.]+)/s '
+    r'end-users=(?P<end_users>[\d.]+)/s duration=(?P<duration>[\d.]+)s'
+)
+OPEN_LOOP_ROW = re.compile(
+    r'^(?P<group>\S+)\s+sent=(?P<sent>\d+)\s+completion_tokens=(?P<tok>-?\d+)\s+'
+    r'p50=(?P<p50>[\d.]+)s\s+p95=(?P<p95>[\d.]+)s\s+p99=(?P<p99>[\d.]+)s\s+codes=\[(?P<codes>.*)\]$'
+)
+
 GROUPS = ("app1", "app2", "end-users")
 
 
@@ -165,12 +182,20 @@ def parse_timeseries(path):
 
 
 def parse_loadgen_log(path):
-    """Returns (offered_workers: {group: int}, rows: {group: {total, p50_sec,
-    p95_sec, statuses}}, duration_seconds_from_log_or_None)."""
+    """Returns (offered_workers: {group: int|float}, rows: {group: {total,
+    p50_sec, p95_sec, statuses}}, duration_seconds_from_log_or_None,
+    generator: "closed-loop"|"open-loop").
+
+    "offered_workers" holds a worker COUNT for the closed-loop generator and
+    a Poisson RATE in req/s for the open-loop one (UNI-137/B5) -- the caller
+    (build_report) only ever compares it to zero to decide whether a group
+    was offered any load, which both units support identically; render_markdown
+    labels the column correctly for whichever generator produced the log."""
     text = open(path).read()
     m = TENANTS_LINE.search(text)
     offered_workers = {g: 0 for g in GROUPS}
     duration = None
+    generator = "closed-loop"
     if m:
         tenants = set(m.group('tenants').split())
         by_name = {"app1": m.group('app1'), "app2": m.group('app2'), "end-users": m.group('end_users')}
@@ -178,22 +203,47 @@ def parse_loadgen_log(path):
             if g in tenants:
                 offered_workers[g] = int(by_name[g])
         duration = int(m.group('duration'))
+    else:
+        m = OPEN_LOOP_TENANTS_LINE.search(text)
+        if m:
+            generator = "open-loop"
+            by_name = {"app1": m.group('app1'), "app2": m.group('app2'), "end-users": m.group('end_users')}
+            for g in GROUPS:
+                rate = float(by_name[g])
+                if rate > 0:
+                    offered_workers[g] = rate
+            duration = float(m.group('duration'))
 
     rows = {}
-    for line in text.splitlines():
-        row = TABLE_ROW.match(line.strip())
-        if not row or row.group(1) == "TENANT":
-            continue
-        group, total, p50, p95, statuses_raw = row.groups()
-        if group not in GROUPS:
-            continue
-        rows[group] = {
-            "total": int(total),
-            "p50_sec": float(p50),
-            "p95_sec": float(p95),
-            "statuses": {code: int(count) for code, count in STATUS_PAIR.findall(statuses_raw)},
-        }
-    return offered_workers, rows, duration
+    if generator == "closed-loop":
+        for line in text.splitlines():
+            row = TABLE_ROW.match(line.strip())
+            if not row or row.group(1) == "TENANT":
+                continue
+            group, total, p50, p95, statuses_raw = row.groups()
+            if group not in GROUPS:
+                continue
+            rows[group] = {
+                "total": int(total),
+                "p50_sec": float(p50),
+                "p95_sec": float(p95),
+                "statuses": {code: int(count) for code, count in STATUS_PAIR.findall(statuses_raw)},
+            }
+    else:
+        for line in text.splitlines():
+            row = OPEN_LOOP_ROW.match(line.strip())
+            if not row:
+                continue
+            group = row.group('group')
+            if group not in GROUPS:
+                continue
+            rows[group] = {
+                "total": int(row.group('sent')),
+                "p50_sec": float(row.group('p50')),
+                "p95_sec": float(row.group('p95')),
+                "statuses": {code: int(count) for code, count in STATUS_PAIR.findall(row.group('codes'))},
+            }
+    return offered_workers, rows, duration, generator
 
 
 # --- UNI-127: timeline/windowed/convergence maths ---------------------------
@@ -360,7 +410,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                   window_seconds=10.0):
     before = parse_metrics(metrics_before_path)
     after = parse_metrics(metrics_after_path)
-    offered_workers, loadgen_rows, logged_duration = parse_loadgen_log(loadgen_log_path)
+    offered_workers, loadgen_rows, logged_duration, generator = parse_loadgen_log(loadgen_log_path)
 
     weight_before = before.get("llm_d_epp_maas_fairness_configured_weight", {})
     weight_after = after.get("llm_d_epp_maas_fairness_configured_weight", {})
@@ -526,16 +576,36 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     # already-documented reason nobody can be contended against it) and a
     # named `control` (deliberately under-offered for a different, already-
     # scored reason).
+    #
+    # UNI-137 (B5): a MISSING contended_seconds_total delta (the EPP's
+    # Prometheus client lazily registers each label, so a group never once
+    # contended has no line in either snapshot) is only trustworthy as
+    # "zero contention" when corroborated by an equally missing/zero
+    # contended_service_tokens_total delta -- both SLIs share the same
+    # contention gate in metrics.go, so a group that was genuinely contended
+    # cannot have tokens without seconds. Requiring that correlation (rather
+    # than treating every missing-seconds group as uncontended outright)
+    # keeps this from misreading a test fixture or a metrics-scrape gap that
+    # only omitted contended_seconds_total as "uncontended" when
+    # contended_service_tokens_total shows real, measured contention. The
+    # live below-saturation run (b5-open-loop-below-saturation) hit the
+    # correlated case for a fresh group (end-users) that was genuinely never
+    # contended: both deltas were missing, and a `None`-disqualifies reading
+    # scored it FAIL ("the EPP accounted nothing for this run") when the
+    # correct verdict is UNCONTENDED; see
+    # test_open_loop_below_saturation_reports_uncontended_when_metric_never_materialized.
     UNCONTENDED_SECONDS_THRESHOLD = 1.0
+    def _group_uncontended(g):
+        seconds = contended_seconds_deltas.get(g)
+        if seconds is not None:
+            return seconds < UNCONTENDED_SECONDS_THRESHOLD
+        tokens = deltas.get(g)
+        return tokens is None or tokens <= 0
     is_uncontended = (
         solo is None
         and not control
         and len(offered_groups) >= 2
-        and all(
-            contended_seconds_deltas.get(g) is not None
-            and contended_seconds_deltas.get(g) < UNCONTENDED_SECONDS_THRESHOLD
-            for g in offered_groups
-        )
+        and all(_group_uncontended(g) for g in offered_groups)
     )
 
     SOLO_SUCCESS_THRESHOLD = 0.90  # "overwhelmingly 200" -- docs/runbook.md's own standing check
@@ -617,7 +687,10 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         reasons.append(
             "every offered group's contended_seconds_total delta stayed under "
             f"{UNCONTENDED_SECONDS_THRESHOLD:g}s (" +
-            ", ".join(f"{g}={contended_seconds_deltas.get(g):.2f}s" for g in offered_groups) +
+            ", ".join(
+                f"{g}={'never contended' if contended_seconds_deltas.get(g) is None else f'{contended_seconds_deltas[g]:.2f}s'}"
+                for g in offered_groups
+            ) +
             f") -- an order of magnitude below the ~9s a genuinely-contending tenant "
             "accrues in a 240s full-contention run (docs/runbook.md), so nobody was ever "
             "backlogged alongside anyone else and the weighted-split deviation check does "
@@ -706,6 +779,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "scenario": scenario,
             "label": label,
             "control": control,
+            "generator": generator,
             "namespace": namespace,
             "enforce": enforce,
             "duration_seconds": duration_seconds if duration_seconds is not None else logged_duration,
@@ -739,6 +813,13 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                 "deploy/poc/04-loadgen.yaml's own run.sh: the 'load: tenants=...' line "
                 "for offered worker counts, and the TENANT/TOTAL/P50_SEC/P95_SEC/STATUSES "
                 "table for delivered requests, status tally, and latency."
+            ) if generator == "closed-loop" else (
+                "deploy/poc/13-loadgen-poisson.py's own stdout (UNI-137/B5): the "
+                "'load: open-loop Poisson arrivals rate ...' line for each offered group's "
+                "Poisson arrival rate in req/s -- NOT a worker count, this generator is "
+                "open-loop -- and each group's own 'sent=... completion_tokens=... p50=...s "
+                "p95=...s p99=...s codes=[...]' summary line for delivered requests, status "
+                "tally, and latency."
             ),
             "expected_share": (
                 "each offered group's configured_weight divided by the sum of configured_weight "
@@ -787,7 +868,7 @@ def render_markdown(report):
     lines.append("| field | value |")
     lines.append("|---|---|")
     for key, label in [
-        ("scenario", "Scenario"), ("enforce", "Enforce"),
+        ("scenario", "Scenario"), ("generator", "Generator"), ("enforce", "Enforce"),
         ("duration_seconds", "Duration (s)"), ("backend", "Backend"),
         ("epp_image_digest", "EPP image digest"), ("epp_pod", "EPP pod"),
         ("namespace", "Namespace"), ("run_start", "Run start"), ("run_end", "Run end"),
@@ -796,8 +877,9 @@ def render_markdown(report):
     lines.append("")
     lines.append("## Per-group result")
     lines.append("")
+    offered_col = "offered req/s" if r.get("generator") == "open-loop" else "offered workers"
     lines.append(
-        "| group | weight | offered workers | requests | statuses | p50s | p95s | "
+        f"| group | weight | {offered_col} | requests | statuses | p50s | p95s | "
         "delivered tokens | expected % | observed % | deviation (pts) | contended_seconds | "
         "cached ratio | dispatch_total |"
     )
@@ -809,7 +891,7 @@ def render_markdown(report):
         cached_pct = g["prompt_tokens_cached_ratio"]
         cached_pct = None if cached_pct is None else cached_pct * 100.0
         lines.append(
-            f"| {g['group']} | {fmt(g['configured_weight'])} | {g['offered_workers']} | "
+            f"| {g['group']} | {fmt(g['configured_weight'])} | {fmt(g['offered_workers'])} | "
             f"{g['requests_total']} | {statuses} | {fmt(g['p50_sec'])} | {fmt(g['p95_sec'])} | "
             f"{fmt(g['delivered_tokens'])} | {fmt(g['expected_share_pct'], '%')} | "
             f"{fmt(g['observed_share_pct'], '%')} | {fmt(g['deviation_pts'])} | "

@@ -1,0 +1,111 @@
+{
+  "schema": "uni54.fairness_benchmark_report.v1",
+  "run": {
+    "scenario": "b5-open-loop-at-saturation",
+    "label": "uni-137-b5-at-saturation",
+    "control": false,
+    "generator": "open-loop",
+    "namespace": "maas-fairness-poc",
+    "enforce": true,
+    "duration_seconds": 240,
+    "backend": "vllm-gpu (real)",
+    "epp_image_digest": "quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135",
+    "epp_pod": "maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-bsl76",
+    "run_start": "2026-11-01T19:01:56Z",
+    "run_end": "2026-11-01T19:05:58Z"
+  },
+  "groups": [
+    {
+      "group": "app1",
+      "configured_weight": 20.0,
+      "offered": true,
+      "offered_workers": 7.0,
+      "requests_total": 1716,
+      "status_tally": {
+        "200": 1716
+      },
+      "p50_sec": 0.95,
+      "p95_sec": 1.74,
+      "delivered_tokens": 650762.0,
+      "expected_share_pct": 21.05263157894737,
+      "observed_share_pct": 33.08341391150331,
+      "deviation_pts": 12.030782332555937,
+      "contended_seconds": 0.4148619569999996,
+      "prompt_tokens_cached_ratio": 0.9771134136977493,
+      "dispatch_total": 1716.0
+    },
+    {
+      "group": "app2",
+      "configured_weight": 10.0,
+      "offered": true,
+      "offered_workers": 7.0,
+      "requests_total": 1638,
+      "status_tally": {
+        "200": 1638
+      },
+      "p50_sec": 0.96,
+      "p95_sec": 1.74,
+      "delivered_tokens": 672260.0,
+      "expected_share_pct": 10.526315789473685,
+      "observed_share_pct": 34.17632842136943,
+      "deviation_pts": 23.65001263189575,
+      "contended_seconds": 0.5859222899999972,
+      "prompt_tokens_cached_ratio": 0.9230122569552194,
+      "dispatch_total": 1638.0
+    },
+    {
+      "group": "end-users",
+      "configured_weight": 65.0,
+      "offered": true,
+      "offered_workers": 7.0,
+      "requests_total": 1642,
+      "status_tally": {
+        "200": 1642
+      },
+      "p50_sec": 0.95,
+      "p95_sec": 1.69,
+      "delivered_tokens": 644012.0,
+      "expected_share_pct": 68.42105263157895,
+      "observed_share_pct": 32.74025766712726,
+      "deviation_pts": -35.680794964451685,
+      "contended_seconds": 0.5641776270000003,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 1642.0
+    },
+    {
+      "group": "unclassified",
+      "configured_weight": 5.0,
+      "offered": false,
+      "offered_workers": 0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": 0.0,
+      "expected_share_pct": null,
+      "observed_share_pct": null,
+      "deviation_pts": null,
+      "contended_seconds": 0.0,
+      "prompt_tokens_cached_ratio": 0.23333333333333334,
+      "dispatch_total": 0.0
+    }
+  ],
+  "verdict": {
+    "result": "UNCONTENDED",
+    "threshold_points": 10.0,
+    "max_abs_deviation_points": 35.680794964451685,
+    "reasons": [
+      "every offered group's contended_seconds_total delta stayed under 1s (app1=0.41s, app2=0.59s, end-users=0.56s) -- an order of magnitude below the ~9s a genuinely-contending tenant accrues in a 240s full-contention run (docs/runbook.md), so nobody was ever backlogged alongside anyone else and the weighted-split deviation check does not apply"
+    ],
+    "epp_restarted_mid_run": false,
+    "solo_group": null,
+    "capped_groups": [],
+    "uncontended_threshold_seconds": 1.0
+  },
+  "sources": {
+    "delivered_tokens_and_observed_share": "llm_d_epp_maas_fairness_contended_service_tokens_total, scraped directly from the EPP's /metrics immediately before and after the run (same mechanism as deploy/poc/13-loadgen-poisson.sh). This is the EPP's own accounting -- the generator cannot see token usage. Reused unmodified from the SLI deploy/grafana-dashboard.yaml (UNI-50) already defines; this report does not invent a second definition of delivered share.",
+    "offered_and_delivered_requests": "deploy/poc/13-loadgen-poisson.py's own stdout (UNI-137/B5): the 'load: open-loop Poisson arrivals rate ...' line for each offered group's Poisson arrival rate in req/s -- NOT a worker count, this generator is open-loop -- and each group's own 'sent=... completion_tokens=... p50=...s p95=...s p99=...s codes=[...]' summary line for delivered requests, status tally, and latency.",
+    "expected_share": "each offered group's configured_weight divided by the sum of configured_weight over OFFERED groups only (excludes the never-offered 'unclassified' catch-all and any group this scenario left idle), so a work-conserving policy absorbing an idle group's share is not scored as a deviation. Also excludes any 'capped_groups' entry (UNI-134's app2-trickle): a group offered but structurally unable to reach a weight-proportional share at its own worker count is scored on a dedicated 'did it get served' check instead, not folded into the other groups' expected-share denominator."
+  },
+  "timeline": null
+}

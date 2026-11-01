@@ -2582,6 +2582,183 @@ item 2's decision, not the decision itself — whether and to what value
 would need to be re-derived alongside it, remains "a policy decision," not
 a technical finding this run can settle on its own.
 
+## UNI-137: B5, open-loop (Poisson) below / at / above saturation (promotes UNI-34)
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, "B" group: does UNI-34's
+open-loop (Poisson-arrival) finding — a measured, severe inversion of the
+20/10/65 split once the pool is pushed past saturation — reproduce as a
+scored, repeatable benchmark scenario, not a one-off manual measurement?
+UNI-34 itself only ran one below-saturation pair and one short
+above-saturation burst, informally, against `13-loadgen-poisson.{py,sh}`
+directly; this ticket wraps that same generator into the same
+named-scenario/report infrastructure every other case in this series uses.
+
+**Harness change: `deploy/poc/17-fairness-benchmark-openloop.sh`.** New
+script, same shape as `15-fairness-benchmark.sh` (one named scenario in,
+one `results/<ts>-<label>/` directory out, scored by
+`15-fairness-report.py`) but built around a local-process generator instead
+of a `Job`: `13-loadgen-poisson.sh` hits the public Route directly, so
+there is no Job to patch or poll, only a "no active `maas-loadgen` Job"
+guard to preserve this series' one-benchmark-at-a-time rule against a
+concurrent closed-loop run. `13-loadgen-poisson.{sh,py}` themselves are
+reused completely unmodified. `15-fairness-report.py` gained an open-loop
+log parser (`OPEN_LOOP_TENANTS_LINE`/`OPEN_LOOP_ROW`, tried only after the
+closed-loop `TENANTS_LINE` match fails, so every prior scenario's report is
+byte-for-byte unaffected) and a `generator` field so the markdown table
+labels the offered-load column correctly (`offered req/s` vs
+`offered workers`).
+
+**Setup:** full-contention mix (`app1`/`app2`/`end-users` all offered, at
+the *same* Poisson rate each, live against `maas-vllm-gpu`, 2 replicas,
+`enforce: true`), at ~70/100/120% of UNI-34's own documented pool ceiling
+(**"~20-22 req/s aggregate on this rig,"** `docs/poc-results.md`'s own
+"Open-loop (Poisson) load generation (UNI-34)" section) — taking the
+midpoint, 21 req/s aggregate, splits evenly to 4.9/7.0/8.4 req/s per tenant
+at 70/100/120%. Each level: 240s + up to 100s drain, `THRESHOLD_POINTS=10`.
+
+**A reporting bug surfaced by the 70% run, fixed before scoring anything.**
+The live below-saturation run's raw metrics show `app1`/`app2`'s
+`contended_seconds_total` delta at a flat `0.00s` (present in both
+snapshots, unchanged) — but `end-users`' `contended_seconds_total` *and*
+`contended_service_tokens_total` lines were **absent from both** snapshots
+entirely. The EPP's Prometheus client lazily registers a counter per label
+on first increment (`metrics.go`), so an entirely-missing line means that
+group has **never once** been contended — stronger evidence of zero
+contention than a present-but-flat delta, not weaker. The existing
+UNCONTENDED check (added by [UNI-135](/UNI/issues/UNI-135)) required
+`contended_seconds_deltas.get(g) is not None`, so it read the missing line
+as disqualifying rather than confirming, and the run scored **FAIL**
+("offered groups delivered zero contended service tokens") instead of the
+correct **UNCONTENDED**. Fixed `15-fairness-report.py`'s `is_uncontended`
+to treat a missing `contended_seconds_total` delta as uncontended *when
+corroborated* by an equally missing/zero `contended_service_tokens_total`
+delta for the same group (both SLIs share one contention gate, so real
+contention cannot produce tokens without seconds) — this correlation keeps
+an older synthetic test fixture that sets only
+`contended_service_tokens_total` and never bothers with
+`contended_seconds_total` from being misread as "uncontended" too. Also
+fixed a latent crash in the UNCONTENDED reason string (`f"{...:.2f}s"` on a
+`None`). Covered by a new regression test,
+`test_open_loop_below_saturation_reports_uncontended_when_metric_never_materialized`,
+built directly from this run's own raw numbers; all 31 unit tests pass.
+The 70% report in `results/` below is the regenerated, corrected one — the
+original mis-scored FAIL JSON/MD this run first produced was discarded, not
+shipped.
+
+**Observed, all three levels:**
+
+| level | rate/tenant (aggregate) | verdict | app1 obs% (dev) | app2 obs% (dev) | end-users obs% (dev) | contended_seconds | client status codes |
+|---|---|---|---|---|---|---|---|
+| 70% | 4.9/s (14.7/s) | **UNCONTENDED** | 0.0% (n/a) | 0.0% (n/a) | n/a (n/a) | app1 0.00s, app2 0.00s, end-users never contended | all 200 (1100/1198/1207 sent) |
+| 100% | 7.0/s (21.0/s) | **UNCONTENDED** | 33.1% (+12.0) | 34.2% (+23.7) | 32.7% (**-35.7**) | app1 0.41s, app2 0.59s, end-users 0.56s | all 200 (1716/1638/1642 sent) |
+| 120% | 8.4/s (25.2/s) | **FAIL** | 32.4% (+11.3) | 18.0% (+7.5) | 49.6% (**-18.8**) | app1 23.9s, app2 24.0s, end-users 21.5s | heavy 50s client timeouts: app1 736/2052 200, app2 404/1976 200, end-users 1050/1982 200 |
+
+(Deviations at 70%/100% are informational only — `expected_share`/
+`deviation_pts` are computed and shown in the full report even for an
+UNCONTENDED run, but the verdict does not score them, by design: see
+[UNI-135](/UNI/issues/UNI-135)'s "a weighted-split deviation is not a
+meaningful question with nobody to share against.")
+
+**Pass/FAIL against the ticket's own prediction: partial.** 70% matched
+exactly — "uncontended" was the correct call once the bug above was fixed.
+120% matched in direction — a real FAIL, `end-users` (weight 65, the
+dominant group) under-served relative to its share while `app1`/`app2`
+over-deliver — reproducing, not refuting, UNI-34's original finding that
+pushing past saturation inverts the configured weights. **100% did not
+match**: the ticket predicted "split within threshold" (PASS), but the run
+scored UNCONTENDED, i.e. still not measurably contended by this report's
+own gate (`contended_seconds_total` 0.41-0.59s, under the 1.0s threshold).
+
+**What surprised us.**
+
+- **The 100% level is both "uncontended" and badly skewed at once.** Even
+  though `contended_seconds_total` stayed under the UNCONTENDED threshold,
+  the per-group deviations the report still computes and prints
+  (+12.0/+23.7/-35.7 points) are already far larger than the 10-point FAIL
+  bar — larger, in fact, than the 120% level's own FAIL deviations. If the
+  system had been scored on deviation alone at 100% (ignoring the
+  UNCONTENDED carve-out), it would have FAILed harder than 120% did. This
+  says the split degrades smoothly and substantially well *before* the
+  binary `contended_seconds_total` gate trips, not sharply at some crisp
+  "ceiling" — the same "contention does not vanish/appear as a step
+  function" pattern [UNI-135](/UNI/issues/UNI-135) found at 20% of a
+  different (closed-loop) ceiling, now seen from the other side.
+- **UNI-34's documented "~20-22 req/s" ceiling may be stale for the current
+  EPP build.** UNI-34 was measured before the `contended_service_tokens_total`
+  accounting fix (`docs/poc-results.md`'s "Outstanding work," `~~Fix
+  contended_service_tokens_total~~`) and before this series' other GPU
+  commissioning changes. This run's 100% level (21 req/s aggregate) still
+  reads as UNCONTENDED by the report's own gate, which is at minimum
+  consistent with the true current ceiling sitting higher than 21 — this
+  ticket did not re-measure the ceiling independently, it reused UNI-34's
+  figure, so the 70/100/120% labels are relative to a number that was not
+  re-verified against the current build.
+- **120%'s inversion is real but markedly less severe than UNI-34's
+  original measurement.** UNI-34's one-off 90s burst at 24 req/s aggregate
+  measured end-users falling from an expected 68.4% to **25.5%** (-42.9
+  points). This 240s, 25.2 req/s-aggregate run measured end-users at
+  **49.6%** (-18.8 points) — still inverted and still a clear FAIL, but
+  under half the original deviation. Not distinguished by this one run:
+  whether the gap is the accounting fix changing the charged numbers, the
+  4x-longer duration (240s vs 90s) giving the policy more time to recover
+  ground within the run, or run-to-run variance on a single sample at each
+  level. This is the baseline [F2](/UNI/issues/UNI-117#document-test-plan)
+  (clamp off) should compare against, not UNI-34's original number, since
+  it was captured on the same EPP build F2 will also run against.
+- **Client-observed evidence agrees with the EPP's own accounting,
+  independently.** At 120%, raw client status codes show heavy, symmetric
+  50s timeouts across all three groups (`0=`1316/1572/932 out of
+  2052/1976/1982 sent) — a client-side signal that does not depend on
+  `contended_service_tokens_total` at all, and it corroborates "the pool
+  genuinely collapsed" rather than "the accounting metric alone drifted."
+
+**Cluster left as found.** This generator never patches the
+LLMInferenceService or EPP config, only reads metrics and sends HTTP
+traffic; confirmed afterward, not assumed:
+
+```
+$ oc get deployment maas-vllm-gpu-kserve -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs,pods -n maas-fairness-poc
+job.batch/maas-loadgen   Complete   1/1   4m10s   41m
+... (no stray/active pods)
+$ # from the 120% run's own metrics-after.txt (EPP's own echoed config):
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app1"} 20
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app2"} 10
+llm_d_epp_maas_fairness_configured_weight{fairness_id="end-users"} 65
+llm_d_epp_maas_fairness_configured_weight{fairness_id="unclassified"} 5
+```
+
+Matches `deploy/poc/09-vllm-gpu.yaml` (replicas) and `deploy/epp-config.yaml`
+(weights) exactly. The completed `maas-loadgen` Job (left over from a prior,
+unrelated closed-loop scenario, not created by this ticket) was left in
+place, same convention as every prior scenario. No orphaned `oc logs -f`
+process survived (checked via `/proc/*/cmdline`, UNI-169/170 convention).
+
+**Raw results:**
+`results/20261101T185150Z-uni-137-b5-below-saturation/`,
+`results/20261101T190155Z-uni-137-b5-at-saturation/`,
+`results/20261101T190612Z-uni-137-b5-above-saturation/` (report JSON/MD,
+loadgen log, metric snapshots, per-tenant client logs, EPP container log,
+for each level).
+
+**Grafana time range** (padded ±60s around each run's `run_start`/`run_end`):
+
+- 70%: `from=1793559050000&to=1793559413000`
+- 100%: `from=1793559656000&to=1793560018000`
+- 120%: `from=1793559913000&to=1793560356000`
+
+https://grafana-grafana.apps.ocp.paladinaura.com/d/maas-fairness-gpu-epp/?orgId=1&from=1793559050000&to=1793560356000&var-group=All&var-window=2m
+(combined span across all three levels)
+
+**Not proven here:** no clamp on/off A/B comparison (same gap UNI-34 itself
+left open — `newcomerClamp` is not independently toggleable without a
+config/code change this ticket's scope excludes); each level is a single
+240s run at a single seed, not repeated for variance; and, per "what
+surprised us" above, the 21 req/s ceiling this ticket's 70/100/120% figures
+are relative to was reused from UNI-34 rather than independently
+re-measured on the current EPP build.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -2597,7 +2774,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Re-run S1 longer~~ | **Done, negative result.** Re-ran at 600s (10 half-lives, vs the original 150s): the split moved to 50.3/49.7%, *further* from 2:1 than the original 1.57:1, which refutes the duration hypothesis — see "A3 (UNI-28): S1 re-run at 600s," above. Root cause is the same worker-sizing-vs-backend-latency mechanism UNI-29's Run 2 identified on this same current (llama-3-1-8b) deployment, not warm-up time. The resize itself is now done — [UNI-103](/UNI/issues/UNI-103), below — and the app1:app2 over-offer ratio is retuned and passing — [UNI-104](/UNI/issues/UNI-104), below | — |
 | 8 | **`maas-default-gateway` inference path** | returns 500: `maas-api-route` targets a TLS service port with no `BackendTLSPolicy`, and that CRD is not installed. **Correction (UNI-129, 2026-11-01): minting keys does not actually require port-forwarding** in this environment -- the agent sandbox has direct pod-network reachability to the `maas-api` Service's ClusterIP, which answers the same `POST .../v1/api-keys` call with no tunnel. Port-forwarding is still the documented, more portable fallback for an environment without that reachability | upstream/MaaS |
 | — | ~~Sustained load through the LLMInferenceService path and the Route (UNI-27)~~ | **Done for status tally and fairness.** 240s closed-loop runs (32 workers/tenant, `app1`/`app2`/`end-users`) against both the in-cluster gateway Service and the public Route landed 94.7% and 97.9% HTTP 200 respectively. `normalized_service` converged to within ~7% across the three backlogged groups on both paths, confirmed at multiple flight-recorder ticks through each run. On the non-200s: the Route path's are directly traced via the gateway access log to a ~2s connection/endpoint-pool warm-up burst at request-storm start (zero thereafter), not a sustained-load or fairness defect. The LLMInferenceService path's (5.3% error rate) are **inferred to be the same mechanism by analogy, not log-verified** — this cluster has no log aggregation and the gateway's own access-log buffer had already rotated past the run window by the time it was checked. Script: `deploy/poc/12-loadgen-route.sh` (Route path); `deploy/poc/04-loadgen.yaml` unchanged (LLMInferenceService path). Does **not** cover the 600s timeout / `buffer-response: false` annotations — see item 15 | N/A -- closed for status tally + fairness scope |
-| — | ~~Open-loop load generation (UNI-34)~~ | **Done, and the clamp finding flips.** `deploy/poc/13-loadgen-poisson.{py,sh}` adds open-loop Poisson arrivals. Below saturation the clamp fires on ~65% of dispatches (vs 0.2–2.2% closed-loop) but is harmless (pool uncontended). Above saturation (24 req/s aggregate vs a measured ~20-22 req/s pool ceiling) it measurably **inverts** the 20/10/65 split: end-users (w=65) delivered 25.5%, app1 (w=20) delivered 40.4%. This **contradicts** the GPU closed-loop "clamp is inert" finding (`## 3`) and confirms the SUPERSEDED section's concern more strongly than originally observed. See "Open-loop (Poisson) load generation (UNI-34)" above for the full data, including what was not tested (no clamp on/off A/B — see that section for why) | **newcomerClamp default should be revisited** — a policy decision, same owner as item 2 |
+| — | ~~Open-loop load generation (UNI-34)~~ | **Done, and the clamp finding flips.** `deploy/poc/13-loadgen-poisson.{py,sh}` adds open-loop Poisson arrivals. Below saturation the clamp fires on ~65% of dispatches (vs 0.2–2.2% closed-loop) but is harmless (pool uncontended). Above saturation (24 req/s aggregate vs a measured ~20-22 req/s pool ceiling) it measurably **inverts** the 20/10/65 split: end-users (w=65) delivered 25.5%, app1 (w=20) delivered 40.4%. This **contradicts** the GPU closed-loop "clamp is inert" finding (`## 3`) and confirms the SUPERSEDED section's concern more strongly than originally observed. See "Open-loop (Poisson) load generation (UNI-34)" above for the full data, including what was not tested (no clamp on/off A/B — see that section for why). **Promoted to a scored benchmark by [UNI-137](/UNI/issues/UNI-137) (B5)**: reproduces the inversion direction at 120% of ceiling (FAIL, end-users -18.8pts) but at roughly half UNI-34's original magnitude, and found 100% of the documented ceiling still reads as UNCONTENDED despite already-large per-group deviations — see "UNI-137," above | **newcomerClamp default should be revisited** — a policy decision, same owner as item 2 |
 | — | ~~Verify metrics reach Prometheus~~ | **Done (UNI-50).** The D3 dashboard (`deploy/grafana-dashboard.yaml`) confirmed this end to end against live Grafana/Thanos: the headline expected-vs-observed panel and five supporting panels all rendered real, current GPU-EPP data from a load run, with the exact PromQL and output pasted on that ticket. Datasource confirmed as the standalone `grafana` namespace's Prometheus-only datasource, pointed at the same UWM Thanos Querier every other observability asset in this repo already reads | N/A -- closed |
 | 12 | **Red Hat support boundary** | a custom EPP image takes that component outside RHOAI support. The plan calls this the biggest non-technical risk and it has never been raised with the account team. Nothing technical unblocks it | a conversation |
 | 13 | **Version-pin maintenance** | flow-control interfaces sit on a module that only reached v1.0.0 on 2026-10-15; we are pinned to v0.11.0. Process, pinned versions and the named interface inventory are now in [version-pinning.md](version-pinning.md). Monthly check, manual — there is no CI runner | process |

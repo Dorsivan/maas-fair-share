@@ -70,6 +70,47 @@ def run_build(tmp, *, tokens_before, tokens_after, tenants, w_app1, w_app2, w_en
     )
 
 
+# UNI-137 (B5): deploy/poc/13-loadgen-poisson.py's own log shape -- a Poisson
+# rate (req/s) per group, not a worker count, and a "sent=... codes=[...]"
+# summary line per group instead of the closed-loop TENANT/TOTAL/.../STATUSES
+# table. See parse_loadgen_log's OPEN_LOOP_TENANTS_LINE/OPEN_LOOP_ROW.
+def open_loop_loadgen_log(rate_app1, rate_app2, rate_end, duration, rows, seed=1):
+    lines = [
+        f"load: open-loop Poisson arrivals rate app1={rate_app1}/s app2={rate_app2}/s "
+        f"end-users={rate_end}/s duration={duration}s seed={seed}"
+    ]
+    lines.append("load: done.")
+    for group, sent, completion_tokens, p50, p95, p99, codes in rows:
+        lines.append(
+            f"{group:12s} sent={sent:<6d} completion_tokens={completion_tokens:<8d} "
+            f"p50={p50:.2f}s p95={p95:.2f}s p99={p99:.2f}s codes=[{codes}]"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def run_build_open_loop(tmp, *, tokens_before, tokens_after, rate_app1, rate_app2, rate_end,
+                         rows, threshold_points=10.0, duration=240, scenario="b5-open-loop",
+                         contended_seconds_before="", contended_seconds_after=""):
+    before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_before + contended_seconds_before)
+    after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_after + contended_seconds_after)
+    log = write(tmp, "loadgen.log", open_loop_loadgen_log(rate_app1, rate_app2, rate_end, duration, rows))
+    return fairness_report.build_report(
+        scenario=scenario,
+        enforce=True,
+        duration_seconds=duration,
+        backend="vllm-gpu (real)",
+        epp_image_digest="sha256:deadbeef",
+        namespace="maas-fairness-poc",
+        epp_pod="maas-vllm-gpu-kserve-router-scheduler-test",
+        run_start="2026-11-01T00:00:00Z",
+        run_end="2026-11-01T00:04:00Z",
+        threshold_points=threshold_points,
+        metrics_before_path=before,
+        metrics_after_path=after,
+        loadgen_log_path=log,
+    )
+
+
 def test_converged_run_passes():
     with tempfile.TemporaryDirectory() as tmp:
         # Delivered shares land within ~1 point of the contention-adjusted
@@ -876,6 +917,171 @@ def test_build_report_timeline_section_populated_with_timeseries_and_config():
         with open(out_json) as f:
             cli_report = json.load(f)
         assert cli_report["timeline"] is not None
+
+
+# UNI-137 (B5): open-loop (Poisson) generator support in parse_loadgen_log.
+def test_parse_loadgen_log_detects_open_loop_generator():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = write(tmp, "loadgen.log", open_loop_loadgen_log(
+            4.0, 4.0, 4.0, 240,
+            rows=[
+                ("app1", 960, 72000, 0.75, 1.10, 1.50, "200=960"),
+                ("app2", 958, 71800, 0.76, 1.12, 1.55, "200=958"),
+                ("end-users", 961, 72100, 0.74, 1.09, 1.48, "200=961"),
+            ],
+        ))
+        offered, rows, duration, generator = fairness_report.parse_loadgen_log(log)
+        assert generator == "open-loop", generator
+        assert offered == {"app1": 4.0, "app2": 4.0, "end-users": 4.0}, offered
+        assert duration == 240.0, duration
+        assert rows["app1"]["total"] == 960
+        assert rows["app1"]["statuses"] == {"200": 960}
+        assert abs(rows["end-users"]["p95_sec"] - 1.09) < 1e-9
+
+
+def test_open_loop_below_saturation_reports_uncontended():
+    # Mirrors UNI-34's own measured below-saturation levels: the clamp may
+    # fire often, but contended_seconds_total stays near zero because the
+    # pool is never actually backlogged -- same UNCONTENDED signature as
+    # test_uncontended_when_everyone_below_capacity, reached via the
+    # open-loop log shape instead of the closed-loop one.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 5.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 5.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 5.0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 5.1\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 5.1\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 5.1\n'
+        )
+        rows = [
+            ("app1", 960, 72000, 0.75, 1.10, 1.50, "200=960"),
+            ("app2", 958, 71800, 0.76, 1.12, 1.55, "200=958"),
+            ("end-users", 961, 72100, 0.74, 1.09, 1.48, "200=961"),
+        ]
+        report = run_build_open_loop(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            rate_app1=4.0, rate_app2=4.0, rate_end=4.0, rows=rows,
+            scenario="b5-open-loop-below-saturation",
+        )
+        assert report["run"]["generator"] == "open-loop", report["run"]
+        assert report["verdict"]["result"] == "UNCONTENDED", report["verdict"]
+
+
+def test_open_loop_below_saturation_reports_uncontended_when_metric_never_materialized():
+    # Regression for the live UNI-137/B5 run (results/20261101T185150Z-uni-
+    # 137-b5-below-saturation): a FRESH fairness_id's contended_seconds_total
+    # and contended_service_tokens_total counters are lazily registered by
+    # the EPP's Prometheus client and only appear once that group has been
+    # contended at least once. A group offered at well under saturation (like
+    # this scenario's end-users) can go an entire run without ever being
+    # contended, which means its counter line is ABSENT from both
+    # metrics-before.txt and metrics-after.txt -- not merely flat at the
+    # before value. That is stronger evidence of zero contention than a
+    # present, sub-threshold delta (test_open_loop_below_saturation_reports_
+    # uncontended above), not weaker, so it must also score UNCONTENDED, not
+    # FAIL ("offered groups delivered zero contended service tokens").
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 727921\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 389716\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 1.9654517519999992\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 1.9654517519999992\n'
+        )
+        tokens_after = (
+            # end-users has no contended_service_tokens_total/contended_seconds_total
+            # line at all -- never contended, so the EPP never registered the label.
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 727921\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 389716\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 1.9654517519999992\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 1.9654517519999992\n'
+        )
+        rows = [
+            ("app1", 1100, 0, 0.8, 1.0, 1.2, "200=1100"),
+            ("app2", 1198, 0, 0.8, 0.9, 1.1, "200=1198"),
+            ("end-users", 1207, 0, 0.8, 1.0, 1.2, "200=1207"),
+        ]
+        report = run_build_open_loop(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            rate_app1=4.9, rate_app2=4.9, rate_end=4.9, rows=rows,
+            scenario="b5-open-loop-below-saturation",
+        )
+        assert report["verdict"]["result"] == "UNCONTENDED", report["verdict"]
+
+
+def test_open_loop_above_saturation_inverted_split_fails():
+    # Mirrors UNI-34's own measured above-saturation result: end-users
+    # (weight 65) delivered far less contended service than app1 (weight 20)
+    # -- an inverted, not just skewed, split that must FAIL the symmetric
+    # threshold check.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 0\n'
+        )
+        tokens_after = (
+            # 40.4% / 34.1% / 25.5% split -- UNI-34's own above-saturation numbers.
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 4040\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 3410\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 2550\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 12.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 13.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 15.0\n'
+        )
+        rows = [
+            ("app1", 731, 54000, 0.90, 25.0, 40.0, "200=731"),
+            ("app2", 641, 48000, 0.95, 28.0, 42.0, "200=641"),
+            ("end-users", 543, 40000, 1.10, 30.0, 45.0, "200=543"),
+        ]
+        report = run_build_open_loop(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            rate_app1=8.0, rate_app2=8.0, rate_end=8.0, rows=rows,
+            scenario="b5-open-loop-above-saturation", duration=90,
+        )
+        assert report["verdict"]["result"] == "FAIL", report["verdict"]
+        by_group = {g["group"]: g for g in report["groups"]}
+        assert by_group["end-users"]["deviation_pts"] < -10
+        assert by_group["app1"]["deviation_pts"] > 10
+
+
+def test_render_markdown_labels_open_loop_rate_column():
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2000\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 1000\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 6500\n'
+        )
+        rows = [
+            ("app1", 100, 7500, 0.80, 1.00, 1.30, "200=100"),
+            ("app2", 100, 7400, 0.80, 1.00, 1.30, "200=100"),
+            ("end-users", 100, 7600, 0.80, 1.00, 1.30, "200=100"),
+        ]
+        report = run_build_open_loop(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            rate_app1=7.0, rate_app2=7.0, rate_end=7.0, rows=rows,
+            scenario="b5-open-loop-at-saturation",
+        )
+        md = fairness_report.render_markdown(report)
+        assert "offered req/s" in md
+        assert "offered workers" not in md
+        assert "| Generator | `open-loop` |" in md
 
 
 def main():

@@ -449,6 +449,21 @@ different situations ("nobody to contend against" vs. "deliberately
 under-offered as a known-bad example" vs. "offered, but too lightly to ever
 contend") into one label.
 
+**Correction (UNI-137):** a *missing* `contended_seconds_total` line for a
+group (not present in either the before or after snapshot) is read the same
+way as a present delta under the threshold, not as disqualifying. The EPP's
+Prometheus client only registers a counter for a label on its first
+increment, so a group that has never once been contended has no line at
+all — stronger evidence of zero contention than a present-but-flat delta,
+not weaker. This is only trusted when corroborated by an equally
+missing/zero `contended_service_tokens_total` delta for the same group
+(the two SLIs share one contention gate, so real contention cannot produce
+tokens without seconds); this keeps an older test fixture that defines only
+`contended_service_tokens_total` and never bothers with
+`contended_seconds_total` from being misread as uncontended too. See
+"UNI-137: B5, open-loop (Poisson) below / at / above saturation" in
+`docs/poc-results.md` for the live run this was found on.
+
 The ticket's other expectation — p50/p95 latency per tenant close to that
 tenant's own *solo* latency — is not an automated gate in this report: a
 true per-tenant solo-latency baseline does not exist for all three groups
@@ -1289,6 +1304,29 @@ pod, or set `CAPTURE_EPP_LOG=0` to disable (e.g. a CPU-path or simulator run —
 both out of this harness's GPU-only scope). A run where no pod matches the
 selector logs a warning and continues without a log artifact rather than
 failing the whole run.
+
+### A scored, named-scenario wrapper for the open-loop generator (UNI-137)
+
+`13-loadgen-poisson.sh` above is the generator itself — one invocation, one
+`$OUT` directory, no verdict. `deploy/poc/17-fairness-benchmark-openloop.sh`
+wraps it the way `15-fairness-benchmark.sh` wraps the closed-loop
+`04-loadgen.yaml` Job: one named scenario in, a `results/<ts>-<label>/`
+directory and a PASS/FAIL/UNCONTENDED verdict out, scored by the same
+`15-fairness-report.py` (which gained an open-loop log parser for this).
+It does not create or poll a Job — this generator is a local process — so
+its only concurrency guard is refusing to start while a `maas-loadgen` Job
+from a closed-loop run is still `Active`.
+
+```sh
+OPENSHIFT_TOKEN=... RATE_APP1=4.9 RATE_APP2=4.9 RATE_END_USERS=4.9 \
+  DURATION=240 ./deploy/poc/17-fairness-benchmark-openloop.sh \
+  b5-open-loop-below-saturation my-label
+```
+
+See "UNI-137: B5, open-loop (Poisson) below / at / above saturation" in
+`docs/poc-results.md` for a worked set of three scenarios (70/100/120% of
+UNI-34's measured pool ceiling) and the UNCONTENDED-verdict fix this ticket
+needed (see also the "Correction (UNI-137)" note above).
 
 ---
 

@@ -1036,3 +1036,36 @@ the RBAC boundary above:**
   of the cleanup script that correctly deletes this pool and a run that
   silently no-ops on it would look identical from any token available to an
   agent.
+
+## Restoring a mis-deleted object does not fix the automation that deleted it (UNI-125)
+
+**UNI-96 deleted `serviceaccount/maas-epp-metrics-reader`, it was restored, and
+the script that deleted it kept doing so for three more days.** UNI-88's
+read-only inventory mis-categorised the SA as dead because its name shares a
+prefix with `serviceaccount/maas-epp`, the genuinely-dead v1 simulator SA.
+UNI-96 deleted it on that false pairing, which cascade-deleted its
+long-lived `secret/maas-epp-metrics-reader-token` and broke the fairness
+benchmark's metrics snapshot step (`deploy/poc/15-fairness-benchmark.sh` and
+`deploy/poc/13-loadgen-poisson.sh` both read that Secret). The incident was
+closed by re-applying the ServiceAccount and Secret from `deploy/rbac.yaml` --
+which fixed the cluster, but not `deploy/poc/cleanup-dead-objects.sh`, which
+still carried the `del serviceaccount maas-epp-metrics-reader` line that
+caused the deletion in the first place.
+
+That line survived two further editing passes on this exact file --
+[UNI-123](/UNI/issues/UNI-123) and [UNI-124](/UNI/issues/UNI-124), both of
+which corrected the InferencePool deletes four lines above it -- because
+neither pass had a reason to look at a line outside its own scope. The restore
+had made the cluster look healthy again, so there was no longer a live symptom
+pointing back at the script. The next run of the script, by anyone, on any
+day, would have deleted the SA again.
+
+**The lesson: a restore closes the incident on the cluster, not in the repo.**
+Fixing the live state and fixing the automation that produced it are two
+separate actions, and only one of them leaves a trace a future `oc get` can
+see. Before closing out an incident that involved restoring a deleted object,
+grep the scripts in this repo for that object's name
+(`grep -rn <name> deploy/ docs/`) and confirm nothing still targets it for
+deletion or pruning. Don't rely on the next person noticing the object is
+"still there" -- that is exactly what an un-fixed script and a not-yet-rerun
+script both look like.

@@ -118,7 +118,17 @@ del inferencepools.v1alpha2.inference.networking.x-k8s.io maas-pool
 del inferencepools.v1.inference.networking.k8s.io maas-pool
 del service maas-pool-ip-73df004c
 del serviceaccount maas-epp
-del serviceaccount maas-epp-metrics-reader
+# Deliberately NOT touched: serviceaccount/maas-epp-metrics-reader. The name
+# looks like it pairs with serviceaccount/maas-epp above, but it does not --
+# it is live infrastructure defined in deploy/rbac.yaml, not v1-simulator
+# residue. Its long-lived secret/maas-epp-metrics-reader-token is consumed by
+# deploy/poc/15-fairness-benchmark.sh and deploy/poc/13-loadgen-poisson.sh to
+# snapshot the fairness counters, and is referenced by deploy/podmonitor.yaml
+# for scraping. UNI-96 deleted this SA on that false pairing with
+# serviceaccount/maas-epp and broke the benchmark's metrics snapshot step; it
+# was restored by re-applying deploy/rbac.yaml. Deleting the SA
+# cascade-deletes the token Secret, so there is no cheap undo -- do not add
+# this line back.
 
 echo "--- 2. stale ReplicaSets at 0/0 ---"
 del_selector replicaset "app=maas-epp"

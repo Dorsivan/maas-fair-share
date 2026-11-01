@@ -595,7 +595,13 @@ plugins:
   - type: maas-weighted-fairness
     name: maas-fairness
     parameters:
-      identityHeader: x-maas-subscription-id   # lowercase; set by Kuadrant AuthPolicy
+      identityHeader: x-maas-subscription   # lowercase; set by Kuadrant AuthPolicy.
+      # CORRECTION (UNI-129, 2026-11-01): this example originally read
+      # "x-maas-subscription-id", which is not the header MaaS actually
+      # injects and was never matched by the live config -- see
+      # deploy/epp-config.yaml's own comment and docs/runbook.md's
+      # "Identity-variant harness (UNI-129)" for the live-confirmed name and
+      # what silently broke while this was wrong.
 
       # Weights sum to 100 so each number reads as a guaranteed floor.
       # First match wins: explicit applications before the prefix catch-all.

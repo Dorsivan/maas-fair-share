@@ -106,6 +106,15 @@
 # MAX_TOKENS, REQUEST_TIMEOUT_SECONDS -- passed through to the Job unchanged
 # when set. All default to the single fixed request shape this benchmark
 # sent before this ticket; a plain scenario invocation is unaffected.
+# UNI-129 harness additions (see docs/runbook.md "Identity-variant harness
+# (UNI-129)" for the full story -- this header is a pointer, not the source
+# of truth): END_USERS_KEYS (D1 key-rotation list), FORGE_FAIRNESS_ID_FRACTION/
+# FORGE_FAIRNESS_ID_VALUE (D3 forged header), CUSTOM_SUBSCRIPTION_NAME/
+# WORKERS_CUSTOM/CUSTOM_START/CUSTOM_STOP/CUSTOM_DUTY (D2 arbitrary identity,
+# needs TENANTS to include "custom"). All default to this benchmark's
+# pre-UNI-129 behaviour when unset. D5 (a path reaching the EPP with a
+# missing/empty x-maas-subscription) is NOT a 04-loadgen.yaml knob -- see
+# deploy/poc/16-loadgen-identity-variants.sh and the runbook section above.
 set -euo pipefail
 
 SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone asymmetric-demand}"
@@ -147,6 +156,13 @@ TIMELINE_VARS="APP1_START APP1_STOP APP1_DUTY APP2_START APP2_STOP APP2_DUTY END
 # 1200-word prompt, max_tokens=64, no streaming, no client aborts, no
 # oversized prompts.
 PROFILE_VARS="PROMPT_WORDS_MIN PROMPT_WORDS_MAX MAX_TOKENS_DEFAULT MAX_TOKENS_OMIT_FRACTION MAX_TOKENS_HUGE_FRACTION MAX_TOKENS_HUGE_VALUE STREAM_FRACTION ABORT_FRACTION ABORT_MIN_FRACTION ABORT_MAX_FRACTION OVERSIZED_FRACTION OVERSIZED_PROMPT_WORDS LONG_GEN_FRACTION LONG_GEN_MAX_TOKENS REQUEST_TIMEOUT_SECONDS"
+
+# UNI-129: identity-variant knobs (D1/D2/D3), passed straight through to the
+# Job when set -- see deploy/poc/04-loadgen.yaml's tenant dispatch and
+# send_one() for what each one means. Unset (the default for every scenario
+# above) reproduces the one, prior identity shape: two end-user keys, no
+# custom tenant, no forged header.
+IDENTITY_VARS="END_USERS_KEYS FORGE_FAIRNESS_ID_FRACTION FORGE_FAIRNESS_ID_VALUE CUSTOM_SUBSCRIPTION_NAME WORKERS_CUSTOM CUSTOM_START CUSTOM_STOP CUSTOM_DUTY"
 
 # UNI-103: is this scenario scored, or a named negative control that is
 # expected not to show the weighted split? Read by the report step below --
@@ -268,6 +284,13 @@ done
 # JSON side-channel needed -- the Job records what it actually did per
 # request itself (see the client-record extraction after the Job completes).
 for v in $PROFILE_VARS; do
+  val="${!v-}"
+  if [ -n "$val" ]; then
+    set_override "$v" "$val"
+  fi
+done
+# UNI-129 identity-variant pass-through: same shape as the profile loop above.
+for v in $IDENTITY_VARS; do
   val="${!v-}"
   if [ -n "$val" ]; then
     set_override "$v" "$val"

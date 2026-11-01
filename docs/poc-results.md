@@ -1759,6 +1759,145 @@ wall-clock target. The existing report's `STATUS_PAIR` regex does not
 count `ABORT` in its structured `status_tally` (see `docs/runbook.md`) —
 a known, accepted gap, not a defect introduced to hide.
 
+## UNI-129: identity-variant harness, development only — no scored case
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan needs D1, D2, D3 and D5,
+which all vary something about *how a request proves its identity* rather
+than what the request contains (UNI-128's scope). This ticket builds that
+into `deploy/poc/04-loadgen.yaml` (D1/D2/D3) and a new standalone probe,
+`deploy/poc/16-loadgen-identity-variants.sh` (D5) — **it does not run or
+score a D1/D2/D3/D5 case itself**, same scope boundary UNI-127/128 set. Full
+mechanism in `docs/runbook.md`'s "Identity-variant harness (UNI-129)".
+
+**Provisioning check (rule 5), done first.** This role can mint new MaaS API
+keys — confirmed live, and used for D1 below — but cannot create new
+`MaaSSubscription` objects: `oc auth can-i create maassubscriptions -n
+models-as-a-service` and the same check in `maas-fairness-poc` both return
+`no`. D1 and D3 need no new subscriptions (they reuse the existing
+`end-user-alpha`/`end-user-beta`/`app1-production` identities), so they are
+fully built. D2 needs a subscription literally named `enduser-foo` to exist
+and does not — see "Blocked: D2" below.
+
+**D1 — key rotation, live evidence.** 20 new `sk-oai-` keys
+(`end-user-gen01`..`end-user-gen20`) were minted directly against
+`maas-api`'s ClusterIP (no `oc port-forward` needed in this environment —
+see the runbook) and bound 10/10 across the two existing `end-user-*`
+subscriptions. Smoke-tested live 2026-11-01: 68 end-users requests
+round-robinning across 3 of the new keys all returned `200`, and the EPP's
+own `fairness_id="end-users"` counter matched exactly (68) — the widened
+key list collapses to the one flow correctly.
+
+**D2 — generic mechanism built, specific identity blocked.** The new
+`custom` pseudo-tenant was smoke-tested live against an existing identity
+(`CUSTOM_SUBSCRIPTION_NAME=app1-production`): 34 requests, all `200`, and
+the EPP's `fairness_id="app1"` counter read exactly 34 — the plumbing
+works end to end. The ticket's specific case, a subscription literally
+named `enduser-foo` (no hyphen, so it should fall outside the `end-user-`
+prefix match into `unclassified`), could not be built: minting a key
+against that name was tried directly and rejected at the gateway
+(`400 invalid_subscription`) because no such `MaaSSubscription` exists, and
+creating one is outside this role's grant (see "Blocked: D2").
+
+**D3 — forged header, live evidence the defense holds.** The same 68-request
+run above set `FORGE_FAIRNESS_ID_FRACTION=0.5` (36 of the 68 end-users
+requests carried a forged `x-llm-d-inference-fairness-id: app1` header
+*alongside* a real end-user key), concurrently with the 34 real app1
+(`custom`-tenant) requests carrying no forged header. The EPP's own
+`llm_d_epp_flow_control_request_enqueue_duration_seconds_count` showed
+`fairness_id="app1"` at exactly 34 and `fairness_id="end-users"` at exactly
+68 — none of the 36 forged requests crossed over. design.md's "Security:
+headers must be stripped at the gateway" claim (the plugin's `PreRequest`
+unconditionally overwrites `FairnessID` from the authenticated subscription)
+holds under direct, live test, not just static code reading.
+
+**D5 — the path is closed on the actual SUT, not open.** Ran
+`deploy/poc/16-loadgen-identity-variants.sh maas-vllm-gpu` live, 2026-11-01:
+
+| probe | result |
+|---|---|
+| real key (control) | `200` |
+| k8s token, `/v1/chat/completions` | `401` |
+| k8s token, `/v1/models` | `403` |
+
+This is the opposite of the naive expectation inherited from
+`docs/gateway-header-stripping.md`'s 2026-10-19 live proof, which used
+exactly this k8s-token mechanism successfully — but against
+`maas-vllm-cpu`, a route with no `AuthPolicy` of its own, so it still
+inherits the Gateway-level `kubernetes-user` rule unmodified. The GPU route
+(the actual SUT this whole repo measures) has since grown its own
+`maas-auth-maas-vllm-gpu` AuthPolicy, whose authentication rules atomically
+replace the Gateway-level ones for that route rather than merging with
+them — confirmed by the 401/403 pair above, not inferred from the YAML.
+Two further avenues were tried and also closed: minting a key with
+`subscription` omitted silently assigns the caller's own first eligible
+subscription rather than leaving it blank, and the pre-MaaS direct rig
+(`deploy/poc/02-epp.yaml`/`03-gateway.yaml`) targets a different Deployment
+entirely, not the `maas-vllm-gpu` LLMInferenceService, so using it would not
+be testing this ticket's SUT. **Net: on `maas-vllm-gpu-kserve-route` today,
+every request that reaches the backend carries a real, non-empty
+subscription — D5, as literally stated, does not currently reproduce
+against this system.** The probe script is built to re-ask this question
+mechanically (not just once, here) in case a future AuthPolicy change
+reopens it — the same "keeps this from silently regressing" posture
+`docs/gateway-header-stripping.md` already established for the objective
+header.
+
+**The identity-header name itself is also worth recording as a surprise.**
+The ticket (and this repo's own `design.md`, Part 2) both say
+`x-maas-subscription-id`. The header actually wired, confirmed in
+`deploy/epp-config.yaml`'s own comment and the live `maas-auth-maas-vllm-gpu`
+AuthPolicy, is `x-maas-subscription` (no `-id`) — `design.md`'s Part 2 config
+block has carried the wrong name since this POC's early days, and this
+ticket's documentation above uses the real one throughout.
+
+**Blocked: D2.** Exact gap: `create` on
+`maassubscriptions.maas.opendatahub.io` in `models-as-a-service` (also
+checked and denied in `maas-fairness-poc`). Verified with `oc auth can-i`,
+not inferred from role tables. Needed to create a `MaaSSubscription` named
+`enduser-foo` so a key minted against it produces a real, authenticatable
+identity that falls outside the `end-user-` prefix match. Raised to the
+board per this chain's standing practice (see the closing comment on this
+task) rather than worked around.
+
+**Cluster left as found.** This ticket's harness makes no replica or
+plugin-config changes — the new knobs and the D5 probe are client-side
+(request headers, auth material, which credential file is read) and never
+touch the LLMInferenceService spec or the EPP's weights. A short smoke-test
+Job (`TENANTS="end-users custom"`, `DURATION=25s`, `WORKERS=2`) was run to
+produce the live evidence above and cleaned up immediately after;
+`spec.replicas` on `maas-vllm-gpu` confirmed at `2` (matching
+`deploy/poc/09-vllm-gpu.yaml`), both vLLM pods and the EPP scheduler
+`1/1 Running` with 0 restarts, and no `job` left in the namespace:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                      READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                     1/1     Running   0          66m
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                     1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-6gkq5    1/1     Running   0          67m
+$ oc get jobs -n maas-fairness-poc
+No resources found in maas-fairness-poc namespace.
+```
+
+One self-inflicted near-miss during this work, recorded for the next
+session rather than hidden: `oc apply -f deploy/poc/04-loadgen.yaml` was
+run directly (not through a patched copy) to reset the Job's env back to
+repo defaults after the smoke test, which — since that file is a ConfigMap
+*and* a Job together — immediately launched a real, full-size
+`app1 app2 end-users` / 240s / 32-worker run against the live GPU pool.
+Caught and deleted at 49s; no results were collected or scored from it, so
+nothing downstream is contaminated, but it consumed ~49s of shared pool
+time outside of any actual benchmark ticket.
+
+**Not proven here, by design:** no D1–D5 case was run or scored as a named,
+reportable scenario — every one is still pending its own ticket, same as
+UNI-127/128 left their cases pending. The smoke tests above exist to prove
+the harness mechanism works and produces correct EPP-side classification,
+not to produce a scenario verdict. D2's `enduser-foo` instance specifically
+cannot be attempted at all until the board resolves the missing grant.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -1772,7 +1911,7 @@ Ordered by how much they would change a conclusion.
 | 5 | **Test on a real RHOAI 3.4 cluster** | three unknowns remain: whether 3.4's controller validates the EndpointPickerConfig, its InferencePool API group, and its tokenizer sidecar (3.5 has no equivalent). The 3.4-shaped preset test covered the flags, not the controller | a 3.4 cluster |
 | — | ~~Fix `contended_service_tokens_total`~~ | **Fixed.** The gate decision (is the band contended) is now made once, at dispatch, and reused at completion instead of being re-checked independently at each of the two charge sites. The metric also now books the real, measured cost once at completion rather than the dispatch estimate plus a separately-gated correction, so an estimator overshoot no longer gets silently dropped (a Prometheus counter cannot move backwards on a negative delta). `TestContendedServiceTokensEqualChargedCost`, `TestContendedServiceTokensEqualChargedCostOnOverestimate`, and `TestAbortedRequestStillBooksContendedService` cover under-estimate, over-estimate, and abort respectively | — |
 | — | ~~Re-run S1 longer~~ | **Done, negative result.** Re-ran at 600s (10 half-lives, vs the original 150s): the split moved to 50.3/49.7%, *further* from 2:1 than the original 1.57:1, which refutes the duration hypothesis — see "A3 (UNI-28): S1 re-run at 600s," above. Root cause is the same worker-sizing-vs-backend-latency mechanism UNI-29's Run 2 identified on this same current (llama-3-1-8b) deployment, not warm-up time. The resize itself is now done — [UNI-103](/UNI/issues/UNI-103), below — and the app1:app2 over-offer ratio is retuned and passing — [UNI-104](/UNI/issues/UNI-104), below | — |
-| 8 | **`maas-default-gateway` inference path** | returns 500: `maas-api-route` targets a TLS service port with no `BackendTLSPolicy`, and that CRD is not installed. API keys currently require port-forwarding to maas-api | upstream/MaaS |
+| 8 | **`maas-default-gateway` inference path** | returns 500: `maas-api-route` targets a TLS service port with no `BackendTLSPolicy`, and that CRD is not installed. **Correction (UNI-129, 2026-11-01): minting keys does not actually require port-forwarding** in this environment -- the agent sandbox has direct pod-network reachability to the `maas-api` Service's ClusterIP, which answers the same `POST .../v1/api-keys` call with no tunnel. Port-forwarding is still the documented, more portable fallback for an environment without that reachability | upstream/MaaS |
 | — | ~~Sustained load through the LLMInferenceService path and the Route (UNI-27)~~ | **Done for status tally and fairness.** 240s closed-loop runs (32 workers/tenant, `app1`/`app2`/`end-users`) against both the in-cluster gateway Service and the public Route landed 94.7% and 97.9% HTTP 200 respectively. `normalized_service` converged to within ~7% across the three backlogged groups on both paths, confirmed at multiple flight-recorder ticks through each run. On the non-200s: the Route path's are directly traced via the gateway access log to a ~2s connection/endpoint-pool warm-up burst at request-storm start (zero thereafter), not a sustained-load or fairness defect. The LLMInferenceService path's (5.3% error rate) are **inferred to be the same mechanism by analogy, not log-verified** — this cluster has no log aggregation and the gateway's own access-log buffer had already rotated past the run window by the time it was checked. Script: `deploy/poc/12-loadgen-route.sh` (Route path); `deploy/poc/04-loadgen.yaml` unchanged (LLMInferenceService path). Does **not** cover the 600s timeout / `buffer-response: false` annotations — see item 15 | N/A -- closed for status tally + fairness scope |
 | — | ~~Open-loop load generation (UNI-34)~~ | **Done, and the clamp finding flips.** `deploy/poc/13-loadgen-poisson.{py,sh}` adds open-loop Poisson arrivals. Below saturation the clamp fires on ~65% of dispatches (vs 0.2–2.2% closed-loop) but is harmless (pool uncontended). Above saturation (24 req/s aggregate vs a measured ~20-22 req/s pool ceiling) it measurably **inverts** the 20/10/65 split: end-users (w=65) delivered 25.5%, app1 (w=20) delivered 40.4%. This **contradicts** the GPU closed-loop "clamp is inert" finding (`## 3`) and confirms the SUPERSEDED section's concern more strongly than originally observed. See "Open-loop (Poisson) load generation (UNI-34)" above for the full data, including what was not tested (no clamp on/off A/B — see that section for why) | **newcomerClamp default should be revisited** — a policy decision, same owner as item 2 |
 | — | ~~Verify metrics reach Prometheus~~ | **Done (UNI-50).** The D3 dashboard (`deploy/grafana-dashboard.yaml`) confirmed this end to end against live Grafana/Thanos: the headline expected-vs-observed panel and five supporting panels all rendered real, current GPU-EPP data from a load run, with the exact PromQL and output pasted on that ticket. Datasource confirmed as the standalone `grafana` namespace's Prometheus-only datasource, pointed at the same UWM Thanos Querier every other observability asset in this repo already reads | N/A -- closed |
@@ -1791,6 +1930,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Resize `full-contention`/`end-users-idle` to over-offer per tenant, re-run all four + a named control (UNI-103)~~ | **Done, 4/5 green.** Per-tenant `WORKERS_APP1`/`WORKERS_APP2`/`WORKERS_END_USERS` replace the single global `WORKERS` in both scenarios; `equal-workers-control` keeps the original equal-worker shape alive as a permanent, explicitly-unscored negative control (`--control`, verdict `INFO`). Live re-run 2026-10-29: `full-contention` now PASSES (16.2/12.8/71.0% vs 21.1/10.5/68.4%), `app1-alone` and `asymmetric-demand` still PASS, `equal-workers-control` reproduces the original artifact as expected (INFO, 29.7pt max deviation). `end-users-idle` still FAILs, now in the opposite direction (app1 82.4% vs a 66.7% target) -- see "UNI-103," below, for the full table and the suspected cause | follow-up: [UNI-104](/UNI/issues/UNI-104), tune the app1:app2 over-offer ratio |
 | — | ~~Retune `end-users-idle`'s app1:app2 worker ratio to match its 2:1 target, re-run (UNI-104)~~ | **Done, PASS.** `WORKERS_APP1` moved from 128 to 64 (keeping `WORKERS_APP2=32`), matching the offered-worker ratio to the pair's actual 2:1 target share ratio instead of reusing `full-contention`'s 4:1 dominant-tenant figure. Live re-run 2026-10-29: 68.4/31.6% against a 66.7/33.3% target (1.8pt max deviation) -- **PASS**. `contended_seconds_total` deltas (app1 1.46s, app2 1.50s) confirm both tenants were genuinely contending. Why the 4:1 ratio overshot so much more than 2:1 undershoots remains unexplained, same as UNI-103 left it -- see "UNI-104," below | root cause of the ratio's exact sensitivity: pending [UNI-100](/UNI/issues/UNI-100)'s scope decision |
 | — | ~~Build the timeline/chaos harness for the edge-case plan (UNI-127)~~ | **Done, development only.** Per-tenant join/leave + duty-cycle timing, EPP-pod-delete and vLLM-scale chaos hooks, windowed per-tenant share, and a time-to-converge figure -- see "UNI-127," above, for the full story including the live finding that a chaos scale-restore's actual capacity recovery (~3m39s on this backend) lags its patch by far more than a short `CHAOS_SCALE_HOLD` accounts for. `full-contention` regression confirmed the whole-run verdict is unchanged. No B1-B4/E1/E2 case was run or scored -- that is every ticket after this one in the chain | the board's edge-case cases themselves (B1-B4, E1, E2, "app3 joins at saturation"), each its own ticket |
+| 17 | **`MaaSSubscription` named `enduser-foo` for D2 (UNI-129)** | D2's harness mechanism (an arbitrary/custom subscription identity) is built and smoke-tested live against an existing identity, but the ticket's specific case -- a subscription named `enduser-foo` (no hyphen, deliberately outside the `end-user-` prefix match) -- cannot be created: `oc auth can-i create maassubscriptions -n models-as-a-service` returns `no`, confirmed live, not inferred. Minting a key against that name directly was also tried and rejected (`400 invalid_subscription`) since no such object exists | `create` on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` -- operator-level approval |
 
 ## Reproducing
 

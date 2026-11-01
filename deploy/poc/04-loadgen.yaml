@@ -12,10 +12,12 @@
 # is the point -- see the WORKERS comment below for why a merely-saturating
 # load produces an equal split and looks like a broken policy.
 #
-# end-users rotates across EIGHT DISTINCT subscription IDs. That is a test,
-# not decoration: all eight must collapse to the single `end-users` flow via
-# the prefix rule. If grouping were broken they would appear as twelve separate
-# queues each holding weight 65, and end users would receive 8x their share.
+# end-users rotates across DISTINCT subscription IDs (default: the two keys
+# end-user-alpha/end-user-beta; UNI-129's END_USERS_KEYS below can widen this
+# to many more). That is a test, not decoration: every one of them must
+# collapse to the single `end-users` flow via the prefix rule. If grouping
+# were broken they would appear as N separate queues each holding weight 65,
+# and end users would receive Nx their share.
 #
 # Run it twice -- once with enforce:false (the FCFS control) and once with
 # enforce:true -- and diff the same counters across the two runs.
@@ -59,6 +61,27 @@ data:
     OVERSIZED_FRACTION="${OVERSIZED_FRACTION:-0}"
     OVERSIZED_PROMPT_WORDS="${OVERSIZED_PROMPT_WORDS:-12000}"
     REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-300}"
+
+    # UNI-129: identity variants (D1 key rotation, D3 forged header). Both
+    # default to this script's pre-UNI-129 behaviour -- two keys, no forged
+    # header -- so a plain invocation is unchanged. See docs/runbook.md
+    # "Identity-variant harness (UNI-129)" for the full story; this comment
+    # block is a pointer, not the source of truth.
+    #
+    # D1: space-separated list of /keys/<name> files to round-robin across
+    # for the end-users tenant, replacing the old fixed alpha/beta pair.
+    # Every name in the list must resolve to a REAL end-user-* MaaSSubscription
+    # (end-user-alpha or end-user-beta today -- see the key inventory), so
+    # this widens the number of distinct CREDENTIALS, not identities.
+    END_USERS_KEYS="${END_USERS_KEYS:-end-user-alpha end-user-beta}"
+    # D3: forge x-llm-d-inference-fairness-id on this fraction of requests,
+    # set to FORGE_FAIRNESS_ID_VALUE. The ticket's own case sets this to
+    # "app1" while the request still authenticates with a real end-user key
+    # -- the point is to prove the plugin's unconditional PreRequest
+    # overwrite (design.md, "Security: headers must be stripped at the
+    # gateway") actually holds, not to find a new hole.
+    FORGE_FAIRNESS_ID_FRACTION="${FORGE_FAIRNESS_ID_FRACTION:-0}"
+    FORGE_FAIRNESS_ID_VALUE="${FORGE_FAIRNESS_ID_VALUE:-app1}"
 
     # roll <fraction 0..1> -> prints 1 ("hit") or 0, using bash's own
     # pseudo-random $RANDOM (0-32767). "$RANDOM" is re-read on every call, so
@@ -149,6 +172,7 @@ data:
       local sub="$1" group="$2"
       local prompt mt_value mt_kind max_tokens_json stream stream_json body
       local tmp http_code latency start end aborted=0 curl_pid abort_flag="" canceller_pid=""
+      local forged=0
       local -a curl_args
       prompt="$(pick_prompt)"
       read -r mt_value mt_kind <<< "$(pick_max_tokens)"
@@ -164,6 +188,11 @@ data:
       start=$(date +%s.%N)
       curl_args=(-sS -o "$tmp" -m "$REQUEST_TIMEOUT_SECONDS" -w '%{http_code}' -X POST)
       [ "$stream" = "1" ] && curl_args+=(-N)
+      # UNI-129 D3: a fraction of requests additionally forge the fairness-id
+      # header while still authenticating with this call's real key/subscription
+      # -- see the FORGE_FAIRNESS_ID_FRACTION comment above.
+      [ "$(roll "$FORGE_FAIRNESS_ID_FRACTION")" = "1" ] && forged=1
+      [ "$forged" = "1" ] && curl_args+=(-H "x-llm-d-inference-fairness-id: $FORGE_FAIRNESS_ID_VALUE")
       curl "${curl_args[@]}" "$GW$MODELPATH/v1/chat/completions" \
         -H 'Content-Type: application/json' \
         -H "Authorization: Bearer $(cat /keys/$sub)" \
@@ -216,7 +245,10 @@ data:
       # max_tokens kind, stream(0/1). Columns 1-2 are exactly the original
       # "code time_total" shape the closing table and 15-fairness-report.py
       # already parse by position ($1, $2) -- everything after is additive.
-      echo "$http_code $latency $ptok $ctok $aborted $mt_value $mt_kind $stream" >> "$OUT/$group"
+      # UNI-129 appends a 9th column: forged(0/1), whether this request carried
+      # the D3 forged fairness-id header -- lets a later pass confirm delivered
+      # share didn't follow the forged value even on the requests that sent it.
+      echo "$http_code $latency $ptok $ctok $aborted $mt_value $mt_kind $stream $forged" >> "$OUT/$group"
       rm -f "$tmp" "${tmp}.code"
     }
 
@@ -314,6 +346,12 @@ data:
     W_APP1="${WORKERS_APP1:-$WORKERS}"
     W_APP2="${WORKERS_APP2:-$WORKERS}"
     W_END="${WORKERS_END_USERS:-$WORKERS}"
+    # UNI-129 D2: a generic "custom" tenant for an arbitrary key/subscription
+    # name, instead of one of the four built in above. Needs
+    # CUSTOM_SUBSCRIPTION_NAME set to a /keys/<name> file that actually
+    # exists in the mounted Secret -- there is no default, unlike every other
+    # tenant, because there is no one arbitrary name to default to.
+    W_CUSTOM="${WORKERS_CUSTOM:-$WORKERS}"
 
     # UNI-127 timeline: seconds-offset START/STOP (default: active the whole
     # run) and an optional "<on>/<off>" DUTY cycle (default: no cycling, i.e.
@@ -324,16 +362,30 @@ data:
     APP1_START="${APP1_START:-0}";             APP1_STOP="${APP1_STOP:-$DURATION}";             APP1_DUTY="${APP1_DUTY:-}"
     APP2_START="${APP2_START:-0}";             APP2_STOP="${APP2_STOP:-$DURATION}";             APP2_DUTY="${APP2_DUTY:-}"
     END_USERS_START="${END_USERS_START:-0}";   END_USERS_STOP="${END_USERS_STOP:-$DURATION}";   END_USERS_DUTY="${END_USERS_DUTY:-}"
-    echo "load: tenants=[${TENANTS}] workers app1=${W_APP1} app2=${W_APP2} end-users=${W_END} duration=${DURATION}s"
+    CUSTOM_START="${CUSTOM_START:-0}";         CUSTOM_STOP="${CUSTOM_STOP:-$DURATION}";         CUSTOM_DUTY="${CUSTOM_DUTY:-}"
+    echo "load: tenants=[${TENANTS}] workers app1=${W_APP1} app2=${W_APP2} end-users=${W_END} custom=${W_CUSTOM} duration=${DURATION}s"
     echo "load: timeline app1=${APP1_START}-${APP1_STOP}s/duty=${APP1_DUTY:-none} app2=${APP2_START}-${APP2_STOP}s/duty=${APP2_DUTY:-none} end-users=${END_USERS_START}-${END_USERS_STOP}s/duty=${END_USERS_DUTY:-none}"
+    echo "load: UNI-129 end-users-keys=[${END_USERS_KEYS}] forge-fairness-id-fraction=${FORGE_FAIRNESS_ID_FRACTION} forge-fairness-id-value=${FORGE_FAIRNESS_ID_VALUE} custom-subscription=${CUSTOM_SUBSCRIPTION_NAME:-none}"
 
     for t in $TENANTS; do
       case "$t" in
         app1)      for _ in $(seq 1 "$W_APP1"); do worker "app1-production" app1 "$APP1_START" "$APP1_STOP" "$APP1_DUTY" & done ;;
         app2)      for _ in $(seq 1 "$W_APP2"); do worker "app2-batch"      app2 "$APP2_START" "$APP2_STOP" "$APP2_DUTY" & done ;;
-        # Distinct subscription per worker -- all must collapse to `end-users`.
-        end-users) for i in $(seq 1 "$W_END");  do
-                     if [ $((i % 2)) -eq 0 ]; then worker end-user-alpha end-users "$END_USERS_START" "$END_USERS_STOP" "$END_USERS_DUTY" & else worker end-user-beta end-users "$END_USERS_START" "$END_USERS_STOP" "$END_USERS_DUTY" & fi
+        # UNI-129 D1: round-robin across END_USERS_KEYS (default: the original
+        # two-key alpha/beta alternation) -- every one of them must still
+        # collapse to the single `end-users` flow via the prefix rule. If
+        # grouping were broken they would appear as N separate queues each
+        # holding weight 65, and end users would receive Nx their share.
+        end-users) read -r -a _eu_keys <<< "$END_USERS_KEYS"
+                   _eu_n=${#_eu_keys[@]}
+                   for i in $(seq 1 "$W_END"); do
+                     worker "${_eu_keys[$(( (i - 1) % _eu_n ))]}" end-users "$END_USERS_START" "$END_USERS_STOP" "$END_USERS_DUTY" &
+                   done ;;
+        # UNI-129 D2: one arbitrary key/subscription name, not one of the
+        # three built-in identities above.
+        custom)    : "${CUSTOM_SUBSCRIPTION_NAME:?set CUSTOM_SUBSCRIPTION_NAME to a /keys/<name> entry}"
+                   for _ in $(seq 1 "$W_CUSTOM"); do
+                     worker "$CUSTOM_SUBSCRIPTION_NAME" custom "$CUSTOM_START" "$CUSTOM_STOP" "$CUSTOM_DUTY" &
                    done ;;
         *) echo "unknown tenant: $t" >&2; exit 1 ;;
       esac
@@ -369,7 +421,7 @@ data:
       awk -v group="$group" '
         {
           total++
-          code=$1; ptok=$3; ctok=$4; aborted=$5; mtkind=$7; stream=$8
+          code=$1; ptok=$3; ctok=$4; aborted=$5; mtkind=$7; stream=$8; forged=$9
           codecount[code]++
           if (aborted=="1") aborts++
           if (code=="000") errors++
@@ -379,13 +431,14 @@ data:
           if (mtkind=="omit") omit_count++
           if (mtkind=="huge") huge_count++
           if (mtkind=="longgen") longgen_count++
+          if (forged=="1") forged_count++
         }
         END {
           printf "CLIENT_RECORD_JSON {\"group\":\"%s\",\"requests_sent\":%d,\"status_tally\":{", group, total+0
           first=1
           for (c in codecount) { if(!first) printf ","; printf "\"%s\":%d", c, codecount[c]; first=0 }
-          printf "},\"aborts\":%d,\"errors\":%d,\"prompt_tokens_total\":%d,\"completion_tokens_total\":%d,\"stream_requests\":%d,\"max_tokens_omitted\":%d,\"max_tokens_huge\":%d,\"long_generations\":%d}\n", \
-            aborts+0, errors+0, ptok_total+0, ctok_total+0, stream_count+0, omit_count+0, huge_count+0, longgen_count+0
+          printf "},\"aborts\":%d,\"errors\":%d,\"prompt_tokens_total\":%d,\"completion_tokens_total\":%d,\"stream_requests\":%d,\"max_tokens_omitted\":%d,\"max_tokens_huge\":%d,\"long_generations\":%d,\"forged_fairness_id\":%d}\n", \
+            aborts+0, errors+0, ptok_total+0, ctok_total+0, stream_count+0, omit_count+0, huge_count+0, longgen_count+0, forged_count+0
         }
       ' "$file"
     }
@@ -489,6 +542,21 @@ spec:
             #   value: "2000"
             # - name: REQUEST_TIMEOUT_SECONDS
             #   value: "300"
+            # UNI-129: identity variants (D1 key rotation, D2 custom identity,
+            # D3 forged header). All default to this Job's pre-UNI-129
+            # behaviour -- two end-user keys, no custom tenant, no forged
+            # header. See docs/runbook.md "Identity-variant harness
+            # (UNI-129)" for the full story.
+            # - name: END_USERS_KEYS
+            #   value: "end-user-gen01 end-user-gen02 end-user-gen03 end-user-gen04 end-user-gen05 end-user-gen06 end-user-gen07 end-user-gen08 end-user-gen09 end-user-gen10 end-user-gen11 end-user-gen12 end-user-gen13 end-user-gen14 end-user-gen15 end-user-gen16 end-user-gen17 end-user-gen18 end-user-gen19 end-user-gen20"
+            # - name: FORGE_FAIRNESS_ID_FRACTION
+            #   value: "0.1"
+            # - name: FORGE_FAIRNESS_ID_VALUE
+            #   value: "app1"
+            # - name: CUSTOM_SUBSCRIPTION_NAME
+            #   value: "app1-production"
+            # - name: WORKERS_CUSTOM
+            #   value: "8"
             - name: DURATION
               # Several half-lives (halfLifeSeconds: 60). The tabs start empty
               # after every EPP restart, so a run shorter than ~3 half-lives
@@ -542,10 +610,16 @@ spec:
           configMap:
             name: maas-loadgen
             defaultMode: 0755
-        # One MaaS API key per subscription. Authentication is now the REAL
+        # One MaaS API key file per credential. Authentication is now the REAL
         # path: Authorino validates the sk-oai key and injects
         # X-MaaS-Subscription, which is what the plugin classifies on. The
         # generator no longer asserts its own identity.
+        #
+        # UNI-129: this Secret holds more key FILES than SUBSCRIPTIONS --
+        # end-user-gen01..20 are 20 distinct sk-oai- credentials minted
+        # against the same two real MaaSSubscriptions (end-user-alpha/beta)
+        # for D1's key-rotation case. See docs/runbook.md's key inventory
+        # (names and subscriptions only -- never values).
         - name: keys
           secret:
             secretName: maas-loadgen-keys

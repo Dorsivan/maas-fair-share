@@ -730,6 +730,145 @@ UNI-103/UNI-127 baselines) is in `docs/poc-results.md`'s UNI-128 section.
 
 ---
 
+### Identity-variant harness (UNI-129)
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan also needs variants in HOW a
+request proves its identity, not just what the request contains: many keys
+per tenant, an arbitrary/mistyped subscription name, a forged classification
+header, and a request that reaches the EPP with no subscription identity at
+all. UNI-129 is the harness work those cases (D1, D2, D3, D5) need -- **it
+does not itself run or score a case**, same scope boundary as UNI-127/128.
+Every knob defaults to this script's pre-UNI-129 behaviour, so a plain
+scenario invocation is unaffected.
+
+**D1 -- key rotation.** `END_USERS_KEYS` (default: `"end-user-alpha
+end-user-beta"`, the original two) is a space-separated list of `/keys/<name>`
+files; the end-users tenant's workers round-robin across however many are
+listed, instead of alternating a fixed pair. Every name must resolve to a
+real, already-minted key in the `maas-loadgen-keys` Secret -- this widens the
+number of distinct CREDENTIALS, not identities, since every one of them
+still has to be a valid `end-user-*` MaaSSubscription for the prefix rule to
+mean anything. The key inventory below adds 20 (`end-user-gen01` ..
+`end-user-gen20`) for this case.
+
+**D2 -- arbitrary/custom subscription identity.** A new `custom` pseudo-tenant
+(add it to `TENANTS`) sends load under `CUSTOM_SUBSCRIPTION_NAME` (no
+default -- there is no one arbitrary name to default to), with
+`WORKERS_CUSTOM`/`CUSTOM_START`/`CUSTOM_STOP`/`CUSTOM_DUTY` following the same
+pattern as the three built-in tenants. This is the generic mechanism the
+case needs; **the specific identity the ticket names, `enduser-foo` (no
+hyphen after "end," so it deliberately falls outside the `end-user-` prefix
+match and should land in `unclassified`), could not be provisioned** -- see
+"Blocked: D2" below. The mechanism itself is smoke-tested against an
+existing identity instead (`CUSTOM_SUBSCRIPTION_NAME=app1-production`):
+live on 2026-11-01, 34 `custom`-tenant requests all returned 200 and the
+EPP's own `llm_d_epp_flow_control_request_enqueue_duration_seconds_count{
+fairness_id="app1"}` showed exactly 34 -- the generic plumbing classifies
+correctly end to end, only the specific `enduser-foo` instance is blocked.
+
+**D3 -- forged fairness-id header.** `FORGE_FAIRNESS_ID_FRACTION` (default
+`0`) and `FORGE_FAIRNESS_ID_VALUE` (default `app1`) add
+`x-llm-d-inference-fairness-id: <value>` to that fraction of requests, **on
+top of** the request's real key -- the point is to confirm the plugin's
+unconditional `PreRequest` overwrite (design.md, "Security: headers must be
+stripped at the gateway") holds even when a legitimately-authenticated
+end-user mixes in a forged header, not to find a new hole. The per-request
+log gets a 9th column (`forged`, 0/1) and `CLIENT_RECORD_JSON` gets a
+`forged_fairness_id` count, so a later pass can confirm the forged requests
+didn't move. **Live proof, 2026-11-01:** 68 end-users requests with
+`FORGE_FAIRNESS_ID_FRACTION=0.5` (36 of them forged to `app1`) against 34
+real `custom`-tenant (`app1-production`) requests with none forged -- the
+EPP's own counters still showed exactly 34 under `fairness_id="app1"` and 68
+under `fairness_id="end-users"`. Zero of the 36 forged requests crossed over;
+the defense holds.
+
+**D5 -- a path with no/empty `x-maas-subscription`.** This is not a
+`04-loadgen.yaml` knob -- it is an auth-boundary question, not a
+fairness-share one, so `deploy/poc/16-loadgen-identity-variants.sh` is a
+small standalone probe instead (same style as `12-loadgen-route.sh`: a few
+single requests, not a closed-loop generator). The mechanism: the per-model
+AuthPolicy sets `X-MaaS-Subscription` to `(has(auth.metadata.apiKeyValidation)
+? subscription : "")`, and `apiKeyValidation` only populates for a request
+that authenticated with a real `sk-oai-` key -- so a request that
+authenticates some OTHER way (a plain Kubernetes ServiceAccount token, via
+the Gateway-level `kubernetes-user` AuthPolicy rule) reaches the EPP with
+this header forced empty, regardless of anything the client sent.
+`docs/gateway-header-stripping.md`'s 2026-10-19 live proof against
+`maas-vllm-cpu` used exactly this mechanism (for a different header).
+
+**Live finding, 2026-11-01, against the actual SUT
+(`maas-vllm-gpu-kserve-route`): this path is CLOSED, not open.** Unlike the
+CPU route (no AuthPolicy of its own, still inherits the unrestricted
+Gateway-level rule), the GPU route now has its own `maas-auth-maas-vllm-gpu`
+AuthPolicy, and its `authentication` rules **atomically replace** the
+Gateway-level ones for this route rather than merging with them --
+confirmed live, not inferred:
+
+| probe | result |
+|---|---|
+| real `sk-oai-` key, `/v1/chat/completions` (control) | `200` |
+| k8s token, `/v1/chat/completions` | `401` -- neither of this route's own authn rules matches (`api-keys` needs an `sk-oai-` key; `kubernetes-tokens` is scoped to `.*/v1/models$`) |
+| k8s token, `/v1/models` | `403` -- this path DOES match `kubernetes-tokens` and authenticates, but then fails `require-group-membership` (a ServiceAccount's OpenShift groups are never in `allowed_groups`) -- and `/v1/models` isn't the inference path the fairness plugin classifies on regardless |
+
+Minting a key was also tried both ways directly against `maas-api`: omitting
+`subscription` from the mint request silently assigns the caller's own first
+eligible subscription (it does not mint a subscription-less key), and
+naming a subscription that doesn't exist is rejected outright at mint time
+(`400 invalid_subscription`). So on this route, today, **every request that
+actually reaches the backend carries a real, non-empty subscription** -- D5
+does not currently reproduce against the GPU SUT. Run
+`./deploy/poc/16-loadgen-identity-variants.sh maas-vllm-gpu` to re-check this
+mechanically rather than trusting this date forever: any future change that
+re-attaches the route to a different (or no) AuthPolicy could reopen it
+silently, the same "keeps this from silently regressing" concern
+`docs/gateway-header-stripping.md` raises for the objective header. Passing
+`maas-vllm-cpu` reproduces the OPEN case for comparison -- but only while
+that LLMInferenceService is scaled above 0 replicas (it is normally scaled
+to zero, see "Restore `maas-vllm-cpu` from zero" above); a 0-replica probe
+fails at the connection level, which must not be misread as "the path is
+closed."
+
+**Blocked: D2.** Minting the `enduser-foo` key needed the subscription
+`enduser-foo` to exist as a real `MaaSSubscription` object (confirmed by
+testing the mint call directly: naming a non-existent subscription returns
+`400 invalid_subscription`, not a silently-accepted key). Creating one needs
+`create` on `maassubscriptions.maas.opendatahub.io` in the
+`models-as-a-service` namespace. `oc auth can-i create maassubscriptions -n
+models-as-a-service` returns `no` for this role, and the same check in
+`maas-fairness-poc` also returns `no` -- there is no RoleBinding anywhere
+that grants it. This is the exact resource/API/permission rule 5 asks be
+named precisely; raised to the board per this chain's standing practice
+(see the closing comment on this ticket).
+
+**Key inventory (names and subscriptions only -- never values).** All keys
+live in `secret/maas-loadgen-keys` in `maas-fairness-poc`:
+
+| key name | bound subscription | minted | expires |
+|---|---|---|---|
+| `app1-production` | `app1-production` | pre-existing (UNI-29 era) | not re-verified this ticket |
+| `app2-batch` | `app2-batch` | pre-existing (UNI-29 era) | not re-verified this ticket |
+| `end-user-alpha` | `end-user-alpha` | pre-existing (UNI-29 era) | not re-verified this ticket |
+| `end-user-beta` | `end-user-beta` | pre-existing (UNI-29 era) | not re-verified this ticket |
+| `end-user-gen01` .. `end-user-gen20` | alternating `end-user-alpha`/`end-user-beta` (odd=alpha, even=beta) | 2026-11-01 (this ticket) | 2026-12-01 (30d) |
+
+`end-user-gen01`..`20` are 20 distinct `sk-oai-` credentials for D1 -- 20
+keys, 2 real subscriptions, which is what API key *rotation* actually means
+(same identity, different credential). Minting them the direct way (see
+"Mint a MaaS API key" above) does not need `oc port-forward`: this
+environment has direct pod-network reachability to the `maas-api` Service's
+ClusterIP (`oc get svc maas-api -n redhat-ods-applications -o
+jsonpath='{.spec.clusterIP}'`), which answers the same `POST .../v1/api-keys`
+call without a forwarding tunnel. **The mint response body contains the raw
+key in plaintext** (`{"key":"sk-oai-...", ...}`) -- always redirect it to a
+file (`curl ... -o <file>`) and extract only non-sensitive fields
+(`id`/`name`/`subscription`/`expiresAt`) for any inventory record; never let
+the body reach stdout, a variable that gets echoed, or a committed file. If
+a value is ever exposed, revoke it immediately: `DELETE
+.../v1/api-keys/<id>` with the same `X-MaaS-Username`/`X-MaaS-Group` headers
+the mint call used (a bare `Authorization`-only `DELETE` 500s).
+
+---
+
 ## Load the fairness dashboard into the live Grafana
 
 `deploy/grafana-dashboard.yaml` ships the dashboard JSON as a ConfigMap

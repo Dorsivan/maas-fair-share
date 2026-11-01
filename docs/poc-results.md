@@ -2289,6 +2289,11 @@ Raw results: `results/20261101T174928Z-uni134-app2-trickle/` (report,
 loadgen log, metric snapshots/timeseries, client-request summary, EPP
 container log).
 
+**Grafana time range** (padded ±60s around `run_start`/`run_end`, per
+`docs/runbook.md`'s "Find a run on the fairness dashboard"):
+`from=1793555310000&to=1793555687000` —
+https://grafana-grafana.apps.ocp.paladinaura.com/d/maas-fairness-gpu-epp/?orgId=1&from=1793555310000&to=1793555687000&var-group=All&var-window=2m
+
 **Not proven here:** "close to the same 2 workers running uncontended," the
 ticket's own phrasing for `app2`'s expected latency/throughput, is not
 checked against an actual uncontended 2-worker baseline run — no such run

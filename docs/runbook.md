@@ -897,12 +897,50 @@ Checking "does the capture mention InferencePool" is not the same question as
 "does the capture contain InferencePool objects." Only the latter is what a
 before/after diff needs.
 
+**Two InferencePool API groups are installed on this cluster, and a Forbidden
+response does not tell you which one `maas-pool` actually lives in.** Both are
+registered on `api.ocp.paladinaura.com`:
+
+```
+inference.networking.k8s.io      v1                    (preferred: v1)
+inference.networking.x-k8s.io    v1alpha2, v1alpha1    (preferred: v1alpha2)
+```
+
+Every agent token gets `Forbidden` on `list` *and* on `get`-by-name for all
+three (`k8s.io/v1`, `x-k8s.io/v1alpha2`, `x-k8s.io/v1alpha1`) — and the error
+message just echoes back whichever group/version you asked about. A Forbidden
+response is therefore not evidence that `maas-pool` exists in that group, only
+that you asked about that group and were denied. The `ownerReferences` entry
+quoted above is the only evidence this repo has of which group the *live*
+`maas-pool` is actually in, and it says `inference.networking.x-k8s.io/v1alpha2`,
+not `inference.networking.k8s.io`.
+
+UNI-123 corrected a mistake that followed directly from this: earlier drafts of
+this section and of `deploy/poc/cleanup-dead-objects.sh` attributed the
+surviving pool to `inference.networking.k8s.io`, on the strength of the
+Forbidden reproduction earlier on this page. That reproduction is still a
+correct demonstration of the RBAC boundary — it was just never evidence for
+*which* group the object lives in, and got read as if it were.
+
+**The generalisable lesson: a Forbidden error names the group you asked about,
+not the group the object is in.** Any `can-i`-style pre-flight built on a bare
+short name (`inferencepool`) inherits the same ambiguity — `oc` resolves a bare
+short name to exactly one group (the preferred version of whichever CRD
+registered it first) silently, with no signal that a second group exists or
+that the resolved one is the wrong one. The fix is the same one that applies to
+`delete`: the pre-flight has to name the fully-qualified resource —
+`inferencepools.v1alpha2.inference.networking.x-k8s.io` — not the bare
+`inferencepool`, and if there are multiple candidate groups, check all of them
+by their fully-qualified names rather than trusting whichever one the short
+name happens to resolve to.
+
 **The set of invisible kinds is a property of the token, not a fixed list.**
-`inference.networking.k8s.io` is what's known-invisible in `maas-fairness-poc`
-today, for the roles that exist today. A different role, a changed RoleBinding,
-or a different namespace can all change which kinds silently drop out — so the
-defence belongs in the snapshot procedure itself, not as a one-time hardcoded
-exclusion list for this one API group.
+Both installed InferencePool groups — `inference.networking.k8s.io` and
+`inference.networking.x-k8s.io` — are what's known-invisible in
+`maas-fairness-poc` today, for the roles that exist today. A different role, a
+changed RoleBinding, or a different namespace can all change which kinds
+silently drop out — so the defence belongs in the snapshot procedure itself,
+not as a one-time hardcoded exclusion list for these two API groups.
 
 **Pre-flight: verify every kind is actually readable before trusting the
 capture.** Loop `oc auth can-i list` over the exact kind list you are about to
@@ -910,7 +948,10 @@ pass to `get`, and fail loudly on any `no`:
 
 ```sh
 NAMESPACE=maas-fairness-poc
-KINDS=(deployment service inferencepool)
+# Fully-qualified, not the bare "inferencepool" short name: a bare short name
+# resolves to exactly one of the two installed InferencePool groups (see
+# above) and would silently stop checking the other one.
+KINDS=(deployment service inferencepools.v1alpha2.inference.networking.x-k8s.io)
 BLIND=()
 for kind in "${KINDS[@]}"; do
   if ! oc auth can-i list "$kind" -n "$NAMESPACE" >/dev/null 2>&1; then
@@ -929,13 +970,13 @@ oc get "$(IFS=,; echo "${KINDS[*]}")" -n "$NAMESPACE" -o yaml
 Run against the real kind list, this is what it reports today:
 
 ```
-$ for kind in deployment service inferencepool; do
+$ for kind in deployment service inferencepools.v1alpha2.inference.networking.x-k8s.io; do
     oc auth can-i list "$kind" -n maas-fairness-poc >/dev/null 2>&1 \
       && echo "$kind: ok" || echo "$kind: BLIND"
   done
 deployment: ok
 service: ok
-inferencepool: BLIND
+inferencepools.v1alpha2.inference.networking.x-k8s.io: BLIND
 ```
 
 That is the authoritative way to know a snapshot is complete — not the exit
@@ -946,13 +987,13 @@ that fails *before* the capture is trusted, rather than requiring someone to
 remember to inspect a second file afterwards.
 
 **Cross-reference:** `deploy/poc/cleanup-dead-objects.sh` already carries this
-gap inline, at the `del inferencepool maas-pool` line — the comment there
-(`UNI-96: ... this delete is expected to fail with Forbidden rather than
-succeed or report not-found ... so a dry run documents the gap instead of
-hiding it`) describes the same RBAC boundary for *delete*. This section is the
-*read*-side counterpart: a dry run's `del` reports its own Forbidden loudly
-(see the `del()` function's own `if ! ... delete` check), but a `get`-based
-snapshot used to gate that same delete does not, unless stderr and `$?` are
-actually checked or the pre-flight above is run first. [UNI-119](/UNI/issues/UNI-119),
-the parent of this ticket, is the pending cluster-admin delete of
-`inferencepool/maas-pool` that this same blind spot applies to.
+gap inline, at the `del inferencepools.v1alpha2.inference.networking.x-k8s.io
+maas-pool` line — the comment there describes the same RBAC boundary for
+*delete*, and (since UNI-123) the correct group for the live object. This
+section is the *read*-side counterpart: a dry run's `del` reports its own
+Forbidden loudly (see the `del()` function's own `if ! ... delete` check), but
+a `get`-based snapshot used to gate that same delete does not, unless stderr
+and `$?` are actually checked or the pre-flight above is run first.
+[UNI-119](/UNI/issues/UNI-119), the parent of this ticket, is the pending
+cluster-admin delete of `inferencepools.v1alpha2.inference.networking.x-k8s.io/maas-pool`
+that this same blind spot applies to.

@@ -74,15 +74,28 @@ del deployment maas-epp
 del deployment maas-sim
 del service maas-epp
 del service maas-sim
-del service maas-pool-ip-73df004c
 del httproute maas-poc-route
-# Known gap: the Engineer role's edit grant in maas-fairness-poc does not
-# extend to inference.networking.k8s.io, so this delete is expected to fail
-# with Forbidden rather than succeed or report not-found. Left in so the
-# script does the right thing the day that grant is widened, and so a dry
-# run documents the gap instead of hiding it. See UNI-96 comments for the
-# RBAC check that found this.
-del inferencepool maas-pool
+# The live object is inference.networking.x-k8s.io/v1alpha2, NOT
+# inference.networking.k8s.io -- confirmed via the ownerReferences on
+# svc/maas-pool-ip-73df004c, read directly from the API server on
+# 2026-11-01 (see UNI-123). Named fully-qualified so it can only ever
+# resolve to that real object, never the empty, alphabetically-first
+# inference.networking.k8s.io pool of the same name that a bare
+# `inferencepool` short name risks landing on. The Engineer role's edit
+# grant in maas-fairness-poc does not extend to either inference group, so
+# this delete is expected to fail with Forbidden rather than succeed or
+# report not-found. Left in so the script does the right thing the day
+# that grant is widened or a cluster-admin runs it, and so a dry run
+# documents the gap instead of hiding it. See UNI-96 comments for the RBAC
+# check that found this.
+#
+# Runs BEFORE the service delete below: maas-pool owns
+# svc/maas-pool-ip-73df004c via ownerReferences, so deleting the pool
+# garbage-collects the Service on its own. Deleting the Service first (as
+# this script used to) just has the controller recreate it before the pool
+# delete lands.
+del inferencepools.v1alpha2.inference.networking.x-k8s.io maas-pool
+del service maas-pool-ip-73df004c
 del serviceaccount maas-epp
 del serviceaccount maas-epp-metrics-reader
 

@@ -586,10 +586,13 @@ combination: `end-users`, the highest-weight tenant, is served fast enough
 that its 32 workers cannot keep it backlogged, so its queue partially drains
 and the delivered split compresses toward equal shares instead of expressing
 20/10/65. This is work conservation doing its job, not enforcement failing —
-but it means **equal-worker sizing, which happened to be sufficient on
-2026-10-15's Qwen2.5-7B setup, is not sufficient on today's llama-3-1-8b
-deployment**; the right concurrency depends on the backend's actual latency
-under load, not a fixed worker count carried over from a different run.
+but it means **equal-worker sizing did not work on 2026-10-15's Qwen2.5-7B
+setup either** (see "The detour, and the lesson in it," above: the same
+equal/under-offered demand produced a stuck-near-equal split there too,
+misread at the time as a hard ceiling). What made the 20/10/65 split visible
+on 2026-10-15 was sizing each tenant's demand above its entitlement, not a
+fixed equal worker count, and today's llama-3-1-8b deployment needs that
+same fix, not a different one.
 
 **Run 3, sized so `end-users` offers enough concurrency to stay backlogged
 (128 workers against its 65% share), reproduces the configured weights:**

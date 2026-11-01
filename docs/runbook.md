@@ -549,6 +549,95 @@ silently clamp the negative delta to zero and pass:
 python3 -I deploy/poc/15-fairness-report-test.py
 ```
 
+### Timeline, chaos, and windowed reporting (UNI-127)
+
+The scenarios above all offer a fixed set of tenants for the whole run and
+score one before/after delta. The board's edge-case plan ([UNI-117](/UNI/issues/UNI-117))
+needs more than that: a tenant joining mid-run, a tenant flapping on and off,
+and the system surviving an EPP pod delete or a vLLM replica scale-down
+without the split falling apart. UNI-127 is the harness work those cases
+need — **it does not itself run or score a case**; it adds the capability and
+proves it does not change any existing scenario's verdict.
+
+**Per-tenant timeline.** `deploy/poc/04-loadgen.yaml`'s `run.sh` now takes, per
+tenant, a `START`/`STOP` offset (seconds from the Job's own start; default:
+active for the whole run) and an optional `DUTY` on/off cycle (`"<on>/<off>"`
+seconds; default: no cycling). `15-fairness-benchmark.sh` passes these through
+unchanged when you set them in the environment — note no unit suffix once it
+reaches the Job, but the ticket's `120s` shorthand is accepted at the shell:
+
+```sh
+END_USERS_START=120s APP1_DUTY=30s/30s \
+  OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh full-contention app3-joins-smoke
+```
+
+Unset (the default for every scenario above), nothing changes — that is the
+regression bar this ticket has to clear, not a suggestion.
+
+**Chaos hooks.** Two independent, one-shot hooks, each a seconds-offset from
+run start:
+
+- `CHAOS_EPP_DELETE_AT=<seconds>` — deletes the EPP scheduler pod
+  (`$EPP_POD`, resolved the same way the rest of the script already does).
+  The Deployment recreates it; what it does NOT do is keep
+  `epp-container.log` continuous across the delete — the log-capture loop
+  re-attaches to the same pod NAME by design (UNI-46), and a deleted pod's
+  replacement has a different one. That gap is a known, accepted limitation
+  of this ticket, not something it claims to solve; the chaos event itself
+  (what happened, when) is still recorded in `chaos-events.log`.
+- `CHAOS_SCALE_AT=<seconds>` (hold `CHAOS_SCALE_HOLD`, default `30s`) —
+  patches `LLMISVC_NAME` (default `maas-vllm-gpu`) from its live replica
+  count down to 1, then back, via `spec.replicas` on the
+  LLMInferenceService CR (the model replicas, not the EPP scheduler's — see
+  `deploy/poc/09-vllm-gpu.yaml`).
+
+Both are logged, with a UTC timestamp, to `chaos-events.log` in the run's
+results directory. The scale-down/restore also has a second, independent
+safety net beyond the chaos loop itself: the script reads the LLMISVC's
+*actual* replica count before doing anything (not a hardcoded 2), and both
+the normal end-of-run path and the `EXIT` trap compare the live count against
+it and patch back if the chaos loop did not get to finish — rule 3 ("leave
+the cluster as you found it") applies to a chaos run same as any other.
+
+**Windowed reporting.** Every run — with or without timeline/chaos knobs —
+now also scrapes `/metrics` every `WINDOW_SECONDS` (default 10) into
+`metrics-timeseries.txt`, not just before and after. The report turns
+consecutive scrapes into windows: delivered-token delta, and (for whichever
+tenants `timeline-config.json` says were actually scheduled active at that
+window's midpoint) expected/observed share and deviation, using the exact
+same definitions as the whole-run numbers — see `deploy/poc/15-fairness-report.py`'s
+module docstring. A plain scenario with no timeline overrides gets a
+`timeline-config.json` with an empty tenant map, which means "every offered
+tenant active the whole run" — the one, prior assumption — so the windows for
+an old-style run should track the whole-run before/after numbers closely.
+
+**Time-to-converge.** A "phase edge" is any second-offset where something
+about the run's shape changes: a tenant's start/stop/duty transition, or a
+chaos event (run start, `t=0`, is always one too). For each edge, the report
+finds the first window from which every active tenant's deviation stays
+within `THRESHOLD_POINTS` for the rest of that phase (a single in-threshold
+window surrounded by out-of-threshold ones does not count) and reports how
+many seconds that took. A phase that never settles reports `n/a`, not a
+guessed number.
+
+**The existing whole-run `verdict` is untouched.** All of the above lives
+under a new, separate `report["timeline"]` key (`null` when
+`--metrics-timeseries` is not passed, e.g. an older caller). Nothing in
+`build_report`'s PASS/FAIL/INFO logic reads it. The regression evidence for
+this is a `full-contention` re-run with no timeline/chaos overrides,
+recorded under `docs/poc-results.md`'s UNI-127 section — same scenario, same
+script invocation shape, verdict unchanged from the prior `full-contention`
+runs in this file.
+
+Unit coverage for the windowed and convergence maths (schedule resolution,
+phase-edge enumeration, per-window share/deviation, and both the
+"converges-and-stays" and "never converges" convergence cases) lives
+alongside the existing tests:
+
+```sh
+python3 -I deploy/poc/15-fairness-report-test.py
+```
+
 ---
 
 ## Load the fairness dashboard into the live Grafana

@@ -47,6 +47,31 @@ therefore not computed for a solo group, and the verdict for that case falls
 back to a request-success-rate bar instead (see SOLO_SUCCESS_THRESHOLD
 below): "receives ~100% of the pool" is judged by HTTP status, not by a
 token-share metric that cannot move in a single-tenant run.
+
+UNI-127 adds a second, purely additive layer on top of the above -- it never
+changes `verdict`, only adds a `timeline` section:
+
+  --metrics-timeseries  periodic /metrics scrapes taken throughout the run
+      (deploy/poc/15-fairness-benchmark.sh's timeseries_loop), not just
+      before/after. Consecutive scrapes become "windows": delivered-token
+      deltas and observed/expected share over that slice of the run, instead
+      of one number for the whole thing.
+  --timeline-config     which tenants were scheduled active (join/leave
+      offsets, on/off duty cycling) and which chaos events were scheduled
+      (EPP pod delete, vLLM replica scale-down/restore), each as a seconds
+      offset from run start. Tenants this run never gave an explicit
+      schedule to fall back to "active for the whole run" -- the one, prior
+      behaviour -- so a report built without this file, or for a scenario
+      that sets none of these knobs, has an unchanged `timeline.windows`
+      membership even though the windows themselves are new.
+
+A "phase edge" is any second offset where something about the run's shape
+changes: a tenant's start/stop/duty transition, or a chaos event. Time-to-
+converge is measured from each edge: how many seconds until every tenant
+active in that window is within `threshold_points` of its expected share,
+and STAYS within it for every window up to the next edge (a single window
+that happens to land close, surrounded by windows that do not, is noise, not
+convergence).
 """
 import argparse
 import json
@@ -66,26 +91,62 @@ STATUS_PAIR = re.compile(r'(\d+)=(\d+)')
 GROUPS = ("app1", "app2", "end-users")
 
 
-def parse_metrics(path):
+def parse_metrics_text(text):
     """{metric_name: {fairness_id_or_None: value}} from a Prometheus text
     scrape (comment lines are harmless here; they never match METRIC_LINE)."""
     series = {}
-    with open(path) as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith('#'):
-                continue
-            m = METRIC_LINE.match(line)
-            if not m:
-                continue
-            name, labelstr, val = m.group(1), m.group(2) or '', m.group(3)
-            try:
-                value = float(val)
-            except ValueError:
-                continue
-            labels = dict(LABEL.findall(labelstr))
-            series.setdefault(name, {})[labels.get('fairness_id')] = value
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        m = METRIC_LINE.match(line)
+        if not m:
+            continue
+        name, labelstr, val = m.group(1), m.group(2) or '', m.group(3)
+        try:
+            value = float(val)
+        except ValueError:
+            continue
+        labels = dict(LABEL.findall(labelstr))
+        series.setdefault(name, {})[labels.get('fairness_id')] = value
     return series
+
+
+def parse_metrics(path):
+    with open(path) as f:
+        return parse_metrics_text(f.read())
+
+
+TIMESERIES_HEADER = re.compile(r'^#\s*ts=(?P<ts>\S+)\s+epoch=(?P<epoch>\d+)\s*$')
+
+
+def parse_timeseries(path):
+    """A sequence of (epoch_seconds: float, iso_ts: str, series: dict) from
+    deploy/poc/15-fairness-benchmark.sh's metrics-timeseries.txt: blocks of
+    Prometheus text, each preceded by a '# ts=<iso> epoch=<unix seconds>'
+    header. Returns entries sorted by epoch (they are written in order, but a
+    clock that is not monotonic -- NTP step, not a backend restart -- would
+    otherwise silently produce a negative-duration window)."""
+    text = open(path).read()
+    entries = []
+    epoch = None
+    ts = None
+    block_lines = []
+
+    def flush():
+        if epoch is not None:
+            entries.append((epoch, ts, parse_metrics_text('\n'.join(block_lines))))
+
+    for line in text.splitlines():
+        m = TIMESERIES_HEADER.match(line)
+        if m:
+            flush()
+            epoch, ts, block_lines = float(m.group('epoch')), m.group('ts'), []
+        else:
+            block_lines.append(line)
+    flush()
+    entries.sort(key=lambda e: e[0])
+    return entries
 
 
 def parse_loadgen_log(path):
@@ -120,10 +181,168 @@ def parse_loadgen_log(path):
     return offered_workers, rows, duration
 
 
+# --- UNI-127: timeline/windowed/convergence maths ---------------------------
+# Pure functions of (schedule, timeseries, weights) -- same no-cluster-access
+# contract as the rest of this file. See the module docstring for the shape
+# of a schedule entry and what a "phase edge" is.
+
+def default_schedule_entry(run_duration):
+    return {"start": 0.0, "stop": float(run_duration), "duty_on": None, "duty_off": None}
+
+
+def resolve_schedule(timeline_tenants, offered_groups, run_duration):
+    """Merge this run's explicit per-tenant timeline (deploy/poc/04-loadgen.yaml's
+    START/STOP/DUTY, as recorded in timeline-config.json) with the fallback for
+    every OTHER offered group: active for the whole run. A group this run
+    never offered at all (TENANTS excluded it) has no schedule entry -- it was
+    never a candidate, so it cannot have a phase edge or a window membership
+    either."""
+    schedule = {}
+    timeline_tenants = timeline_tenants or {}
+    for g in GROUPS:
+        if g in timeline_tenants:
+            e = timeline_tenants[g]
+            stop = e.get("stop")
+            schedule[g] = {
+                "start": float(e.get("start", 0) or 0),
+                "stop": float(stop) if stop is not None else float(run_duration),
+                "duty_on": float(e["duty_on"]) if e.get("duty_on") else None,
+                "duty_off": float(e["duty_off"]) if e.get("duty_off") else None,
+            }
+        elif g in offered_groups:
+            schedule[g] = default_schedule_entry(run_duration)
+    return schedule
+
+
+def tenant_active_at(entry, t):
+    """Mirrors deploy/poc/04-loadgen.yaml's tenant_active() exactly -- the
+    report's idea of "active" must agree with the generator's, or a window's
+    expected-share denominator would not match what was actually offered."""
+    start = entry.get("start", 0) or 0
+    stop = entry.get("stop")
+    if stop is None:
+        stop = float("inf")
+    if t < start or t >= stop:
+        return False
+    duty_on = entry.get("duty_on")
+    if not duty_on:
+        return True
+    duty_off = entry.get("duty_off") or 0
+    cycle = duty_on + duty_off
+    if cycle <= 0:
+        return True
+    phase = (t - start) % cycle
+    return phase < duty_on
+
+
+def compute_phase_edges(schedule, chaos_events, run_duration):
+    """Every second-offset, within [0, run_duration], where some tenant's
+    active/inactive state changes or a chaos event fires. Always includes 0
+    (run start is itself the first phase)."""
+    edges = {0.0}
+    for entry in schedule.values():
+        start, stop = entry["start"], entry["stop"]
+        edges.add(max(0.0, min(start, run_duration)))
+        edges.add(max(0.0, min(stop, run_duration)))
+        duty_on, duty_off = entry.get("duty_on"), entry.get("duty_off")
+        if duty_on:
+            t, on = start, True
+            while t < stop and t <= run_duration:
+                edges.add(max(0.0, min(t, run_duration)))
+                t += duty_on if on else (duty_off or duty_on)
+                on = not on
+    for ev in chaos_events or []:
+        edges.add(max(0.0, min(float(ev["at_seconds"]), run_duration)))
+    return sorted(e for e in edges if 0.0 <= e <= run_duration)
+
+
+def compute_windows(timeseries, schedule, weights):
+    """One row per consecutive pair of time-series snapshots: per-group
+    delivered-token delta, which groups were active at the window's midpoint,
+    and (for active groups) expected/observed share and deviation -- the same
+    definitions build_report uses for the whole-run numbers, just applied to a
+    slice instead of the whole run. A counter going backwards within a window
+    means the EPP restarted between those two scrapes; clamp to zero and flag
+    it, same as the whole-run calculation does, rather than reporting a
+    negative delivered-tokens number."""
+    if len(timeseries) < 2:
+        return [], False
+    t0 = timeseries[0][0]
+    windows = []
+    any_restart = False
+    for (e0, _, s0), (e1, _, s1) in zip(timeseries, timeseries[1:]):
+        tok0 = s0.get("llm_d_epp_maas_fairness_contended_service_tokens_total", {})
+        tok1 = s1.get("llm_d_epp_maas_fairness_contended_service_tokens_total", {})
+        start_s, end_s = e0 - t0, e1 - t0
+        mid_s = (start_s + end_s) / 2.0
+        deltas = {}
+        for gid in schedule:
+            b, a = tok0.get(gid, 0.0), tok1.get(gid, 0.0)
+            d = a - b
+            if d < 0:
+                any_restart = True
+                d = 0.0
+            deltas[gid] = d
+        active = [g for g in schedule if tenant_active_at(schedule[g], mid_s)]
+        weight_total = sum(weights.get(g) or 0.0 for g in active)
+        tokens_total = sum(deltas.get(g, 0.0) for g in active)
+        groups = []
+        for gid in schedule:
+            is_active = gid in active
+            expected_pct = 100.0 * weights.get(gid, 0.0) / weight_total if is_active and weight_total > 0 else None
+            if is_active:
+                observed_pct = 100.0 * deltas.get(gid, 0.0) / tokens_total if tokens_total > 0 else 0.0
+            else:
+                observed_pct = None
+            deviation = (observed_pct - expected_pct) if (expected_pct is not None and observed_pct is not None) else None
+            groups.append({
+                "group": gid,
+                "active": is_active,
+                "delivered_tokens": deltas.get(gid, 0.0),
+                "expected_share_pct": expected_pct,
+                "observed_share_pct": observed_pct,
+                "deviation_pts": deviation,
+            })
+        windows.append({"start_s": start_s, "end_s": end_s, "groups": groups})
+    return windows, any_restart
+
+
+def compute_convergence(windows, phase_edges, threshold_points):
+    """For each phase edge, the first window at/after it from which every
+    active group's deviation stays within threshold_points for the rest of
+    that phase (up to the next edge). A single in-threshold window surrounded
+    by out-of-threshold ones does not count -- "converges and stays there" is
+    the literal bar this ticket sets."""
+    edges_sorted = sorted(phase_edges)
+    results = []
+    for i, edge in enumerate(edges_sorted):
+        next_edge = edges_sorted[i + 1] if i + 1 < len(edges_sorted) else float("inf")
+        segment = [w for w in windows if w["start_s"] >= edge - 1e-9 and w["start_s"] < next_edge]
+        converged_at = None
+        for j, w in enumerate(segment):
+            rest = segment[j:]
+
+            def in_threshold(win):
+                devs = [g["deviation_pts"] for g in win["groups"] if g["active"] and g["deviation_pts"] is not None]
+                return bool(devs) and all(abs(d) <= threshold_points for d in devs)
+
+            if all(in_threshold(w2) for w2 in rest):
+                converged_at = w["start_s"]
+                break
+        results.append({
+            "phase_edge_s": edge,
+            "converged_at_s": converged_at,
+            "seconds_to_converge": (converged_at - edge) if converged_at is not None else None,
+        })
+    return results
+
+
 def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_digest,
                   namespace, epp_pod, run_start, run_end, threshold_points,
                   metrics_before_path, metrics_after_path, loadgen_log_path,
-                  label=None, control=False):
+                  label=None, control=False,
+                  metrics_timeseries_path=None, timeline_config_path=None,
+                  window_seconds=10.0):
     before = parse_metrics(metrics_before_path)
     after = parse_metrics(metrics_after_path)
     offered_workers, loadgen_rows, logged_duration = parse_loadgen_log(loadgen_log_path)
@@ -297,6 +516,36 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             f"share, exceeding the {threshold_points:g}-point threshold"
         )
 
+    # UNI-127: purely additive. Never reads or writes `verdict` above -- a run
+    # with no timeseries/timeline-config, or one that doesn't use any of the
+    # timeline/chaos knobs, gets timeline=None or an empty-schedule timeline,
+    # and the verdict this report's "done when" is graded on is identical
+    # either way.
+    timeline_section = None
+    if metrics_timeseries_path:
+        run_duration = duration_seconds if duration_seconds is not None else (logged_duration or 0)
+        timeline_cfg = {}
+        if timeline_config_path:
+            with open(timeline_config_path) as f:
+                timeline_cfg = json.load(f)
+        schedule = resolve_schedule(timeline_cfg.get("tenants"), set(offered_groups), run_duration)
+        chaos_events = timeline_cfg.get("chaos_events", [])
+        weights = {g: (weight_after.get(g) if weight_after.get(g) is not None else weight_before.get(g)) or 0.0
+                   for g in schedule}
+        timeseries = parse_timeseries(metrics_timeseries_path)
+        windows, windows_epp_restarted = compute_windows(timeseries, schedule, weights)
+        phase_edges = compute_phase_edges(schedule, chaos_events, run_duration)
+        convergence = compute_convergence(windows, phase_edges, threshold_points)
+        timeline_section = {
+            "window_seconds": window_seconds,
+            "schedule": schedule,
+            "chaos_events": chaos_events,
+            "phase_edges": phase_edges,
+            "windows": windows,
+            "convergence": convergence,
+            "epp_restarted_during_windows": windows_epp_restarted,
+        }
+
     report = {
         "schema": "uni54.fairness_benchmark_report.v1",
         "run": {
@@ -342,6 +591,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                 "an idle group's share is not scored as a deviation."
             ),
         },
+        "timeline": timeline_section,
     }
     return report
 
@@ -395,6 +645,55 @@ def render_markdown(report):
             f"{fmt(g['observed_share_pct'], '%')} | {fmt(g['deviation_pts'])} |"
         )
     lines.append("")
+    lines.append("## Timeline (UNI-127)")
+    lines.append("")
+    t = report.get("timeline")
+    if not t:
+        lines.append("N/A: no `--metrics-timeseries` recorded for this run (older report, or the "
+                      "benchmark script predates UNI-127).")
+    else:
+        lines.append(f"Window size: {t['window_seconds']:g}s (actual window durations vary slightly "
+                      "with scrape latency; see each window's own start/end below).")
+        lines.append("")
+        if t["chaos_events"]:
+            lines.append("**Chaos events (scheduled):**")
+            for ev in t["chaos_events"]:
+                detail = ", ".join(f"{k}={v}" for k, v in ev.items() if k not in ("type", "at_seconds"))
+                lines.append(f"- t+{ev['at_seconds']:g}s: {ev['type']}" + (f" ({detail})" if detail else ""))
+        else:
+            lines.append("**Chaos events:** none configured for this run.")
+        lines.append("")
+        lines.append("**Per-tenant schedule:**")
+        for gid, e in t["schedule"].items():
+            duty = f"{e['duty_on']:g}s on / {e['duty_off']:g}s off" if e.get("duty_on") else "no duty cycle"
+            lines.append(f"- {gid}: active {e['start']:g}s-{e['stop']:g}s, {duty}")
+        lines.append("")
+        lines.append("**Time-to-converge** (seconds from a phase edge until every active tenant is "
+                      f"within {report['verdict']['threshold_points']:g} points and stays there):")
+        lines.append("")
+        lines.append("| phase edge (s) | converged at (s) | seconds to converge |")
+        lines.append("|---|---|---|")
+        for c in t["convergence"]:
+            conv = "n/a (never converged in this phase)" if c["converged_at_s"] is None else f"{c['converged_at_s']:.1f}"
+            secs = "n/a" if c["seconds_to_converge"] is None else f"{c['seconds_to_converge']:.1f}"
+            lines.append(f"| {c['phase_edge_s']:.1f} | {conv} | {secs} |")
+        lines.append("")
+        lines.append(f"**Windows** ({len(t['windows'])} total" +
+                      (", EPP restart detected mid-window at least once" if t["epp_restarted_during_windows"] else "") +
+                      "):")
+        lines.append("")
+        lines.append("| start (s) | end (s) | group | active | delivered tokens | expected % | observed % | deviation (pts) |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for w in t["windows"]:
+            for g in w["groups"]:
+                def wfmt(v, suffix=""):
+                    return "n/a" if v is None else f"{v:.1f}{suffix}"
+                lines.append(
+                    f"| {w['start_s']:.1f} | {w['end_s']:.1f} | {g['group']} | {g['active']} | "
+                    f"{wfmt(g['delivered_tokens'])} | {wfmt(g['expected_share_pct'], '%')} | "
+                    f"{wfmt(g['observed_share_pct'], '%')} | {wfmt(g['deviation_pts'])} |"
+                )
+    lines.append("")
     lines.append("## Sources")
     lines.append("")
     for key, text in report["sources"].items():
@@ -428,6 +727,18 @@ def main():
              "code stays 0 unless a structural problem (no load, EPP restart, zero tokens "
              "accounted) makes the run itself invalid.",
     )
+    p.add_argument(
+        "--metrics-timeseries", default=None,
+        help="UNI-127: path to the periodic /metrics scrape file "
+             "(deploy/poc/15-fairness-benchmark.sh's metrics-timeseries.txt). Omit to get a "
+             "report with no 'timeline' section -- the pre-UNI-127 shape.",
+    )
+    p.add_argument(
+        "--timeline-config", default=None,
+        help="UNI-127: path to timeline-config.json (per-tenant START/STOP/DUTY and chaos "
+             "events). Omit to treat every offered group as active the whole run.",
+    )
+    p.add_argument("--window-seconds", type=float, default=10.0)
     args = p.parse_args()
 
     report = build_report(
@@ -446,6 +757,9 @@ def main():
         metrics_after_path=args.metrics_after,
         loadgen_log_path=args.loadgen_log,
         control=args.control,
+        metrics_timeseries_path=args.metrics_timeseries,
+        timeline_config_path=args.timeline_config,
+        window_seconds=args.window_seconds,
     )
 
     with open(args.out_json, "w") as f:

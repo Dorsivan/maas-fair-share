@@ -85,6 +85,20 @@
 # EPP_CONTAINER, BACKEND, THRESHOLD_POINTS (default 10 -- see
 # docs/runbook.md "Run the fairness benchmark" for how that number was
 # chosen).
+#
+# UNI-127 harness additions (see docs/runbook.md "Timeline, chaos, and
+# windowed reporting" for the full story -- this header is a pointer, not the
+# source of truth):
+#   WINDOW_SECONDS           time-series snapshot interval, default 10.
+#   APP1_START/STOP/DUTY, APP2_START/STOP/DUTY, END_USERS_START/STOP/DUTY
+#                             per-tenant timeline, e.g. END_USERS_START=120s.
+#                             Unset (the default) = active the whole run, same
+#                             as every scenario before this ticket.
+#   CHAOS_EPP_DELETE_AT       delete the EPP scheduler pod at t+<seconds>.
+#   CHAOS_SCALE_AT            scale LLMISVC_NAME (default maas-vllm-gpu) to 1
+#                             replica at t+<seconds>, restored after
+#                             CHAOS_SCALE_HOLD (default 30s).
+# All default to empty/off; a plain scenario invocation is unaffected.
 set -euo pipefail
 
 SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone asymmetric-demand}"
@@ -98,6 +112,26 @@ BACKEND="${BACKEND:-vllm-gpu (real)}"
 THRESHOLD_POINTS="${THRESHOLD_POINTS:-10}"
 JOB_NAME="maas-loadgen"
 DURATION="${DURATION:-240}"
+
+# UNI-127: windowed time-series reporting (default on for every run) and the
+# optional timeline/chaos harness. None of these change a single thing about
+# an invocation that does not set them -- that is the regression bar this
+# ticket has to clear.
+WINDOW_SECONDS="${WINDOW_SECONDS:-10}"
+LLMISVC_NAME="${LLMISVC_NAME:-maas-vllm-gpu}"
+# Seconds-offset chaos hooks, accepting the ticket's "120s" shorthand or a
+# bare integer. Empty (the default) means that hook never fires.
+CHAOS_EPP_DELETE_AT="${CHAOS_EPP_DELETE_AT:-}"
+CHAOS_EPP_DELETE_AT="${CHAOS_EPP_DELETE_AT//s/}"
+CHAOS_SCALE_AT="${CHAOS_SCALE_AT:-}"
+CHAOS_SCALE_AT="${CHAOS_SCALE_AT//s/}"
+CHAOS_SCALE_HOLD="${CHAOS_SCALE_HOLD:-30s}"
+CHAOS_SCALE_HOLD="${CHAOS_SCALE_HOLD//s/}"
+# Per-tenant timeline (START/STOP/DUTY), passed straight through to the
+# loadgen Job when set -- see deploy/poc/04-loadgen.yaml's tenant_active() for
+# what they mean. Unset (the default) reproduces the one, prior behaviour:
+# every offered tenant active for the whole run.
+TIMELINE_VARS="APP1_START APP1_STOP APP1_DUTY APP2_START APP2_STOP APP2_DUTY END_USERS_START END_USERS_STOP END_USERS_DUTY"
 
 # UNI-103: is this scenario scored, or a named negative control that is
 # expected not to show the weighted split? Read by the report step below --
@@ -201,6 +235,65 @@ for kv in "${PER_TENANT_OVERRIDES[@]+"${PER_TENANT_OVERRIDES[@]}"}"; do
   set_override "${kv%%=*}" "${kv#*=}"
 done
 
+# --- UNI-127 timeline pass-through: only touches the Job (and the report's
+# phase-edge math below) when one of these env vars is actually set. A plain
+# invocation of an existing scenario sets none of them, so TIMELINE_JSON_ENTRIES
+# stays empty and behaviour is unchanged. ----------------------------------
+TIMELINE_JSON_ENTRIES=()
+for v in $TIMELINE_VARS; do
+  val="${!v-}"
+  val="${val//s/}"
+  if [ -n "$val" ]; then
+    set_override "$v" "$val"
+    TIMELINE_JSON_ENTRIES+=("$v=$val")
+  fi
+done
+TIMELINE_CONFIG="$ARTIFACT_DIR/timeline-config.json"
+python3 -I - "$TIMELINE_CONFIG" "${TIMELINE_JSON_ENTRIES[@]+"${TIMELINE_JSON_ENTRIES[@]}"}" << 'PYEOF'
+import json, sys
+out_path, entries = sys.argv[1], sys.argv[2:]
+by_tenant = {}
+for e in entries:
+    var, val = e.split("=", 1)
+    if var.startswith("APP1_"):
+        tenant, field = "app1", var[len("APP1_"):]
+    elif var.startswith("APP2_"):
+        tenant, field = "app2", var[len("APP2_"):]
+    else:
+        tenant, field = "end-users", var[len("END_USERS_"):]
+    entry = by_tenant.setdefault(tenant, {})
+    if field == "START":
+        entry["start"] = float(val)
+    elif field == "STOP":
+        entry["stop"] = float(val)
+    elif field == "DUTY":
+        on, off = val.split("/", 1)
+        entry["duty_on"] = float(on)
+        entry["duty_off"] = float(off)
+json.dump({"tenants": by_tenant, "chaos_events": []}, open(out_path, "w"), indent=2)
+PYEOF
+
+# --- UNI-127 chaos hooks: queue up what this run will do to the live system,
+# for the trap/chaos loop below and for the report's phase-edge math. Empty
+# unless CHAOS_EPP_DELETE_AT / CHAOS_SCALE_AT are set. --------------------
+CHAOS_RESTORE_AT=""
+if [ -n "$CHAOS_SCALE_AT" ]; then
+  CHAOS_RESTORE_AT=$(( CHAOS_SCALE_AT + CHAOS_SCALE_HOLD ))
+fi
+python3 -I - "$TIMELINE_CONFIG" "$CHAOS_EPP_DELETE_AT" "$CHAOS_SCALE_AT" "$CHAOS_RESTORE_AT" "$LLMISVC_NAME" << 'PYEOF'
+import json, sys
+path, delete_at, scale_at, restore_at, llmisvc = sys.argv[1:6]
+cfg = json.load(open(path))
+events = []
+if delete_at:
+    events.append({"type": "epp_delete", "at_seconds": float(delete_at)})
+if scale_at:
+    events.append({"type": "scale_down", "at_seconds": float(scale_at), "target": llmisvc, "to": 1})
+    events.append({"type": "scale_restore", "at_seconds": float(restore_at), "target": llmisvc})
+cfg["chaos_events"] = events
+json.dump(cfg, open(path, "w"), indent=2)
+PYEOF
+
 # --- Clean up any previous run of the same Job name -------------------------
 $OC delete job "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found --wait=true >/dev/null
 
@@ -213,6 +306,18 @@ fi
 EPP_IMAGE_DIGEST="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath="{.status.containerStatuses[?(@.name=='$EPP_CONTAINER')].imageID}")"
 START_RESTARTS="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
 echo "[benchmark] target pod: $EPP_POD  image: $EPP_IMAGE_DIGEST  (restarts so far: $START_RESTARTS)"
+
+# UNI-127: capture the LLMInferenceService's current replica count before any
+# chaos runs, so a scale-down can be restored to what was actually there --
+# not a hardcoded 2 -- whether or not the chaos loop gets to do it itself.
+ORIGINAL_REPLICAS=""
+if [ -n "$CHAOS_SCALE_AT" ]; then
+  ORIGINAL_REPLICAS="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')"
+  echo "[benchmark] chaos: will scale $LLMISVC_NAME $ORIGINAL_REPLICAS -> 1 -> $ORIGINAL_REPLICAS at t+${CHAOS_SCALE_AT}s (hold ${CHAOS_SCALE_HOLD}s)"
+fi
+if [ -n "$CHAOS_EPP_DELETE_AT" ]; then
+  echo "[benchmark] chaos: will delete EPP pod $EPP_POD at t+${CHAOS_EPP_DELETE_AT}s"
+fi
 
 METRICS_TOKEN="$($OC get secret maas-epp-metrics-reader-token -n "$NAMESPACE" -o jsonpath='{.data.token}' | base64 -d)"
 EPP_METRICS_SVC_IP="${EPP_METRICS_SVC_IP:-}"
@@ -228,8 +333,14 @@ echo "[benchmark] metrics snapshot: before"
 snapshot_metrics > "$METRICS_BEFORE"
 ENFORCE="$(awk '/^llm_d_epp_maas_fairness_enforcing/ {print ($2==1)?"true":"false"}' "$METRICS_BEFORE")"
 RUN_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RUN_START_EPOCH="$(date +%s)"
 
 # --- Log-capture loop: restarts -f if the stream ends early (UNI-46 shape) --
+# UNI-127 note: CHAOS_EPP_DELETE_AT means $EPP_POD can go permanently NotFound
+# partway through the run (the Deployment's replacement pod gets a new name --
+# see docs/runbook.md's "Timeline, chaos, and windowed reporting"). Without
+# the sleep below, "oc logs -f" against a gone pod fails instantly and this
+# loop would hammer the API server every iteration for the rest of the run.
 capture_loop() {
   local since="$RUN_START"
   while true; do
@@ -237,13 +348,73 @@ capture_loop() {
     $OC logs -f "$EPP_POD" -n "$NAMESPACE" -c "$EPP_CONTAINER" --since-time="$since" >> "$EPP_LOG" 2>>"$EPP_LOG.capture-stderr" || true
     since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "--- [benchmark] oc logs -f exited at $since; checking for a pod restart ---" >> "$EPP_LOG"
+    sleep 1
   done
 }
 capture_loop &
 CAPTURE_PID=$!
+
+# --- UNI-127 time-series loop: snapshot the same /metrics endpoint every
+# WINDOW_SECONDS, so the report can turn before/after into a sequence of
+# windows instead of one whole-run delta. Runs for every invocation, not just
+# ones using the timeline/chaos knobs -- this is the harness capability the
+# ticket asks be available by default. First entry mirrors metrics-before.txt
+# exactly, so the first window starts at t=0 with no extra scrape needed.
+METRICS_TS="$ARTIFACT_DIR/metrics-timeseries.txt"
+{ echo "# ts=$RUN_START epoch=$RUN_START_EPOCH"; cat "$METRICS_BEFORE"; } > "$METRICS_TS"
+timeseries_loop() {
+  while true; do
+    sleep "$WINDOW_SECONDS"
+    { echo "# ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) epoch=$(date +%s)"; snapshot_metrics; } >> "$METRICS_TS"
+  done
+}
+timeseries_loop &
+TS_PID=$!
+
+# --- UNI-127 chaos loop: fires the configured hooks at their t+offset and
+# logs each one, with a timestamp, to chaos-events.log. A no-op loop (nothing
+# configured) still runs but never does anything -- simpler than conditionally
+# starting it, and it exits the moment the trap kills it.
+CHAOS_LOG="$ARTIFACT_DIR/chaos-events.log"
+: > "$CHAOS_LOG"
+chaos_log() {
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" | tee -a "$CHAOS_LOG"
+}
+chaos_loop() {
+  local delete_done=false scale_down_done=false scale_up_done=false elapsed
+  while true; do
+    elapsed=$(( $(date +%s) - RUN_START_EPOCH ))
+    if [ -n "$CHAOS_EPP_DELETE_AT" ] && [ "$delete_done" = false ] && [ "$elapsed" -ge "$CHAOS_EPP_DELETE_AT" ]; then
+      $OC delete pod "$EPP_POD" -n "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
+      chaos_log "chaos: deleted EPP scheduler pod $EPP_POD (t+${elapsed}s, target was t+${CHAOS_EPP_DELETE_AT}s)"
+      delete_done=true
+    fi
+    if [ -n "$CHAOS_SCALE_AT" ] && [ "$scale_down_done" = false ] && [ "$elapsed" -ge "$CHAOS_SCALE_AT" ]; then
+      $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":{"replicas":1}}' >/dev/null
+      chaos_log "chaos: scaled $LLMISVC_NAME replicas $ORIGINAL_REPLICAS -> 1 (t+${elapsed}s, target was t+${CHAOS_SCALE_AT}s)"
+      scale_down_done=true
+    fi
+    if [ "$scale_down_done" = true ] && [ "$scale_up_done" = false ] && [ "$elapsed" -ge "$CHAOS_RESTORE_AT" ]; then
+      $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"replicas\":$ORIGINAL_REPLICAS}}" >/dev/null
+      chaos_log "chaos: restored $LLMISVC_NAME replicas 1 -> $ORIGINAL_REPLICAS (t+${elapsed}s, target was t+${CHAOS_RESTORE_AT}s)"
+      scale_up_done=true
+    fi
+    sleep 1
+  done
+}
+chaos_loop &
+CHAOS_PID=$!
+
 trap '
-  kill "$CAPTURE_PID" 2>/dev/null || true
-  wait "$CAPTURE_PID" 2>/dev/null || true
+  kill "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+  wait "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+  if [ -n "$CHAOS_SCALE_AT" ]; then
+    CUR_REPLICAS="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath="{.spec.replicas}" 2>/dev/null || true)"
+    if [ -n "$CUR_REPLICAS" ] && [ "$CUR_REPLICAS" != "$ORIGINAL_REPLICAS" ]; then
+      echo "[benchmark] safety-net restore: $LLMISVC_NAME replicas $CUR_REPLICAS -> $ORIGINAL_REPLICAS (chaos loop did not finish)" >&2
+      $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"replicas\":$ORIGINAL_REPLICAS}}" >/dev/null 2>&1 || true
+    fi
+  fi
 ' EXIT
 
 # --- Apply the patched Job and poll to completion ---------------------------
@@ -270,9 +441,20 @@ if [ "$PHASE" != "done" ]; then
   echo "[benchmark] WARNING: polling timed out before the Job reported completion" >&2
 fi
 
-# --- Stop capture, collect loadgen's own log, snapshot metrics after -------
-kill "$CAPTURE_PID" 2>/dev/null || true
-wait "$CAPTURE_PID" 2>/dev/null || true
+# --- Stop capture/timeseries/chaos, collect loadgen's own log, snapshot
+# metrics after. Run the same restore check the EXIT trap would, THEN clear
+# the trap -- clearing it first would leave a misconfigured chaos run with no
+# safety net at all, since the run ends normally from here, not via the trap.
+kill "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+wait "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+if [ -n "$CHAOS_SCALE_AT" ]; then
+  CUR_REPLICAS="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  if [ -n "$CUR_REPLICAS" ] && [ "$CUR_REPLICAS" != "$ORIGINAL_REPLICAS" ]; then
+    echo "[benchmark] safety-net restore: $LLMISVC_NAME replicas $CUR_REPLICAS -> $ORIGINAL_REPLICAS (chaos loop did not finish before the Job did)" >&2
+    $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"replicas\":$ORIGINAL_REPLICAS}}" >/dev/null
+    chaos_log "chaos: safety-net restore $LLMISVC_NAME replicas $CUR_REPLICAS -> $ORIGINAL_REPLICAS"
+  fi
+fi
 trap - EXIT
 
 LOADGEN_POD="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')"
@@ -281,6 +463,7 @@ $OC logs "$LOADGEN_POD" -n "$NAMESPACE" > "$LOADGEN_LOG" 2>&1 || echo "[benchmar
 echo "[benchmark] metrics snapshot: after"
 snapshot_metrics > "$METRICS_AFTER"
 RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+{ echo "# ts=$RUN_END epoch=$(date +%s)"; cat "$METRICS_AFTER"; } >> "$METRICS_TS"
 
 # --- Build the report; its exit code becomes this script's exit code -------
 set +e
@@ -290,6 +473,7 @@ REPORT_ARGS=(
   --epp-image-digest "$EPP_IMAGE_DIGEST" --namespace "$NAMESPACE" --epp-pod "$EPP_POD"
   --run-start "$RUN_START" --run-end "$RUN_END" --threshold-points "$THRESHOLD_POINTS"
   --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" --loadgen-log "$LOADGEN_LOG"
+  --metrics-timeseries "$METRICS_TS" --timeline-config "$TIMELINE_CONFIG" --window-seconds "$WINDOW_SECONDS"
   --out-json "$REPORT_JSON" --out-md "$REPORT_MD"
 )
 if [ "$IS_CONTROL" = "true" ]; then

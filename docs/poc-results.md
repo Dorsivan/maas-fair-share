@@ -1508,6 +1508,116 @@ root-causing the 2:1 pair.
 **Scope held:** no plugin or weight change was made; this was a worker-count
 retune and re-run only, per this ticket's and UNI-103's scope.
 
+## UNI-127: timeline/chaos harness, development only — no scored case
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan (B1–B4, E1, E2, and the
+board's "app3 joins at saturation" case) needs tenants that join/leave
+mid-run, duty-cycle on and off, and a system that gets hit with an EPP pod
+delete or a vLLM replica scale-down while under load. None of the scenarios
+above can express any of that. This ticket builds the capability and proves
+it doesn't change anything that already works; **it does not run or score a
+case** — that is every later ticket in the chain.
+
+**Setup.** `deploy/poc/04-loadgen.yaml`'s `run.sh` gained a per-tenant
+`START`/`STOP` offset and an optional `DUTY` on/off cycle (default: active
+the whole run, unchanged). `15-fairness-benchmark.sh` gained two one-shot
+chaos hooks (`CHAOS_EPP_DELETE_AT`, `CHAOS_SCALE_AT`/`CHAOS_SCALE_HOLD`) and
+a default-on periodic `/metrics` scrape (`WINDOW_SECONDS`, default 10) that
+the report turns into windowed per-tenant share and a time-to-converge
+figure per phase edge. Full mechanism in `docs/runbook.md`'s "Timeline,
+chaos, and windowed reporting."
+
+**Expected result:** every existing scenario produces the same verdict as
+before (the regression bar), and the new chaos/timeline knobs, when
+exercised, produce correctly-shaped evidence (events logged with
+timestamps, windows that respect tenant membership, a convergence figure
+that is honest about whether the system actually settled).
+
+**Observed, both runs live against the GPU EPP (`llama-3-1-8b`), 2026-11-01
+(see the closing comment on this task for the merged commit SHA), EPP image
+digest `sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135`
+(unchanged from the UNI-97/UNI-98 pin):**
+
+1. **Regression — `full-contention`, no timeline/chaos overrides**
+   (`results/20261101T155608Z-uni127-regression-full-contention/`):
+
+   | group | weight | observed % | expected % | deviation |
+   |---|---|---|---|---|
+   | app1 | 20 | 16.5% | 21.1% | -4.5 |
+   | app2 | 10 | 14.7% | 10.5% | +4.1 |
+   | end-users | 65 | 68.8% | 68.4% | +0.4 |
+
+   **PASS**, deviations within a point or two of the UNI-103 baseline
+   (-4.9/+2.3/+2.6) — same scenario, same script invocation shape, verdict
+   and magnitude unchanged. The new `timeline` report section is present
+   (27 ten-second windows, two phase edges at 0s/240s) and does not affect
+   `verdict` at all, confirming the regression bar this ticket set for
+   itself.
+
+2. **Smoke test — chaos + timeline mechanics**
+   (`results/20261101T154611Z-uni127-chaos-timeline-smoke/`, labelled, not
+   scored): `full-contention` with `DURATION=90s`, `APP1_DUTY=20s/10s`,
+   `END_USERS_START=30s`, `CHAOS_EPP_DELETE_AT=40s`,
+   `CHAOS_SCALE_AT=55s`/`CHAOS_SCALE_HOLD=15s`. Verdict came back **FAIL**
+   (expected and correct — rule 4: a FAIL from a deliberately disruptive,
+   unscored smoke run is still a valid, recorded result, not a reason to
+   mark this `blocked`). What it proved:
+   - `chaos-events.log` recorded both hooks with real UTC timestamps,
+     within 0s of their configured offset.
+   - `timeline-config.json` correctly captured app1's duty cycle and
+     end-users' late join, and the report's windows correctly show app1
+     inactive during its 20–30s "off" slice and end-users inactive before
+     its 30s join — i.e., window membership tracks the schedule, not the
+     static `TENANTS` list.
+   - The EPP pod delete was correctly detected as a counter-reset
+     (`epp_restarted_mid_run: true`) rather than silently producing a
+     nonsense negative delta.
+   - Time-to-converge correctly reported "never converged" for every phase
+     from the EPP delete onward — see "what surprised us," next.
+
+**What surprised us.** The vLLM replica scale-down/restore is not instant:
+`oc get events` showed the replacement pod's main container didn't actually
+start until **3m39s** after the "scaled up 1→2" event, not within the 15s
+`CHAOS_SCALE_HOLD` this smoke test used (GPU model weight load + CUDA init
+dominates, not the patch itself). The harness's restore patch still fired
+and landed on schedule — `spec.replicas` was back to 2 within the
+configured hold — but the live, actually-Ready capacity took far longer to
+return. This is exactly the gap "time-to-converge" exists to surface: the
+smoke run's phases from t=40s onward correctly report "never converged"
+because the system genuinely had not recovered by the run's end, 90s in.
+**Anyone writing a chaos-scale case on this backend should size
+`CHAOS_SCALE_HOLD` (and the run's total `DURATION`) in minutes, not
+seconds**, or expect every post-chaos phase to read as non-convergent by
+construction. A second, smaller surprise: per-10s windows on
+`full-contention` swing ±15–20 points even on a run whose 240s aggregate
+PASSes at a few points of deviation — small windows are measuring the same
+noise the whole-run number averages out, not a different phenomenon, so a
+single noisy window should not be read as a regression on its own.
+
+**Cluster left as found.** `spec.replicas` on `maas-vllm-gpu` confirmed
+back at `2` (matching `deploy/poc/09-vllm-gpu.yaml`) after both runs, both
+vLLM pods `1/1 Running`, EPP scheduler `1/1 Running`, `job/maas-loadgen`
+`Complete` (the normal end state every scenario in this file leaves, per
+"What it produces" in `docs/runbook.md`).
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk    1/1     Running   0          13m
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-6gkq5   1/1   Running   0   14m
+```
+
+**Not proven here, by design:** no B1–B4/E1/E2 case was run or scored —
+that is the explicit scope boundary this ticket set itself, and every case
+in the series is still pending its own ticket. The EPP-pod-delete chaos
+hook also does not keep `epp-container.log` continuous across the delete
+(the log-capture loop re-attaches by pod name, and a deleted pod's
+replacement has a new one) — a known, documented limitation, not a defect
+introduced to hide.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -1539,6 +1649,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Per-run fairness benchmark with a PASS/FAIL verdict (UNI-54)~~ | **Done.** `deploy/poc/15-fairness-benchmark.sh` + `15-fairness-report.py` turn a named scenario run into its own verdict -- JSON + markdown, delivered share from the EPP's own `contended_service_tokens_total` (reusing UNI-50's SLI unchanged), run metadata including the EPP image digest, a documented 10-point threshold, and an exit code a pipeline can gate on. All four scenarios run live against the GPU EPP 2026-10-29: see "UNI-54: an automated fairness benchmark," above, for the full table. Two scenarios (`full-contention`, `end-users-idle`) correctly FAIL on the pre-existing equal-worker-sizing artifact (same mechanism as A4/UNI-29's Run 2, above -- not a new defect; follow-up tracked on that same Outstanding-work row); two (`app1-alone`, `asymmetric-demand`) PASS once the verdict logic was fixed to stop scoring a structurally-zero or structurally-demand-capped share as a failure. `15-fairness-report-test.py` proves the FAIL path against synthetic data with a real non-zero exit, independent of cluster access | N/A -- closed |
 | — | ~~Resize `full-contention`/`end-users-idle` to over-offer per tenant, re-run all four + a named control (UNI-103)~~ | **Done, 4/5 green.** Per-tenant `WORKERS_APP1`/`WORKERS_APP2`/`WORKERS_END_USERS` replace the single global `WORKERS` in both scenarios; `equal-workers-control` keeps the original equal-worker shape alive as a permanent, explicitly-unscored negative control (`--control`, verdict `INFO`). Live re-run 2026-10-29: `full-contention` now PASSES (16.2/12.8/71.0% vs 21.1/10.5/68.4%), `app1-alone` and `asymmetric-demand` still PASS, `equal-workers-control` reproduces the original artifact as expected (INFO, 29.7pt max deviation). `end-users-idle` still FAILs, now in the opposite direction (app1 82.4% vs a 66.7% target) -- see "UNI-103," below, for the full table and the suspected cause | follow-up: [UNI-104](/UNI/issues/UNI-104), tune the app1:app2 over-offer ratio |
 | — | ~~Retune `end-users-idle`'s app1:app2 worker ratio to match its 2:1 target, re-run (UNI-104)~~ | **Done, PASS.** `WORKERS_APP1` moved from 128 to 64 (keeping `WORKERS_APP2=32`), matching the offered-worker ratio to the pair's actual 2:1 target share ratio instead of reusing `full-contention`'s 4:1 dominant-tenant figure. Live re-run 2026-10-29: 68.4/31.6% against a 66.7/33.3% target (1.8pt max deviation) -- **PASS**. `contended_seconds_total` deltas (app1 1.46s, app2 1.50s) confirm both tenants were genuinely contending. Why the 4:1 ratio overshot so much more than 2:1 undershoots remains unexplained, same as UNI-103 left it -- see "UNI-104," below | root cause of the ratio's exact sensitivity: pending [UNI-100](/UNI/issues/UNI-100)'s scope decision |
+| — | ~~Build the timeline/chaos harness for the edge-case plan (UNI-127)~~ | **Done, development only.** Per-tenant join/leave + duty-cycle timing, EPP-pod-delete and vLLM-scale chaos hooks, windowed per-tenant share, and a time-to-converge figure -- see "UNI-127," above, for the full story including the live finding that a chaos scale-restore's actual capacity recovery (~3m39s on this backend) lags its patch by far more than a short `CHAOS_SCALE_HOLD` accounts for. `full-contention` regression confirmed the whole-run verdict is unchanged. No B1-B4/E1/E2 case was run or scored -- that is every ticket after this one in the chain | the board's edge-case cases themselves (B1-B4, E1, E2, "app3 joins at saturation"), each its own ticket |
 
 ## Reproducing
 

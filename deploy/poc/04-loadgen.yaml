@@ -52,14 +52,48 @@ data:
     OUT=/tmp/codes
     mkdir -p "$OUT"
 
+    # UNI-127: per-tenant timeline. A tenant can join/leave mid-run (START/STOP,
+    # seconds offset from this script's own start) and duty-cycle on/off while
+    # active (DUTY, "<on>/<off>" seconds -- e.g. "30/30"). Unset START/STOP means
+    # "active for the whole run" (START=0, STOP=DURATION), the prior, only
+    # behaviour, so a run that sets none of these is unchanged. The benchmark
+    # computes the same schedule independently (as seconds, no unit suffix, by
+    # the time it reaches this script) and writes it to timeline-config.json
+    # for the report step -- this loop and that file must agree on what "active"
+    # means at a given offset, see tenant_active_at() in 15-fairness-report.py.
+    SCRIPT_START=$(date +%s)
+    tenant_active() {
+      local group="$1" start="$2" stop="$3" duty="$4" now elapsed on off cycle phase
+      now=$(date +%s)
+      elapsed=$(( now - SCRIPT_START ))
+      if [ "$elapsed" -lt "$start" ] || [ "$elapsed" -ge "$stop" ]; then
+        return 1
+      fi
+      if [ -z "$duty" ]; then
+        return 0
+      fi
+      on="${duty%%/*}"
+      off="${duty##*/}"
+      cycle=$(( on + off ))
+      if [ "$cycle" -le 0 ]; then
+        return 0
+      fi
+      phase=$(( (elapsed - start) % cycle ))
+      [ "$phase" -lt "$on" ]
+    }
+
     # Latency is recorded alongside the status code because the work-conservation
     # tests are latency tests, not throughput tests. "app1 is not throttled when
     # the pool is half empty" means its per-request latency matches its solo
     # baseline; a throughput number alone cannot distinguish "not throttled"
     # from "throttled but asking for less".
     worker() {
-      local sub="$1" group="$2" out
+      local sub="$1" group="$2" start="$3" stop="$4" duty="$5" out
       while [ "$(date +%s)" -lt "$END" ]; do
+        if ! tenant_active "$group" "$start" "$stop" "$duty"; then
+          sleep 1
+          continue
+        fi
         out=$(curl -sS -o /dev/null -m 300 -w '%{http_code} %{time_total}' -X POST "$GW$MODELPATH/v1/chat/completions" \
           -H 'Content-Type: application/json' \
           -H "Authorization: Bearer $(cat /keys/$sub)" \
@@ -103,15 +137,26 @@ data:
     W_APP1="${WORKERS_APP1:-$WORKERS}"
     W_APP2="${WORKERS_APP2:-$WORKERS}"
     W_END="${WORKERS_END_USERS:-$WORKERS}"
+
+    # UNI-127 timeline: seconds-offset START/STOP (default: active the whole
+    # run) and an optional "<on>/<off>" DUTY cycle (default: no cycling, i.e.
+    # on for the whole [START,STOP) window). No suffix on these -- plain
+    # integer seconds; 15-fairness-benchmark.sh strips any "120s"-style
+    # shorthand before setting them, since this is the one place both this
+    # script and the report's independent schedule math have to agree on.
+    APP1_START="${APP1_START:-0}";             APP1_STOP="${APP1_STOP:-$DURATION}";             APP1_DUTY="${APP1_DUTY:-}"
+    APP2_START="${APP2_START:-0}";             APP2_STOP="${APP2_STOP:-$DURATION}";             APP2_DUTY="${APP2_DUTY:-}"
+    END_USERS_START="${END_USERS_START:-0}";   END_USERS_STOP="${END_USERS_STOP:-$DURATION}";   END_USERS_DUTY="${END_USERS_DUTY:-}"
     echo "load: tenants=[${TENANTS}] workers app1=${W_APP1} app2=${W_APP2} end-users=${W_END} duration=${DURATION}s"
+    echo "load: timeline app1=${APP1_START}-${APP1_STOP}s/duty=${APP1_DUTY:-none} app2=${APP2_START}-${APP2_STOP}s/duty=${APP2_DUTY:-none} end-users=${END_USERS_START}-${END_USERS_STOP}s/duty=${END_USERS_DUTY:-none}"
 
     for t in $TENANTS; do
       case "$t" in
-        app1)      for _ in $(seq 1 "$W_APP1"); do worker "app1-production" app1 & done ;;
-        app2)      for _ in $(seq 1 "$W_APP2"); do worker "app2-batch"      app2 & done ;;
+        app1)      for _ in $(seq 1 "$W_APP1"); do worker "app1-production" app1 "$APP1_START" "$APP1_STOP" "$APP1_DUTY" & done ;;
+        app2)      for _ in $(seq 1 "$W_APP2"); do worker "app2-batch"      app2 "$APP2_START" "$APP2_STOP" "$APP2_DUTY" & done ;;
         # Distinct subscription per worker -- all must collapse to `end-users`.
         end-users) for i in $(seq 1 "$W_END");  do
-                     if [ $((i % 2)) -eq 0 ]; then worker end-user-alpha end-users & else worker end-user-beta end-users & fi
+                     if [ $((i % 2)) -eq 0 ]; then worker end-user-alpha end-users "$END_USERS_START" "$END_USERS_STOP" "$END_USERS_DUTY" & else worker end-user-beta end-users "$END_USERS_START" "$END_USERS_STOP" "$END_USERS_DUTY" & fi
                    done ;;
         *) echo "unknown tenant: $t" >&2; exit 1 ;;
       esac
@@ -165,6 +210,31 @@ spec:
             #   value: "0"
             # - name: WORKERS_END_USERS
             #   value: "2"
+            # UNI-127: per-tenant timeline. START/STOP are seconds offset from
+            # this Job's own start (unset = active for the whole run); DUTY is
+            # an "<on>/<off>" seconds duty cycle while active (unset = no
+            # cycling). For example, to have end-users join at the 120s mark:
+            #   END_USERS_START=120
+            # and to duty-cycle app1 30s on/30s off the whole run:
+            #   APP1_DUTY=30/30
+            # - name: APP1_START
+            #   value: "0"
+            # - name: APP1_STOP
+            #   value: "240"
+            # - name: APP1_DUTY
+            #   value: "30/30"
+            # - name: APP2_START
+            #   value: "0"
+            # - name: APP2_STOP
+            #   value: "240"
+            # - name: APP2_DUTY
+            #   value: "30/30"
+            # - name: END_USERS_START
+            #   value: "120"
+            # - name: END_USERS_STOP
+            #   value: "240"
+            # - name: END_USERS_DUTY
+            #   value: "30/30"
             - name: DURATION
               # Several half-lives (halfLifeSeconds: 60). The tabs start empty
               # after every EPP restart, so a run shorter than ~3 half-lives

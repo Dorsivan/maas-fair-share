@@ -328,6 +328,7 @@ reasoning there is load-bearing.
 | `app1-idle` | `TENANTS="app2 end-users"`, per-tenant `WORKERS_APP2=32 WORKERS_END_USERS=208` (UNI-133) | A4 in the same series: app1 excluded entirely, pair target renormalizes to 13.3/86.7 (10:65) -- the most extreme pair ratio (6.5:1) of the three, worker ratio sized to match directly per the same UNI-104 lesson |
 | `app2-trickle` | `TENANTS="app1 app2 end-users"`, per-tenant `WORKERS_APP1=32 WORKERS_APP2=2 WORKERS_END_USERS=104` (UNI-134) | A5, promoting the by-hand "S2"/"S4" checks (`docs/poc-results.md`) into the benchmark: unlike `app2-idle`/`app1-idle`, app2 is offered but trickles (2 workers, well under its weight entitlement) alongside two HARD tenants. A weight is a floor, not a ceiling: app2 is not throttled further (it gets ~100% of what it asks for, scored on its own success-rate check in `15-fairness-report.py`'s `capped_groups`), and its unused entitlement goes to app1/end-users, who split it 23.5/76.5 (20:65) -- app2's weight is excluded from that pair's expected-share denominator, same renormalized target as `app2-idle` |
 | `asymmetric-demand` | `WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2` | app1 is not held near its weight when the highest-weight tenant (end-users) sends only a trickle — this is the YAML's own commented-out example, which also idles app2; the ticket's prose names only APP1/END_USERS but the YAML it points to is the source of truth |
+| `below-capacity` | `TENANTS="app1 app2 end-users"`, per-tenant `WORKERS_APP1=6 WORKERS_APP2=6 WORKERS_END_USERS=26` (UNI-135) | A6 "below capacity, everyone light": each tenant at ~20% of `full-contention`'s saturating ceiling (32/32/128). Nobody is ever backlogged alongside anyone else, so the policy has nothing to do -- `15-fairness-report.py` reports a fourth verdict, UNCONTENDED, instead of scoring a weighted-split deviation that would only be noise |
 
 `full-contention` and `end-users-idle` used to set a single global `WORKERS`
 for every tenant. UNI-100 traced both scenarios' FAILs on the live
@@ -362,6 +363,8 @@ wire it into anything that should break a pipeline on a regression.
 sets automatically for that scenario) gets a third verdict, INFO, which also
 exits 0: a control is expected to show a large deviation, and failing a
 pipeline on that would be reporting the control for doing its job.
+`below-capacity` (UNI-135) gets a fourth verdict, UNCONTENDED, which also
+exits 0 -- see "A fourth verdict: UNCONTENDED" below.
 
 ### Expected share, and why it is not just "the configured weight"
 
@@ -414,6 +417,46 @@ every group a genuine chance to compete too, but is deliberately sized so
 that chance cannot be taken (see below) — so its verdict is INFO, not a PASS
 or a FAIL against the symmetric threshold (`--control`; see "The PASS/FAIL
 threshold" above this section for the exit-code consequence).
+
+### A fourth verdict: UNCONTENDED (UNI-135)
+
+`below-capacity` is a fourth kind of special case, and it needed a fourth
+verdict rather than reusing `solo`'s or `control`'s: every tenant is offered
+(unlike `solo`), and the load is not deliberately mis-sized as a known-bad
+negative example (unlike `control`) — it is sized deliberately *light*, well
+under what any of them needs to saturate the pool, because this is the
+"nobody is actually competing for anything" case the plan's A6 asks for.
+
+The rule is read straight from the EPP's own evidence, the same
+`contended_seconds_total` metric "How to check a tenant was actually
+saturated" above already uses to *distrust* an under-contended tenant's
+share: if every offered group's `contended_seconds_total` delta stays under
+`UNCONTENDED_SECONDS_THRESHOLD` (1.0s in `15-fairness-report.py`, an order of
+magnitude below the ~9s a genuinely-contending tenant accrues in a 240s
+full-contention run), the run is classified UNCONTENDED instead of being
+scored against the symmetric weighted-split threshold — that threshold would
+only measure noise with nobody backlogged to share against. A genuinely
+uncontended run also, correctly, scrapes a near-zero
+`contended_service_tokens_total` delta (both SLIs share the same contention
+gate in `pkg/fairness/weightedlas/metrics.go`); the report does not read
+that near-zero total as "the EPP accounted nothing," the structural FAIL it
+is everywhere else, when the run is already classified UNCONTENDED.
+
+This check is skipped for `solo` and for a named `control` — both are
+already special-cased above for their own, different reasons, and forcing
+either through the UNCONTENDED rule as well would blur two genuinely
+different situations ("nobody to contend against" vs. "deliberately
+under-offered as a known-bad example" vs. "offered, but too lightly to ever
+contend") into one label.
+
+The ticket's other expectation — p50/p95 latency per tenant close to that
+tenant's own *solo* latency — is not an automated gate in this report: a
+true per-tenant solo-latency baseline does not exist for all three groups
+(`app1-alone`/`app2-alone` exist; there is no `end-users-alone` scenario in
+this suite), so comparing against an incomplete reference set would be
+comparing against prose, not evidence. See `docs/poc-results.md`'s UNI-135
+section for the by-hand comparison against the two solo baselines that do
+exist, and what is explicitly not proven for `end-users`.
 
 ### Per-tenant worker sizing and the saturation check (UNI-103)
 

@@ -2306,6 +2306,120 @@ this ticket and is covered by two new unit tests
 `test_app2_trickle_throttled_capped_group_fails`) in
 `15-fairness-report-test.py`, but has only this one live run behind it.
 
+## UNI-135: A6, `below-capacity` — the pool was not actually uncontended at 20%
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, sixth and final case in the
+chain: "below capacity, everyone light." Unlike every other case in this
+series, all three tenants are offered simultaneously and none is excluded,
+trickled, or deliberately mis-sized — each is sized to ~20% of its own
+saturating ceiling, so the question is whether the policy has to do
+anything at all when nobody is actually competing for the pool.
+
+**Setup:** `TENANTS="app1 app2 end-users"`, 240s, live against
+`maas-vllm-gpu` (2 replicas, llama-3-1-8b), `enforce: true`. Per-tenant
+workers are 20% of `full-contention`'s saturating ceiling (32/32/128, UNI-29
+A4 Run 3): `WORKERS_APP1=6 WORKERS_APP2=6 WORKERS_END_USERS=26`
+(32×0.2=6.4→6, 32×0.2=6.4→6, 128×0.2=25.6→26).
+
+**Expected split:** per the ticket, a new **UNCONTENDED** verdict (neither
+PASS nor FAIL) with p50/p95 latency per tenant close to that tenant's own
+solo latency. `15-fairness-report.py` was extended with exactly this
+verdict, gated on every offered group's
+`llm_d_epp_maas_fairness_contended_seconds_total` delta staying under
+`UNCONTENDED_SECONDS_THRESHOLD` (1.0s — an order of magnitude below the ~9s
+a genuinely-contending tenant accrues in a 240s `full-contention` run), and
+covered by two new unit tests
+(`test_uncontended_when_everyone_below_capacity`,
+`test_uncontended_does_not_apply_when_one_group_actually_contends`), plus a
+third (`test_uncontended_does_not_override_solo_or_control`) confirming the
+new rule can't fire alongside the existing `solo`/`control` carve-outs. See
+`docs/runbook.md`, "A fourth verdict: UNCONTENDED," for the full rule and
+why it reads `contended_seconds_total` rather than inventing a new metric.
+
+**Observed split: PASS, not UNCONTENDED.** `app1` **14.9%** (expected
+21.1%, deviation **-6.1** points), `app2` **14.6%** (expected 10.5%,
+deviation **+4.1**), `end-users` **70.5%** (expected 68.4%, deviation
+**+2.1**) — all within the 10-point threshold, so the run scored PASS on
+the ordinary weighted-split check. It did **not** hit UNCONTENDED: every
+offered group's `contended_seconds_total` delta came in at app1 2.39s, app2
+2.28s, end-users 2.48s — all comfortably clear of the 1.0s threshold, so
+the EPP's own evidence says the pool genuinely was contended at this
+concurrency, just far more lightly than `full-contention`'s ~9s.
+
+**What surprised us.** The ticket's framing — "everyone light" implies
+"nobody backlogged" — turned out not to hold at the ceiling's chosen 20%
+figure. Two things point the same direction:
+
+- `contended_seconds_total` (2.3-2.5s across all three groups) is real and
+  consistent, not noise from one outlier group — it is roughly a quarter of
+  `full-contention`'s per-tenant figure at roughly a fifth of the worker
+  count, i.e. contention did not scale down linearly with offered load.
+- Latency is measurably elevated against the one genuine solo baseline this
+  series has for two of the three tenants: `app1`'s most recent solo run
+  (UNI-103, 32 workers) measured p50 1.40s/p95 1.77s against this run's
+  p50 1.84s/p95 2.19s (+31%/+24%); `app2`'s solo run (UNI-131, 32 workers)
+  measured p50 1.40s/p95 1.70s against this run's p50 1.90s/p95 2.27s
+  (+36%/+34%). `end-users` has no solo baseline in this suite (same gap
+  `app2-trickle`, UNI-134, already noted) so only the `contended_seconds`
+  evidence applies to it.
+
+Read together, this says the 1.0s `UNCONTENDED_SECONDS_THRESHOLD` and/or the
+20%-of-ceiling sizing rule are the things to revisit, not the report logic:
+the rule as specified correctly classified a run that *was* contended as
+not-uncontended, rather than the alternative failure mode (silently
+mislabeling a genuinely contended run as UNCONTENDED). Whether 20% was
+simply still high enough to produce real queueing on this backend, or
+whether any nonzero concurrency across three tenants sharing two vLLM
+replicas always produces a small but detectable `contended_seconds`
+footprint, is not distinguished by this one run — a sweep across lower
+percentages would be needed to tell the two apart, and is out of scope for
+this ticket.
+
+**Cluster left as found.** `below-capacity` sets no chaos event and does
+not touch the LLMInferenceService spec or EPP weight config; confirmed
+after the run, not assumed:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          147m
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-6gkq5   1/1     Running   0          147m
+$ # from this run's own metrics-after.txt snapshot (EPP's own echoed config, not copied from the repo):
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app1"} 20
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app2"} 10
+llm_d_epp_maas_fairness_configured_weight{fairness_id="end-users"} 65
+llm_d_epp_maas_fairness_configured_weight{fairness_id="unclassified"} 5
+llm_d_epp_maas_fairness_enforcing 1
+```
+
+`replicas: 2` matches `deploy/poc/09-vllm-gpu.yaml`; weights and `enforcing`
+match `deploy/epp-config.yaml` exactly. The completed `maas-loadgen` Job was
+left in place (same convention as every prior scored scenario). No
+orphaned `oc logs -f` process was left behind by this run (checked against
+the UNI-169/170 fix by walking `/proc/*/cmdline` and the run's own
+`.capture-oc.pid`, which no longer corresponds to a live process).
+
+Raw results: `results/20261101T180755Z-uni135-below-capacity/` (report,
+loadgen log, metric snapshots/timeseries, client-request summary, EPP
+container log).
+
+**Grafana time range** (padded ±60s around `run_start`/`run_end`, per
+`docs/runbook.md`'s "Find a run on the fairness dashboard"):
+`from=1793556416000&to=1793556789000` —
+https://grafana-grafana.apps.ocp.paladinaura.com/d/maas-fairness-gpu-epp/?orgId=1&from=1793556416000&to=1793556789000&var-group=All&var-window=2m
+
+**Not proven here:** no `end-users-alone` scenario exists in this suite (the
+same gap `app2-trickle`/UNI-134 noted), so the latency comparison above
+covers `app1` and `app2` directly but relies on `contended_seconds_total`
+alone for `end-users`. This is also the only run in the edge-case chain
+where every tenant is simultaneously below its own saturating point, so the
+finding that contention does not vanish at 20% is a single data point, not
+a curve — see "What surprised us," above, for the sweep that would be
+needed to generalize it.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

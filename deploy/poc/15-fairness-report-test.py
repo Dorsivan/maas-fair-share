@@ -427,6 +427,156 @@ def test_control_scenario_reports_info_not_scored():
         assert "INFO" in proc.stdout
 
 
+def test_uncontended_when_everyone_below_capacity():
+    # UNI-135: A6 "below capacity, everyone light" -- all three tenants
+    # offered at well under their own saturating worker counts (6/6/26 vs.
+    # full-contention's 32/32/128). Nobody is ever backlogged alongside
+    # anyone else, so contended_seconds_total stays near zero for every
+    # offered group -- and so does contended_service_tokens_total, since both
+    # metrics share the same contention gate (metrics.go). That near-zero
+    # tokens total must NOT be read as "the EPP accounted nothing" (a
+    # structural FAIL elsewhere in this file); it is this scenario's correct,
+    # expected signature.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 10.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 10.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 10.0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 40\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 35\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 90\n'
+            # Deltas of 0.1-0.3s -- an order of magnitude below the ~9s a
+            # genuinely-contending tenant accrues in full-contention.
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 10.2\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 10.1\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 10.3\n'
+        )
+        rows = [
+            ("app1", 180, "0.80", "1.00", "200=180"),
+            ("app2", 180, "0.80", "1.00", "200=180"),
+            ("end-users", 780, "0.80", "1.00", "200=780"),
+        ]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 app2 end-users", w_app1=6, w_app2=6, w_end=26, rows=rows,
+            scenario="below-capacity",
+        )
+        assert report["verdict"]["result"] == "UNCONTENDED", report["verdict"]
+        assert not report["verdict"]["reasons"][0].startswith("offered groups delivered zero")
+        assert any("contended_seconds_total" in r for r in report["verdict"]["reasons"])
+        by_group = {g["group"]: g for g in report["groups"]}
+        assert abs(by_group["app1"]["contended_seconds"] - 0.2) < 1e-6
+        assert abs(by_group["app2"]["contended_seconds"] - 0.1) < 1e-6
+        assert abs(by_group["end-users"]["contended_seconds"] - 0.3) < 1e-6
+
+        # The CLI must exit 0 for UNCONTENDED, same as PASS/INFO.
+        before = write(tmp, "before2.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_before)
+        after = write(tmp, "after2.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_after)
+        log = write(tmp, "loadgen2.log", loadgen_log("app1 app2 end-users", 6, 6, 26, 240, rows))
+        out_json = os.path.join(tmp, "uncontended-report.json")
+        out_md = os.path.join(tmp, "uncontended-report.md")
+        proc = subprocess.run(
+            [sys.executable, "-I", os.path.join(HERE, "15-fairness-report.py"),
+             "--scenario", "below-capacity", "--enforce", "true",
+             "--backend", "vllm-gpu", "--epp-image-digest", "sha256:deadbeef",
+             "--namespace", "maas-fairness-poc", "--epp-pod", "test-pod",
+             "--run-start", "2026-10-29T00:00:00Z", "--run-end", "2026-10-29T00:04:00Z",
+             "--metrics-before", before, "--metrics-after", after, "--loadgen-log", log,
+             "--out-json", out_json, "--out-md", out_md],
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, f"expected zero exit for UNCONTENDED, got {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        assert "UNCONTENDED" in proc.stdout
+
+
+def test_uncontended_does_not_apply_when_one_group_actually_contends():
+    # Same light-weight shape as above, but app1's contended_seconds delta
+    # (8.5s) is in full-contention's genuinely-contending range while app2/
+    # end-users stay near zero -- "below capacity, everyone light" does not
+    # hold (app1 is NOT light here), so this must fall through to the normal
+    # symmetric deviation scoring instead of being misclassified UNCONTENDED.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 0.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 0.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 0.0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2105\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 1038\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 6857\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 8.5\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 0.2\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 0.3\n'
+        )
+        rows = [
+            ("app1", 180, "0.80", "1.00", "200=180"),
+            ("app2", 180, "0.80", "1.00", "200=180"),
+            ("end-users", 780, "0.80", "1.00", "200=780"),
+        ]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 app2 end-users", w_app1=6, w_app2=6, w_end=26, rows=rows,
+            scenario="below-capacity",
+        )
+        assert report["verdict"]["result"] != "UNCONTENDED", report["verdict"]
+
+
+def test_uncontended_does_not_override_solo_or_control():
+    # A solo group's contended_seconds_total is correctly, always zero
+    # (nobody to contend against) -- that must still be judged on the
+    # success-rate bar the `solo` case already uses, not relabelled
+    # UNCONTENDED just because it clears the same threshold. A named control
+    # similarly keeps its own INFO verdict rather than being reclassified.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = 'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+        tokens_after = 'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+        rows = [("app1", 500, "1.40", "1.80", "200=495 500=5")]
+        solo_report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1", w_app1=32, w_app2=0, w_end=0, rows=rows,
+            scenario="app1-alone",
+        )
+        assert solo_report["verdict"]["result"] == "PASS", solo_report["verdict"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 0.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 0.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 0.0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 40\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 35\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 90\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 0.2\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 0.1\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 0.3\n'
+        )
+        rows = [
+            ("app1", 180, "0.80", "1.00", "200=180"),
+            ("app2", 180, "0.80", "1.00", "200=180"),
+            ("end-users", 780, "0.80", "1.00", "200=780"),
+        ]
+        control_report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 app2 end-users", w_app1=6, w_app2=6, w_end=26, rows=rows,
+            scenario="equal-workers-control", control=True,
+        )
+        assert control_report["verdict"]["result"] == "INFO", control_report["verdict"]
+
+
 def test_epp_restart_mid_run_fails():
     # A counter going backwards between snapshots means the EPP restarted
     # and the delta is meaningless -- must FAIL, not silently clamp and pass.

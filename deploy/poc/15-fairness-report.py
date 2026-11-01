@@ -72,6 +72,19 @@ active in that window is within `threshold_points` of its expected share,
 and STAYS within it for every window up to the next edge (a single window
 that happens to land close, surrounded by windows that do not, is noise, not
 convergence).
+
+UNI-135 adds a fourth verdict, UNCONTENDED (neither PASS nor FAIL), for a run
+where every offered group is genuinely light -- below-capacity, not just
+excluded or demand-capped like the `solo`/`capped_groups` cases above. The
+rule is explicit and reuses the EPP's own evidence rather than inventing a
+new metric: every offered group's
+`llm_d_epp_maas_fairness_contended_seconds_total` delta must stay under
+UNCONTENDED_SECONDS_THRESHOLD, an order of magnitude below the ~9s a
+genuinely-contending tenant accrues in a 240s full-contention run
+(docs/runbook.md). When that holds, the symmetric weighted-split deviation
+check is skipped (it would only measure noise -- nobody was ever backlogged
+alongside anyone else to share against), the same way it is already skipped
+for `solo` and for a named `control`.
 """
 import argparse
 import json
@@ -353,6 +366,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     weight_after = after.get("llm_d_epp_maas_fairness_configured_weight", {})
     tokens_before = before.get("llm_d_epp_maas_fairness_contended_service_tokens_total", {})
     tokens_after = after.get("llm_d_epp_maas_fairness_contended_service_tokens_total", {})
+    contended_seconds_before = before.get("llm_d_epp_maas_fairness_contended_seconds_total", {})
+    contended_seconds_after = after.get("llm_d_epp_maas_fairness_contended_seconds_total", {})
 
     all_group_ids = sorted(
         g for g in set(weight_before) | set(weight_after) | set(GROUPS)
@@ -373,6 +388,26 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             epp_restarted = True
             d = 0.0
         deltas[gid] = d
+
+    # UNI-135: same before/after delta mechanism as contended_service_tokens
+    # above, for contended_seconds_total -- the "was this group ever actually
+    # backlogged alongside anyone else" evidence the UNCONTENDED verdict
+    # reads below. A backwards counter here means the same EPP restart the
+    # tokens counter would also have caught; fold into the same flag rather
+    # than inventing a second one.
+    contended_seconds_deltas = {}
+    for gid in all_group_ids:
+        b = contended_seconds_before.get(gid)
+        a = contended_seconds_after.get(gid)
+        if a is None:
+            contended_seconds_deltas[gid] = None
+            continue
+        b = b if b is not None else 0.0
+        d = a - b
+        if d < 0:
+            epp_restarted = True
+            d = 0.0
+        contended_seconds_deltas[gid] = d
 
     offered_groups = [g for g in GROUPS if offered_workers.get(g, 0) > 0]
     # A single offered group is never "contended" by definition (metrics.go:
@@ -439,7 +474,33 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "expected_share_pct": expected_pct,
             "observed_share_pct": observed_pct,
             "deviation_pts": deviation_pts,
+            "contended_seconds": contended_seconds_deltas.get(gid),
         })
+
+    # UNI-135: A6 "below capacity, everyone light" -- every tenant offered at
+    # well under its own saturating concurrency (deploy/poc/15-fairness-
+    # benchmark.sh's below-capacity scenario), so nobody is ever backlogged
+    # alongside anyone else. docs/runbook.md's own reference point: a
+    # genuinely-contending tenant in full-contention accrues ~9s of
+    # contended_seconds_total over a 240s run; UNCONTENDED_SECONDS_THRESHOLD
+    # is set an order of magnitude below that, the same "order of magnitude
+    # below its peers" margin the runbook already uses to distrust an
+    # under-contended tenant's measured share. Excluded from this check the
+    # same way they are excluded from the deviation check: `solo` (its own,
+    # already-documented reason nobody can be contended against it) and a
+    # named `control` (deliberately under-offered for a different, already-
+    # scored reason).
+    UNCONTENDED_SECONDS_THRESHOLD = 1.0
+    is_uncontended = (
+        solo is None
+        and not control
+        and len(offered_groups) >= 2
+        and all(
+            contended_seconds_deltas.get(g) is not None
+            and contended_seconds_deltas.get(g) < UNCONTENDED_SECONDS_THRESHOLD
+            for g in offered_groups
+        )
+    )
 
     SOLO_SUCCESS_THRESHOLD = 0.90  # "overwhelmingly 200" -- docs/runbook.md's own standing check
     verdict = "PASS"
@@ -464,6 +525,14 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                 f"but only {success_frac:.1%} of its {total} requests succeeded, short of the "
                 f"{SOLO_SUCCESS_THRESHOLD:.0%} bar for 'receives ~100% of the pool'"
             )
+    elif is_uncontended:
+        # A genuinely uncontended run legitimately scrapes near-zero
+        # contended_service_tokens_total too -- that counter only accrues
+        # under the same contention contended_seconds_total measures (both
+        # metrics.go SLIs share the same gate). Flagging this as "the EPP
+        # accounted nothing" would fail a run that is behaving exactly as
+        # this scenario intends.
+        pass
     elif offered_tokens_total <= 0 and offered_groups:
         verdict = "FAIL"
         reasons.append("offered groups delivered zero contended service tokens -- the EPP accounted nothing for this run")
@@ -506,7 +575,19 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     is_demand_capped_scenario = (
         scenario == "asymmetric-demand" and solo is None and len(offered_groups) >= 2
     )
-    if is_demand_capped_scenario:
+    if is_uncontended:
+        if verdict != "FAIL":
+            verdict = "UNCONTENDED"
+        reasons.append(
+            "every offered group's contended_seconds_total delta stayed under "
+            f"{UNCONTENDED_SECONDS_THRESHOLD:g}s (" +
+            ", ".join(f"{g}={contended_seconds_deltas.get(g):.2f}s" for g in offered_groups) +
+            f") -- an order of magnitude below the ~9s a genuinely-contending tenant "
+            "accrues in a 240s full-contention run (docs/runbook.md), so nobody was ever "
+            "backlogged alongside anyone else and the weighted-split deviation check does "
+            "not apply"
+        )
+    elif is_demand_capped_scenario:
         ASYMMETRIC_DEMAND_CAP_MARGIN_POINTS = 2.0  # slack for sampling noise
         dominant = max(offered_groups, key=lambda g: offered_workers.get(g, 0))
         dominant_row = next(r for r in rows if r["group"] == dominant)
@@ -607,6 +688,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "epp_restarted_mid_run": epp_restarted,
             "solo_group": solo,
             "capped_groups": sorted(capped_groups),
+            "uncontended_threshold_seconds": UNCONTENDED_SECONDS_THRESHOLD,
         },
         "sources": {
             "delivered_tokens_and_observed_share": (
@@ -650,6 +732,13 @@ def render_markdown(report):
             f"{v['threshold_points']:g}-point threshold. Expected to NOT reproduce the "
             "configured weights; see docs/runbook.md."
         )
+    elif v["result"] == "UNCONTENDED":
+        lines.append(
+            f"**Verdict: UNCONTENDED** -- every offered group's `contended_seconds_total` "
+            f"delta stayed under {v['uncontended_threshold_seconds']:g}s, so the pool was "
+            f"never actually contended. Not scored against the {v['threshold_points']:g}-point "
+            "weighted-split threshold; see docs/runbook.md."
+        )
     else:
         lines.append(f"**Verdict: {v['result']}** (threshold: {v['threshold_points']:g} points)")
     if v["reasons"]:
@@ -673,9 +762,9 @@ def render_markdown(report):
     lines.append("")
     lines.append(
         "| group | weight | offered workers | requests | statuses | p50s | p95s | "
-        "delivered tokens | expected % | observed % | deviation (pts) |"
+        "delivered tokens | expected % | observed % | deviation (pts) | contended_seconds |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for g in report["groups"]:
         def fmt(v, suffix=""):
             return "n/a" if v is None else f"{v:.1f}{suffix}" if isinstance(v, float) else f"{v}{suffix}"
@@ -684,7 +773,8 @@ def render_markdown(report):
             f"| {g['group']} | {fmt(g['configured_weight'])} | {g['offered_workers']} | "
             f"{g['requests_total']} | {statuses} | {fmt(g['p50_sec'])} | {fmt(g['p95_sec'])} | "
             f"{fmt(g['delivered_tokens'])} | {fmt(g['expected_share_pct'], '%')} | "
-            f"{fmt(g['observed_share_pct'], '%')} | {fmt(g['deviation_pts'])} |"
+            f"{fmt(g['observed_share_pct'], '%')} | {fmt(g['deviation_pts'])} | "
+            f"{fmt(g['contended_seconds'], 's')} |"
         )
     lines.append("")
     lines.append("## Timeline (UNI-127)")
@@ -813,7 +903,7 @@ def main():
     print(f"verdict: {report['verdict']['result']}")
     for reason in report["verdict"]["reasons"]:
         print(f"  - {reason}")
-    return 0 if report["verdict"]["result"] in ("PASS", "INFO") else 1
+    return 0 if report["verdict"]["result"] in ("PASS", "INFO", "UNCONTENDED") else 1
 
 
 if __name__ == "__main__":

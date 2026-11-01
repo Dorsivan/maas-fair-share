@@ -115,6 +115,18 @@
 #                          ticket prose only names APP1/END_USERS but the
 #                          YAML comment it points to is the source of truth
 #                          here.
+#   below-capacity         TENANTS="app1 app2 end-users", per-tenant workers
+#                          6/6/26 (app1/app2/end-users) -- UNI-135: A6 "below
+#                          capacity, everyone light." Each tenant is sized to
+#                          ~20% of the same per-tenant ceiling full-contention
+#                          uses to saturate the pool (32/32/128 -- the most
+#                          recent determined saturating config, UNI-29/A4 Run
+#                          3): 32*0.2=6.4->6, 32*0.2=6.4->6, 128*0.2=25.6->26.
+#                          Expected: nobody is ever backlogged alongside
+#                          anyone else at this concurrency --
+#                          15-fairness-report.py's "UNCONTENDED" verdict
+#                          (neither PASS nor FAIL) is this scenario's correct
+#                          result, not a weighted-split score.
 #
 # Per-tenant worker sizing (see docs/runbook.md "Per-tenant worker sizing
 # and the saturation check" for the full method): every ACTIVE tenant in a
@@ -164,7 +176,7 @@
 # deploy/poc/16-loadgen-identity-variants.sh and the runbook section above.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity}"
 LABEL="${2:-$SCENARIO}"
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -299,8 +311,17 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2)
     ;;
+  below-capacity)
+    # UNI-135: A6 "below capacity, everyone light" -- each tenant at ~20% of
+    # full-contention's saturating per-tenant ceiling (32/32/128):
+    # 32*0.2=6.4->6, 32*0.2=6.4->6, 128*0.2=25.6->26. All three offered, none
+    # over its own entitlement, so nobody should ever be backlogged alongside
+    # anyone else -- see 15-fairness-report.py's UNCONTENDED verdict.
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=6 WORKERS_APP2=6 WORKERS_END_USERS=26)
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity)" >&2
     exit 1
     ;;
 esac

@@ -807,3 +807,152 @@ re-arms on every EPP restart: a crashlooping or rescheduled pod keeps re-emittin
 up to `requestTierV4TimeBoxSeconds` after each restart even if nobody touched the
 config, so reverting the ConfigMap (not just waiting out the box once) is what
 actually ends it.
+
+---
+
+## Namespace snapshots silently omit Forbidden resource types (UNI-122)
+
+UNI-99's review of the UNI-96 cleanup found that `before.yaml`/`after.yaml` — a
+multi-kind `oc get ... -o yaml` redirected to a file — contained **zero**
+`InferencePool` objects even though `inferencepool` was in the argument list. No
+agent role on this cluster can `list` `inference.networking.k8s.io`:
+
+```
+$ oc auth can-i list inferencepools.inference.networking.k8s.io -n maas-fairness-poc
+no
+$ echo "exit=$?"
+exit=1
+```
+
+**The mechanism, established empirically (2026-11-01), is more precise than "omitted,
+not errored."** A multi-kind `get` where one kind is Forbidden does two things at
+once, on two different channels:
+
+```
+$ oc get deployment,service,inferencepool -n maas-fairness-poc -o yaml \
+    > /tmp/snap.yaml 2>/tmp/snap.err
+$ echo "exit=$?"
+exit=1
+$ cat /tmp/snap.err
+Error from server (Forbidden): inferencepools.inference.networking.k8s.io is forbidden:
+User "system:serviceaccount:paperclip:poc-agent" cannot list resource "inferencepools"
+in API group "inference.networking.k8s.io" in the namespace "maas-fairness-poc"
+$ wc -l /tmp/snap.yaml
+1664 /tmp/snap.yaml
+```
+
+- **stdout is a complete, valid, well-formed `List`** containing every object of
+  every *permitted* kind — 1664 lines, identical to running `oc get deployment,service`
+  alone with `inferencepool` dropped from the argument list entirely. There is no
+  error marker, placeholder, or comment inside the YAML. A reviewer who only opens
+  the file sees a document that looks exhaustive.
+- **The process still exits non-zero (1) and writes the Forbidden error to stderr.**
+  This is the part that refines the review's framing: the capture is not silent
+  end-to-end — `$?` and stderr both carry the signal — it is silent **only on the
+  channel most reviewers actually look at**, which is the YAML content itself. If
+  stderr was redirected to `/dev/null`, merged into the same file as stdout with
+  `2>&1` (which would also corrupt the YAML), or simply not captured by whatever
+  ran the original `oc get`, the only trace of the gap disappears and the file on
+  disk is indistinguishable from a complete snapshot. So: **check `$?`, every
+  time, before trusting a redirected capture** — it is a real, working defence
+  here, not a false lead — but it is not sufficient by itself, because it is easy
+  to lose track of in a pipeline or a script that doesn't check it.
+
+A Forbidden kind requested **alone** behaves the same way, just with an empty list
+instead of a partial one — still exit 1, still a valid (empty) document on stdout:
+
+```
+$ oc get inferencepool -n maas-fairness-poc -o yaml
+apiVersion: v1
+items: []
+kind: List
+metadata:
+  resourceVersion: ""
+$ echo "exit=$?"
+exit=1
+```
+
+So mixing a Forbidden kind into a list of permitted ones does not change the
+exit code or suppress the stderr message; it only changes what stdout looks like
+(a plausible, non-empty document instead of an obviously-empty one). The
+partial-but-plausible case is the dangerous one, because `items: []` at least
+looks suspicious on inspection, where a 1664-line document of real objects does
+not.
+
+**One trap that will fool a text search of the captured YAML**: `grep -c
+"kind: InferencePool"` against `/tmp/snap.yaml` above returns `3`, not `0` — but
+none of the three are top-level `List` items. They are `ownerReferences` entries
+on the Istio-generated `Service` objects for the pool (e.g.
+`maas-pool-ip-73df004c`), which the token *can* list:
+
+```yaml
+    ownerReferences:
+    - apiVersion: inference.networking.x-k8s.io/v1alpha2
+      kind: InferencePool
+      name: maas-pool
+      uid: b440f252-353c-4e6d-9cc6-43148b1a9379
+```
+
+Checking "does the capture mention InferencePool" is not the same question as
+"does the capture contain InferencePool objects." Only the latter is what a
+before/after diff needs.
+
+**The set of invisible kinds is a property of the token, not a fixed list.**
+`inference.networking.k8s.io` is what's known-invisible in `maas-fairness-poc`
+today, for the roles that exist today. A different role, a changed RoleBinding,
+or a different namespace can all change which kinds silently drop out — so the
+defence belongs in the snapshot procedure itself, not as a one-time hardcoded
+exclusion list for this one API group.
+
+**Pre-flight: verify every kind is actually readable before trusting the
+capture.** Loop `oc auth can-i list` over the exact kind list you are about to
+pass to `get`, and fail loudly on any `no`:
+
+```sh
+NAMESPACE=maas-fairness-poc
+KINDS=(deployment service inferencepool)
+BLIND=()
+for kind in "${KINDS[@]}"; do
+  if ! oc auth can-i list "$kind" -n "$NAMESPACE" >/dev/null 2>&1; then
+    BLIND+=("$kind")
+  fi
+done
+if [ "${#BLIND[@]}" -gt 0 ]; then
+  echo "REFUSING snapshot: cannot list ${BLIND[*]} in $NAMESPACE — capture would" \
+       "silently omit these kinds. Get the RBAC gap addressed or drop them from" \
+       "KINDS with that gap recorded in the ticket." >&2
+  exit 1
+fi
+oc get "$(IFS=,; echo "${KINDS[*]}")" -n "$NAMESPACE" -o yaml
+```
+
+Run against the real kind list, this is what it reports today:
+
+```
+$ for kind in deployment service inferencepool; do
+    oc auth can-i list "$kind" -n maas-fairness-poc >/dev/null 2>&1 \
+      && echo "$kind: ok" || echo "$kind: BLIND"
+  done
+deployment: ok
+service: ok
+inferencepool: BLIND
+```
+
+That is the authoritative way to know a snapshot is complete — not the exit
+code of `get`, and not a `grep` of the result. Keeping stderr alongside stdout
+(`2> snap.err` next to `> snap.yaml`, never `2>&1` into the same file, never
+`2>/dev/null`) is a cheap second line of defence, but the pre-flight is the one
+that fails *before* the capture is trusted, rather than requiring someone to
+remember to inspect a second file afterwards.
+
+**Cross-reference:** `deploy/poc/cleanup-dead-objects.sh` already carries this
+gap inline, at the `del inferencepool maas-pool` line — the comment there
+(`UNI-96: ... this delete is expected to fail with Forbidden rather than
+succeed or report not-found ... so a dry run documents the gap instead of
+hiding it`) describes the same RBAC boundary for *delete*. This section is the
+*read*-side counterpart: a dry run's `del` reports its own Forbidden loudly
+(see the `del()` function's own `if ! ... delete` check), but a `get`-based
+snapshot used to gate that same delete does not, unless stderr and `$?` are
+actually checked or the pre-flight above is run first. [UNI-119](/UNI/issues/UNI-119),
+the parent of this ticket, is the pending cluster-admin delete of
+`inferencepool/maas-pool` that this same blind spot applies to.

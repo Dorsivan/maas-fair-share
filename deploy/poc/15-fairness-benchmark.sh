@@ -448,11 +448,23 @@ RUN_START_EPOCH="$(date +%s)"
 # see docs/runbook.md's "Timeline, chaos, and windowed reporting"). Without
 # the sleep below, "oc logs -f" against a gone pod fails instantly and this
 # loop would hammer the API server every iteration for the rest of the run.
+# UNI-169: $CAPTURE_PID below is the PID of the capture_loop *function's*
+# subshell, not of the "oc logs -f" it execs -- bash does not propagate
+# signals from a non-interactive shell to children it already forked, so
+# killing $CAPTURE_PID alone leaves "oc logs -f" running and orphaned,
+# reparented, and still appending to $EPP_LOG forever. Backgrounding the oc
+# invocation itself and recording its own PID (refreshed on every re-attach,
+# since a pod restart gets a new oc process) lets the trap/stop code below
+# reach the actual log-streaming process.
+CAPTURE_OC_PIDFILE="$ARTIFACT_DIR/.capture-oc.pid"
+rm -f "$CAPTURE_OC_PIDFILE"
 capture_loop() {
   local since="$RUN_START"
   while true; do
     echo "--- [benchmark] (re)attaching oc logs -f at $since ---" >> "$EPP_LOG"
-    $OC logs -f "$EPP_POD" -n "$NAMESPACE" -c "$EPP_CONTAINER" --since-time="$since" >> "$EPP_LOG" 2>>"$EPP_LOG.capture-stderr" || true
+    $OC logs -f "$EPP_POD" -n "$NAMESPACE" -c "$EPP_CONTAINER" --since-time="$since" >> "$EPP_LOG" 2>>"$EPP_LOG.capture-stderr" &
+    echo "$!" > "$CAPTURE_OC_PIDFILE"
+    wait "$!" || true
     since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "--- [benchmark] oc logs -f exited at $since; checking for a pod restart ---" >> "$EPP_LOG"
     sleep 1
@@ -513,7 +525,7 @@ chaos_loop &
 CHAOS_PID=$!
 
 trap '
-  kill "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+  kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
   wait "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
   if [ -n "$CHAOS_SCALE_AT" ]; then
     CUR_REPLICAS="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath="{.spec.replicas}" 2>/dev/null || true)"
@@ -552,7 +564,7 @@ fi
 # metrics after. Run the same restore check the EXIT trap would, THEN clear
 # the trap -- clearing it first would leave a misconfigured chaos run with no
 # safety net at all, since the run ends normally from here, not via the trap.
-kill "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
 wait "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
 if [ -n "$CHAOS_SCALE_AT" ]; then
   CUR_REPLICAS="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"

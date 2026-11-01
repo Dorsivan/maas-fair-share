@@ -1975,6 +1975,93 @@ this case only shows it is uncapped when alone, same scope boundary
 contention is covered by the other named scenarios (`full-contention`,
 `end-users-idle`, etc.), not re-litigated here.
 
+## UNI-132: A3, `app2-idle` — pair `app1` + `end-users`, promoting the by-hand "S3" check
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, third case in the chain.
+This is the cleanest proportionality check of the series — app2 fully
+excluded, only two tenants contending, no demand-capping or timeline
+complications — and per the ticket it "has only ever been done once by hand"
+(the "S3" row in the "Scenario matrix — demand patterns and edge cases"
+section above, from an earlier manual run: 23.7%/75.0% against a 23.5/76.5
+target). This ticket adds it as a named, automated `15-fairness-benchmark.sh`
+scenario (`app2-idle`) instead of leaving it a one-off hand measurement.
+
+**Setup:** `TENANTS="app1 end-users"` (app2 excluded entirely, not just
+idle-but-offered), 240s, live against `maas-vllm-gpu` (2 replicas,
+llama-3-1-8b), `enforce: true`. Per-tenant workers sized by the
+[UNI-104](/UNI/issues/UNI-104) lesson — offered-worker ratio close to target
+ratio, not copied verbatim from another scenario's dominant-tenant ratio:
+app1 anchored at the usual baseline of 32 workers, end-users scaled to
+32×(65/20)=104, so the 32:104 offered ratio matches the pair's exact 20:65
+weight ratio.
+
+**Expected split:** with app2 excluded, the pair's weights renormalize to
+20/(20+65)=23.5% (app1) and 65/(20+65)=76.5% (end-users) — exactly the
+23.5/76.5 target the ticket names.
+
+**Observed split:** app1 20.2%, end-users 79.8% — deviations -3.3 and +3.3
+points against a 10-point threshold.
+
+**Verdict: PASS.**
+
+**Both tenants were genuinely contending, not just offered.**
+`llm_d_epp_maas_fairness_contended_seconds_total` deltas over the run: app1
+1.390s, end-users 1.390s — identical to three decimal places, the strongest
+same-run contention signal seen anywhere in this series so far (compare
+`full-contention`'s ~9s/~9s/~9s, or `end-users-idle`'s 1.46s/1.50s after its
+UNI-104 retune). app2, correctly offered zero workers, shows no delta
+(6.44s before and after). This directly answers the ticket's ask to record
+these deltas as proof of contention, not just a plausible-looking share
+number.
+
+**What surprised me:** the per-10s timeline window swings wildly — app1
+ranges from 0% to 38% of delivered tokens window-to-window (see the full
+report's timeline table), occasionally hitting a dead 0.0%-for-10s window
+three separate times over the run. The whole-run aggregate still lands
+within 3.3 points of target, so this looks like short-timescale oscillation
+around the converged split rather than a sustained drift, but it is a wider
+swing than `full-contention`'s timeline shows at the same window size and is
+not explained by anything in this ticket's scope — worth a closer look if a
+future case depends on short-window stability rather than whole-run
+aggregates. Also notable: 7/667 app1 requests and 50/2551 end-users requests
+returned HTTP 500 (~1-2%) — consistent with background error noise seen in
+other runs on this backend, not something this ticket root-caused.
+
+**Cluster left as found.** `app2-idle` sets no chaos event and does not touch
+the LLMInferenceService spec or EPP weight config; confirmed after the run,
+not assumed:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          92m
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-6gkq5   1/1     Running   0          93m
+$ # from this run's own metrics-after.txt snapshot (EPP's own echoed config, not copied from the repo):
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app1"} 20
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app2"} 10
+llm_d_epp_maas_fairness_configured_weight{fairness_id="end-users"} 65
+llm_d_epp_maas_fairness_configured_weight{fairness_id="unclassified"} 5
+llm_d_epp_maas_fairness_enforcing 1
+```
+
+`replicas: 2` matches `deploy/poc/09-vllm-gpu.yaml`; weights and `enforcing`
+match `deploy/epp-config.yaml` exactly. The completed `maas-loadgen` Job was
+left in place (same convention as every prior scored scenario — the next
+benchmark run deletes it unconditionally before creating its own).
+
+Raw results: `results/20261101T171523Z-uni132-app2-idle/` (report, loadgen
+log, metric snapshots/timeseries, client-request summary, EPP container log).
+
+**Not proven here:** the short-timescale oscillation noted above is
+described, not explained — no root cause is claimed. Multi-tenant behaviour
+involving `app2` under this pair's conditions is out of scope by
+construction (app2 is excluded, not merely idle). S4-equivalent behaviour
+(app2 trickling back in on top of this pair) is a different, not-yet-run
+case in the UNI-117 plan.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

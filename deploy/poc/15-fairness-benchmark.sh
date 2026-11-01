@@ -64,6 +64,17 @@
 #                          UNI-131: app1-alone only shows the highest-weight
 #                          tenant is uncapped when alone; this is the same
 #                          check for the lowest-weight tenant.
+#   app2-idle              TENANTS="app1 end-users", per-tenant workers 32/104
+#                          (app1/end-users) -- UNI-132: promotes the old
+#                          by-hand "S3" check (docs/poc-results.md) into the
+#                          automated benchmark. app2 is excluded entirely, so
+#                          the pair's renormalized target is 23.5/76.5
+#                          (20/(20+65), 65/(20+65)), and per the UNI-104
+#                          lesson the offered-worker ratio is sized to match
+#                          that target ratio (20:65) rather than reusing
+#                          either existing scenario's ratio verbatim: app1
+#                          anchored at the usual 32, end-users scaled to
+#                          32*65/20=104.
 #   asymmetric-demand      WORKERS_APP1=32, WORKERS_APP2=0,
 #                          WORKERS_END_USERS=2 -- the exact commented-out
 #                          example in 04-loadgen.yaml's per-tenant-override
@@ -121,7 +132,7 @@
 # deploy/poc/16-loadgen-identity-variants.sh and the runbook section above.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone asymmetric-demand}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle asymmetric-demand}"
 LABEL="${2:-$SCENARIO}"
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -217,12 +228,23 @@ case "$SCENARIO" in
     TENANTS="app2"
     PER_TENANT_OVERRIDES=()
     ;;
+  app2-idle)
+    # UNI-132: promotes the by-hand "S3" check (docs/poc-results.md,
+    # "Scenario matrix") into the automated benchmark. app2 is excluded, so
+    # the pair's renormalized target is 20/(20+65)=23.5% / 65/(20+65)=76.5%.
+    # Per the UNI-104 lesson, the offered-worker ratio is sized to match that
+    # target ratio (20:65) directly rather than copying full-contention's or
+    # end-users-idle's ratio: app1 anchored at the usual 32, end-users scaled
+    # to 32*(65/20)=104.
+    TENANTS="app1 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_END_USERS=104)
+    ;;
   asymmetric-demand)
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2)
     ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone asymmetric-demand)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle asymmetric-demand)" >&2
     exit 1
     ;;
 esac

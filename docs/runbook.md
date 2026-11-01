@@ -323,6 +323,7 @@ reasoning there is load-bearing.
 | `end-users-idle` | `TENANTS="app1 app2"`, per-tenant `WORKERS_APP1=64 WORKERS_APP2=32` (UNI-104; was `128/32` under UNI-103) | end-users' 65% is **absorbed** by app1/app2, not reserved while idle, with app1 over-offering relative to app2 to express their 2:1 (66.7/33.3 renormalized) ratio |
 | `equal-workers-control` | `TENANTS="app1 app2 end-users"`, equal `WORKERS` (the **original** full-contention shape) | **negative control, not scored.** Kept to show what an under-offered load looks like on this backend — expected to compress toward equal thirds, not 20/10/65. See "Per-tenant worker sizing and the saturation check" below |
 | `app1-alone` | `TENANTS="app1"` | a single tenant receives ~100% of the pool, not capped near its 20% weight |
+| `app2-idle` | `TENANTS="app1 end-users"`, per-tenant `WORKERS_APP1=32 WORKERS_END_USERS=104` (UNI-132) | promotes the by-hand "S3" check (`docs/poc-results.md`) into the benchmark: app2 excluded entirely (not just idle-but-offered), pair target renormalizes to 23.5/76.5 (20:65), worker ratio sized to match that ratio directly per the UNI-104 lesson |
 | `asymmetric-demand` | `WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2` | app1 is not held near its weight when the highest-weight tenant (end-users) sends only a trickle — this is the YAML's own commented-out example, which also idles app2; the ticket's prose names only APP1/END_USERS but the YAML it points to is the source of truth |
 
 `full-contention` and `end-users-idle` used to set a single global `WORKERS`
@@ -450,6 +451,12 @@ tenant drained its queue and the split compressed toward equal. The fix
   purpose, as a named, permanent negative control — see the scenario table
   above. Its own report says plainly that it is not scored, so a future
   reader does not mistake its large deviation for a regression.
+- `app2-idle` (UNI-132): `WORKERS_APP1=32 WORKERS_END_USERS=104` — app1
+  anchored at the usual baseline 32, end-users scaled to 32*(65/20)=104 so
+  the offered-worker ratio matches the pair's actual 20:65 target ratio
+  directly, applying the UNI-104 lesson (match the ratio to the target, don't
+  copy another scenario's dominant-tenant ratio verbatim) from the start
+  instead of discovering an overshoot first.
 
 **How to check a tenant was actually saturated, so a future backend change
 doesn't silently break this again:** the EPP's own

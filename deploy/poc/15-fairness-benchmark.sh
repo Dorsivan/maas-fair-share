@@ -89,6 +89,24 @@
 #                          (end-users) to match the ratio exactly rather than
 #                          reusing another scenario's figure --
 #                          32*65/10=208.
+#   app2-trickle           TENANTS="app1 app2 end-users" (all three offered,
+#                          unlike app2-idle/app1-idle which exclude one
+#                          entirely), per-tenant workers 32/2/104
+#                          (app1/app2/end-users) -- UNI-134: A5, promoting the
+#                          by-hand "S2"/"S4" checks (docs/poc-results.md
+#                          "Scenario matrix") into the benchmark. app1 and
+#                          end-users are HARD (over-offered); app2 trickles at
+#                          2 workers, well under its own weight entitlement.
+#                          Expected: app2's weight is a floor, not a ceiling,
+#                          so it is not throttled further -- it gets ~100% of
+#                          what it asks for -- and its unused entitlement goes
+#                          to app1/end-users, who split it in their own 20:65
+#                          ratio, renormalized to 23.5/76.5 exactly as
+#                          app2-idle's pair (the ratio BETWEEN app1 and
+#                          end-users is unaffected by app2's presence). Same
+#                          sizing as app2-idle for app1/end-users; app2's 2
+#                          workers is the literal S2/S4 trickle figure, not
+#                          derived from a ratio.
 #   asymmetric-demand      WORKERS_APP1=32, WORKERS_APP2=0,
 #                          WORKERS_END_USERS=2 -- the exact commented-out
 #                          example in 04-loadgen.yaml's per-tenant-override
@@ -146,7 +164,7 @@
 # deploy/poc/16-loadgen-identity-variants.sh and the runbook section above.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle asymmetric-demand}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand}"
 LABEL="${2:-$SCENARIO}"
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -263,12 +281,26 @@ case "$SCENARIO" in
     TENANTS="app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP2=32 WORKERS_END_USERS=208)
     ;;
+  app2-trickle)
+    # UNI-134: A5, promoting the by-hand "S2"/"S4" checks (docs/poc-results.md
+    # "Scenario matrix") into the benchmark. Unlike app2-idle/app1-idle, all
+    # three tenants are offered here -- app2 is not excluded, it trickles at
+    # the literal S2/S4 figure of 2 workers, well under its own weight
+    # entitlement. app1/end-users are sized identically to app2-idle (32/104)
+    # since the ratio BETWEEN them (20:65, renormalized 23.5/76.5) is
+    # unaffected by app2's presence -- 15-fairness-report.py excludes app2
+    # from the weight total used to score that pair, and scores app2 itself
+    # on a dedicated "did it get served" check instead of the symmetric
+    # deviation threshold (see the "app2-trickle" branch there).
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=2 WORKERS_END_USERS=104)
+    ;;
   asymmetric-demand)
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2)
     ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle asymmetric-demand)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand)" >&2
     exit 1
     ;;
 esac

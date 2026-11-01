@@ -383,9 +383,22 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     # bar ("must receive ~100% of the pool") is a request-success-rate
     # question instead, judged against SOLO_SUCCESS_THRESHOLD below.
     solo = offered_groups[0] if len(offered_groups) == 1 else None
+    # UNI-134: app2-trickle offers app2 alongside two HARD tenants, but at a
+    # demand (2 workers) well under its own weight entitlement -- the same
+    # "structurally capped by its own worker count" situation
+    # asymmetric-demand already handles for a single dominant tenant, except
+    # here TWO other tenants (app1, end-users) are both HARD and need to be
+    # scored against EACH OTHER's weights, not against a 3-way split that
+    # still counts app2's unreachable entitlement in the denominator. Exclude
+    # app2 from offered_weight_total so app1/end-users' expected share
+    # renormalizes to 23.5/76.5 (20:65) exactly as app2-idle's pair, and give
+    # app2 its own demand-capped check below instead of the symmetric
+    # deviation threshold.
+    capped_groups = {"app2"} if scenario == "app2-trickle" and len(offered_groups) == 3 else set()
     offered_weight_total = sum(
         (weight_after.get(g) if weight_after.get(g) is not None else weight_before.get(g)) or 0.0
         for g in offered_groups
+        if g not in capped_groups
     )
     offered_tokens_total = sum(deltas.get(g) or 0.0 for g in offered_groups)
 
@@ -399,7 +412,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         expected_pct = None
         observed_pct = None
         deviation_pts = None
-        if is_offered and gid != solo:
+        if is_offered and gid != solo and gid not in capped_groups:
             if offered_weight_total > 0 and weight is not None:
                 expected_pct = 100.0 * weight / offered_weight_total
             delivered_tokens_for_pct = deltas.get(gid)
@@ -454,6 +467,28 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     elif offered_tokens_total <= 0 and offered_groups:
         verdict = "FAIL"
         reasons.append("offered groups delivered zero contended service tokens -- the EPP accounted nothing for this run")
+
+    # UNI-134: app2-trickle's capped group (app2) is excluded from the
+    # weighted-split comparison above -- it structurally cannot reach a
+    # weight-proportional share at 2 workers, by design. The only thing this
+    # scenario can check for that group is "did a weight floor throttle it
+    # BELOW what it asked for", the same success-rate proxy app1-alone/
+    # app2-alone use for "receives ~100% of the pool" (no independent
+    # uncontended baseline is captured in-run to compare latency against).
+    CAPPED_SUCCESS_THRESHOLD = 0.90
+    for cg in sorted(capped_groups):
+        gen_row = loadgen_rows.get(cg, {"total": 0, "statuses": {}})
+        total = gen_row["total"]
+        ok = sum(v for k, v in gen_row["statuses"].items() if k.startswith("2"))
+        success_frac = (ok / total) if total > 0 else 0.0
+        if total <= 0 or success_frac < CAPPED_SUCCESS_THRESHOLD:
+            verdict = "FAIL"
+            reasons.append(
+                f"{cg} is this scenario's demand-capped trickle group ({offered_workers.get(cg, 0)} "
+                f"workers, well under its own weight entitlement) but only {success_frac:.1%} of "
+                f"its {total} requests succeeded, short of the {CAPPED_SUCCESS_THRESHOLD:.0%} bar "
+                "for 'gets everything it asks for'"
+            )
 
     max_abs_dev = max((abs(d) for _, d in deviations_for_verdict), default=None)
     # asymmetric-demand's low-worker group is capped by its OWN worker count,
@@ -571,6 +606,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "reasons": reasons,
             "epp_restarted_mid_run": epp_restarted,
             "solo_group": solo,
+            "capped_groups": sorted(capped_groups),
         },
         "sources": {
             "delivered_tokens_and_observed_share": (
@@ -590,7 +626,11 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                 "each offered group's configured_weight divided by the sum of configured_weight "
                 "over OFFERED groups only (excludes the never-offered 'unclassified' catch-all "
                 "and any group this scenario left idle), so a work-conserving policy absorbing "
-                "an idle group's share is not scored as a deviation."
+                "an idle group's share is not scored as a deviation. Also excludes any "
+                "'capped_groups' entry (UNI-134's app2-trickle): a group offered but "
+                "structurally unable to reach a weight-proportional share at its own worker "
+                "count is scored on a dedicated 'did it get served' check instead, not folded "
+                "into the other groups' expected-share denominator."
             ),
         },
         "timeline": timeline_section,

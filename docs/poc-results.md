@@ -2190,6 +2190,117 @@ cold-start window further, or whether a different worker-sizing ratio
 shortens the cold start itself, is untested — both are plausible given the
 windowed data but neither was tried here.
 
+## UNI-134: A5, `app2-trickle` — a weight is a floor, not a ceiling
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, fifth case in the chain,
+promoting the by-hand "S2"/"S4" checks (`docs/poc-results.md`'s "Scenario
+matrix," above) into the automated benchmark. Unlike `app2-idle`/`app1-idle`
+(A3/A4), no tenant is excluded here: all three are offered, but `app2`
+trickles at the literal S2/S4 figure of 2 workers — well under its own
+weight entitlement — while `app1` and `end-users` are both HARD.
+
+**Setup:** `TENANTS="app1 app2 end-users"`, 240s, live against
+`maas-vllm-gpu` (2 replicas, llama-3-1-8b), `enforce: true`. `app1` and
+`end-users` are sized identically to `app2-idle` (UNI-132) — 32 and 104
+workers — since the ratio *between* them (20:65) is unaffected by `app2`'s
+presence; `app2` is pinned at 2 workers, the ticket's own trickle figure, not
+derived from a ratio.
+
+**Expected split:** `app2`'s weight is a floor under contention, never a
+ceiling (the S2 lesson) — at 2 workers it structurally cannot reach a
+weight-proportional share, so it should get ~100% of what it asks for rather
+than being throttled further. Its unused entitlement goes to `app1` and
+`end-users`, who split it in their own 20:65 ratio, renormalized to
+**23.5/76.5** — the same target `app2-idle`'s pair has, because excluding
+`app2`'s weight from *that* ratio's denominator is correct whether `app2` is
+absent or merely capped by its own demand.
+
+This is a genuinely different comparison from `app2`'s naive 3-way weight
+share (10/95=10.5%), which is what a run would wrongly be scored against if
+`app2`'s weight stayed in the denominator for `app1`/`end-users`' target —
+`15-fairness-report.py` was extended with a `capped_groups` mechanism (new
+`app2-trickle` branch) specifically to exclude it, and to score `app2` itself
+on a dedicated "did it get served" success-rate check instead of the
+symmetric deviation threshold (mirroring the existing `solo`/
+`asymmetric-demand` carve-outs for the same underlying reason: a
+structurally-demand-capped group cannot be held to a weight-proportional
+share without failing a run that is working exactly as intended).
+
+**Observed split:** `app1` **18.8%**, `end-users` **79.7%** — deviations
+**-4.7** and **+3.3** points against the 23.5/76.5 target and a 10-point
+threshold. `app2`: 46/46 requests succeeded (100%, HTTP 200), p50 11.15s /
+p95 17.58s — in the same range as `app1`'s (p50 11.16s / p95 18.96s) and
+`end-users`' (p50 11.02s / p95 12.46s), not elevated as it would be if its
+trickle demand were queueing behind the two HARD tenants.
+
+**Verdict: PASS.**
+
+**`app2` received a small fraction of total delivered tokens — far below its
+naive 10.5% weight share — and that is the correct, intended result, not a
+miss.** Of the run's 4,144,594 total delivered tokens, `app2` accounted for
+59,510 (1.4%), against `app1`'s 780,454 (18.8%, the observed share reported
+above) and `end-users`' 3,304,630 (79.7%). `app2` offering only 2 workers for
+240s is the entire explanation — it has no way to generate demand for a
+larger share, and the policy correctly did not withhold what it did ask for
+(100% success, uncontended-looking latency) to artificially inflate its
+share toward its weight. This is the directional finding the historical by-hand
+S4 check made ("app2 trickled and received exactly the 2.9% it asked for")
+reproduced under the automated harness, though the exact percentage differs
+(1.4% here vs. 2.9% in S4) because the worker sizing, run duration, and
+backend are not identical between the two measurements — this run does not
+attempt to reproduce S4's number exactly, only its conclusion.
+
+**Both HARD tenants were genuinely contending, not just offered.**
+`llm_d_epp_maas_fairness_contended_seconds_total` deltas over the run: app1
+1.65s, app2 1.59s, end-users 1.64s — all three in the same range, meaning
+`app2`'s trickle was large enough to register real contention against the
+scheduler's priority band even though it could never win a proportional
+share of it. `end-users` had 17/2504 requests return HTTP 500 (0.7%),
+consistent with the background error noise seen elsewhere in this series,
+not root-caused here.
+
+**Cluster left as found.** `app2-trickle` sets no chaos event and does not
+touch the LLMInferenceService spec or EPP weight config; confirmed after the
+run, not assumed:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          126m
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-6gkq5   1/1     Running   0          127m
+$ # from this run's own metrics-after.txt snapshot (EPP's own echoed config, not copied from the repo):
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app1"} 20
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app2"} 10
+llm_d_epp_maas_fairness_configured_weight{fairness_id="end-users"} 65
+llm_d_epp_maas_fairness_configured_weight{fairness_id="unclassified"} 5
+llm_d_epp_maas_fairness_enforcing 1
+```
+
+`replicas: 2` matches `deploy/poc/09-vllm-gpu.yaml`; weights and `enforcing`
+match `deploy/epp-config.yaml` exactly. The completed `maas-loadgen` Job was
+left in place (same convention as every prior scored scenario). No orphaned
+`oc logs -f` process was left behind by this run (checked against the
+UNI-169 fix, confirmed live by walking `/proc/*/cmdline` before and after).
+
+Raw results: `results/20261101T174928Z-uni134-app2-trickle/` (report,
+loadgen log, metric snapshots/timeseries, client-request summary, EPP
+container log).
+
+**Not proven here:** "close to the same 2 workers running uncontended," the
+ticket's own phrasing for `app2`'s expected latency/throughput, is not
+checked against an actual uncontended 2-worker baseline run — no such run
+exists in this series to compare against, so the claim is supported only
+indirectly, by `app2`'s latency/success rate looking unremarkable next to
+the two HARD tenants' own numbers in this same run, not by a direct
+before/after comparison. The `capped_groups` report mechanism is new in
+this ticket and is covered by two new unit tests
+(`test_app2_trickle_served_and_pair_split_passes`,
+`test_app2_trickle_throttled_capped_group_fails`) in
+`15-fairness-report-test.py`, but has only this one live run behind it.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

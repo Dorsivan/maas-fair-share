@@ -308,6 +308,71 @@ def test_asymmetric_demand_saturating_group_capped_fails():
         assert report["verdict"]["reasons"]
 
 
+def test_app2_trickle_served_and_pair_split_passes():
+    # UNI-134: A5. app1/end-users are HARD (32/104 workers) and split the
+    # pool in their own 20:65 ratio, renormalized to 23.5/76.5 -- app2's
+    # weight (10) must NOT be folded into that denominator even though app2
+    # is offered (2 workers), or the target would wrongly become 21.1/68.4.
+    # app2 itself is mostly 200s (served, not throttled below its own
+    # trickle demand).
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2350000\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 150000\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 7650000\n'
+        )
+        rows = [
+            ("app1", 5000, "1.50", "1.90", "200=4950 500=50"),
+            ("app2", 300, "0.90", "1.10", "200=297 500=3"),
+            ("end-users", 16000, "1.60", "2.00", "200=15840 500=160"),
+        ]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 app2 end-users", w_app1=32, w_app2=2, w_end=104, rows=rows,
+            scenario="app2-trickle",
+        )
+        assert report["verdict"]["result"] == "PASS", report["verdict"]
+        assert report["verdict"]["capped_groups"] == ["app2"]
+        by_group = {g["group"]: g for g in report["groups"]}
+        assert abs(by_group["app1"]["expected_share_pct"] - 23.529) < 0.01
+        assert abs(by_group["end-users"]["expected_share_pct"] - 76.470) < 0.01
+        assert by_group["app2"]["expected_share_pct"] is None  # excluded, not scored as a share
+
+
+def test_app2_trickle_throttled_capped_group_fails():
+    # Same pair split (still a clean 23.5/76.5), but app2's own requests are
+    # now mostly failing -- its weight floor did not protect its trickle
+    # demand. The pair passing its own check must not mask this.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2350000\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 20000\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 7650000\n'
+        )
+        rows = [
+            ("app1", 5000, "1.50", "1.90", "200=4950 500=50"),
+            ("app2", 300, "5.90", "9.10", "200=90 500=210"),
+            ("end-users", 16000, "1.60", "2.00", "200=15840 500=160"),
+        ]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 app2 end-users", w_app1=32, w_app2=2, w_end=104, rows=rows,
+            scenario="app2-trickle",
+        )
+        assert report["verdict"]["result"] == "FAIL", report["verdict"]
+        assert any("app2" in r for r in report["verdict"]["reasons"]), report["verdict"]["reasons"]
+
+
 def test_control_scenario_reports_info_not_scored():
     # UNI-103: equal-workers-control reuses the exact equal-worker shape that
     # produced the pre-resize FAIL (31/30.7/38.3 against 20/10/65 on this

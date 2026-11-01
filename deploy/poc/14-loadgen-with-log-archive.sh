@@ -90,11 +90,24 @@ RESTART_EVENTS=0
 
 # --- Log-capture loop: restarts -f if the stream ends early -----------------
 # Runs in the background for the whole script; killed in the trap below.
+# UNI-170: $CAPTURE_PID below is the PID of the capture_loop *function's*
+# subshell, not of the "oc logs -f" it execs -- bash does not propagate
+# signals from a non-interactive shell to children it already forked, so
+# killing $CAPTURE_PID alone leaves "oc logs -f" running and orphaned,
+# reparented, and still appending to $EPP_LOG forever (see UNI-169, the same
+# bug in 15-fairness-benchmark.sh). Backgrounding the oc invocation itself and
+# recording its own PID (refreshed on every re-attach, since a pod restart
+# gets a new oc process) lets the trap/stop code below reach the actual
+# log-streaming process.
+CAPTURE_OC_PIDFILE="$ARTIFACT_DIR/.capture-oc.pid"
+rm -f "$CAPTURE_OC_PIDFILE"
 capture_loop() {
   local since="$RUN_START"
   while true; do
     echo "--- [archive] (re)attaching oc logs -f at $since ---" >> "$EPP_LOG"
-    $OC logs -f "$EPP_POD" -n "$NAMESPACE" -c "$EPP_CONTAINER" --since-time="$since" >> "$EPP_LOG" 2>>"$EPP_LOG.capture-stderr" || true
+    $OC logs -f "$EPP_POD" -n "$NAMESPACE" -c "$EPP_CONTAINER" --since-time="$since" >> "$EPP_LOG" 2>>"$EPP_LOG.capture-stderr" &
+    echo "$!" > "$CAPTURE_OC_PIDFILE"
+    wait "$!" || true
     # oc logs -f returned: either the run is over (parent will kill us) or the
     # container restarted mid-run. Check which, and say so in the log rather
     # than silently losing whatever comes next.
@@ -105,7 +118,7 @@ capture_loop() {
 capture_loop &
 CAPTURE_PID=$!
 trap '
-  kill "$CAPTURE_PID" 2>/dev/null || true
+  kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" 2>/dev/null || true
   wait "$CAPTURE_PID" 2>/dev/null || true
 ' EXIT
 
@@ -134,7 +147,7 @@ if [ "$PHASE" != "done" ]; then
 fi
 
 # --- Stop capture, collect loadgen's own log, finalize manifest ------------
-kill "$CAPTURE_PID" 2>/dev/null || true
+kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" 2>/dev/null || true
 wait "$CAPTURE_PID" 2>/dev/null || true
 trap - EXIT
 

@@ -2062,6 +2062,134 @@ construction (app2 is excluded, not merely idle). S4-equivalent behaviour
 (app2 trickling back in on top of this pair) is a different, not-yet-run
 case in the UNI-117 plan.
 
+## UNI-133: A4, `app1-idle` — pair `app2` + `end-users`, the most extreme pair ratio
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, fourth case in the chain (A1
+`app2-alone`/UNI-131, A3 `app2-idle`/UNI-132, this is A4). `app1` is excluded
+entirely (not merely idle), leaving `app2` (weight 10) and `end-users`
+(weight 65) as the only two offered tenants — a 6.5:1 ratio, the most
+extreme of the three possible pairs (compare 2:1 for app1:app2 and 1:3.25 for
+app1:end-users). New `app1-idle` scenario added to
+`deploy/poc/15-fairness-benchmark.sh`. The ticket also asks that `app2`'s own
+signed deviation be reported on its own: this repo's simulator-era "Residual
+gap: small-weight groups run ~4 points rich" finding (above) predicted a
+low-weight group would run *rich* under contention, and this pair's extreme
+ratio was flagged as the sharpest test of that prediction.
+
+**Setup:** `TENANTS="app2 end-users"` (app1 excluded entirely), 240s, live
+against `maas-vllm-gpu` (2 replicas, llama-3-1-8b), `enforce: true`.
+Per-tenant workers sized by the [UNI-104](/UNI/issues/UNI-104) lesson, same
+method as `app2-idle`: anchor the smaller weight (`app2`) at the usual
+baseline of 32 workers, scale the larger (`end-users`) to match the pair's
+exact ratio: 32×(65/10)=208.
+
+**Expected split:** with app1 excluded, the pair's weights renormalize to
+10/(10+65)=13.3% (app2) and 65/(10+65)=86.7% (end-users) — the 13.3/86.7
+target the ticket names.
+
+**Observed split (whole-run aggregate):** app2 **8.9%**, end-users **91.1%**
+— deviations **-4.5** and **+4.5** points against a 10-point threshold.
+
+**Verdict: PASS.**
+
+**app2's signed deviation, reported on its own as asked: -4.5 points — poor,
+not rich.** This is the opposite sign from the ticket's "~4 points rich"
+hypothesis for small-weight groups. The whole-run aggregate is not the full
+story, though: the per-10s windowed timeline (full report,
+`results/20261101T172853Z-app1-idle/fairness-report.md`) shows app2 received
+**zero** delivered tokens for eight consecutive windows, t=20s through
+t=101s — 81 seconds of the 240s run — while `end-users`'s far larger offered
+concurrency (208 vs. 32 workers) filled the pool first. `compute_convergence`
+puts the phase's first sustained within-threshold window at t=101s (close to
+two `halfLifeSeconds=60` half-lives). From t=101s to the end of the run, the
+per-window split tracks the 13.3/86.7 target tightly — every window from
+111s on is within ±1.1 points, several within ±0.2 — which is actually the
+*strongest* steady-state convergence at any ratio run in this series so far.
+The whole-run **aggregate** deviation is -4.5 because the aggregate average
+cannot distinguish "never contended" from "contended but shut out during a
+long cold start": roughly a third of the run's windows (8 of 24 active
+windows) contributed a large negative pull to app2's share before the system
+settled.
+
+**Why this refutes, not confirms, the "~4 points rich" hypothesis for this
+pair.** The original residual-gap finding (simulator, no `newcomerClamp`,
+clamp-off) attributed low-weight-group richness to early-run FCFS-like
+behavior, where all groups look equally unserved before weights have had time
+to bite — a mechanism that should bias the low-weight group *up*, not down.
+What this run shows instead, at the most extreme ratio in the series, is the
+opposite: the low-weight group's queue is the one that gets starved out
+during the cold start, because the high-weight group's much larger offered
+concurrency (208 workers, sized intentionally to match its 86.7% target
+share) saturates the pool before app2's comparatively small 32-worker queue
+can build enough backlog to compete for the weighted scheduler's attention.
+The two mechanisms are not the same thing, and this result does not
+reproduce the older finding — it shows a different, ratio-dependent cold-start
+dynamic that happens to also be a few points in magnitude. No root cause
+beyond this description is claimed.
+
+**Both tenants were genuinely contending, not just offered.**
+`llm_d_epp_maas_fairness_contended_seconds_total` deltas over the run: app2
+20.05s, end-users 20.08s — matching to two decimal places, the same
+same-run contention signal `app2-idle` showed for its pair. `app1`, correctly
+excluded, shows no delta (9.277s before and after, identical). Status tally:
+app2 100% HTTP 200 (297/297); end-users 99.0% (2867/2895, 28×500) —
+consistent with the background error noise seen elsewhere in this series, not
+root-caused here. app2's P95 latency (101.8s) is far higher than end-users'
+(20.4s) — consistent with app2's requests queueing behind the much larger
+end-users backlog during the cold-start window described above, not with
+app2 being under-offered relative to its entitlement.
+
+**Cluster left as found.** `app1-idle` sets no chaos event and does not touch
+the LLMInferenceService spec or EPP weight config; confirmed after the run,
+not assumed:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          108m
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-6gkq5   1/1     Running   0          109m
+$ # from this run's own metrics-after.txt snapshot (EPP's own echoed config, not copied from the repo):
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app1"} 20
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app2"} 10
+llm_d_epp_maas_fairness_configured_weight{fairness_id="end-users"} 65
+llm_d_epp_maas_fairness_enforcing 1
+```
+
+`replicas: 2` matches `deploy/poc/09-vllm-gpu.yaml`; weights and `enforcing`
+match `deploy/epp-config.yaml` exactly. The completed `maas-loadgen` Job was
+left in place (same convention as every prior scored scenario — the next
+benchmark run deletes it unconditionally before creating its own).
+
+**A process bug in the harness found and fixed during this run, out of
+scope for a code change here.** Five orphaned `oc logs -f` processes from
+UNI-127 through UNI-132 were found still running and still appending to
+their original runs' `epp-container.log` files (three of them inside this
+repo's committed `results/` directories, corrupting already-closed tickets'
+raw artifacts after the fact) — `15-fairness-benchmark.sh`'s exit/EXIT-trap
+`kill "$CAPTURE_PID"` only signals the wrapper function's subshell, not the
+`oc logs -f` grandchild process it execs, so the grandchild is orphaned and
+never reaped. All five were killed and the two contaminated committed files
+in this repo were restored with `git checkout --` before this run started;
+this run's own equivalent orphan was caught and killed the same way
+immediately after. Not fixed in the script itself — that is a harness change
+affecting every scenario in this suite, out of scope for this benchmark
+ticket. Filed as a backlog idea for whoever owns the harness next.
+
+Raw results: `results/20261101T172853Z-app1-idle/` (report, loadgen log,
+metric snapshots/timeseries, client-request summary, EPP container log).
+
+**Not proven here:** the cold-start mechanism described above is described,
+not root-caused — no claim is made about exactly why the low-weight group's
+queue is the one that drains during the transient, only that it is
+(contrast the higher-weight group holding queue depth throughout). Whether a
+longer run shrinks the whole-run aggregate deviation by diluting the
+cold-start window further, or whether a different worker-sizing ratio
+shortens the cold start itself, is untested — both are plausible given the
+windowed data but neither was tried here.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

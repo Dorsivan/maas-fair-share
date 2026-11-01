@@ -75,6 +75,20 @@
 #                          either existing scenario's ratio verbatim: app1
 #                          anchored at the usual 32, end-users scaled to
 #                          32*65/20=104.
+#   app1-idle              TENANTS="app2 end-users", per-tenant workers
+#                          32/208 (app2/end-users) -- UNI-133: fourth and
+#                          hardest case in this A-series (A1 app2-alone/
+#                          UNI-131, A3 app2-idle/UNI-132, this is A4). app1 is
+#                          excluded entirely, leaving the pair with the most
+#                          extreme ratio of the three possible pairs (10:65,
+#                          6.5:1 -- vs. 2:1 for app1:app2 and 1:3.25 for
+#                          app1:end-users), so renormalized target is
+#                          13.3/86.7 (10/(10+65), 65/(10+65)). Same UNI-104
+#                          sizing lesson as app2-idle: anchor the smaller
+#                          weight (app2) at the usual 32, scale the larger
+#                          (end-users) to match the ratio exactly rather than
+#                          reusing another scenario's figure --
+#                          32*65/10=208.
 #   asymmetric-demand      WORKERS_APP1=32, WORKERS_APP2=0,
 #                          WORKERS_END_USERS=2 -- the exact commented-out
 #                          example in 04-loadgen.yaml's per-tenant-override
@@ -132,7 +146,7 @@
 # deploy/poc/16-loadgen-identity-variants.sh and the runbook section above.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle asymmetric-demand}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle asymmetric-demand}"
 LABEL="${2:-$SCENARIO}"
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -239,12 +253,22 @@ case "$SCENARIO" in
     TENANTS="app1 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_END_USERS=104)
     ;;
+  app1-idle)
+    # UNI-133: A4 in the same series as app2-alone (A1, UNI-131) and app2-idle
+    # (A3, UNI-132). app1 is excluded, so the pair's renormalized target is
+    # 10/(10+65)=13.3% / 65/(10+65)=86.7% -- the most extreme ratio (6.5:1) of
+    # the three possible pairs. Same UNI-104 sizing lesson as app2-idle: anchor
+    # the smaller weight (app2) at the usual 32, scale the larger (end-users)
+    # to match the ratio exactly: 32*(65/10)=208.
+    TENANTS="app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP2=32 WORKERS_END_USERS=208)
+    ;;
   asymmetric-demand)
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2)
     ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle asymmetric-demand)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle asymmetric-demand)" >&2
     exit 1
     ;;
 esac

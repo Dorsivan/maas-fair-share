@@ -50,6 +50,25 @@ model download and vLLM startup.
 
 ---
 
+## Restore `maas-vllm-cpu` from zero (UNI-98)
+
+Scaled to zero on 2026-11-01 to reclaim the 4 CPU / 16Gi it held standing with
+no test touching it ([UNI-88](/UNI/issues/UNI-88)). The route
+(`maas-vllm-cpu-kserve-route`) and `maas-trlp-maas-vllm-cpu` were left in
+place, so bringing it back is one command — no object was deleted and nothing
+else needs to be recreated:
+
+```sh
+oc patch llminferenceservice maas-vllm-cpu -n maas-fairness-poc --type=merge -p '{"spec":{"replicas":2}}'
+```
+
+It comes back on `deploy/poc/07-vllm-cpu.yaml`'s current scheduler pin,
+`quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135`
+— the same digest the GPU path runs (UNI-97). Allow ~1-2 minutes for the two
+Qwen2.5-0.5B CPU pods to become `Ready`.
+
+---
+
 ## Mint a MaaS API key
 
 Inference endpoints accept **only** keys with the `sk-oai-` prefix. Kubernetes
@@ -119,8 +138,16 @@ json.dump({'auths':{k:v for k,v in d['auths'].items() if 'quay.io' in k}},open('
 oc create secret generic quay-maas-pull -n maas-fairness-poc \
   --from-file=.dockerconfigjson=/tmp/q.json --type=kubernetes.io/dockerconfigjson
 oc secrets link maas-vllm-gpu-epp-sa quay-maas-pull --for=pull -n maas-fairness-poc
+oc secrets link maas-vllm-cpu-epp-sa quay-maas-pull --for=pull -n maas-fairness-poc
 shred -u /tmp/q.json
 ```
+
+Both service accounts need the link — each LLMInferenceService's router-scheduler
+runs under its own `<name>-epp-sa`, and the pull secret does not transfer between
+them. UNI-98 (2026-11-01) hit this directly: pinning `deploy/poc/07-vllm-cpu.yaml`'s
+scheduler to the digest without this second `oc secrets link` left the CPU-path
+scheduler pod in `ImagePullBackOff` — `<auth-denied>` on the private repo — even
+though the GPU path, already linked, pulled the same digest fine.
 
 Quay rather than the in-cluster registry is deliberate: **the GPU nodes cannot
 reach the internal registry's ClusterIP** (`dial tcp 172.30.x:5000: i/o
@@ -222,13 +249,19 @@ useful to pin than this now-stale one. Both manifests reference the UNI-29 diges
 the same commit — do not let the pin drift a third time.
 
 Do **not** "fix" a future drift like this by repointing those two manifests at an
-in-cluster-registry digest like the one above instead:
-that image is reachable only from inside this cluster, and this registry is known to
-time out from some nodes in this pool — the CPU-path EPP deployment
-(`maas-vllm-cpu-kserve-router-scheduler-*`, same internal registry, different tag) is
-sitting in `ImagePullBackOff` against exactly this failure mode as of this writing. The
-digest above exists only to prove the plugin logic end to end from inside the cluster;
-it is not a transferable or deployable artifact, and does not leave this cluster.
+in-cluster-registry digest like the one above instead: that image is reachable only
+from inside this cluster, and this registry is known to time out from some nodes in
+this pool. The digest above exists only to prove the plugin logic end to end from
+inside the cluster; it is not a transferable or deployable artifact, and does not
+leave this cluster.
+
+Update, UNI-98 (2026-11-01): the CPU-path scheduler
+(`maas-vllm-cpu-kserve-router-scheduler-*`) previously ran `maas-epp:latest` off
+this same in-cluster registry and was seen sitting in `ImagePullBackOff` against
+exactly this failure mode. It, and the two other manifests that shared that
+floating tag (`deploy/poc/02-epp.yaml`, `deploy/poc/06-rhoai34-shape.yaml`), are
+now pinned to the same Quay digest as the GPU path — see "Restore `maas-vllm-cpu`
+from zero (UNI-98)" above.
 
 ---
 

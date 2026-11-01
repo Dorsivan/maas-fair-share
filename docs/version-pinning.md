@@ -121,10 +121,10 @@ carries `python:3.11-slim` in `Dockerfile.mock` and `Dockerfile.wfq`, and
 
 | File | Reference | State |
 |---|---|---|
-| `deploy/poc/02-epp.yaml:145` | `image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp:latest` | **violates** — floating tag, in-cluster registry |
-| `deploy/poc/05-llmisvc-sim.yaml:185` | same `maas-epp:latest` | **violates** |
-| `deploy/poc/06-rhoai34-shape.yaml:79` | same `maas-epp:latest` | **violates** |
-| `deploy/poc/07-vllm-cpu.yaml:150` | same `maas-epp:latest` | **violates** |
+| `deploy/poc/02-epp.yaml:145` | `quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a7...` | **satisfies** — fixed for UNI-98, same digest UNI-29/UNI-97 landed on |
+| `deploy/poc/05-llmisvc-sim.yaml:185` | same digest | **satisfies** — fixed for UNI-98 |
+| `deploy/poc/06-rhoai34-shape.yaml:79` | same digest | **satisfies** — fixed for UNI-98 |
+| `deploy/poc/07-vllm-cpu.yaml:150` | same digest | **satisfies** — fixed for UNI-98 |
 | `deploy/llmisvc.yaml:106` | `quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a7...` | **satisfies** — fixed for UNI-29; see `docs/runbook.md`'s "Publishing to Quay without a local podman" note for how this one was built |
 | `deploy/poc/09-vllm-gpu.yaml:111` | same digest | **satisfies** |
 | `deploy/poc/01-sim-backend.yaml:45` | `ghcr.io/llm-d/llm-d-inference-sim:v0.11.4` | version tag, not a digest — **violates**, lower risk |
@@ -139,12 +139,12 @@ carries `python:3.11-slim` in `Dockerfile.mock` and `Dockerfile.wfq`, and
 
 Six of these manifests also carry `imagePullPolicy: Always` (`deploy/poc/02-epp.yaml:146`,
 `05-llmisvc-sim.yaml:186`, `06-rhoai34-shape.yaml:80`, `07-vllm-cpu.yaml:151`,
-`deploy/llmisvc.yaml:107`, `deploy/poc/09-vllm-gpu.yaml:112`). On the four `:latest`
-references that makes the problem worse, not better: it guarantees that a restarted pod
-picks up whatever the tag points at now, so two replicas of the "same" deployment can run
-different binaries. On the two digest-pinned references it is harmless — a digest cannot
-move, so `Always` only re-pulls the same bytes. That contrast is the argument for the rule
-in §4 in one line.
+`deploy/llmisvc.yaml:107`, `deploy/poc/09-vllm-gpu.yaml:112`). All six now point at a digest
+(fixed for UNI-98), so `Always` is harmless on every one of them — a digest cannot move,
+so `Always` only re-pulls the same bytes. Before UNI-98, four of the six were `:latest`,
+where the same setting made the problem worse instead: it guaranteed a restarted pod picked
+up whatever the tag pointed at *now*, so two replicas of the "same" deployment could run
+different binaries. That contrast was the argument for the rule in §4 in one line.
 
 Nothing in this table is fixed by this document. It is the inventory the enforcement rule
 in §4 is written against, and the per-manifest changes belong to their own tickets.
@@ -336,12 +336,14 @@ Three consequences specific to this POC:
 
 - `imagePullPolicy: Always` on a floating tag means a pod restart can change the running
   binary with no manifest change and no audit trail. Six of our manifests set `Always`;
-  four of them sit on a `:latest` tag and are exposed to this. The other two are digest-
-  pinned, where `Always` is inert. See the §2.3 inventory for the list.
+  all six are now digest-pinned (fixed for UNI-98), where `Always` is inert. Before
+  UNI-98, four of them sat on a `:latest` tag and were exposed to this. See the §2.3
+  inventory for the list.
 - The in-cluster reference `image-registry.openshift-image-registry.svc:5000/.../maas-epp:latest`
   cannot be transferred at all. It names a registry that does not exist outside this
   cluster, and the GPU nodes cannot reach it even inside this one
   (`dial tcp 172.30.x:5000: i/o timeout`), which is why the GPU manifests point at Quay.
+  No manifest in this repository references it any longer (UNI-98).
 - An air-gapped mirror is populated by digest. A manifest that names a tag cannot be
   matched to an `IDMS`/`ICSP` entry deterministically, which makes the POC's stated
   air-gap goal unverifiable rather than merely untested.

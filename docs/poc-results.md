@@ -2946,6 +2946,185 @@ separately exercised here (`CACHE_SHAPE_*` left at default), so the ledger's
 cached-token term is small and mostly untested at scale; see UNI-136 for
 that dimension on its own.
 
+## UNI-139: H1, repeatability — every scored scenario 5×, threshold derived from data
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, H1 in the chain. Every prior
+scenario in this series (`full-contention`, `end-users-idle`, `app1-alone`,
+`asymmetric-demand`, plus the three added earlier in this chain — `app2-idle`
+(A3/UNI-132), `app1-idle` (A4/UNI-133), `app2-trickle` (A5/UNI-134)) had only
+ever been run once each. This ticket reruns all seven, 5× apiece (35 runs
+total, ~2h45m of GPU time), to answer two questions the single-run numbers
+elsewhere in this doc can't: how much does a scenario's deviation actually
+move run to run, and does that noise floor justify the 10-point threshold
+`15-fairness-report.py` has used throughout?
+
+**Setup:** same scenario definitions as their originating tickets (see
+`deploy/poc/15-fairness-benchmark.sh`, same `TENANTS`/`PER_TENANT_OVERRIDES`
+per scenario), 240s each, live against `maas-vllm-gpu` (2 replicas,
+llama-3-1-8b), `enforce: true`, weights 20/10/65/5. Run one scenario at a
+time (5 reps, back to back) to respect the one-benchmark-on-the-GPU-pool
+rule; namespace checked clear of any other loadgen job before every scenario
+started. Driven by a scratch-only (`/tmp/uni139/`, not committed) shell
+driver so the sweep survived two unrelated session interruptions along the
+way without losing progress or contaminating results.
+
+**Results: 35/35 runs completed, all recorded.** 32 PASS, 1 FAIL, 2
+UNCONTENDED — see the two findings below for both non-PASS groups; neither
+is a new defect.
+
+### Two of the seven scenarios aren't threshold-scored at all
+
+`app1-alone` (`solo_group`, nothing to compare a lone tenant's share
+against) and `asymmetric-demand` (`end-users` demand-capped at 2 workers,
+scored by `15-fairness-report.py`'s one-sided "did the uncapped tenant still
+get served" check, not the symmetric deviation threshold — see "UNI-54,"
+above) report a `max_abs_deviation_points` number in their JSON, but that
+number is not what `threshold_points: 10` gates on for these two scenarios.
+Including them in a threshold-derivation average would be comparing noise on
+two different instruments. They're reported here for completeness, excluded
+from the threshold analysis below:
+
+| scenario | n | verdicts | max_abs_deviation_points (not threshold-scored) |
+|---|---|---|---|
+| `app1-alone` | 5 | 5× PASS | n/a every rep (solo tenant, nothing to deviate from) |
+| `asymmetric-demand` | 5 | 3× PASS, 2× UNCONTENDED | mean 70.3, sd 0.28 (range 70.00–70.58) |
+
+**`asymmetric-demand`'s PASS/UNCONTENDED split is itself a finding.** The
+underlying signal — `end-users` demand-capped to ~6% of its weighted
+entitlement — is rock-stable across all 5 reps (70.0–70.6 points, sd 0.28,
+barely more noise than measurement precision). What flips between PASS and
+UNCONTENDED is `contended_seconds`, which landed at 1.245s, 1.045s, 1.184s
+(PASS, all >1.0s) then 0.983s, 0.984s (UNCONTENDED, both <1.0s) against the
+benchmark's `uncontended_threshold_seconds: 1.0`. A ~27% run-to-run spread in
+a sub-two-second measurement is swinging the verdict across a hard cutoff
+that sits inside that spread — not a sign the underlying fairness behavior
+changed, but a sign this particular knife-edge threshold is too tight
+relative to its own noise floor. Out of scope to fix here (that constant
+belongs to the contention gate, not the 10-point deviation threshold this
+ticket was asked to evaluate), flagged as a follow-up.
+
+### The five threshold-scored scenarios
+
+| scenario | n | verdicts | max_abs_deviation_points: mean ± sd (min–max) |
+|---|---|---|---|
+| `full-contention` | 5 | 5× PASS | 4.24 ± 0.66 (3.84–5.39) |
+| `end-users-idle` | 5 | 5× PASS | 3.03 ± 0.70 (2.36–4.07) |
+| `app2-idle` | 5 | 5× PASS | 3.53 ± 0.72 (2.85–4.49) |
+| `app2-trickle` | 5 | 5× PASS | 3.68 ± 0.27 (3.22–3.89) |
+| `app1-idle` | 5 | 4× PASS, **1× FAIL** | 7.33 ± 4.27 (0.18–11.21) |
+| **all 25 reps** | 25 | 24 PASS, 1 FAIL | **4.36 ± 2.40** (0.18–11.21) |
+
+Per-group signed deviation (mean ± sd, points), the number the ticket asked
+for directly:
+
+| scenario | group A | group B |
+|---|---|---|
+| `full-contention` | app1 −4.18 ± 0.71 | app2 +3.49 ± 0.43 (end-users +0.69 ± 0.67) |
+| `end-users-idle` | app1 +3.03 ± 0.70 | app2 −3.03 ± 0.70 |
+| `app2-idle` | app1 −3.53 ± 0.72 | end-users +3.53 ± 0.72 |
+| `app2-trickle` | app1 −3.68 ± 0.27 | end-users +2.06 ± 0.27 (app2 capped, not scored) |
+| `app1-idle` | app2 −7.26 ± 4.42 | end-users +7.26 ± 4.42 |
+
+**`app1-idle` alone carries almost all the series' noise, and it's the
+scenario that FAILed.** Its sd (4.27 on the max-abs figure, 4.42 on the
+per-group figure) is 6–16× every other scored scenario's sd (0.27–0.72). The
+other four scenarios' entire observed range across 20 reps (2.36–5.39) sits
+inside `app1-idle`'s own 5-rep range (0.18–11.21) on its own. This isn't new
+information in isolation — "UNI-133: A4, `app1-idle`" (above) already
+described a cold-start mechanism where the minority tenant (`app2`, the
+6.5:1 pair's small side) can be shut out of the pool entirely for the first
+~100s of a 240s run while the much larger `end-users` worker count (208 vs
+32) fills it first, and how much of the run that cold start eats varies
+rep to rep. This 5-rep sweep is the first time that variance has actually
+been measured instead of described from a single run: rep 5's 0.18-point
+deviation and rep 3's 11.21-point FAIL are the same scenario, same weights,
+same worker counts, back to back, 14 minutes apart. `app2`'s own
+`requests_total` makes the mechanism visible directly — 183, 138, 127, 212,
+433 across the 5 reps, a >3× spread in a 240s closed-loop run, with no
+corresponding spread on `end-users`' side (~2750–3040) — consistent with
+`app2`'s queue depth, not `end-users`', being what varies with how long the
+cold start happens to last each time.
+
+**The one FAIL (rep 3, 11.21 points) is a valid result, not a flake to
+explain away.** Per the ticket's own rule 4, it's recorded as data, not
+rerun or discarded. `epp_restarted_mid_run: false` and status tallies were
+unremarkable on that rep — nothing in the artifacts marks it as degenerate
+run, just the upper end of this scenario's own noise distribution.
+
+### Threshold recommendation
+
+Across the 25 threshold-scored reps, `mean + 2·sd ≈ 9.15` and
+`mean + 3·sd ≈ 11.54`. The current 10-point threshold sits almost exactly at
++2.4 sd above the pooled mean — close enough that the series' single FAIL
+(11.21) is not distinguishable from pure run-to-run noise at a 3-sigma
+level, and the rep immediately before it (9.80, also `app1-idle`) already
+sat within half a point of the cutoff. That FAIL was entirely driven by one
+scenario's structurally wider noise band (above), not by four of the five
+scenarios, whose full 20-rep observed range (2.36–5.39) never comes
+remotely close to 10.
+
+**Recommendation (not applied in this ticket, per its own instructions):
+raise the global threshold to 12 points.** This clears the full observed
+range of all 25 threshold-scored reps (max 11.21) with a point of margin,
+costs essentially nothing against the four well-behaved scenarios (whose
+observed ceiling, 5.39, is still more than 2× under even the current 10),
+and tracks the data-derived `mean + 3·sd ≈ 11.5` figure rather than a round
+number chosen before any repeatability data existed. A more surgical
+alternative — leave the global constant at 10 and give `app1-idle`
+specifically (and any other scenario with a worker-count ratio as extreme as
+its 6.5:1) a documented, scenario-specific allowance, the same way
+`app1-alone` and `asymmetric-demand` already get structural carve-outs from
+the symmetric deviation check — would preserve the current threshold's
+sensitivity everywhere else, but needs its own ticket: this one data point
+isn't enough to size a second constant, only to show the first one is a
+closer call than it looks from any single run.
+
+### Cluster left as found
+
+Confirmed from the EPP's own live `/metrics` (not the repo manifest) after
+the sweep finished, same method as every prior scored scenario in this
+series:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          6h44m
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-bsl76   1/1     Running   0          4h2m
+# from the last run's own metrics-after.txt (EPP's own echoed config):
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app1"} 20
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app2"} 10
+llm_d_epp_maas_fairness_configured_weight{fairness_id="end-users"} 65
+llm_d_epp_maas_fairness_configured_weight{fairness_id="unclassified"} 5
+llm_d_epp_maas_fairness_enforcing 1
+```
+
+`replicas: 2` matches `deploy/poc/09-vllm-gpu.yaml`; weights and `enforcing`
+match the live ConfigMap exactly (the committed `deploy/epp-config.yaml`
+ships `enforce: false` as its documented shadow-mode default — see
+"Reproducing," below — the live cluster has run patched to `enforce: true`,
+"the live default," since earlier tickets in this series; this ticket never
+touched that patch either way). No scenario in this sweep edits the
+LLMInferenceService spec, weights, or replica count — nothing needed
+restoring beyond deleting each scenario's own `maas-loadgen` Job before the
+next one started, same convention as every prior run.
+
+Raw results: `results/<timestamp>-uni139-<scenario>-r<1-5>/` (35
+directories — report, loadgen log, metric snapshots/timeseries, client
+request summary, EPP container log, each).
+
+**Not proven here:** why `app1-idle`'s cold start varies in duration rep to
+rep (GPU scheduler/batching jitter is the suspect, per "UNI-133," above, but
+not instrumented or isolated here); whether a longer run (the same
+untested lever "UNI-133" left open) would shrink that scenario's noise band
+by diluting the cold-start window, or whether the recommended 12-point
+threshold would hold up over a larger sample than 5 reps. The
+`asymmetric-demand` PASS/UNCONTENDED knife-edge is described, not fixed —
+its own threshold constant (`uncontended_threshold_seconds: 1.0`) is a
+different lever than the one this ticket was scoped to evaluate.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

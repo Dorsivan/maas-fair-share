@@ -679,26 +679,26 @@ binary's own startup log confirms `commit-sha: fc27130f0703b8228127a4040eb160567
 matching `HEAD` exactly. That proves the digest is genuinely pullable from outside the
 cluster's internal registry, by the same credential path the live deployment already uses.
 
-**What was not re-verified: the fairness split against this exact digest, live.** Rolling
-the change out to the actual `LLMInferenceService` (`oc apply` or `oc patch`, either one) is
-blocked right now by the same stale `MutatingWebhookConfiguration` described above in "The
-stale webhook that blocked all of this" — it currently rejects every create *and* update to
-any `LLMInferenceService` in the cluster, not something specific to this change, and deleting
-it is a cluster-scoped action outside what this role can even read
-(`mutatingwebhookconfigurations` is not namespace-scoped; `auth can-i` returns `no`). Since
-the plugin source is byte-for-byte unchanged from what Run 1–3 tested, there is no reason to
-expect a different split — but that is an inference from unchanged source, not a repeated
-measurement, and the next person who can clear that webhook should re-run at least the
-sized-worker enforce case against the now-committed digest to close that inference out.
+**The fairness split against this exact digest, live: now re-verified (UNI-97, 2026-11-01).**
+Rolling the change out to the actual `LLMInferenceService` was blocked for a time by the same
+stale `MutatingWebhookConfiguration` described above in "The stale webhook that blocked all of
+this," which regressed after this section was first written and needed a second cluster-admin
+clearance — see "UNI-97: repointed to Quay, verified live," below, for the full sequence. Once
+cleared, `maas-vllm-gpu` was repointed at this digest and a `full-contention` run against it
+matched a same-day pre-repoint baseline within run-to-run noise (≤0.9pt per group). The
+inference from unchanged source that this paragraph originally relied on is now a repeated
+measurement, not just an inference.
 
-### UNI-97: the webhook regressed, so the live repoint is still not done
+### UNI-97: repointed to Quay, verified live
 
-Picked up the item above on 2026-10-29. Progress and a new blocker, same shape as before:
+Picked up the item above on 2026-10-29, blocked on a regressed webhook, resumed and finished
+on 2026-11-01 once that was cleared. Full sequence below.
 
-**Digest/commit bookkeeping (done).** `bc/maas-epp` build 4 (2026-10-20, the build behind the
-live digest `sha256:5ef5df2776364e6161f91e5a3df0fbed9a4751bde847658af51923b1eded7f40`) built
-commit `e86c3ee4e411d663ac207df66579372bdae7a114`. `bc/maas-epp-quay-publish-1` (2026-10-22,
-behind the Quay digest `sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135`)
+**Digest/commit bookkeeping (done 2026-10-29).** `bc/maas-epp` build 4 (2026-10-20, the build
+behind the then-live digest
+`sha256:5ef5df2776364e6161f91e5a3df0fbed9a4751bde847658af51923b1eded7f40`) built commit
+`e86c3ee4e411d663ac207df66579372bdae7a114`. `bc/maas-epp-quay-publish-1` (2026-10-22, behind
+the Quay digest `sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135`)
 built `fc27130f0703b8228127a4040eb160567000bc27`. `e86c3ee` is an ancestor of `fc27130`
 (confirmed with `git merge-base --is-ancestor`), and `git log e86c3ee..fc27130 -- cmd/ pkg/
 Dockerfile.epp go.mod go.sum` is empty — so the two digests differ only because `bc/maas-epp`
@@ -707,33 +707,17 @@ built with the Dockerfile's default `COMMIT_SHA=unknown`/`BUILD_REF=` ldflags wh
 of any source drift. **No rebuild was needed**; the already-published Quay digest is the same
 plugin logic as what's running.
 
-**Pull secret (confirmed, already provisioned).** Re-verified today that
-`quay.io/rh-ee-dsivan/maas-fair-share` is private (anonymous `/v2/.../manifests/...` returns
-401; the `quay-maas-pull` secret's own credential returns 200 for this exact digest). That
-secret is already attached to `maas-vllm-gpu-epp-sa`'s `imagePullSecrets`, so nothing new was
-needed on this front either — matches the "no new pull-secret work" finding above.
+**Pull secret (confirmed, already provisioned).** `quay.io/rh-ee-dsivan/maas-fair-share` is
+private (anonymous `/v2/.../manifests/...` returns 401; the `quay-maas-pull` secret's own
+credential returns 200 for this exact digest). That secret is already attached to
+`maas-vllm-gpu-epp-sa`'s `imagePullSecrets`, so nothing new was needed on this front — matches
+the "no new pull-secret work" finding above, and this was borne out live by the repoint below
+(the new pod's `Pulled` event shows a successful pull with no manual intervention).
 
-**Baseline captured against the current (pre-repoint) config.** `full-contention` scenario,
-`enforce: true`, `WORKERS=32` (equal across tenants), 240s, against the live in-cluster-registry
-digest:
-
-| group | weight | requests | expected % | observed % | deviation (pts) |
-|---|---|---|---|---|---|
-| app1 | 20.0 | 1081 | 21.1% | 30.1% | +9.1 |
-| app2 | 10.0 | 1127 | 10.5% | 31.5% | +21.0 |
-| end-users | 65.0 | 1350 | 68.4% | 38.3% | **-30.1** |
-
-Verdict: **FAIL** (end-users exceeds the 10-point threshold). This is the known equal-worker
-shape, not a new problem — see "What this means for a load test, and for an SLA" above: equal
-`WORKERS` across tenants doesn't size end-users' queue depth enough to pull its full 65% share.
-It is a baseline to diff against, not a target to hit. Full report:
-`results/20261029T162814Z-uni97-baseline/fairness-report.md` (gitignored, not committed —
-numbers reproduced here per repo convention).
-
-**Blocked again: the stale-webhook fix from UNI-29 didn't stick.** Attempted the repoint —
-`oc patch` (both JSON-patch and merge-patch) and `oc apply --dry-run=server` against
-`llminferenceservice/maas-vllm-gpu`, changing only the scheduler image to the Quay digest.
-All three rejected with the exact same error UNI-29 already diagnosed and fixed once:
+**First blocker (2026-10-29): the stale-webhook fix from UNI-29 didn't stick.** Attempted the
+repoint — `oc patch` (both JSON-patch and merge-patch) and `oc apply --dry-run=server` against
+`llminferenceservice/maas-vllm-gpu`, changing only the scheduler image to the Quay digest. All
+three rejected with the exact same error UNI-29 already diagnosed and fixed once:
 
 ```
 failed calling webhook "connection-llmisvc-v1alpha2.odh-model-controller.opendatahub.io":
@@ -741,24 +725,74 @@ failed calling webhook "connection-llmisvc-v1alpha2.odh-model-controller.opendat
 ```
 
 Reproduced identically against `maas-vllm-cpu` too (a one-field annotation patch, unrelated to
-this change), and the `odh-model-controller` pod now running (`redhat-ods-applications`,
-started 2026-10-29T15:16:37Z) is healthy and reconciling normally — this is the admission
-webhook, not the controller being down. Per "The stale webhook that blocked all of this"
-above, deleting the stale `MutatingWebhookConfiguration` fixed this exact failure on
-2026-10-22, and the 3.4.4 operator recreated a correct 3-webhook version automatically within
-seconds. Either that fix didn't survive (operator/CSV reconcile re-applied the 3.5.0-era
-5-webhook config), or a separate installation path recreated the same stale object. This
-role's token still cannot `get`/`list`/`delete`
-`mutatingwebhookconfigurations.admissionregistration.k8s.io` at the cluster scope (confirmed
-again today) — same boundary as before, needs the same kind of one-time cluster-scoped
-intervention to clear.
+this change) — this rejected every write to every `LLMInferenceService` in the cluster, not
+something caused by this change. This role's token cannot `get`/`list`/`delete`
+`mutatingwebhookconfigurations.admissionregistration.k8s.io` at the cluster scope, so clearing
+it needed a one-time cluster-admin action — the same shape of fix UNI-29 already used once.
+That action was requested on the ticket and completed by an operator before 2026-11-01;
+`oc apply --dry-run=server` against `maas-vllm-gpu` and `maas-vllm-cpu` both succeeded cleanly
+once resumed, confirming the fix without this role ever reading the webhook object itself.
 
-**Net state: still not repointed live.** The repo manifests (`deploy/llmisvc.yaml`,
-`deploy/poc/09-vllm-gpu.yaml`) already pin the Quay digest from UNI-29 and need no further
-edit. `llminferenceservice/maas-vllm-gpu` itself is still running the in-cluster-registry
-digest. Once the webhook is cleared, the remaining work is: apply the image change, confirm
-the scheduler pod pulls via `quay-maas-pull` and goes `1/1`, then re-run `full-contention`
-with `LABEL` distinguishing it from the baseline above and diff the two reports.
+**A concurrent problem: the 2026-10-29 baseline no longer matched the scenario it was meant to
+diff against.** The baseline captured that day (`full-contention`, equal `WORKERS=32` across
+every tenant, FAIL — end-users at 38.3% against a 68.4% target, -30.1pt) used the *original*
+equal-worker sizing. [UNI-103](/UNI/issues/UNI-103) landed a few hours later, the same day, and
+resized `full-contention`'s per-tenant workers to `32/32/128` (app1/app2/end-users) specifically
+to fix that equal-worker shape — see "What this means for a load test, and for an SLA" above.
+By the time this ticket resumed on 2026-11-01, `full-contention` no longer offered the load
+shape the 2026-10-29 baseline measured, so diffing a post-repoint run against it would have
+confounded two independent changes (registry **and** worker sizing) instead of isolating the
+one this ticket is about. Recaptured a same-day baseline instead, immediately before the
+repoint, under the resized config that is actually current.
+
+**Baseline, recaptured 2026-11-01, pre-repoint, in-cluster-registry digest.**
+`full-contention`, `enforce: true`, `PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32
+WORKERS_END_USERS=128)`, 240s, against
+`image-registry.openshift-image-registry.svc:5000/maas-fairness-poc/maas-epp@sha256:5ef5df27...`:
+
+| group | weight | requests | expected % | observed % | deviation (pts) |
+|---|---|---|---|---|---|
+| app1 | 20.0 | 550 | 21.1% | 15.9% | -5.2 |
+| app2 | 10.0 | 457 | 10.5% | 13.3% | +2.7 |
+| end-users | 65.0 | 2244 | 68.4% | 70.8% | +2.4 |
+
+Verdict: **PASS**. Full report: `results/20261101T134535Z-uni97-prerepoint-baseline/fairness-report.md`
+(gitignored, not committed — numbers reproduced here per repo convention).
+
+**Repoint applied.** `oc patch llminferenceservice/maas-vllm-gpu --type merge` set
+`spec.router.scheduler.template.containers[0].image` to
+`quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135`.
+The controller rolled a new scheduler pod automatically; its `Pulled` event confirms
+`Successfully pulled image "quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a7..." in 1.032s`,
+and `LLMInferenceService.status.conditions` returned to all-`True`/`Ready` within ~40s of the
+patch. `deploy/llmisvc.yaml` and `deploy/poc/09-vllm-gpu.yaml` already carried this digest
+(from UNI-29), so no manifest edit was needed — the live object now matches what a clean
+checkout of `main` deploys.
+
+**Re-run, post-repoint, Quay digest, same scenario, same config, immediately after.**
+
+| group | weight | requests | expected % | observed % | deviation (pts) |
+|---|---|---|---|---|---|
+| app1 | 20.0 | 573 | 21.1% | 16.8% | -4.3 |
+| app2 | 10.0 | 441 | 10.5% | 13.1% | +2.5 |
+| end-users | 65.0 | 2257 | 68.4% | 70.2% | +1.8 |
+
+Verdict: **PASS**. Full report: `results/20261101T135250Z-uni97-postrepoint/fairness-report.md`
+(gitignored, same convention).
+
+**Diff: same verdict, per-tenant shares agree within run-to-run noise.** Every group's
+deviation moved by ≤0.9pt between the two runs (app1 -5.2→-4.3, app2 +2.7→+2.5, end-users
++2.4→+1.8) — smaller than the spread already seen between repeated runs of this scenario on
+this backend elsewhere in this document. The registry the EPP pulls from changed; the measured
+fairness behaviour did not.
+
+**Net state: done.** `llminferenceservice/maas-vllm-gpu` runs the Quay image live. The POC's
+single largest air-gap gap — a measured configuration that depended on an in-cluster-only
+image reference — is closed: the image under test is now the same image a disconnected mirror
+would carry. Registry, digest and the pull-secret requirement are documented above in "The EPP
+image above was not transferable, and `main` didn't deploy it — now fixed"; that section's
+registry/digest/secret facts are unchanged by this update, only the "not yet re-verified live"
+caveat it ends on is resolved by the live re-run just above.
 
 ## GPU test suite — four results
 

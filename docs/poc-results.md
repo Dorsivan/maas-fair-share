@@ -1898,6 +1898,83 @@ the harness mechanism works and produces correct EPP-side classification,
 not to produce a scenario verdict. D2's `enduser-foo` instance specifically
 cannot be attempted at all until the board resolves the missing grant.
 
+## UNI-131: A1, `app2-alone` — the lowest-weight tenant gets the whole pool when alone
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, first case, simplest in the
+chain. `app1-alone` ([UNI-54](/UNI/issues/UNI-54)) already showed the
+highest-weight tenant is never capped when it is the only one offered; this
+is the same check for `app2` (weight 10, the lowest of the three real
+tenants), to rule out the capping logic treating "lowest weight" as a special
+case. New `app2-alone` scenario added to `deploy/poc/15-fairness-benchmark.sh`
+(`TENANTS="app2"`, 32 workers, no per-tenant overrides — identical shape to
+`app1-alone`, tenant swapped).
+
+**Setup:** solo `app2`, 32 workers, 240s, live against `maas-vllm-gpu`
+(2 replicas, llama-3-1-8b), `enforce: true`.
+**Expected:** app2 receives ~100% of delivered service (the solo-scenario bar
+is request success rate, not token share — see `app1-alone`'s own writeup
+above for why `contended_service_tokens_total` is correctly zero with nobody
+to contend against).
+**Observed:** 5403 requests, 200=5385/500=18 (99.7% success) — clears the 90%
+bar. Throughput essentially matches the most recent `app1-alone` run
+([UNI-103](/UNI/issues/UNI-103), same 240s/32-worker shape): 5403 vs. 5421
+requests, p50 1.4s vs. 1.4s, p95 1.7s vs. 1.8s.
+**Verdict: PASS.**
+
+**This run surfaced a real parser regression, found and fixed as part of
+this ticket.** The first pass through `15-fairness-report.py` returned
+`FAIL — "no group was offered any load"` despite the loadgen pod having
+actually sent all 5403 requests. Cause: [UNI-129](/UNI/issues/UNI-129) added
+a `custom=${W_CUSTOM}` field to `deploy/poc/04-loadgen.yaml`'s
+`load: tenants=... workers ...` log line (between `end-users=N` and
+`duration=Ns`), but `15-fairness-report.py`'s `TENANTS_LINE` regex was never
+updated to tolerate it — the whole line stopped matching, so
+`offered_workers` silently fell back to all zeros for every group, every
+scenario, going forward. `15-fairness-report-test.py`'s synthetic fixtures
+never exercise the real log format (`loadgen_log()` doesn't emit `custom=`
+either), so the test suite's 20/20-green status gave no warning. This is the
+first scenario benchmark run since UNI-129 landed (`ab2729f`), so no
+previously-`done` ticket's recorded verdict is affected — but every
+remaining case in this chain (UNI-132 onward) would have hit the same false
+FAIL. Fixed by making the `custom=` field optional-and-skipped in the regex,
+and added `test_tenants_line_tolerates_custom_identity_field` (real log
+shape, including `custom=`) to `15-fairness-report-test.py` so this can't
+regress silently again; full suite re-run green (21/21). The report was then
+regenerated from this run's own saved raw artifacts
+(`metrics-before.txt`/`metrics-after.txt`/`loadgen.log`/
+`metrics-timeseries.txt`/`timeline-config.json`) — no second GPU run was
+needed, since `15-fairness-report.py` is a pure function of those files (see
+its own module docstring).
+
+**Cluster left as found.** `app2-alone` sets no per-tenant override and
+triggers no chaos event, so the benchmark script never touches the
+LLMInferenceService spec or the EPP's weight config for this scenario —
+confirmed, not assumed:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          82m
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-6gkq5   1/1     Running   0          82m
+```
+
+`replicas: 2` matches `deploy/poc/09-vllm-gpu.yaml`. The completed
+`maas-loadgen` Job was left in place (same convention as every prior scored
+scenario in this repo — the next benchmark run deletes it unconditionally
+before creating its own, `15-fairness-benchmark.sh` line 359).
+
+Raw results: `results/20261101T170012Z-uni131-app2-alone/` (report, loadgen
+log, metric snapshots/timeseries, client-request summary, EPP container log).
+
+**Not proven here:** multi-tenant contention behaviour involving `app2` —
+this case only shows it is uncapped when alone, same scope boundary
+`app1-alone` set for `app1`. Whether `app2` holds its weighted share under
+contention is covered by the other named scenarios (`full-contention`,
+`end-users-idle`, etc.), not re-litigated here.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

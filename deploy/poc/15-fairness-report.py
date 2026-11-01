@@ -83,6 +83,8 @@ LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 TENANTS_LINE = re.compile(
     r'load: tenants=\[(?P<tenants>.*?)\] '
     r'workers app1=(?P<app1>\d+) app2=(?P<app2>\d+) end-users=(?P<end_users>\d+) '
+    r'(?:custom=\d+ )?'  # UNI-129 added this field to 04-loadgen.yaml's run.sh;
+                         # it is not a GROUPS member, so it is skipped, not captured.
     r'duration=(?P<duration>\d+)s'
 )
 TABLE_ROW = re.compile(r'^(\S+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(.+)$')

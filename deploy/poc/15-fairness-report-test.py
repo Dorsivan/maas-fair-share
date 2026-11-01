@@ -35,8 +35,9 @@ def write(tmp, name, content):
     return path
 
 
-def loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows):
-    lines = [f"load: tenants=[{tenants}] workers app1={w_app1} app2={w_app2} end-users={w_end} duration={duration}s"]
+def loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows, w_custom=None):
+    custom_field = f"custom={w_custom} " if w_custom is not None else ""
+    lines = [f"load: tenants=[{tenants}] workers app1={w_app1} app2={w_app2} end-users={w_end} {custom_field}duration={duration}s"]
     lines.append("load: done.")
     lines.append(f"{'TENANT':<12} {'TOTAL':<7} {'P50_SEC':<9} {'P95_SEC':<9} STATUSES")
     for group, total, p50, p95, statuses in rows:
@@ -47,10 +48,10 @@ def loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows):
 
 def run_build(tmp, *, tokens_before, tokens_after, tenants, w_app1, w_app2, w_end,
               rows, threshold_points=10.0, duration=240, scenario="test-scenario",
-              control=False):
+              control=False, w_custom=None):
     before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_before)
     after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON + tokens_after)
-    log = write(tmp, "loadgen.log", loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows))
+    log = write(tmp, "loadgen.log", loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows, w_custom=w_custom))
     return fairness_report.build_report(
         scenario=scenario,
         enforce=True,
@@ -208,6 +209,28 @@ def test_solo_group_passes_on_success_rate_not_token_share():
         assert by_group["app1"]["expected_share_pct"] is None
         assert by_group["app1"]["observed_share_pct"] is None
         assert by_group["app1"]["deviation_pts"] is None
+
+
+def test_tenants_line_tolerates_custom_identity_field():
+    # UNI-129 added a `custom=N` field to 04-loadgen.yaml's run.sh log line,
+    # between `end-users=N` and `duration=Ns`. Found on UNI-131: the real
+    # loadgen.log (which always includes this field now) stopped matching
+    # TENANTS_LINE entirely, so offered_workers silently fell back to all
+    # zeros and every run reported "no group was offered any load" instead
+    # of the correct verdict. This must parse exactly like the no-custom-
+    # field case.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = 'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 500\n'
+        tokens_after = 'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 500\n'
+        rows = [("app2", 5403, "1.40", "1.70", "200=5385 500=18")]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app2", w_app1=32, w_app2=32, w_end=32, rows=rows, w_custom=32,
+        )
+        assert report["verdict"]["result"] == "PASS", report["verdict"]
+        assert report["verdict"]["solo_group"] == "app2"
+        by_group = {g["group"]: g for g in report["groups"]}
+        assert by_group["app2"]["offered_workers"] == 32
 
 
 def test_solo_group_fails_on_low_success_rate():

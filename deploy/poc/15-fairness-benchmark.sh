@@ -60,6 +60,10 @@
 #                          and it does not count toward this script's exit
 #                          code or the suite's pass/fail bar.
 #   app1-alone             TENANTS="app1" -- must receive ~100% of the pool.
+#   app2-alone             TENANTS="app2" -- must receive ~100% of the pool.
+#                          UNI-131: app1-alone only shows the highest-weight
+#                          tenant is uncapped when alone; this is the same
+#                          check for the lowest-weight tenant.
 #   asymmetric-demand      WORKERS_APP1=32, WORKERS_APP2=0,
 #                          WORKERS_END_USERS=2 -- the exact commented-out
 #                          example in 04-loadgen.yaml's per-tenant-override
@@ -117,7 +121,7 @@
 # deploy/poc/16-loadgen-identity-variants.sh and the runbook section above.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone asymmetric-demand}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone asymmetric-demand}"
 LABEL="${2:-$SCENARIO}"
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -205,12 +209,20 @@ case "$SCENARIO" in
     TENANTS="app1"
     PER_TENANT_OVERRIDES=()
     ;;
+  app2-alone)
+    # UNI-131: mirror of app1-alone for the lowest-weight tenant. Same
+    # default WORKERS (32, the "usual over-offering" count every solo
+    # scenario uses), no per-tenant override needed with only one tenant
+    # offered.
+    TENANTS="app2"
+    PER_TENANT_OVERRIDES=()
+    ;;
   asymmetric-demand)
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=0 WORKERS_END_USERS=2)
     ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone asymmetric-demand)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone asymmetric-demand)" >&2
     exit 1
     ;;
 esac

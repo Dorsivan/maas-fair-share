@@ -127,6 +127,31 @@
 #                          15-fairness-report.py's "UNCONTENDED" verdict
 #                          (neither PASS nor FAIL) is this scenario's correct
 #                          result, not a weighted-split score.
+#   cache-heavy-vs-cache-cold
+#                          TENANTS="app1 app2", per-tenant workers 64/32 --
+#                          UNI-136: C8, cache-heavy vs cache-cold tenant, the
+#                          evidence for the cachedInputTokenWeight decision
+#                          (Outstanding item 2, docs/poc-results.md).
+#                          CACHE_SHAPE_APP1=hot (a byte-identical shared
+#                          prefix, deploy/poc/10-cache-profile.yaml's app1
+#                          shape) vs CACHE_SHAPE_APP2=cold (fully unique
+#                          prompts every request, that file's app2/control
+#                          shape) -- both run at the live default
+#                          cachedInputTokenWeight: 1.0, so neither is
+#                          discounted for its cache hits. Same 64/32 (2:1)
+#                          sizing as end-users-idle's app1:app2 pair, the only
+#                          existing scenario already proven to over-offer both
+#                          sides of this exact pairing (20:10 weight ratio).
+#                          Run this scenario with the EPP pod freshly
+#                          restarted (so prompt_tokens_cached_ratio -- a
+#                          cumulative-since-process-start Gauge, not scoped to
+#                          one run -- reads clean); 15-fairness-benchmark.sh
+#                          does not do this automatically. This is a
+#                          characterisation, not a scored case (the ticket
+#                          asks for the split by charged tokens/request
+#                          count/cache ratio, not a PASS/FAIL), so it runs
+#                          with --control to report the numbers without
+#                          scoring them against the weighted-split threshold.
 #
 # Per-tenant worker sizing (see docs/runbook.md "Per-tenant worker sizing
 # and the saturation check" for the full method): every ACTIVE tenant in a
@@ -176,7 +201,7 @@
 # deploy/poc/16-loadgen-identity-variants.sh and the runbook section above.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold}"
 LABEL="${2:-$SCENARIO}"
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -320,8 +345,18 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=6 WORKERS_APP2=6 WORKERS_END_USERS=26)
     ;;
+  cache-heavy-vs-cache-cold)
+    # UNI-136: C8. Same app1:app2 pairing and 64/32 sizing as end-users-idle
+    # (the only existing scenario already proven to over-offer both sides of
+    # this exact 20:10 weight ratio) -- the only new thing is each tenant's
+    # cache-hit shape, not its worker count. See the header comment above for
+    # the full rationale, including why this runs as a control.
+    TENANTS="app1 app2"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=64 WORKERS_APP2=32 CACHE_SHAPE_APP1=hot CACHE_SHAPE_APP2=cold)
+    IS_CONTROL="true"
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold)" >&2
     exit 1
     ;;
 esac

@@ -922,6 +922,70 @@ the mint call used (a bare `Authorization`-only `DELETE` 500s).
 
 ---
 
+### Cache-shape profile harness (UNI-136)
+
+C8 needs two tenants in the *same* run with deliberately different cache-hit
+profiles -- every scenario before this ticket deliberately sent every tenant
+the identical prompt shape, so cache effects would not confound the
+weighted-split measurement (see "Scenario matrix" and "Per-group
+cache-hit profile" in `docs/poc-results.md`). `CACHE_SHAPE_APP1` /
+`CACHE_SHAPE_APP2` / `CACHE_SHAPE_END_USERS` (unset = unchanged, the global
+`PROMPT_WORDS_MIN`/`MAX` shape applies to that tenant as before) add that:
+
+| value | what it sends |
+|---|---|
+| `hot` | a byte-identical 160-word shared prefix plus a short unique tail -- same construction as `deploy/poc/10-cache-profile.yaml`'s app1 "fixed" shape |
+| `cold` | a fully unique 40-word body every request, no shared prefix at all -- that file's app2/control shape |
+
+`15-fairness-benchmark.sh`'s `cache-heavy-vs-cache-cold` scenario sets
+`CACHE_SHAPE_APP1=hot CACHE_SHAPE_APP2=cold` via the same
+`PER_TENANT_OVERRIDES` mechanism as `WORKERS_APP1`/`APP2` (no new
+pass-through env list needed -- these are scenario-fixed, not meant to be
+overridden ad hoc at invocation time the way the UNI-128 profile knobs are).
+
+**Restart the EPP pod before the run, not during.**
+`llm_d_epp_maas_fairness_prompt_tokens_cached_ratio` is a cumulative Gauge
+(`groupState.cachedRatio()`, `pkg/fairness/weightedlas/state.go`) --
+cached/total prompt tokens since the EPP **process** started, not scoped to
+one run. Any prior run that sent the same highly-cacheable prompt to every
+tenant (every scenario before this ticket did) leaves the ratio reading
+high for every group, `cold` included, until the process restarts. Delete
+the EPP scheduler pod and wait for `Ready` *before* invoking the benchmark
+script -- `15-fairness-benchmark.sh` resolves `EPP_POD` fresh at its own
+start, so a restart done first is invisible to its mid-run restart
+detection (which would otherwise mark the run's deltas invalid). A restart
+also resets `configured_weight`/`enforcing`, which the EPP re-populates
+from the live config immediately on startup -- confirm they read correctly
+again before starting the run, same as any other config-touching step.
+
+**`oc` must be on `PATH`** before invoking `15-fairness-benchmark.sh`/
+`13-loadgen-poisson.sh` directly: both scripts build `$OC` as `oc
+--token=...`, a bare `oc` as the first word, so whatever shell runs them
+needs the real binary on `PATH` (e.g. `PATH=/paperclip/bin:$PATH` in this
+environment). Without it, the script fails loudly with "command not found"
+on its own first `$OC` call (clearing out any stale Job from a prior run),
+`set -euo pipefail` stops it there, and nothing on the cluster is touched
+for this attempt -- but it is still easy to misread as "`oc` isn't
+installed" rather than "not on `PATH` for this shell."
+
+**Reading the result.** `15-fairness-report.py` added two fields to each
+group's row: `prompt_tokens_cached_ratio` (an `after`-snapshot read, not a
+before/after delta -- it is already run-scoped once the EPP was freshly
+restarted, per above) and `dispatch_total` (a normal before/after delta,
+same mechanism as `contended_seconds`) -- the latter because the panel
+table above already names `dispatch_total` as this case's own metric for
+"request count," as an EPP-side cross-check independent of the loadgen's
+own `requests_total`/`delivered_tokens`/share, which were already in every
+report. Run
+this case with `--control` (`15-fairness-benchmark.sh` sets this
+automatically for `cache-heavy-vs-cache-cold`): the ticket asks for a
+characterisation (split by charged tokens, request count, and cache ratio),
+not a PASS/FAIL, and the weighted-split threshold is not the question this
+case is answering. See `docs/poc-results.md`'s UNI-136 section for the full
+result and what it says about the `cachedInputTokenWeight` decision.
+
+---
+
 ## Load the fairness dashboard into the live Grafana
 
 `deploy/grafana-dashboard.yaml` ships the dashboard JSON as a ConfigMap

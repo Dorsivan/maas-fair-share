@@ -2420,6 +2420,168 @@ finding that contention does not vanish at 20% is a single data point, not
 a curve — see "What surprised us," above, for the sweep that would be
 needed to generalize it.
 
+## UNI-136: C8, `cache-heavy-vs-cache-cold` — evidence for the `cachedInputTokenWeight` decision
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, first case in the "C" group
+(dispatch vs token share / cache accounting). This is the task that feeds
+Outstanding item 2, below, and [UNI-91](/UNI/issues/UNI-91): does leaving
+`cachedInputTokenWeight` at its default `1.0` over-charge a tenant whose
+traffic is highly cacheable relative to the GPU work it actually causes?
+Unlike "Per-group cache-hit profile," above (the three-tenant,
+`10-cache-profile.yaml`-only run that first measured the 6.3%/87.7%/96.4%
+spread), this case runs the differentiated shapes through the scored
+benchmark harness itself, so the question can be answered in the same units
+(`contended_service_tokens_total`) the live policy actually charges in.
+
+**Harness change required.** `04-loadgen.yaml` previously sent every tenant
+the identical prompt shape (deliberately — "uniform traffic so cache
+effects do not confound," per the Scenario matrix above); there was no way
+to make two tenants in the *same* run cache-differently. This ticket adds
+`CACHE_SHAPE_APP1`/`CACHE_SHAPE_APP2`/`CACHE_SHAPE_END_USERS` (unset =
+unchanged global shape): `hot` sends a byte-identical 160-word shared
+prefix plus a short unique tail (the same construction as
+`10-cache-profile.yaml`'s app1 "fixed" shape), `cold` sends a fully unique
+40-word body every request (that file's app2/control shape). A matching
+`cache-heavy-vs-cache-cold` scenario was added to
+`15-fairness-benchmark.sh`, and `15-fairness-report.py` now reads
+`llm_d_epp_maas_fairness_prompt_tokens_cached_ratio` into each group's row
+(it already captured everything else this case needs — `requests_total`
+and `delivered_tokens`/share were already in every report).
+
+**The cached-ratio metric needed a clean EPP first.** It is a cumulative
+Gauge (`groupState.cachedRatio()`, `pkg/fairness/weightedlas/state.go`) —
+cached/total prompt tokens since the EPP **process** started, not scoped to
+one run. Checked live before this run: every group already read 96-99%,
+including `app2` (the intended cache-cold control) — contaminated by every
+`full-contention`/A1-A6 run since the last EPP restart, all of which sent
+the *same* fixed, highly-cacheable 1200-word prompt to every tenant. Fixed
+by deleting the EPP scheduler pod and waiting for its replacement to be
+Ready *before* starting the benchmark (not during — a mid-run restart is
+the thing `15-fairness-report.py` already treats as invalidating a run).
+Confirmed clean afterward (`prompt_tokens_cached_ratio` absent from
+`metrics-before.txt`, i.e. zero history), and confirmed the restart changed
+nothing else: `configured_weight`/`enforcing` read identically before and
+after (20/10/65/5, enforcing=1).
+
+**Setup:** `TENANTS="app1 app2"`, 240s, live against `maas-vllm-gpu` (2
+replicas, llama-3-1-8b), `enforce: true`, `cachedInputTokenWeight: 1.0`
+(live default, unchanged). `WORKERS_APP1=64 WORKERS_APP2=32` — the same 2:1
+over-offer ratio `end-users-idle` already proved saturates this exact
+app1:app2 (20:10) pairing, reused rather than re-derived.
+`CACHE_SHAPE_APP1=hot`, `CACHE_SHAPE_APP2=cold`. Run as a `--control` (the
+ticket asks for a characterisation, not a PASS/FAIL) so the numbers are
+reported without being scored against the weighted-split threshold.
+
+**Observed split:**
+
+| group | weight | requests | request share | charged tokens | charged-token share (expected 66.7/33.3) | `prompt_tokens_cached_ratio` |
+|---|---|---|---|---|---|---|
+| app1 (hot) | 20 | 2,383 | 69.5% | 727,921 | 65.1% (dev. -1.5 pts) | **87.6%** |
+| app2 (cold) | 10 | 1,047 | 30.5% | 389,716 | 34.9% (dev. +1.5 pts) | **6.2%** |
+
+(`contended_seconds_total`: 2.0s both groups — genuinely, if lightly,
+contended, not a work-conservation artefact. Status tally: app1
+200=2373/500=10, app2 200=1040/500=7 — a small, sub-0.5% error rate on both
+sides, not investigated further here. The EPP's own `dispatch_total`
+delta — `docs/runbook.md`'s panel table already ties this case to that
+metric specifically — agrees with the client-reported request count to
+within 0.2 points: app1 2,372/3,409 = 69.6%, app2 1,037/3,409 = 30.4%.)
+
+The per-tenant cache ratios (87.6% / 6.2%) reproduce the earlier
+cache-profile measurement (87.7% / 6.3% for the same app1/app2 shapes) to
+within run-to-run noise — the clean-EPP fix above is working as intended.
+
+**Answer to the ticket's question: yes, the cache-heavy tenant is
+over-charged relative to the GPU work it actually uses, at the live
+`cachedInputTokenWeight: 1.0`.** The charged-token split (65.1/34.9) landed
+almost exactly on the configured 20:10 weight ratio **despite** the
+enormous gap in cache profile — because `1.0` applies no discount at all,
+every one of app1's cache-hit prompt tokens is billed identically to a
+cache-miss token. Concretely: of app1's 477,716 prompt tokens, ~87.6%
+(≈418,500) were served from the prefix cache and needed little fresh
+prefill compute, yet all 477,716 counted in full toward its
+`contended_service_tokens_total` share; app2's 266,673 prompt tokens were
+93.8% cache misses, i.e. its charge already tracks its real compute cost
+closely. Re-deriving with `cachedInputTokenWeight: 0.1` (the figure the
+"Per-group cache-hit profile" section above used illustratively) against
+*this* run's actual token counts: app1's effective prompt-token charge
+would fall from 477,716 to ≈101,000 tokens (0.124×477,716 cache-misses at
+full price + 0.876×477,716×0.1 cache-hits at the discounted price) — a
+~79% cut to its prompt-token charge, ~61% cut to its total billed tokens
+including completions (613,392 → 236,717) for **identical delivered work**.
+Under live enforcement that would force app1 to deliver substantially more
+real throughput to hold the same 66.7% entitlement — the same
+"re-pricing... by almost an order of magnitude" the existing section above
+already flagged, now reproduced with a differentiated rather than
+illustrative traffic shape, inside the actual scored harness.
+
+**Request count is not a clean second axis here.** app1's request share
+(69.5%) overshoots its charged-token share (65.1%) because the two groups'
+prompts are not token-matched: app2's 40 nominally-"unique" words
+tokenize to *more* raw tokens per request on average (266,673/1,047 ≈
+254.7) than app1's 160-word natural-language prefix+tail
+(477,716/2,383 ≈ 200.5), despite having fewer nominal words — BPE handles
+common English words far more efficiently than the random
+alphanumeric `wNNNNN` tokens `cold` generates for uniqueness. This does not
+change the direction of the headline cache-ratio finding (6.2% vs 87.6% is
+unaffected by it), but it means request-count share and charged-token share
+answer slightly different questions here and should not be read as two
+measurements of the same thing.
+
+**Actual GPU time, split by tenant: not obtainable.** Confirmed directly,
+not assumed — `docs/runbook.md`'s "Known gaps" already states vLLM's own
+series carry no `fairness_id`/group label, and every `vllm:*` query against
+this run's window (`18:30:25`–`18:34:37Z`) came back with no group
+dimension to split on. Pool-wide numbers for context only (not
+attributable to either tenant): `vllm:num_requests_running` averaged 3.56,
+`vllm:num_requests_waiting` averaged 16.4 (a real backlog existed, matching
+the nonzero `contended_seconds_total` above), zero
+`vllm:num_preemptions_total`, TTFT p50 ≈2.99s, queue-time p50 ≈2.89s.
+
+**Cluster left as found.** The only live change made for this run was the
+pre-run EPP pod restart above (not a config/weight/replica change — nothing
+to restore). Confirmed after the run:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get deployment maas-vllm-gpu-kserve -n maas-fairness-poc -o jsonpath='{.status.readyReplicas}/{.status.replicas}{"\n"}'
+2/2
+$ # from this run's own metrics-after.txt (EPP's own echoed config):
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app1"} 20
+llm_d_epp_maas_fairness_configured_weight{fairness_id="app2"} 10
+llm_d_epp_maas_fairness_configured_weight{fairness_id="end-users"} 65
+llm_d_epp_maas_fairness_configured_weight{fairness_id="unclassified"} 5
+llm_d_epp_maas_fairness_enforcing 1
+```
+
+Matches `deploy/poc/09-vllm-gpu.yaml` (replicas) and `deploy/epp-config.yaml`
+(weights, enforcing) exactly. The completed `maas-loadgen` Job was left in
+place (same convention as every prior scenario). No orphaned `oc logs -f`
+process was left behind (checked against the UNI-169/170 fix by walking
+`/proc/*/cmdline`; this run's own `.capture-oc.pid` no longer corresponds to
+a live process).
+
+Raw results: `results/20261101T183024Z-uni136-cache-heavy-vs-cache-cold/`
+(report JSON/MD, loadgen log, metric snapshots/timeseries, client-request
+summary, EPP container log).
+
+**Grafana time range** (padded ±60s around `run_start`/`run_end`):
+`from=1793557765000&to=1793558137000` —
+https://grafana-grafana.apps.ocp.paladinaura.com/d/maas-fairness-gpu-epp/?orgId=1&from=1793557765000&to=1793558137000&var-group=All&var-window=2m
+
+**Not proven here:** only the app1/app2 pairing was run — `end-users`,
+which the original cache-profile measurement found even more cacheable
+(96.4%, the long-shared-prefix multi-turn-chat proxy), was not included in
+this scored run, so there is no three-way or end-users-paired variant of
+this result. GPU time is pool-wide only, never per-tenant, on this metric
+set (see above). This is a single 240s run, not repeated for variance. And
+per the ticket's own framing, this is a characterisation for Outstanding
+item 2's decision, not the decision itself — whether and to what value
+`cachedInputTokenWeight` should actually move, and how the group weights
+would need to be re-derived alongside it, remains "a policy decision," not
+a technical finding this run can settle on its own.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -2427,7 +2589,7 @@ Ordered by how much they would change a conclusion.
 | # | item | why it matters | blocked on |
 |---|---|---|---|
 | — | ~~Calibrate `outputTokenWeight`~~ | **Not a POC gap.** This is a per-environment commissioning step, not a number this repo can ship: it is an efficiency ratio that moves with GPU, model, quantisation, batch size and vLLM version. The deliverable is the procedure in [calibrating-output-token-weight.md](calibrating-output-token-weight.md); run it when commissioning each environment, and re-derive the group weights in the same change | — |
-| 2 | **Decide `cachedInputTokenWeight`** | measured, not theoretical: hit rates span 6.3% to 96.4% across groups, and moving the weight 1.0 -> 0.1 shifted end-users from 56.3% to 70.1% of delivered service while **halving total throughput**. A real lever with a real cost | a policy decision |
+| 2 | **Decide `cachedInputTokenWeight`** | measured, not theoretical: hit rates span 6.3% to 96.4% across groups, and moving the weight 1.0 -> 0.1 shifted end-users from 56.3% to 70.1% of delivered service while **halving total throughput**. A real lever with a real cost. [UNI-136](/UNI/issues/UNI-136) (C8, above) adds the differentiated-shape evidence inside the scored harness itself: at the live `1.0`, a cache-heavy tenant's charged-token share tracks its configured weight almost exactly regardless of its 87.6% cache-hit rate, i.e. it is measurably over-charged relative to the GPU work it actually causes | a policy decision |
 | 3 | **ClusterRole for `llmisvc-controller-manager`** | the LLMInferenceService never reports `Ready`, and the controller is stuck in a failing reconcile so it will not apply future spec edits cleanly. Needs `get/list/watch` on `llm-d.ai` `inferenceobjectives` and `inferencemodelrewrites` | operator-level approval |
 | 4 | **Durable NFD fix** | GPU exposure currently depends on a hand-applied `feature.node.kubernetes.io/pci-10de.present` label per node. Set `deviceLabelFields: [vendor]` on the NodeFeatureDiscovery CR or **every new GPU node will look like broken hardware** | operator-level approval |
 | 5 | **Test on a real RHOAI 3.4 cluster** | three unknowns remain: whether 3.4's controller validates the EndpointPickerConfig, its InferencePool API group, and its tokenizer sidecar (3.5 has no equivalent). The 3.4-shaped preset test covered the flags, not the controller | a 3.4 cluster |

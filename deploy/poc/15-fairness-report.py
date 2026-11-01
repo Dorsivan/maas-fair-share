@@ -368,6 +368,24 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     tokens_after = after.get("llm_d_epp_maas_fairness_contended_service_tokens_total", {})
     contended_seconds_before = before.get("llm_d_epp_maas_fairness_contended_seconds_total", {})
     contended_seconds_after = after.get("llm_d_epp_maas_fairness_contended_seconds_total", {})
+    # UNI-136 (C8): the EPP's own dispatch-opportunity count, per
+    # docs/runbook.md's panel table ("Dispatch share vs token share ... C8")
+    # -- an independent, EPP-side cross-check of requests_total (the
+    # client's own count, from the loadgen log) for the "split by request
+    # count" deliverable. Same before/after delta mechanism as
+    # contended_service_tokens_total above.
+    dispatch_before = before.get("llm_d_epp_maas_fairness_dispatch_total", {})
+    dispatch_after = after.get("llm_d_epp_maas_fairness_dispatch_total", {})
+    # UNI-136 (C8): a Gauge, not a Counter -- cumulative cached/total prompt
+    # tokens since the EPP process started (pkg/fairness/weightedlas/state.go
+    # groupState.cachedRatio()), not scoped to this run. Reading it straight
+    # from the "after" snapshot is only a clean per-run figure when the EPP
+    # was restarted immediately before this run started (so the cumulative
+    # window IS this run); 15-fairness-benchmark.sh does not do this
+    # automatically, so the caller must restart the EPP pod first and record
+    # that it did. A report built without that precondition still shows the
+    # value -- it is just contaminated by whatever traffic preceded it.
+    cached_ratio_after = after.get("llm_d_epp_maas_fairness_prompt_tokens_cached_ratio", {})
 
     all_group_ids = sorted(
         g for g in set(weight_before) | set(weight_after) | set(GROUPS)
@@ -408,6 +426,22 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             epp_restarted = True
             d = 0.0
         contended_seconds_deltas[gid] = d
+
+    # UNI-136 (C8): same before/after delta mechanism as contended_seconds
+    # above, for dispatch_total.
+    dispatch_deltas = {}
+    for gid in all_group_ids:
+        b = dispatch_before.get(gid)
+        a = dispatch_after.get(gid)
+        if a is None:
+            dispatch_deltas[gid] = None
+            continue
+        b = b if b is not None else 0.0
+        d = a - b
+        if d < 0:
+            epp_restarted = True
+            d = 0.0
+        dispatch_deltas[gid] = d
 
     offered_groups = [g for g in GROUPS if offered_workers.get(g, 0) > 0]
     # A single offered group is never "contended" by definition (metrics.go:
@@ -475,6 +509,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "observed_share_pct": observed_pct,
             "deviation_pts": deviation_pts,
             "contended_seconds": contended_seconds_deltas.get(gid),
+            "prompt_tokens_cached_ratio": cached_ratio_after.get(gid),
+            "dispatch_total": dispatch_deltas.get(gid),
         })
 
     # UNI-135: A6 "below capacity, everyone light" -- every tenant offered at
@@ -762,19 +798,23 @@ def render_markdown(report):
     lines.append("")
     lines.append(
         "| group | weight | offered workers | requests | statuses | p50s | p95s | "
-        "delivered tokens | expected % | observed % | deviation (pts) | contended_seconds |"
+        "delivered tokens | expected % | observed % | deviation (pts) | contended_seconds | "
+        "cached ratio | dispatch_total |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for g in report["groups"]:
         def fmt(v, suffix=""):
             return "n/a" if v is None else f"{v:.1f}{suffix}" if isinstance(v, float) else f"{v}{suffix}"
         statuses = ", ".join(f"{k}={v}" for k, v in sorted(g["status_tally"].items())) or "n/a"
+        cached_pct = g["prompt_tokens_cached_ratio"]
+        cached_pct = None if cached_pct is None else cached_pct * 100.0
         lines.append(
             f"| {g['group']} | {fmt(g['configured_weight'])} | {g['offered_workers']} | "
             f"{g['requests_total']} | {statuses} | {fmt(g['p50_sec'])} | {fmt(g['p95_sec'])} | "
             f"{fmt(g['delivered_tokens'])} | {fmt(g['expected_share_pct'], '%')} | "
             f"{fmt(g['observed_share_pct'], '%')} | {fmt(g['deviation_pts'])} | "
-            f"{fmt(g['contended_seconds'], 's')} |"
+            f"{fmt(g['contended_seconds'], 's')} | {fmt(cached_pct, '%')} | "
+            f"{fmt(g['dispatch_total'])} |"
         )
     lines.append("")
     lines.append("## Timeline (UNI-127)")

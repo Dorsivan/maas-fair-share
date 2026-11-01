@@ -62,6 +62,20 @@ data:
     OVERSIZED_PROMPT_WORDS="${OVERSIZED_PROMPT_WORDS:-12000}"
     REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-300}"
 
+    # UNI-136 (C8): per-tenant cache-hit shape, independent of the PROMPT_WORDS_*
+    # knobs above. Unset (the default) means "use the global shape computed
+    # above" -- a plain invocation is unaffected, same contract as every other
+    # knob in this block. "hot" sends a byte-identical shared prefix plus a
+    # short unique tail (same construction as deploy/poc/10-cache-profile.yaml's
+    # app1 "fixed" shape); "cold" sends a fully unique body every request, no
+    # shared prefix at all (that file's app2 "unique"/control shape). This
+    # exists so two tenants in the SAME run can be given deliberately different
+    # cache-hit profiles -- the global PROMPT_WORDS_MIN/MAX shape is identical
+    # for every tenant and cannot do that.
+    CACHE_SHAPE_APP1="${CACHE_SHAPE_APP1:-}"
+    CACHE_SHAPE_APP2="${CACHE_SHAPE_APP2:-}"
+    CACHE_SHAPE_END_USERS="${CACHE_SHAPE_END_USERS:-}"
+
     # UNI-129: identity variants (D1 key rotation, D3 forged header). Both
     # default to this script's pre-UNI-129 behaviour -- two keys, no forged
     # header -- so a plain invocation is unchanged. See docs/runbook.md
@@ -123,7 +137,33 @@ data:
       OVERSIZED_PROMPT="$(build_prompt_words "$OVERSIZED_PROMPT_WORDS")"
     fi
 
+    # UNI-136 (C8): built once, same reasoning as FIXED_PROMPT/OVERSIZED_PROMPT
+    # above -- only when some tenant actually needs the "hot" shape. 160 words
+    # = 40 reps of the 4-word phrase, matching 10-cache-profile.yaml's
+    # APP1_PREFIX (mk 40) exactly, so a group's measured hit rate here is
+    # directly comparable to that already-measured baseline.
+    HOT_PREFIX=""
+    if [ "$CACHE_SHAPE_APP1" = "hot" ] || [ "$CACHE_SHAPE_APP2" = "hot" ] || [ "$CACHE_SHAPE_END_USERS" = "hot" ]; then
+      HOT_PREFIX="$(build_prompt_words 160)"
+    fi
+
     pick_prompt() {
+      local group="${1:-}" cache_shape=""
+      case "$group" in
+        app1)      cache_shape="$CACHE_SHAPE_APP1" ;;
+        app2)      cache_shape="$CACHE_SHAPE_APP2" ;;
+        end-users) cache_shape="$CACHE_SHAPE_END_USERS" ;;
+      esac
+      if [ "$cache_shape" = "hot" ]; then
+        printf '%s question %s%s' "$HOT_PREFIX" "$RANDOM" "$RANDOM"
+        return
+      fi
+      if [ "$cache_shape" = "cold" ]; then
+        local p="" i
+        for i in $(seq 1 40); do p="${p}w$RANDOM "; done
+        printf '%s' "$p"
+        return
+      fi
       if [ -n "$OVERSIZED_PROMPT" ] && [ "$(roll "$OVERSIZED_FRACTION")" = "1" ]; then
         printf '%s' "$OVERSIZED_PROMPT"
         return
@@ -174,7 +214,7 @@ data:
       local tmp http_code latency start end aborted=0 curl_pid abort_flag="" canceller_pid=""
       local forged=0
       local -a curl_args
-      prompt="$(pick_prompt)"
+      prompt="$(pick_prompt "$group")"
       read -r mt_value mt_kind <<< "$(pick_max_tokens)"
       max_tokens_json=""
       [ "$mt_kind" != "omit" ] && max_tokens_json="\"max_tokens\": ${mt_value}, "
@@ -366,6 +406,7 @@ data:
     echo "load: tenants=[${TENANTS}] workers app1=${W_APP1} app2=${W_APP2} end-users=${W_END} custom=${W_CUSTOM} duration=${DURATION}s"
     echo "load: timeline app1=${APP1_START}-${APP1_STOP}s/duty=${APP1_DUTY:-none} app2=${APP2_START}-${APP2_STOP}s/duty=${APP2_DUTY:-none} end-users=${END_USERS_START}-${END_USERS_STOP}s/duty=${END_USERS_DUTY:-none}"
     echo "load: UNI-129 end-users-keys=[${END_USERS_KEYS}] forge-fairness-id-fraction=${FORGE_FAIRNESS_ID_FRACTION} forge-fairness-id-value=${FORGE_FAIRNESS_ID_VALUE} custom-subscription=${CUSTOM_SUBSCRIPTION_NAME:-none}"
+    echo "load: UNI-136 cache-shape app1=${CACHE_SHAPE_APP1:-default} app2=${CACHE_SHAPE_APP2:-default} end-users=${CACHE_SHAPE_END_USERS:-default}"
 
     for t in $TENANTS; do
       case "$t" in
@@ -557,6 +598,16 @@ spec:
             #   value: "app1-production"
             # - name: WORKERS_CUSTOM
             #   value: "8"
+            # UNI-136 (C8): per-tenant cache-hit shape -- "hot" (shared prefix,
+            # see deploy/poc/10-cache-profile.yaml's app1 shape) or "cold"
+            # (fully unique, that file's app2/control shape). Unset = use the
+            # PROMPT_WORDS_MIN/MAX shape above for that tenant, unchanged.
+            # - name: CACHE_SHAPE_APP1
+            #   value: "hot"
+            # - name: CACHE_SHAPE_APP2
+            #   value: "cold"
+            # - name: CACHE_SHAPE_END_USERS
+            #   value: "hot"
             - name: DURATION
               # Several half-lives (halfLifeSeconds: 60). The tabs start empty
               # after every EPP restart, so a run shorter than ~3 half-lives

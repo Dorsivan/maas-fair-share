@@ -45,13 +45,32 @@
 # unavoidable either way. The exact extraction/apply/restart commands for
 # that copy step are in docs/runbook.md, "Load the fairness dashboard into
 # the live Grafana" -- do not reconstruct them by hand from this file; the
-# data key name below has to match exactly. Verified instead, for this
-# ticket's done-when bar, by importing this exact JSON into the live
-# instance via `POST /api/dashboards/db` and querying its panels through
-# Grafana's own `/api/ds/query` pipeline (not a raw Thanos query) -- see the
-# UNI-50 ticket comment for the pasted queries, real output, and scrape
-# timestamps. That import lives in Grafana's emptyDir sqlite and does not
-# survive a pod restart; it is verification evidence, not the deliverable.
+# data key name below has to match exactly.
+#
+# GENERATED -- DO NOT HAND-EDIT THE JSON BELOW (UNI-130). The panels are built
+# by deploy/grafana-dashboard.py; change that file and run
+#     python3 -I deploy/grafana-dashboard.py --write
+# which rewrites only the data block under the key line, leaving this header
+# alone. UNI-130 grew the dashboard from 6 panels to 51 in 12 rows (run
+# overview, PrometheusRule alert states, expected-vs-observed share incl.
+# windowed share over time, normalized_service convergence, contended vs total
+# tokens, truing error / accounting-leak detectors, classification, flow-control
+# queue / wait / shedding per group, traffic and errors, per-group latency,
+# vLLM, EPP health), adds the `group` (multi-select fairness_id) and `window`
+# (share window) template variables, and Prometheus-backed annotations for
+# loadgen Job activity, EPP process start, weight/enforcement changes, vLLM
+# replica changes and MaasFairness* alerts firing. Every panel query was run
+# through the live Grafana's own /api/ds/query (anonymous Viewer, no import) on
+# 2026-11-01 and returned data or a deliberate empty result -- see the UNI-130
+# ticket comment. Panels whose metric has no fairness_id label (pool-level
+# flow-control outcomes, Istio status codes, vLLM series) say so in their
+# description; the provisional in-flight charge is not exported as a metric
+# at all, so no panel can show it.
+#
+# SIZE: `oc apply` stores the whole object in the last-applied-configuration
+# annotation (256 KiB cap). This ConfigMap's annotation is ~170 KB; if the
+# generator grows the JSON much further, switch the generator to compact JSON
+# or load with `oc create`/`oc replace` instead of `apply`.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -70,6 +89,7 @@ data:
     {
       "title": "MaaS Fairness - GPU EPP (maas-vllm-gpu-kserve-router-scheduler)",
       "uid": "maas-fairness-gpu-epp",
+      "description": "Edge-case series dashboard (UNI-130). Set the time range to one run: see docs/runbook.md, 'Find a run on the fairness dashboard'.",
       "tags": [
         "maas-fairness",
         "gpu",
@@ -77,13 +97,15 @@ data:
       ],
       "timezone": "utc",
       "schemaVersion": 39,
-      "version": 1,
+      "version": 2,
       "editable": true,
+      "graphTooltip": 1,
       "refresh": "30s",
       "time": {
         "from": "now-1h",
         "to": "now"
       },
+      "links": [],
       "templating": {
         "list": [
           {
@@ -94,327 +116,186 @@ data:
             "current": {},
             "hide": 0,
             "refresh": 1
+          },
+          {
+            "name": "group",
+            "type": "query",
+            "label": "Group",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "$datasource"
+            },
+            "definition": "label_values(llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}, fairness_id)",
+            "query": {
+              "query": "label_values(llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}, fairness_id)",
+              "refId": "group"
+            },
+            "refresh": 2,
+            "multi": true,
+            "includeAll": true,
+            "allValue": ".*",
+            "current": {
+              "selected": true,
+              "text": [
+                "All"
+              ],
+              "value": [
+                "$__all"
+              ]
+            },
+            "sort": 1,
+            "hide": 0
+          },
+          {
+            "name": "window",
+            "type": "interval",
+            "label": "Share window",
+            "query": "1m,2m,5m,10m,15m",
+            "current": {
+              "selected": true,
+              "text": "2m",
+              "value": "2m"
+            },
+            "auto": false,
+            "hide": 0,
+            "options": [
+              {
+                "selected": false,
+                "text": "1m",
+                "value": "1m"
+              },
+              {
+                "selected": true,
+                "text": "2m",
+                "value": "2m"
+              },
+              {
+                "selected": false,
+                "text": "5m",
+                "value": "5m"
+              },
+              {
+                "selected": false,
+                "text": "10m",
+                "value": "10m"
+              },
+              {
+                "selected": false,
+                "text": "15m",
+                "value": "15m"
+              }
+            ]
+          }
+        ]
+      },
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {
+              "type": "grafana",
+              "uid": "-- Grafana --"
+            },
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          },
+          {
+            "name": "Loadgen job running",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "$datasource"
+            },
+            "enable": true,
+            "iconColor": "blue",
+            "step": "15s",
+            "expr": "max by (job_name) (kube_job_status_active{namespace=\"maas-fairness-poc\", job_name=~\"maas-loadgen.*\"}) > 0",
+            "titleFormat": "loadgen running",
+            "textFormat": "Job {{job_name}}",
+            "tagKeys": "job_name"
+          },
+          {
+            "name": "EPP process start",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "$datasource"
+            },
+            "enable": true,
+            "iconColor": "red",
+            "step": "60s",
+            "expr": "max by (pod) (process_start_time_seconds{job=\"maas-vllm-gpu-epp-service\"}) * 1000",
+            "useValueForTime": true,
+            "titleFormat": "EPP started",
+            "textFormat": "{{pod}} -- fairness counters reset here",
+            "tagKeys": "pod"
+          },
+          {
+            "name": "Weights / enforcement changed",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "$datasource"
+            },
+            "enable": true,
+            "iconColor": "purple",
+            "step": "30s",
+            "expr": "(changes(llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}[1m]) > 0) or (changes(llm_d_epp_maas_fairness_enforcing{job=\"maas-vllm-gpu-epp-service\"}[1m]) > 0)",
+            "titleFormat": "config changed",
+            "textFormat": "{{__name__}} {{fairness_id}}",
+            "tagKeys": "fairness_id"
+          },
+          {
+            "name": "vLLM replica change",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "$datasource"
+            },
+            "enable": true,
+            "iconColor": "orange",
+            "step": "30s",
+            "expr": "changes(kube_deployment_status_replicas_ready{namespace=\"maas-fairness-poc\", deployment=\"maas-vllm-gpu-kserve\"}[1m]) > 0",
+            "titleFormat": "vLLM ready replicas changed"
+          },
+          {
+            "name": "MaaS fairness alerts firing",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "$datasource"
+            },
+            "enable": true,
+            "iconColor": "dark-red",
+            "step": "30s",
+            "expr": "ALERTS{alertname=~\"MaasFairness.*\", alertstate=\"firing\"}",
+            "titleFormat": "{{alertname}} firing",
+            "tagKeys": "alertname,severity"
           }
         ]
       },
       "panels": [
         {
           "id": 1,
-          "type": "table",
-          "title": "Expected vs observed delivered share per group (GPU EPP, selected time range)",
-          "description": "Expected % is computed live from llm_d_epp_maas_fairness_configured_weight (the ConfigMap's weight, echoed as a metric) so this panel never needs a human to remember deploy/poc/00-config.yaml. Observed % is each group's share of llm_d_epp_maas_fairness_contended_service_tokens_total delivered over the selected time range -- the SLI this POC's design doc defines as the real measure of delivered share (only counted while a group was actually contending, per docs/design.md). A group with no contention in this window shows no row, not a 0 -- it was not competing for anything.",
+          "type": "row",
+          "title": "Run overview -- read this row first",
+          "collapsed": false,
+          "panels": [],
           "gridPos": {
-            "h": 10,
+            "h": 1,
             "w": 24,
             "x": 0,
             "y": 0
-          },
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "targets": [
-            {
-              "refId": "A",
-              "datasource": {
-                "type": "prometheus",
-                "uid": "$datasource"
-              },
-              "format": "table",
-              "instant": true,
-              "expr": "100 * llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"} / scalar(sum(llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}))",
-              "legendFormat": "__auto"
-            },
-            {
-              "refId": "B",
-              "datasource": {
-                "type": "prometheus",
-                "uid": "$datasource"
-              },
-              "format": "table",
-              "instant": true,
-              "expr": "100 * sum by (fairness_id) (increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])) / scalar(sum(increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])))",
-              "legendFormat": "__auto"
-            }
-          ],
-          "transformations": [
-            {
-              "id": "joinByField",
-              "options": {
-                "byField": "fairness_id",
-                "mode": "outer"
-              }
-            },
-            {
-              "id": "organize",
-              "options": {
-                "excludeByName": {
-                  "Time 1": true,
-                  "Time 2": true
-                },
-                "indexByName": {},
-                "renameByName": {
-                  "fairness_id": "Group",
-                  "Value #A": "Expected %",
-                  "Value #B": "Observed %"
-                }
-              }
-            },
-            {
-              "id": "calculateField",
-              "options": {
-                "mode": "binary",
-                "binary": {
-                  "left": "Expected %",
-                  "operator": "-",
-                  "right": "Observed %"
-                },
-                "alias": "Gap (expected - observed, pts)",
-                "replaceFields": false
-              }
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {
-              "unit": "none",
-              "decimals": 1,
-              "custom": {
-                "align": "auto",
-                "cellOptions": {
-                  "type": "auto"
-                }
-              }
-            },
-            "overrides": [
-              {
-                "matcher": {
-                  "id": "byRegexp",
-                  "options": "Expected %|Observed %"
-                },
-                "properties": [
-                  {
-                    "id": "unit",
-                    "value": "percent"
-                  },
-                  {
-                    "id": "custom.cellOptions",
-                    "value": {
-                      "type": "gauge",
-                      "mode": "gradient"
-                    }
-                  },
-                  {
-                    "id": "min",
-                    "value": 0
-                  },
-                  {
-                    "id": "max",
-                    "value": 100
-                  }
-                ]
-              },
-              {
-                "matcher": {
-                  "id": "byName",
-                  "options": "Gap (expected - observed, pts)"
-                },
-                "properties": [
-                  {
-                    "id": "unit",
-                    "value": "none"
-                  }
-                ]
-              }
-            ]
           }
         },
         {
           "id": 2,
-          "type": "timeseries",
-          "title": "normalized_service convergence across backlogged groups",
-          "description": "attainedService/weight per group (docs/design.md). Equal across every group that is actually backlogged means the weighted-fairness policy has converged; a persistent outlier is being starved or is monopolizing. A flat, unmoving line is a group the Pick loop has not touched recently (this gauge only updates lazily, on dispatch) -- not evidence of a leak by itself.",
+          "type": "stat",
+          "title": "Enforcement mode",
+          "description": "llm_d_epp_maas_fairness_enforcing: 1 = the weighted-fairness pick is honoured; 0 = shadow mode (FCFS decides, the plugin only accounts). In shadow mode observed share is NOT expected to track expected share -- judge nothing below until this says ENFORCING. Serves: every case.",
           "gridPos": {
-            "h": 8,
-            "w": 12,
+            "h": 5,
+            "w": 4,
             "x": 0,
-            "y": 10
-          },
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "targets": [
-            {
-              "refId": "A",
-              "datasource": {
-                "type": "prometheus",
-                "uid": "$datasource"
-              },
-              "expr": "llm_d_epp_maas_fairness_normalized_service{job=\"maas-vllm-gpu-epp-service\"}",
-              "legendFormat": "{{fairness_id}}"
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {
-              "unit": "none"
-            },
-            "overrides": []
-          }
-        },
-        {
-          "id": 3,
-          "type": "gauge",
-          "title": "prompt_tokens_cached_ratio per group",
-          "description": "Cumulative cached prompt tokens / total prompt tokens, per group -- the headline shadow-mode reading for whether cachedInputTokenWeight is a real lever. A flat zero across every group means --enable-prompt-tokens-details is missing from the vLLM flags, not that the cache is cold (docs/design.md).",
-          "gridPos": {
-            "h": 8,
-            "w": 12,
-            "x": 12,
-            "y": 10
-          },
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "targets": [
-            {
-              "refId": "A",
-              "datasource": {
-                "type": "prometheus",
-                "uid": "$datasource"
-              },
-              "expr": "llm_d_epp_maas_fairness_prompt_tokens_cached_ratio{job=\"maas-vllm-gpu-epp-service\"}",
-              "legendFormat": "{{fairness_id}}"
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {
-              "unit": "percentunit",
-              "min": 0,
-              "max": 1
-            },
-            "overrides": []
-          }
-        },
-        {
-          "id": 4,
-          "type": "stat",
-          "title": "requests_without_usage_total (regression detector -- expect flat zero)",
-          "description": "Completed requests whose response carried no usage block, per group, over the selected range. With --enable-force-include-usage set on every model server this must be flat zero; non-zero means a server shipped without the flag and that group's tab is an estimate, not a measurement (docs/design.md -- 'Alert on > 0').",
-          "gridPos": {
-            "h": 6,
-            "w": 8,
-            "x": 0,
-            "y": 18
-          },
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "targets": [
-            {
-              "refId": "A",
-              "datasource": {
-                "type": "prometheus",
-                "uid": "$datasource"
-              },
-              "expr": "sum by (fairness_id) (increase(llm_d_epp_maas_fairness_requests_without_usage_total{job=\"maas-vllm-gpu-epp-service\"}[$__range]))",
-              "legendFormat": "{{fairness_id}}",
-              "instant": true
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {
-              "unit": "none",
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "red",
-                    "value": 1
-                  }
-                ]
-              }
-            },
-            "overrides": []
-          },
-          "options": {
-            "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ]
-            },
-            "textMode": "value_and_name"
-          }
-        },
-        {
-          "id": 5,
-          "type": "stat",
-          "title": "unmatched_subscriptions_total (expect flat zero)",
-          "description": "Requests whose subscription ID matched no configured group and fell through to the catch-all. Deliberately unlabelled by subscription value (cardinality guard, docs/design.md) -- a nonzero count means a typo or stale mapping in the ConfigMap's groups[].match, and the offending values are in the rate-limited log line and the state dump, not here.",
-          "gridPos": {
-            "h": 6,
-            "w": 8,
-            "x": 8,
-            "y": 18
-          },
-          "datasource": {
-            "type": "prometheus",
-            "uid": "$datasource"
-          },
-          "targets": [
-            {
-              "refId": "A",
-              "datasource": {
-                "type": "prometheus",
-                "uid": "$datasource"
-              },
-              "expr": "increase(llm_d_epp_maas_fairness_unmatched_subscriptions_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])",
-              "instant": true
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {
-              "unit": "none",
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "red",
-                    "value": 1
-                  }
-                ]
-              }
-            },
-            "overrides": []
-          },
-          "options": {
-            "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ]
-            },
-            "textMode": "value"
-          }
-        },
-        {
-          "id": 6,
-          "type": "stat",
-          "title": "Enforcement status (GPU EPP)",
-          "description": "llm_d_epp_maas_fairness_enforcing: 1 when the weighted-fairness policy's pick is actually honoured, 0 when the plugin is only accounting in shadow mode and FCFS is deciding dispatch order. Read this before trusting the headline panel above -- in shadow mode, 'observed' share is not expected to track 'expected' share at all.",
-          "gridPos": {
-            "h": 6,
-            "w": 8,
-            "x": 16,
-            "y": 18
+            "y": 1
           },
           "datasource": {
             "type": "prometheus",
@@ -428,7 +309,9 @@ data:
                 "uid": "$datasource"
               },
               "expr": "llm_d_epp_maas_fairness_enforcing{job=\"maas-vllm-gpu-epp-service\"}",
-              "instant": true
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false
             }
           ],
           "fieldConfig": {
@@ -439,16 +322,31 @@ data:
                   "type": "value",
                   "options": {
                     "0": {
-                      "text": "SHADOW MODE",
-                      "color": "blue"
+                      "text": "SHADOW",
+                      "color": "blue",
+                      "index": 0
                     },
                     "1": {
                       "text": "ENFORCING",
-                      "color": "green"
+                      "color": "green",
+                      "index": 1
                     }
                   }
                 }
-              ]
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "noValue": "EPP NOT SCRAPED"
             },
             "overrides": []
           },
@@ -456,9 +354,5216 @@ data:
             "reduceOptions": {
               "calcs": [
                 "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 3,
+          "type": "bargauge",
+          "title": "Live configured weights",
+          "description": "llm_d_epp_maas_fairness_configured_weight -- the weights the running EPP actually loaded (echoed by the plugin, not copied from the repo). Expected at rest: app1=20, app2=10, end-users=65, unclassified=5. A case that patches weights must show the new values here during the run and the originals afterwards. Serves: weight-change cases, rule 3 restore check.",
+          "gridPos": {
+            "h": 5,
+            "w": 6,
+            "x": 4,
+            "y": 1
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"})",
+              "legendFormat": "{{fairness_id}}",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "min": 0,
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "purple"
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "orientation": "horizontal",
+            "displayMode": "basic",
+            "showUnfilled": true,
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          }
+        },
+        {
+          "id": 4,
+          "type": "stat",
+          "title": "EPP build",
+          "description": "llm_d_epp_info build_ref label of the GPU EPP. Record it with every run: a result is only comparable to another run on the same build.",
+          "gridPos": {
+            "h": 5,
+            "w": 4,
+            "x": 10,
+            "y": 1
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "llm_d_epp_info{job=\"maas-vllm-gpu-epp-service\"}",
+              "legendFormat": "{{build_ref}}",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "noValue": "EPP NOT SCRAPED"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "name",
+            "colorMode": "none",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 5,
+          "type": "stat",
+          "title": "vLLM replicas (ready / desired)",
+          "description": "kube_deployment_status_replicas_ready / kube_deployment_status_replicas for maas-vllm-gpu-kserve. The system under test is 2 replicas; anything else here invalidates a share result unless the case changed it on purpose.",
+          "gridPos": {
+            "h": 5,
+            "w": 4,
+            "x": 14,
+            "y": 1
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "kube_deployment_status_replicas_ready{namespace=\"maas-fairness-poc\", deployment=\"maas-vllm-gpu-kserve\"}",
+              "legendFormat": "ready",
+              "instant": true,
+              "range": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "kube_deployment_status_replicas{namespace=\"maas-fairness-poc\", deployment=\"maas-vllm-gpu-kserve\"}",
+              "legendFormat": "desired",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value_and_name",
+            "colorMode": "none",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 6,
+          "type": "stat",
+          "title": "EPP restarts in range",
+          "description": "increase(kube_pod_container_status_restarts_total) for the GPU EPP container over the selected time range. Any non-zero value means the fairness counters reset mid-run and the share numbers for this range are not trustworthy (the report flags the same thing as epp_restarted).",
+          "gridPos": {
+            "h": 5,
+            "w": 3,
+            "x": 18,
+            "y": 1
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum(increase(kube_pod_container_status_restarts_total{namespace=\"maas-fairness-poc\", pod=~\"maas-vllm-gpu-kserve-router-scheduler-.*\", container=\"main\"}[$__range])) or vector(0)",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 7,
+          "type": "stat",
+          "title": "Loadgen now",
+          "description": "sum(kube_job_status_active) over maas-loadgen* Jobs in maas-fairness-poc. Rule 1: only one benchmark on the GPU pool at a time -- check this says IDLE before starting a run.",
+          "gridPos": {
+            "h": 5,
+            "w": 3,
+            "x": 21,
+            "y": 1
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum(kube_job_status_active{namespace=\"maas-fairness-poc\", job_name=~\"maas-loadgen.*\"}) or vector(0)",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "IDLE",
+                      "color": "green",
+                      "index": 0
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 8,
+          "type": "row",
+          "title": "PrometheusRule alert states (deploy/prometheusrule.yaml)",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 6
+          }
+        },
+        {
+          "id": 9,
+          "type": "stat",
+          "title": "Rule loaded?",
+          "description": "Whether deploy/prometheusrule.yaml (maas-fairness-alerts) is being evaluated: counts its rule group in the user-workload Thanos Ruler's prometheus_rule_group_rules. NOT LOADED means the alert tiles to the right are blank because nothing evaluates them -- not because the system is healthy. (A rule labelled openshift.io/prometheus-rule-evaluation-scope: leaf-prometheus would be evaluated by UWM Prometheus instead and would read NOT LOADED here; the repo's rule carries no such label.)",
+          "gridPos": {
+            "h": 4,
+            "w": 4,
+            "x": 0,
+            "y": 7
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "count(prometheus_rule_group_rules{rule_group=~\".*maas-fairness-poc-maas-fairness-alerts.*\"}) or vector(0)",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "NOT LOADED",
+                      "color": "red",
+                      "index": 0
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 10,
+          "type": "stat",
+          "title": "NotConverging",
+          "description": "ALERTS{alertname=\"MaasFairnessNotConverging\"}: FIRING / PENDING / OK. Shows RULE NOT LOADED when the rule group is absent (see 'Rule loaded?'). Firing/pending periods also appear as dashboard annotations. Serves: convergence / contention cases.",
+          "gridPos": {
+            "h": 4,
+            "w": 4,
+            "x": 4,
+            "y": 7
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "(max(ALERTS{alertname=\"MaasFairnessNotConverging\", alertstate=\"firing\"}) or 0.5 * max(ALERTS{alertname=\"MaasFairnessNotConverging\", alertstate=\"pending\"}) or vector(0)) and on() (count(prometheus_rule_group_rules{rule_group=~\".*maas-fairness-poc-maas-fairness-alerts.*\"}) > 0)",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "OK",
+                      "color": "green",
+                      "index": 0
+                    },
+                    "0.5": {
+                      "text": "PENDING",
+                      "color": "orange",
+                      "index": 1
+                    },
+                    "1": {
+                      "text": "FIRING",
+                      "color": "red",
+                      "index": 2
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "noValue": "RULE NOT LOADED"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 11,
+          "type": "stat",
+          "title": "ClassificationBroken",
+          "description": "ALERTS{alertname=\"MaasFairnessClassificationBroken\"}: FIRING / PENDING / OK. Shows RULE NOT LOADED when the rule group is absent (see 'Rule loaded?'). Firing/pending periods also appear as dashboard annotations. Serves: classification / unclassified-traffic cases.",
+          "gridPos": {
+            "h": 4,
+            "w": 4,
+            "x": 8,
+            "y": 7
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "(max(ALERTS{alertname=\"MaasFairnessClassificationBroken\", alertstate=\"firing\"}) or 0.5 * max(ALERTS{alertname=\"MaasFairnessClassificationBroken\", alertstate=\"pending\"}) or vector(0)) and on() (count(prometheus_rule_group_rules{rule_group=~\".*maas-fairness-poc-maas-fairness-alerts.*\"}) > 0)",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "OK",
+                      "color": "green",
+                      "index": 0
+                    },
+                    "0.5": {
+                      "text": "PENDING",
+                      "color": "orange",
+                      "index": 1
+                    },
+                    "1": {
+                      "text": "FIRING",
+                      "color": "red",
+                      "index": 2
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "noValue": "RULE NOT LOADED"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 12,
+          "type": "stat",
+          "title": "BandSplit",
+          "description": "ALERTS{alertname=\"MaasFairnessBandSplit\"}: FIRING / PENDING / OK. Shows RULE NOT LOADED when the rule group is absent (see 'Rule loaded?'). Firing/pending periods also appear as dashboard annotations. Serves: priority-header / band cases.",
+          "gridPos": {
+            "h": 4,
+            "w": 4,
+            "x": 12,
+            "y": 7
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "(max(ALERTS{alertname=\"MaasFairnessBandSplit\", alertstate=\"firing\"}) or 0.5 * max(ALERTS{alertname=\"MaasFairnessBandSplit\", alertstate=\"pending\"}) or vector(0)) and on() (count(prometheus_rule_group_rules{rule_group=~\".*maas-fairness-poc-maas-fairness-alerts.*\"}) > 0)",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "OK",
+                      "color": "green",
+                      "index": 0
+                    },
+                    "0.5": {
+                      "text": "PENDING",
+                      "color": "orange",
+                      "index": 1
+                    },
+                    "1": {
+                      "text": "FIRING",
+                      "color": "red",
+                      "index": 2
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "noValue": "RULE NOT LOADED"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 13,
+          "type": "stat",
+          "title": "SheddingIsRealAllocator",
+          "description": "ALERTS{alertname=\"MaasFairnessSheddingIsRealAllocator\"}: FIRING / PENDING / OK. Shows RULE NOT LOADED when the rule group is absent (see 'Rule loaded?'). Firing/pending periods also appear as dashboard annotations. Serves: overload / shedding cases.",
+          "gridPos": {
+            "h": 4,
+            "w": 4,
+            "x": 16,
+            "y": 7
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "(max(ALERTS{alertname=\"MaasFairnessSheddingIsRealAllocator\", alertstate=\"firing\"}) or 0.5 * max(ALERTS{alertname=\"MaasFairnessSheddingIsRealAllocator\", alertstate=\"pending\"}) or vector(0)) and on() (count(prometheus_rule_group_rules{rule_group=~\".*maas-fairness-poc-maas-fairness-alerts.*\"}) > 0)",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "OK",
+                      "color": "green",
+                      "index": 0
+                    },
+                    "0.5": {
+                      "text": "PENDING",
+                      "color": "orange",
+                      "index": 1
+                    },
+                    "1": {
+                      "text": "FIRING",
+                      "color": "red",
+                      "index": 2
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "noValue": "RULE NOT LOADED"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 14,
+          "type": "stat",
+          "title": "AccountingLeak",
+          "description": "ALERTS{alertname=\"MaasFairnessAccountingLeak\"}: FIRING / PENDING / OK. Shows RULE NOT LOADED when the rule group is absent (see 'Rule loaded?'). Firing/pending periods also appear as dashboard annotations. Serves: accounting / truing cases.",
+          "gridPos": {
+            "h": 4,
+            "w": 4,
+            "x": 20,
+            "y": 7
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "(max(ALERTS{alertname=\"MaasFairnessAccountingLeak\", alertstate=\"firing\"}) or 0.5 * max(ALERTS{alertname=\"MaasFairnessAccountingLeak\", alertstate=\"pending\"}) or vector(0)) and on() (count(prometheus_rule_group_rules{rule_group=~\".*maas-fairness-poc-maas-fairness-alerts.*\"}) > 0)",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                {
+                  "type": "value",
+                  "options": {
+                    "0": {
+                      "text": "OK",
+                      "color": "green",
+                      "index": 0
+                    },
+                    "0.5": {
+                      "text": "PENDING",
+                      "color": "orange",
+                      "index": 1
+                    },
+                    "1": {
+                      "text": "FIRING",
+                      "color": "red",
+                      "index": 2
+                    }
+                  }
+                }
+              ],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "text",
+                    "value": null
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              },
+              "noValue": "RULE NOT LOADED"
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 15,
+          "type": "row",
+          "title": "Delivered share: expected vs observed (the pass criterion)",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 11
+          }
+        },
+        {
+          "id": 16,
+          "type": "table",
+          "title": "Expected vs observed share per group (selected time range)",
+          "description": "Same arithmetic as deploy/poc/15-fairness-report.py. Expected % = weight / sum of weights of the groups that OFFERED load in the range (had any llm_d_epp_request_total increase) -- an idle group's weight is redistributed, as work conservation requires. Observed % = the group's share of increase(llm_d_epp_maas_fairness_contended_service_tokens_total) over the range (the design's SLI: service only counted while contended). Deviation = observed - expected, in points; the series pass threshold is |deviation| <= 10. Set the time range to exactly the run (see the runbook's time-range convention) or the numbers mix runs. Single-offered-group cases have no contention by definition and show no observed value. Serves: every share case.",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 0,
+            "y": 12
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "100 * (sum by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}) and on (fairness_id) (sum by (fairness_id) (increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])) > 0)) / scalar(sum(sum by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}) and on (fairness_id) (sum by (fairness_id) (increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])) > 0)))",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false,
+              "format": "table"
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "100 * sum by (fairness_id) (increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])) / scalar(sum(increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])))",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false,
+              "format": "table"
+            },
+            {
+              "refId": "C",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "(100 * sum by (fairness_id) (increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])) / scalar(sum(increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])))) - on (fairness_id) (100 * (sum by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}) and on (fairness_id) (sum by (fairness_id) (increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])) > 0)) / scalar(sum(sum by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}) and on (fairness_id) (sum by (fairness_id) (increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])) > 0))))",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false,
+              "format": "table"
+            },
+            {
+              "refId": "D",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$__range]))",
+              "legendFormat": "__auto",
+              "instant": true,
+              "range": false,
+              "format": "table"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "merge",
+              "options": {}
+            },
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true
+                },
+                "renameByName": {
+                  "fairness_id": "Group",
+                  "Value #A": "Expected %",
+                  "Value #B": "Observed %",
+                  "Value #C": "Deviation (pts)",
+                  "Value #D": "Requests"
+                },
+                "indexByName": {
+                  "fairness_id": 0,
+                  "Value #A": 1,
+                  "Value #B": 2,
+                  "Value #C": 3,
+                  "Value #D": 4
+                }
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "decimals": 1,
+              "unit": "none"
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Deviation (pts)"
+                },
+                "properties": [
+                  {
+                    "id": "custom.cellOptions",
+                    "value": {
+                      "type": "color-background"
+                    }
+                  },
+                  {
+                    "id": "thresholds",
+                    "value": {
+                      "mode": "absolute",
+                      "steps": [
+                        {
+                          "color": "red",
+                          "value": null
+                        },
+                        {
+                          "color": "green",
+                          "value": -10
+                        },
+                        {
+                          "color": "red",
+                          "value": 10.0001
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Requests"
+                },
+                "properties": [
+                  {
+                    "id": "decimals",
+                    "value": 0
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [
+              {
+                "displayName": "Group"
+              }
+            ]
+          }
+        },
+        {
+          "id": 17,
+          "type": "timeseries",
+          "title": "Observed vs expected share over time (window = $window)",
+          "description": "Solid = observed contended-service share in each trailing $window; dashed = expected share for the groups that offered load in that same window. A healthy enforcing policy shows each solid line settling onto its dashed line within a few windows of contention starting. Gaps = no contention in that window (nothing to share). Serves: every share case, especially ramp / bursty / arrival-order cases where the range total hides transients.",
+          "gridPos": {
+            "h": 9,
+            "w": 12,
+            "x": 12,
+            "y": 12
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "100 * sum by (fairness_id) (increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$window])) / scalar(sum(increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$window]))) and on (fairness_id) sum by (fairness_id) (llm_d_epp_request_total{fairness_id=~\"$group\"})",
+              "legendFormat": "{{fairness_id}} observed",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "(100 * (sum by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}) and on (fairness_id) (sum by (fairness_id) (increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$window])) > 0)) / scalar(sum(sum by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}) and on (fairness_id) (sum by (fairness_id) (increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$window])) > 0)))) and on (fairness_id) sum by (fairness_id) (llm_d_epp_request_total{fairness_id=~\"$group\"})",
+              "legendFormat": "{{fairness_id}} expected",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0,
+              "max": 100
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/expected/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        10,
+                        10
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
               ]
             },
-            "textMode": "value"
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 18,
+          "type": "timeseries",
+          "title": "Deviation from expected share (points, window = $window)",
+          "description": "observed - expected per group, per trailing $window. The shaded band is the series' +/-10-point pass threshold. Serves: every share case; read with the table to the left.",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 21
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "((100 * sum by (fairness_id) (increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$window])) / scalar(sum(increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$window])))) - on (fairness_id) (100 * (sum by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}) and on (fairness_id) (sum by (fairness_id) (increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$window])) > 0)) / scalar(sum(sum by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{job=\"maas-vllm-gpu-epp-service\"}) and on (fairness_id) (sum by (fairness_id) (increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$window])) > 0))))) and on (fairness_id) sum by (fairness_id) (llm_d_epp_request_total{fairness_id=~\"$group\"})",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                },
+                "thresholdsStyle": {
+                  "mode": "line+area"
+                }
+              },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "transparent",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": -1000
+                  },
+                  {
+                    "color": "transparent",
+                    "value": -10
+                  },
+                  {
+                    "color": "red",
+                    "value": 10
+                  }
+                ]
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 19,
+          "type": "timeseries",
+          "title": "Dispatch (request-count) share vs token share (window = $window)",
+          "description": "Solid = share of llm_d_epp_maas_fairness_dispatch_total (requests); dashed = share of contended service tokens. They diverge when groups send different request sizes -- the policy equalises tokens, not request counts, so a group with short prompts legitimately gets more requests. Serves: mixed-request-size / long-prompt cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 21
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "100 * sum by (fairness_id) (increase(llm_d_epp_maas_fairness_dispatch_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$window])) / scalar(sum(increase(llm_d_epp_maas_fairness_dispatch_total{job=\"maas-vllm-gpu-epp-service\"}[$window])))",
+              "legendFormat": "{{fairness_id}} dispatch",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "100 * sum by (fairness_id) (increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$window])) / scalar(sum(increase(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\"}[$window]))) and on (fairness_id) sum by (fairness_id) (llm_d_epp_request_total{fairness_id=~\"$group\"})",
+              "legendFormat": "{{fairness_id}} tokens",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0,
+              "max": 100
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/tokens/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        10,
+                        10
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 20,
+          "type": "row",
+          "title": "Convergence: normalized_service",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 29
+          }
+        },
+        {
+          "id": 21,
+          "type": "timeseries",
+          "title": "normalized_service per group",
+          "description": "llm_d_epp_maas_fairness_normalized_service = decayed attained service / weight. Converged = the lines of all BACKLOGGED groups meet. An idle group decays toward zero and is expected to sit below the others. A persistent outlier under contention is being starved (low) or monopolising (high). Serves: convergence, newcomer, idle-return cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 30
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "max by (fairness_id) (llm_d_epp_maas_fairness_normalized_service{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"})",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 22,
+          "type": "timeseries",
+          "title": "normalized_service spread (max / min, configured groups)",
+          "description": "The MaasFairnessNotConverging alert's left-hand side: max/min normalized_service across non-unclassified groups (min over groups > 0). The red line is the alert's 1.5x threshold; the alert also requires pool saturation and active contention. Includes idle groups, so it is only meaningful while all configured groups are backlogged. Serves: convergence cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 30
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "max(llm_d_epp_maas_fairness_normalized_service{job=\"maas-vllm-gpu-epp-service\", fairness_id!=\"unclassified\"}) / min(llm_d_epp_maas_fairness_normalized_service{job=\"maas-vllm-gpu-epp-service\", fairness_id!=\"unclassified\"} > 0)",
+              "legendFormat": "max / min",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                },
+                "thresholdsStyle": {
+                  "mode": "line+area"
+                }
+              },
+              "min": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "transparent",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1.5
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 23,
+          "type": "timeseries",
+          "title": "normalized_service_observed by half-life",
+          "description": "llm_d_epp_maas_fairness_normalized_service_observed: the same tab accounted through extra half-lives (20s, 120s) that do not drive decisions. The short half-life shows transients the decision half-life smooths; the long one shows whether the split holds over minutes. Serves: half-life / bursty-traffic cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 30
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "max by (fairness_id, half_life_seconds) (llm_d_epp_maas_fairness_normalized_service_observed{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"})",
+              "legendFormat": "{{fairness_id}} hl={{half_life_seconds}}s",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/hl=20s/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        10,
+                        10
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 24,
+          "type": "row",
+          "title": "Service tokens: contended vs total",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 38
+          }
+        },
+        {
+          "id": 25,
+          "type": "timeseries",
+          "title": "Contended service per group (cost units / s)",
+          "description": "rate(llm_d_epp_maas_fairness_contended_service_tokens_total): weighted service cost charged while the group's band was contended -- the numerator of the share SLI. Flat zero for a group means it never contended, not that it was unserved. Serves: every share case.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 39
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (rate(llm_d_epp_maas_fairness_contended_service_tokens_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval]))",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 26,
+          "type": "timeseries",
+          "title": "Total raw tokens per group (tokens / s, contended or not)",
+          "description": "rate of llm_d_epp_request_input_tokens_sum (dashed) and llm_d_epp_request_output_tokens_sum (solid) per group -- all traffic, contended or not. These are raw tokens, NOT the plugin's cost units (cost weights input/output/cached differently), so compare shapes with the panel to the left, not absolute values. There is no exported total-service-cost counter. Serves: work-conservation / idle-group cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 39
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (rate(llm_d_epp_request_output_tokens_sum{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval]))",
+              "legendFormat": "{{fairness_id}} output",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (rate(llm_d_epp_request_input_tokens_sum{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval]))",
+              "legendFormat": "{{fairness_id}} input",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/input/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        10,
+                        10
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 27,
+          "type": "timeseries",
+          "title": "Fraction of time contended per group",
+          "description": "rate(llm_d_epp_maas_fairness_contended_seconds_total): 1.0 = the group was backlogged alongside another group the whole time (the share SLI's denominator). Near-zero during a run means the load never created contention and the share result is vacuous. Serves: every share case (validity check).",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 39
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (rate(llm_d_epp_maas_fairness_contended_seconds_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval]))",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 28,
+          "type": "row",
+          "title": "Accounting: truing error and leak detectors",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 47
+          }
+        },
+        {
+          "id": 29,
+          "type": "timeseries",
+          "title": "Mean truing error per request (actual - estimated cost)",
+          "description": "rate(truing_error_tokens_sum) / rate(truing_error_tokens_count) per group. Symmetric noise around 0 is fine. A persistent bias means the provisional (bytes-per-token) estimate is wrong for that group's content and its tab is mis-charged until true-up. NOTE: the provisional charge itself (groupState.provisionalTotal) is NOT exported as a metric -- it is only visible in the EPP state dump -- so in-flight provisional tokens cannot be graphed. Serves: long-prompt, CJK/multimodal, max_tokens-skew cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 48
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (rate(llm_d_epp_maas_fairness_truing_error_tokens_sum{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval])) / sum by (fairness_id) (rate(llm_d_epp_maas_fairness_truing_error_tokens_count{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval]))",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 30,
+          "type": "bargauge",
+          "title": "Truing error distribution (selected range)",
+          "description": "Non-cumulative bucket counts of llm_d_epp_maas_fairness_truing_error_tokens over the range, all selected groups. Mass should sit in the buckets nearest 0; a fat tail on one side is systematic over- or under-estimation. Serves: accounting cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 48
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (le) (increase(llm_d_epp_maas_fairness_truing_error_tokens_bucket{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__range]))",
+              "legendFormat": "{{le}}",
+              "instant": true,
+              "range": false,
+              "format": "heatmap"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "min": 0,
+              "color": {
+                "mode": "fixed",
+                "fixedColor": "purple"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "orientation": "vertical",
+            "displayMode": "basic",
+            "showUnfilled": true,
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            }
+          }
+        },
+        {
+          "id": 31,
+          "type": "timeseries",
+          "title": "Accounting-leak detector (tab grew with zero dispatches, 15m)",
+          "description": "The MaasFairnessAccountingLeak expression evaluated live: increase in normalized_service over 15m, shown only for groups with ZERO recorded dispatches in that 15m. Expected: no data, ever. Any point here means tokens were charged to a group that dispatched nothing -- BUT an isolated single point can be the true-up of a request dispatched just before the 15m window (the alert requires 15m sustained, this panel shows the raw expression). Evaluated here even when the PrometheusRule is not loaded. Serves: accounting / cancellation / idle-group cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 48
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "((llm_d_epp_maas_fairness_normalized_service{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"} - (llm_d_epp_maas_fairness_normalized_service{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"} offset 15m)) > 0) and (increase(llm_d_epp_maas_fairness_dispatch_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[15m]) == 0)",
+              "legendFormat": "{{fairness_id}} ({{pod}})",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 32,
+          "type": "timeseries",
+          "title": "Requests without usage (expect flat zero)",
+          "description": "increase(llm_d_epp_maas_fairness_requests_without_usage_total) per $window. Non-zero = a response carried no usage block, so that group's tab stayed at the provisional estimate with no true-up (model server missing --enable-force-include-usage, or streaming without include_usage). Serves: streaming / accounting cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 56
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (increase(llm_d_epp_maas_fairness_requests_without_usage_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$window]))",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 33,
+          "type": "timeseries",
+          "title": "Newcomer clamps per group (/ min)",
+          "description": "60 * rate(llm_d_epp_maas_fairness_newcomer_clamps_total): times a returning-idle group's tab was raised to the band minimum (so it cannot burst on banked credit). A high steady rate means halfLifeSeconds is short relative to the traffic's burstiness. Serves: idle-return / on-off / newcomer cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 56
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "60 * sum by (fairness_id) (rate(llm_d_epp_maas_fairness_newcomer_clamps_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval]))",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 34,
+          "type": "timeseries",
+          "title": "Cached prompt-token ratio per group",
+          "description": "llm_d_epp_maas_fairness_prompt_tokens_cached_ratio (cumulative cached / total prompt tokens). Flat zero across all groups means --enable-prompt-tokens-details is missing, not that the cache is cold. Serves: prefix-cache cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 56
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "max by (fairness_id) (llm_d_epp_maas_fairness_prompt_tokens_cached_ratio{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"})",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 35,
+          "type": "row",
+          "title": "Classification",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 64
+          }
+        },
+        {
+          "id": 36,
+          "type": "timeseries",
+          "title": "Unclassified share of requests (window = $window)",
+          "description": "rate of llm_d_epp_request_total{fairness_id=\"unclassified\"} / all requests. Red line = the MaasFairnessClassificationBroken 5% threshold. The benchmark harness offers no unclassified load unless a case sends it on purpose, so anything above 0 in other runs is misrouted traffic. Serves: classification / unknown-subscription cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 65
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum(rate(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=\"unclassified\"}[$window])) / sum(rate(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\"}[$window]))",
+              "legendFormat": "unclassified share",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                },
+                "thresholdsStyle": {
+                  "mode": "line+area"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "transparent",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.05
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 37,
+          "type": "timeseries",
+          "title": "Unmatched subscriptions (per $window, expect zero)",
+          "description": "increase(llm_d_epp_maas_fairness_unmatched_subscriptions_total): requests whose subscription matched no group rule and fell to the catch-all. Unlabelled by design (subscription strings are attacker-controlled cardinality); the values are in the EPP's rate-limited log. Serves: classification cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 65
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum(increase(llm_d_epp_maas_fairness_unmatched_subscriptions_total{job=\"maas-vllm-gpu-epp-service\"}[$window]))",
+              "legendFormat": "unmatched",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 38,
+          "type": "stat",
+          "title": "Classification totals (selected range)",
+          "description": "Unclassified requests and unmatched subscriptions over the selected range. Both should be 0 for a harness run.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 65
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum(increase(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=\"unclassified\"}[$__range])) or vector(0)",
+              "legendFormat": "unclassified requests",
+              "instant": true,
+              "range": false
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum(increase(llm_d_epp_maas_fairness_unmatched_subscriptions_total{job=\"maas-vllm-gpu-epp-service\"}[$__range])) or vector(0)",
+              "legendFormat": "unmatched subscriptions",
+              "instant": true,
+              "range": false
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 1
+                  }
+                ]
+              },
+              "color": {
+                "mode": "thresholds"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "textMode": "value_and_name",
+            "colorMode": "background",
+            "graphMode": "none",
+            "justifyMode": "center"
+          }
+        },
+        {
+          "id": 39,
+          "type": "row",
+          "title": "Flow control: queue depth, queue wait, shedding",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 73
+          }
+        },
+        {
+          "id": 40,
+          "type": "timeseries",
+          "title": "Queue depth per group",
+          "description": "llm_d_epp_flow_control_queue_size: requests waiting in the EPP's flow-control queue per group. A backlogged group is one with a non-zero line here -- only backlogged groups compete. Serves: every contention case.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 74
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (llm_d_epp_flow_control_queue_size{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"})",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 41,
+          "type": "timeseries",
+          "title": "Queue wait p50 / p95 per group (dispatched)",
+          "description": "histogram_quantile over llm_d_epp_flow_control_request_queue_duration_seconds{outcome=\"Dispatched\"}. The lower-weight group should wait longer under contention; a group waiting far longer than its weight implies is being starved. Serves: latency-fairness / starvation cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 74
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (fairness_id, le) (rate(llm_d_epp_flow_control_request_queue_duration_seconds_bucket{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\", outcome=\"Dispatched\"}[$__rate_interval])))",
+              "legendFormat": "{{fairness_id}} p95",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.5, sum by (fairness_id, le) (rate(llm_d_epp_flow_control_request_queue_duration_seconds_bucket{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\", outcome=\"Dispatched\"}[$__rate_interval])))",
+              "legendFormat": "{{fairness_id}} p50",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/p50/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        10,
+                        10
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 42,
+          "type": "timeseries",
+          "title": "Shed / evicted / rejected per group (req / s)",
+          "description": "rate of llm_d_epp_flow_control_request_queue_duration_seconds_count with outcome != Dispatched, by group and outcome (EvictedTTL, EvictedContextCancelled, Rejected*, ...). Evicted requests never reach the fairness policy, so if this is non-zero, eviction order -- not the weights -- is deciding who gets served. llm_d_epp_flow_control_requests_total itself carries no group label; this histogram does. Serves: overload / timeout / client-cancel cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 74
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id, outcome) (rate(llm_d_epp_flow_control_request_queue_duration_seconds_count{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\", outcome!=\"Dispatched\"}[$__rate_interval]))",
+              "legendFormat": "{{fairness_id}} {{outcome}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 43,
+          "type": "timeseries",
+          "title": "Flow-control outcomes, whole pool (req / s)",
+          "description": "rate(llm_d_epp_flow_control_requests_total) by outcome and priority band (no group label exists on this series). More than one priority value = band split (see that alert). Serves: band-split / overload cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 82
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (outcome, priority) (rate(llm_d_epp_flow_control_requests_total{job=\"maas-vllm-gpu-epp-service\"}[$__rate_interval]))",
+              "legendFormat": "{{outcome}} p{{priority}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 44,
+          "type": "timeseries",
+          "title": "Pool saturation and flow-control capacity",
+          "description": "llm_d_epp_flow_control_pool_saturation{stage=\"effective\"} (>= 1 = saturated: requests are queued in the EPP instead of dispatched immediately) and capacity utilisation by requests. Fairness only acts while saturated; a run that never reaches 1 never exercised the policy. Serves: every contention case (validity check).",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 82
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "llm_d_epp_flow_control_pool_saturation{job=\"maas-vllm-gpu-epp-service\"}",
+              "legendFormat": "saturation {{stage}}",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "llm_d_epp_flow_control_capacity_utilization_requests{job=\"maas-vllm-gpu-epp-service\"}",
+              "legendFormat": "capacity util (requests)",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                },
+                "thresholdsStyle": {
+                  "mode": "line+area"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "transparent",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 45,
+          "type": "timeseries",
+          "title": "Queued bytes per group",
+          "description": "llm_d_epp_flow_control_queue_bytes per group: queue depth weighted by request size. A long-prompt group shows high bytes with low count. Serves: long-prompt / mixed-size cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 82
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (llm_d_epp_flow_control_queue_bytes{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"})",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 46,
+          "type": "row",
+          "title": "Traffic, errors and status codes",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 90
+          }
+        },
+        {
+          "id": 47,
+          "type": "timeseries",
+          "title": "Request rate per group (req / s)",
+          "description": "rate(llm_d_epp_request_total) per group as seen by the EPP. Compare with each case's offered load (workers / Poisson rate) to confirm the loadgen actually drove what the case says. Serves: every case.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 91
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id) (rate(llm_d_epp_request_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval]))",
+              "legendFormat": "{{fairness_id}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "normal",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 48,
+          "type": "timeseries",
+          "title": "EPP request errors per group by error_code (req / s)",
+          "description": "rate(llm_d_epp_request_error_total) by group and error_code (e.g. ServiceUnavailable). This is the only per-group error/status signal the stack exports; HTTP codes seen by the loadgen are in its log and the report. Serves: overload / failure-injection cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 91
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (fairness_id, error_code) (rate(llm_d_epp_request_error_total{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval]))",
+              "legendFormat": "{{fairness_id}} {{error_code}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 49,
+          "type": "timeseries",
+          "title": "Gateway HTTP status codes to the GPU pool (req / s, NOT per group)",
+          "description": "rate(istio_requests_total) from the maas-poc-gateway to the maas-vllm-gpu InferencePool service, by response_code. Istio has no fairness-group label, so this is pool-wide; use it to spot 5xx/429 bursts and attribute them with the panel to the left. Serves: overload / failure cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 91
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (response_code) (rate(istio_requests_total{destination_service_namespace=\"maas-fairness-poc\", destination_service_name=~\"maas-vllm-gpu-inference-pool.*\", reporter=\"source\"}[$__rate_interval]))",
+              "legendFormat": "HTTP {{response_code}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 50,
+          "type": "row",
+          "title": "Latency per group",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 99
+          }
+        },
+        {
+          "id": 51,
+          "type": "timeseries",
+          "title": "TTFT p50 / p95 per group",
+          "description": "histogram_quantile over llm_d_epp_request_ttft_seconds (EPP-measured, includes EPP queue wait). The harness sends non-streaming requests (streaming=\"false\"), for which first token arrives with the whole body -- so TTFT approximates e2e there. Serves: latency-fairness cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 100
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (fairness_id, le) (rate(llm_d_epp_request_ttft_seconds_bucket{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval])))",
+              "legendFormat": "{{fairness_id}} p95",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.5, sum by (fairness_id, le) (rate(llm_d_epp_request_ttft_seconds_bucket{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval])))",
+              "legendFormat": "{{fairness_id}} p50",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/p50/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        10,
+                        10
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 52,
+          "type": "timeseries",
+          "title": "End-to-end latency p50 / p95 per group",
+          "description": "histogram_quantile over llm_d_epp_request_duration_seconds (EPP receive -> response complete). Serves: every case (a fair share at unusable latency is not a pass in practice).",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 100
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (fairness_id, le) (rate(llm_d_epp_request_duration_seconds_bucket{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval])))",
+              "legendFormat": "{{fairness_id}} p95",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.5, sum by (fairness_id, le) (rate(llm_d_epp_request_duration_seconds_bucket{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval])))",
+              "legendFormat": "{{fairness_id}} p50",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/p50/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        10,
+                        10
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 53,
+          "type": "timeseries",
+          "title": "Normalized time per output token p95 per group",
+          "description": "histogram_quantile(0.95) over llm_d_epp_request_ntpot_seconds. Decode-speed per group; should be roughly equal across groups (the GPU does not know about groups). A per-group gap points at batching/prefix effects, not the policy. Serves: long-output / max_tokens cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 100
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (fairness_id, le) (rate(llm_d_epp_request_ntpot_seconds_bucket{job=\"maas-vllm-gpu-epp-service\", fairness_id=~\"$group\"}[$__rate_interval])))",
+              "legendFormat": "{{fairness_id}} p95",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app1( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "blue"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^app2( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "orange"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^end-users( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "green"
+                    }
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/^unclassified( |$)/"
+                },
+                "properties": [
+                  {
+                    "id": "color",
+                    "value": {
+                      "mode": "fixed",
+                      "fixedColor": "#8f8f8f"
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 54,
+          "type": "row",
+          "title": "vLLM (GPU pool: maas-vllm-gpu-kserve)",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 108
+          }
+        },
+        {
+          "id": 55,
+          "type": "timeseries",
+          "title": "Replicas",
+          "description": "kube_deployment_status_replicas (desired) / _ready for maas-vllm-gpu-kserve, plus count of vLLM pods actually being scraped and ready endpoints the EPP sees (llm_d_epp_ready_endpoints). All four should read 2. Serves: replica-change / pod-loss cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 0,
+            "y": 109
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "kube_deployment_status_replicas{namespace=\"maas-fairness-poc\", deployment=\"maas-vllm-gpu-kserve\"}",
+              "legendFormat": "desired",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "kube_deployment_status_replicas_ready{namespace=\"maas-fairness-poc\", deployment=\"maas-vllm-gpu-kserve\"}",
+              "legendFormat": "ready",
+              "range": true
+            },
+            {
+              "refId": "C",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "count(vllm:num_requests_running{llm_isvc_name=\"maas-vllm-gpu\", llm_isvc_component=\"workload\"})",
+              "legendFormat": "vLLM pods scraped",
+              "range": true
+            },
+            {
+              "refId": "D",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "llm_d_epp_ready_endpoints{job=\"maas-vllm-gpu-epp-service\"}",
+              "legendFormat": "EPP ready endpoints",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 56,
+          "type": "timeseries",
+          "title": "KV-cache usage per replica",
+          "description": "vllm:kv_cache_usage_perc per pod. Sustained ~100% means the GPU itself is the bottleneck and requests queue inside vLLM (outside the EPP's control). Serves: long-context / saturation cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 6,
+            "y": 109
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "vllm:kv_cache_usage_perc{llm_isvc_name=\"maas-vllm-gpu\", llm_isvc_component=\"workload\"}",
+              "legendFormat": "{{pod}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0,
+              "max": 1
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 57,
+          "type": "timeseries",
+          "title": "Running / waiting requests per replica",
+          "description": "vllm:num_requests_running (solid) and vllm:num_requests_waiting (dashed) per pod. Waiting inside vLLM is queueing the fairness policy cannot reorder -- if it is large, the EPP is over-dispatching and share is decided by vLLM FCFS. Serves: every contention case.",
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 12,
+            "y": 109
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "vllm:num_requests_running{llm_isvc_name=\"maas-vllm-gpu\", llm_isvc_component=\"workload\"}",
+              "legendFormat": "{{pod}} running",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "vllm:num_requests_waiting{llm_isvc_name=\"maas-vllm-gpu\", llm_isvc_component=\"workload\"}",
+              "legendFormat": "{{pod}} waiting",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/waiting/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        10,
+                        10
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 58,
+          "type": "timeseries",
+          "title": "vLLM-side queue time, TTFT p95 and preemptions",
+          "description": "vLLM's own view (pool-wide, no group label): p95 vllm:request_queue_time_seconds and vllm:time_to_first_token_seconds, plus preemptions/s (right axis). Serves: saturation / KV-pressure cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 18,
+            "y": 109
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:request_queue_time_seconds_bucket{llm_isvc_name=\"maas-vllm-gpu\", llm_isvc_component=\"workload\"}[$__rate_interval])))",
+              "legendFormat": "vLLM queue p95",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket{llm_isvc_name=\"maas-vllm-gpu\", llm_isvc_component=\"workload\"}[$__rate_interval])))",
+              "legendFormat": "vLLM TTFT p95",
+              "range": true
+            },
+            {
+              "refId": "C",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum(rate(vllm:num_preemptions_total{llm_isvc_name=\"maas-vllm-gpu\", llm_isvc_component=\"workload\"}[$__rate_interval]))",
+              "legendFormat": "preemptions / s",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "preemptions / s"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "short"
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 59,
+          "type": "row",
+          "title": "EPP health (maas-vllm-gpu-kserve-router-scheduler)",
+          "collapsed": false,
+          "panels": [],
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 117
+          }
+        },
+        {
+          "id": 60,
+          "type": "timeseries",
+          "title": "EPP CPU (cores)",
+          "description": "rate(container_cpu_usage_seconds_total) for the GPU EPP's main container. A pegged EPP adds scheduling latency to every group equally and can masquerade as a fairness problem. Serves: high-rate / many-tenant cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 0,
+            "y": 118
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (pod) (rate(container_cpu_usage_seconds_total{namespace=\"maas-fairness-poc\", pod=~\"maas-vllm-gpu-kserve-router-scheduler-.*\", container=\"main\"}[$__rate_interval]))",
+              "legendFormat": "{{pod}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 61,
+          "type": "timeseries",
+          "title": "EPP memory (working set)",
+          "description": "container_memory_working_set_bytes for the GPU EPP. Steady growth across runs = per-group state not being released. Serves: many-tenant / long-soak cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 6,
+            "y": 118
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"maas-fairness-poc\", pod=~\"maas-vllm-gpu-kserve-router-scheduler-.*\", container=\"main\"})",
+              "legendFormat": "{{pod}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 62,
+          "type": "timeseries",
+          "title": "EPP restarts and process starts",
+          "description": "kube_pod_container_status_restarts_total for the EPP (step up = container restart; the counters behind every fairness panel reset at that moment) and minutes since process start (drops to 0 on restart or pod replacement). Serves: every case (validity), crash/upgrade cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 12,
+            "y": 118
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "sum by (pod) (kube_pod_container_status_restarts_total{namespace=\"maas-fairness-poc\", pod=~\"maas-vllm-gpu-kserve-router-scheduler-.*\", container=\"main\"})",
+              "legendFormat": "{{pod}} restarts",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "(time() - max by (pod) (process_start_time_seconds{job=\"maas-vllm-gpu-epp-service\"})) / 60",
+              "legendFormat": "{{pod}} uptime (min)",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": "/uptime/"
+                },
+                "properties": [
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          }
+        },
+        {
+          "id": 63,
+          "type": "timeseries",
+          "title": "Scheduling latency p95",
+          "description": "p95 of llm_d_epp_scheduler_e2e_duration_seconds and of the maas-weighted-fairness plugin's own extension points (llm_d_epp_plugin_duration_seconds). The fairness plugin should stay well under a millisecond. Serves: high-rate / many-tenant cases.",
+          "gridPos": {
+            "h": 8,
+            "w": 6,
+            "x": 18,
+            "y": 118
+          },
+          "datasource": {
+            "type": "prometheus",
+            "uid": "$datasource"
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(llm_d_epp_scheduler_e2e_duration_seconds_bucket{job=\"maas-vllm-gpu-epp-service\"}[$__rate_interval])))",
+              "legendFormat": "scheduler e2e p95",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "$datasource"
+              },
+              "expr": "histogram_quantile(0.95, sum by (le, extension_point) (rate(llm_d_epp_plugin_duration_seconds_bucket{job=\"maas-vllm-gpu-epp-service\", plugin_type=\"maas-weighted-fairness\"}[$__rate_interval])))",
+              "legendFormat": "fairness {{extension_point}} p95",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 0,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "mode": "none",
+                  "group": "A"
+                }
+              },
+              "min": 0
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "table",
+              "placement": "bottom",
+              "calcs": [
+                "lastNotNull",
+                "max"
+              ]
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
           }
         }
       ]

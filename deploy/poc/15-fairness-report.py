@@ -85,6 +85,54 @@ genuinely-contending tenant accrues in a 240s full-contention run
 check is skipped (it would only measure noise -- nobody was ever backlogged
 alongside anyone else to share against), the same way it is already skipped
 for `solo` and for a named `control`.
+
+UNI-138 (G2) adds a second, purely additive layer -- like UNI-127's timeline,
+it never changes `verdict`, only adds a `ledger` section. It checks a
+different invariant than the weighted-split SLI: does the EPP's own
+accounting agree with what the client actually sent and received, not just
+whether the split matches the configured weights.
+
+  --client-record-jsonl   deploy/poc/04-loadgen.yaml's CLIENT_RECORD_JSON
+      lines (one per offered tenant), pulled out of the loadgen pod's stdout
+      by 15-fairness-benchmark.sh into client-request-summary.jsonl. Real
+      usage-block prompt/completion token counts the client itself observed
+      -- independent of the EPP's internal accounting, since it comes from
+      the client's own HTTP responses.
+
+Two EPP-side numbers are cross-checked against that client ledger, per
+offered tenant:
+
+  - `llm_d_epp_request_input_tokens_sum` + `_output_tokens_sum` (the "total"
+    raw-token counters): these are core framework histograms, observed only
+    from a real response Usage block (pkg/epp/handlers/response.go), never
+    from the fairness plugin's dispatch-time estimate, and are NOT gated on
+    contention -- every completed request with a usage block counts. This is
+    the most direct check: raw tokens in should equal raw tokens out,
+    regardless of cost model.
+  - `llm_d_epp_maas_fairness_contended_service_tokens_total` (the "cost"
+    counter already used for the weighted-split SLI above): this one IS
+    gated on contention, and is denominated in the configured cost unit
+    (inputTokenWeight*(prompt-cached) + cachedInputTokenWeight*cached +
+    outputTokenWeight*completion -- see pkg/fairness/weightedlas/cost.go),
+    not raw tokens. Comparing it to raw client tokens directly would read a
+    deliberate cost-model choice (outputTokenWeight=2.0 live) as a bug, so
+    the client's own prompt/completion totals are run through the same
+    formula first (using the EPP's own measured cached-token delta, since
+    the client has no way to see cache hits) before the two are compared.
+    Caller-supplied --input-token-weight/--output-token-weight/
+    --cached-input-token-weight (no metric exposes these; the caller reads
+    them from the live EPP ConfigMap) select the formula; they default to
+    1.0/1.0/1.0 (plain token sum) so an older report is unaffected. This
+    check is only meaningful for a scenario shaped like "full contention for
+    (almost) the whole run" -- the contention gate and the client's
+    whole-run total are treated as covering the same set of requests, which
+    only holds when nobody is ever offered without being contended.
+
+`--ledger-tolerance-pct` (default 10.0, independent of --threshold-points)
+is the max absolute percent difference allowed on either check before a
+group fails the ledger cross-check. The result lives in
+`report["ledger"]["verdict"]`, separate from the top-level `verdict` --
+these are different invariants and a run can fail one without the other.
 """
 import argparse
 import json
@@ -244,6 +292,47 @@ def parse_loadgen_log(path):
                 "statuses": {code: int(count) for code, count in STATUS_PAIR.findall(row.group('codes'))},
             }
     return offered_workers, rows, duration, generator
+
+
+def parse_client_record(path):
+    """{group: {...}} from deploy/poc/15-fairness-benchmark.sh's
+    client-request-summary.jsonl -- one CLIENT_RECORD_JSON line per tenant,
+    emitted by deploy/poc/04-loadgen.yaml's run.sh and already pulled out of
+    the loadgen pod's own stdout. These are real usage-block token counts the
+    client itself sent/received (see docs/runbook.md "The client-side
+    record"), independent evidence from the client's own HTTP responses, not
+    the EPP's internal accounting."""
+    records = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            records[rec["group"]] = rec
+    return records
+
+
+def _counter_deltas(before_map, after_map, group_ids):
+    """Per-group delta of a cumulative Counter/Histogram-sum metric between
+    two snapshots, with the same backwards-counter EPP-restart detection the
+    contended_service_tokens_total/contended_seconds_total/dispatch_total
+    deltas in build_report use. Returns (deltas, restarted)."""
+    deltas = {}
+    restarted = False
+    for gid in group_ids:
+        b = before_map.get(gid)
+        a = after_map.get(gid)
+        if a is None:
+            deltas[gid] = None
+            continue
+        b = b if b is not None else 0.0
+        d = a - b
+        if d < 0:
+            restarted = True
+            d = 0.0
+        deltas[gid] = d
+    return deltas, restarted
 
 
 # --- UNI-127: timeline/windowed/convergence maths ---------------------------
@@ -407,7 +496,10 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                   metrics_before_path, metrics_after_path, loadgen_log_path,
                   label=None, control=False,
                   metrics_timeseries_path=None, timeline_config_path=None,
-                  window_seconds=10.0):
+                  window_seconds=10.0,
+                  client_record_jsonl_path=None,
+                  input_token_weight=1.0, output_token_weight=1.0,
+                  cached_input_token_weight=1.0, ledger_tolerance_pct=10.0):
     before = parse_metrics(metrics_before_path)
     after = parse_metrics(metrics_after_path)
     offered_workers, loadgen_rows, logged_duration, generator = parse_loadgen_log(loadgen_log_path)
@@ -436,6 +528,20 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     # that it did. A report built without that precondition still shows the
     # value -- it is just contaminated by whatever traffic preceded it.
     cached_ratio_after = after.get("llm_d_epp_maas_fairness_prompt_tokens_cached_ratio", {})
+    # UNI-138 (G2): the EPP's core, un-gated, un-weighted token histograms
+    # (pkg/epp/handlers/response.go -- observed only from a real response
+    # Usage block, same source the fairness plugin's own true-up reads, but
+    # NOT contention-gated and NOT run through the cost formula). Missing
+    # entirely from a snapshot taken by a benchmark script that predates
+    # UNI-138 (it only scraped the `llm_d_epp_maas_fairness_` prefix) --
+    # every delta below comes back None in that case, same as any other
+    # metric this report reads defensively via .get().
+    input_tokens_before = before.get("llm_d_epp_request_input_tokens_sum", {})
+    input_tokens_after = after.get("llm_d_epp_request_input_tokens_sum", {})
+    output_tokens_before = before.get("llm_d_epp_request_output_tokens_sum", {})
+    output_tokens_after = after.get("llm_d_epp_request_output_tokens_sum", {})
+    cached_tokens_before = before.get("llm_d_epp_request_cached_tokens_sum", {})
+    cached_tokens_after = after.get("llm_d_epp_request_cached_tokens_sum", {})
 
     all_group_ids = sorted(
         g for g in set(weight_before) | set(weight_after) | set(GROUPS)
@@ -492,6 +598,16 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             epp_restarted = True
             d = 0.0
         dispatch_deltas[gid] = d
+
+    # UNI-138 (G2): same before/after delta mechanism as the three series
+    # above, for the core un-gated token histograms. A restart detected here
+    # folds into the same epp_restarted flag -- it invalidates every delta in
+    # this report equally, not just the ledger section.
+    input_tokens_deltas, _restarted_in = _counter_deltas(input_tokens_before, input_tokens_after, all_group_ids)
+    output_tokens_deltas, _restarted_out = _counter_deltas(output_tokens_before, output_tokens_after, all_group_ids)
+    cached_tokens_deltas, _restarted_cached = _counter_deltas(cached_tokens_before, cached_tokens_after, all_group_ids)
+    if _restarted_in or _restarted_out or _restarted_cached:
+        epp_restarted = True
 
     offered_groups = [g for g in GROUPS if offered_workers.get(g, 0) > 0]
     # A single offered group is never "contended" by definition (metrics.go:
@@ -773,6 +889,112 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "epp_restarted_during_windows": windows_epp_restarted,
         }
 
+    # UNI-138 (G2): purely additive, like the timeline section above -- never
+    # reads or writes `verdict`. This checks a different invariant (does the
+    # EPP's accounting agree with what the client actually sent/received?),
+    # not the weighted-split SLI the main verdict already covers, so it gets
+    # its own `ledger.verdict` rather than folding into or overriding the
+    # top-level one.
+    ledger_section = None
+    if client_record_jsonl_path:
+        client_records = parse_client_record(client_record_jsonl_path)
+        ledger_rows = []
+        ledger_reasons = []
+        ledger_ok = True
+        for gid in offered_groups:
+            rec = client_records.get(gid)
+            epp_in = input_tokens_deltas.get(gid)
+            epp_out = output_tokens_deltas.get(gid)
+            epp_cached = cached_tokens_deltas.get(gid)
+            contended_cost = deltas.get(gid)
+            if rec is None:
+                ledger_ok = False
+                ledger_reasons.append(
+                    f"{gid} was offered load but has no client-side record "
+                    "(client-request-summary.jsonl is missing its line)"
+                )
+                ledger_rows.append({
+                    "group": gid,
+                    "client_prompt_tokens": None, "client_completion_tokens": None,
+                    "client_requests_sent": None, "client_aborts": None, "client_errors": None,
+                    "epp_total_input_tokens_delta": epp_in, "epp_total_output_tokens_delta": epp_out,
+                    "epp_total_cached_tokens_delta": epp_cached, "epp_total_raw_tokens_delta": None,
+                    "raw_tokens_pct_diff": None, "epp_contended_cost_delta": contended_cost,
+                    "expected_cost_from_client": None, "cost_pct_diff": None, "within_tolerance": None,
+                })
+                continue
+
+            client_prompt = rec.get("prompt_tokens_total", 0)
+            client_completion = rec.get("completion_tokens_total", 0)
+            client_raw_total = client_prompt + client_completion
+            epp_raw_total = (epp_in + epp_out) if (epp_in is not None and epp_out is not None) else None
+            raw_pct_diff = (
+                100.0 * (epp_raw_total - client_raw_total) / client_raw_total
+                if epp_raw_total is not None and client_raw_total > 0 else None
+            )
+
+            # The client cannot see cache hits, so the EPP's own (measured,
+            # not estimated) cached-token delta stands in for that term --
+            # clamped to the client's prompt total defensively, the same
+            # direction cost.go's own cf>pf guard takes.
+            cached_for_cost = min(epp_cached, client_prompt) if epp_cached is not None else 0.0
+            expected_cost = (
+                input_token_weight * (client_prompt - cached_for_cost)
+                + cached_input_token_weight * cached_for_cost
+                + output_token_weight * client_completion
+            )
+            cost_pct_diff = (
+                100.0 * (contended_cost - expected_cost) / expected_cost
+                if contended_cost is not None and expected_cost > 0 else None
+            )
+
+            within = (
+                raw_pct_diff is not None and abs(raw_pct_diff) <= ledger_tolerance_pct
+                and cost_pct_diff is not None and abs(cost_pct_diff) <= ledger_tolerance_pct
+            )
+            if not within:
+                ledger_ok = False
+                detail = []
+                if raw_pct_diff is None or abs(raw_pct_diff) > ledger_tolerance_pct:
+                    detail.append(f"raw tokens {'n/a' if raw_pct_diff is None else f'{raw_pct_diff:+.1f}%'}")
+                if cost_pct_diff is None or abs(cost_pct_diff) > ledger_tolerance_pct:
+                    detail.append(f"cost {'n/a' if cost_pct_diff is None else f'{cost_pct_diff:+.1f}%'}")
+                ledger_reasons.append(
+                    f"{gid} exceeded the {ledger_tolerance_pct:g}% ledger tolerance: " + ", ".join(detail)
+                )
+
+            ledger_rows.append({
+                "group": gid,
+                "client_prompt_tokens": client_prompt,
+                "client_completion_tokens": client_completion,
+                "client_requests_sent": rec.get("requests_sent"),
+                "client_aborts": rec.get("aborts"),
+                "client_errors": rec.get("errors"),
+                "epp_total_input_tokens_delta": epp_in,
+                "epp_total_output_tokens_delta": epp_out,
+                "epp_total_cached_tokens_delta": epp_cached,
+                "epp_total_raw_tokens_delta": epp_raw_total,
+                "raw_tokens_pct_diff": raw_pct_diff,
+                "epp_contended_cost_delta": contended_cost,
+                "expected_cost_from_client": expected_cost,
+                "cost_pct_diff": cost_pct_diff,
+                "within_tolerance": within,
+            })
+
+        ledger_section = {
+            "tolerance_pct": ledger_tolerance_pct,
+            "cost_model": {
+                "input_token_weight": input_token_weight,
+                "output_token_weight": output_token_weight,
+                "cached_input_token_weight": cached_input_token_weight,
+            },
+            "rows": ledger_rows,
+            "verdict": {
+                "result": "PASS" if ledger_ok else "FAIL",
+                "reasons": ledger_reasons,
+            },
+        }
+
     report = {
         "schema": "uni54.fairness_benchmark_report.v1",
         "run": {
@@ -833,6 +1055,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             ),
         },
         "timeline": timeline_section,
+        "ledger": ledger_section,
     }
     return report
 
@@ -948,6 +1171,41 @@ def render_markdown(report):
                     f"{wfmt(g['observed_share_pct'], '%')} | {wfmt(g['deviation_pts'])} |"
                 )
     lines.append("")
+    lines.append("## Ledger cross-check (UNI-138/G2)")
+    lines.append("")
+    l = report.get("ledger")
+    if not l:
+        lines.append("N/A: no `--client-record-jsonl` recorded for this run (older report, or the "
+                      "benchmark script predates UNI-138).")
+    else:
+        cm = l["cost_model"]
+        lines.append(
+            f"**Ledger verdict: {l['verdict']['result']}** (tolerance: {l['tolerance_pct']:g}%, "
+            f"cost model: input={cm['input_token_weight']:g} output={cm['output_token_weight']:g} "
+            f"cached={cm['cached_input_token_weight']:g})"
+        )
+        if l["verdict"]["reasons"]:
+            lines.append("")
+            for reason in l["verdict"]["reasons"]:
+                lines.append(f"- {reason}")
+        lines.append("")
+        lines.append(
+            "| group | client prompt tok | client completion tok | EPP raw tokens (in+out) | "
+            "raw diff % | EPP contended cost | expected cost (from client) | cost diff % | "
+            "within tolerance |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        for row in l["rows"]:
+            def lfmt(v, suffix=""):
+                return "n/a" if v is None else f"{v:.1f}{suffix}" if isinstance(v, float) else f"{v}{suffix}"
+            lines.append(
+                f"| {row['group']} | {lfmt(row['client_prompt_tokens'])} | "
+                f"{lfmt(row['client_completion_tokens'])} | {lfmt(row['epp_total_raw_tokens_delta'])} | "
+                f"{lfmt(row['raw_tokens_pct_diff'], '%')} | {lfmt(row['epp_contended_cost_delta'])} | "
+                f"{lfmt(row['expected_cost_from_client'])} | {lfmt(row['cost_pct_diff'], '%')} | "
+                f"{row['within_tolerance']} |"
+            )
+    lines.append("")
     lines.append("## Sources")
     lines.append("")
     for key, text in report["sources"].items():
@@ -993,6 +1251,24 @@ def main():
              "events). Omit to treat every offered group as active the whole run.",
     )
     p.add_argument("--window-seconds", type=float, default=10.0)
+    p.add_argument(
+        "--client-record-jsonl", default=None,
+        help="UNI-138 (G2): path to client-request-summary.jsonl (deploy/poc/15-fairness-"
+             "benchmark.sh's pull of 04-loadgen.yaml's CLIENT_RECORD_JSON lines). Omit to get "
+             "a report with no 'ledger' section -- the pre-UNI-138 shape.",
+    )
+    p.add_argument(
+        "--input-token-weight", type=float, default=1.0,
+        help="UNI-138 (G2): live EPP ConfigMap's inputTokenWeight -- no metric exposes this, "
+             "so the caller must read it from maas-epp-config and pass it through.",
+    )
+    p.add_argument("--output-token-weight", type=float, default=1.0)
+    p.add_argument("--cached-input-token-weight", type=float, default=1.0)
+    p.add_argument(
+        "--ledger-tolerance-pct", type=float, default=10.0,
+        help="UNI-138 (G2): max absolute percent difference between the EPP's accounting and "
+             "the client-recorded ledger before a group fails the ledger cross-check.",
+    )
     args = p.parse_args()
 
     report = build_report(
@@ -1014,6 +1290,11 @@ def main():
         metrics_timeseries_path=args.metrics_timeseries,
         timeline_config_path=args.timeline_config,
         window_seconds=args.window_seconds,
+        client_record_jsonl_path=args.client_record_jsonl,
+        input_token_weight=args.input_token_weight,
+        output_token_weight=args.output_token_weight,
+        cached_input_token_weight=args.cached_input_token_weight,
+        ledger_tolerance_pct=args.ledger_tolerance_pct,
     )
 
     with open(args.out_json, "w") as f:

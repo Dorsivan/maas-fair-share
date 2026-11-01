@@ -1084,6 +1084,163 @@ def test_render_markdown_labels_open_loop_rate_column():
         assert "| Generator | `open-loop` |" in md
 
 
+# UNI-138 (G2): ledger cross-check -- client-recorded tokens vs the EPP's
+# own core (ungated, unweighted) token histograms and the fairness plugin's
+# (gated, cost-weighted) contended_service_tokens_total.
+def client_record_jsonl(records):
+    return "\n".join(json.dumps(r) for r in records) + "\n"
+
+
+def run_build_with_ledger(tmp, *, tenants, w_app1, w_app2, w_end, rows,
+                           contended_cost, input_tokens, output_tokens, cached_tokens,
+                           client_records, input_token_weight=1.0, output_token_weight=2.0,
+                           cached_input_token_weight=1.0, ledger_tolerance_pct=10.0,
+                           duration=240, scenario="full-contention"):
+    def series(name, values):
+        return "".join(f'{name}{{fairness_id="{g}"}} {v}\n' for g, v in values.items())
+
+    before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON)
+    after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON
+                  + series("llm_d_epp_maas_fairness_contended_service_tokens_total", contended_cost)
+                  + series("llm_d_epp_request_input_tokens_sum", input_tokens)
+                  + series("llm_d_epp_request_output_tokens_sum", output_tokens)
+                  + series("llm_d_epp_request_cached_tokens_sum", cached_tokens))
+    log = write(tmp, "loadgen.log", loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows))
+    client_path = write(tmp, "client-request-summary.jsonl", client_record_jsonl(client_records))
+    return fairness_report.build_report(
+        scenario=scenario,
+        enforce=True,
+        duration_seconds=duration,
+        backend="vllm-gpu (real)",
+        epp_image_digest="sha256:deadbeef",
+        namespace="maas-fairness-poc",
+        epp_pod="maas-vllm-gpu-kserve-router-scheduler-test",
+        run_start="2026-11-01T00:00:00Z",
+        run_end="2026-11-01T00:04:00Z",
+        threshold_points=10.0,
+        metrics_before_path=before,
+        metrics_after_path=after,
+        loadgen_log_path=log,
+        client_record_jsonl_path=client_path,
+        input_token_weight=input_token_weight,
+        output_token_weight=output_token_weight,
+        cached_input_token_weight=cached_input_token_weight,
+        ledger_tolerance_pct=ledger_tolerance_pct,
+    )
+
+
+LEDGER_TENANTS = "app1 app2 end-users"
+LEDGER_ROWS = [
+    ("app1", 1000, 0.80, 1.00, "200=1000"),
+    ("app2", 1000, 0.80, 1.00, "200=1000"),
+    ("end-users", 1000, 0.80, 1.00, "200=1000"),
+]
+# Chosen so expected cost (input*prompt + output*2*completion, cached=0) comes
+# out exact: app1 100000+2*20000=140000, app2 90000+2*18000=126000,
+# end-users 80000+2*16000=112000 -- see the module docstring's cost formula.
+LEDGER_CLIENT_RECORDS = [
+    {"group": "app1", "requests_sent": 1000, "status_tally": {"200": 1000}, "aborts": 0,
+     "errors": 0, "prompt_tokens_total": 100000, "completion_tokens_total": 20000,
+     "stream_requests": 0, "max_tokens_omitted": 0, "max_tokens_huge": 0,
+     "long_generations": 0, "forged_fairness_id": 0},
+    {"group": "app2", "requests_sent": 1000, "status_tally": {"200": 1000}, "aborts": 0,
+     "errors": 0, "prompt_tokens_total": 90000, "completion_tokens_total": 18000,
+     "stream_requests": 0, "max_tokens_omitted": 0, "max_tokens_huge": 0,
+     "long_generations": 0, "forged_fairness_id": 0},
+    {"group": "end-users", "requests_sent": 1000, "status_tally": {"200": 1000}, "aborts": 0,
+     "errors": 0, "prompt_tokens_total": 80000, "completion_tokens_total": 16000,
+     "stream_requests": 0, "max_tokens_omitted": 0, "max_tokens_huge": 0,
+     "long_generations": 0, "forged_fairness_id": 0},
+]
+LEDGER_INPUT_TOKENS = {"app1": 100000, "app2": 90000, "end-users": 80000}
+LEDGER_OUTPUT_TOKENS = {"app1": 20000, "app2": 18000, "end-users": 16000}
+LEDGER_CACHED_TOKENS = {"app1": 0, "app2": 0, "end-users": 0}
+LEDGER_CONTENDED_COST = {"app1": 140000, "app2": 126000, "end-users": 112000}
+
+
+def test_ledger_section_absent_without_client_record_arg():
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = 'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+        tokens_after = 'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 100\n'
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1", w_app1=32, w_app2=0, w_end=0,
+            rows=[("app1", 10, 0.8, 1.0, "200=10")],
+        )
+        assert report["ledger"] is None
+        md = fairness_report.render_markdown(report)
+        assert "N/A: no `--client-record-jsonl`" in md
+
+
+def test_ledger_passes_when_epp_accounting_matches_client():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_with_ledger(
+            tmp, tenants=LEDGER_TENANTS, w_app1=32, w_app2=32, w_end=128, rows=LEDGER_ROWS,
+            contended_cost=LEDGER_CONTENDED_COST, input_tokens=LEDGER_INPUT_TOKENS,
+            output_tokens=LEDGER_OUTPUT_TOKENS, cached_tokens=LEDGER_CACHED_TOKENS,
+            client_records=LEDGER_CLIENT_RECORDS,
+        )
+        ledger = report["ledger"]
+        assert ledger["verdict"]["result"] == "PASS", ledger["verdict"]["reasons"]
+        for row in ledger["rows"]:
+            assert row["within_tolerance"] is True, row
+            assert abs(row["raw_tokens_pct_diff"]) < 1e-6
+            assert abs(row["cost_pct_diff"]) < 1e-6
+        # Unaffected: the weighted-split verdict is a different check.
+        assert report["verdict"]["result"] in ("PASS", "FAIL")
+        md = fairness_report.render_markdown(report)
+        assert "Ledger verdict: PASS" in md
+
+
+def test_ledger_fails_on_raw_token_mismatch_but_not_cost():
+    with tempfile.TemporaryDirectory() as tmp:
+        skewed_input = dict(LEDGER_INPUT_TOKENS, **{"end-users": 200000})
+        report = run_build_with_ledger(
+            tmp, tenants=LEDGER_TENANTS, w_app1=32, w_app2=32, w_end=128, rows=LEDGER_ROWS,
+            contended_cost=LEDGER_CONTENDED_COST, input_tokens=skewed_input,
+            output_tokens=LEDGER_OUTPUT_TOKENS, cached_tokens=LEDGER_CACHED_TOKENS,
+            client_records=LEDGER_CLIENT_RECORDS,
+        )
+        ledger = report["ledger"]
+        assert ledger["verdict"]["result"] == "FAIL"
+        assert any("end-users" in r and "raw tokens" in r for r in ledger["verdict"]["reasons"])
+        app1_row = next(r for r in ledger["rows"] if r["group"] == "app1")
+        assert app1_row["within_tolerance"] is True
+
+
+def test_ledger_fails_on_contended_cost_mismatch_but_not_raw_tokens():
+    with tempfile.TemporaryDirectory() as tmp:
+        skewed_cost = dict(LEDGER_CONTENDED_COST, **{"app1": 50000})
+        report = run_build_with_ledger(
+            tmp, tenants=LEDGER_TENANTS, w_app1=32, w_app2=32, w_end=128, rows=LEDGER_ROWS,
+            contended_cost=skewed_cost, input_tokens=LEDGER_INPUT_TOKENS,
+            output_tokens=LEDGER_OUTPUT_TOKENS, cached_tokens=LEDGER_CACHED_TOKENS,
+            client_records=LEDGER_CLIENT_RECORDS,
+        )
+        ledger = report["ledger"]
+        assert ledger["verdict"]["result"] == "FAIL"
+        assert any("app1" in r and "cost" in r for r in ledger["verdict"]["reasons"])
+        app1_row = next(r for r in ledger["rows"] if r["group"] == "app1")
+        assert abs(app1_row["raw_tokens_pct_diff"]) < 1e-6
+        assert app1_row["within_tolerance"] is False
+
+
+def test_ledger_fails_when_offered_group_has_no_client_record():
+    with tempfile.TemporaryDirectory() as tmp:
+        partial_records = [r for r in LEDGER_CLIENT_RECORDS if r["group"] != "end-users"]
+        report = run_build_with_ledger(
+            tmp, tenants=LEDGER_TENANTS, w_app1=32, w_app2=32, w_end=128, rows=LEDGER_ROWS,
+            contended_cost=LEDGER_CONTENDED_COST, input_tokens=LEDGER_INPUT_TOKENS,
+            output_tokens=LEDGER_OUTPUT_TOKENS, cached_tokens=LEDGER_CACHED_TOKENS,
+            client_records=partial_records,
+        )
+        ledger = report["ledger"]
+        assert ledger["verdict"]["result"] == "FAIL"
+        assert any("end-users" in r and "no client-side record" in r for r in ledger["verdict"]["reasons"])
+        missing_row = next(r for r in ledger["rows"] if r["group"] == "end-users")
+        assert missing_row["within_tolerance"] is None
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

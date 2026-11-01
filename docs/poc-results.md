@@ -2759,6 +2759,193 @@ surprised us" above, the 21 req/s ceiling this ticket's 70/100/120% figures
 are relative to was reused from UNI-34 rather than independently
 re-measured on the current EPP build.
 
+## UNI-138: G2, ledger cross-check -- EPP token counters vs tokens the loadgen received
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, "G" group: does the EPP's own
+accounting agree with what the client actually sent and received, not just
+whether the weighted split matches the configured weights (every prior case
+in this series)? This is a different invariant from the fairness SLI --  it
+checks for a second, independent kind of bug: the policy could split traffic
+in exactly the right proportions while still mis-accounting the absolute
+token counts it is dividing up.
+
+**Harness change: none needed for the client side.** [UNI-128](/UNI/issues/UNI-128)
+already added `CLIENT_RECORD_JSON` (real `usage.prompt_tokens`/
+`completion_tokens` from each response body, not an estimate) and
+`15-fairness-benchmark.sh` already pulls it into
+`client-request-summary.jsonl`. Two things *were* missing:
+
+1. **`snapshot_metrics()` only ever scraped the `llm_d_epp_maas_fairness_`
+   prefix.** The EPP's core, per-request token histograms
+   (`llm_d_epp_request_input_tokens`, `_output_tokens`, `_cached_tokens` --
+   `fairness_id`-labelled, owned by the framework, not the fairness plugin;
+   `pkg/fairness/weightedlas/metrics.go`'s own comment says not to duplicate
+   them) were invisible to every report before this ticket. Fixed by
+   broadening the grep to also capture their `_sum`/`_count` lines. These are
+   observed *only* from a real response `Usage` block
+   (`pkg/epp/handlers/response.go`), never from the fairness plugin's
+   dispatch-time estimate, and are **not** contention-gated -- the most
+   direct possible check against the client's raw totals.
+2. **No metric exposes the cost-model weights**
+   (`inputTokenWeight`/`outputTokenWeight`/`cachedInputTokenWeight`), and
+   `contended_service_tokens_total` is denominated in that cost unit, not raw
+   tokens (`cost.go`: `inputTokenWeight*(prompt-cached) +
+   cachedInputTokenWeight*cached + outputTokenWeight*completion`). Comparing
+   it to raw client tokens directly would read a deliberate cost-model choice
+   (`outputTokenWeight: 2.0` live) as a bug. Fixed by reading the three
+   weights live from the `maas-epp-config` ConfigMap and running the client's
+   own prompt/completion totals through the identical formula before
+   comparing.
+
+`15-fairness-report.py` gained a `ledger` section (`--client-record-jsonl`,
+`--input-token-weight`/`--output-token-weight`/`--cached-input-token-weight`,
+`--ledger-tolerance-pct`) -- purely additive, like UNI-127's `timeline`: it
+never reads or writes the top-level `verdict`, since this checks a different
+invariant and gets its own `ledger.verdict`. Five new unit tests
+(`test_ledger_*`); all 36 pass.
+
+**Setup:** a plain `full-contention` run (`app1`/`app2`/`end-users`,
+32/32/128 workers, 240s, no request-shape overrides -- the same shape every
+other full-contention measurement in this series uses) against the live GPU
+pool, 2 replicas, `enforce: true`.
+
+**Expected split:** 20/10/65 (renormalized: 21.1/10.5/68.4% of the offered
+total).
+
+**Observed split:** app1 17.7% (-3.3pts), app2 14.0% (+3.5pts), end-users
+68.2% (-0.2pts) -- max deviation 3.5pts, **PASS** against the 10-point
+threshold (this is the same weighted-split check every other case in this
+series runs; G2's own pass bar is the ledger table below, not this number).
+
+**Ledger cross-check -- two independent comparisons per tenant:**
+
+| group | client prompt/completion tok | EPP raw tokens (in+out) | raw diff % | EPP contended cost | expected cost (client tok through cost formula) | cost diff % |
+|---|---|---|---|---|---|---|
+| app1 | 694,950 / 34,457 | 729,407 | **0.00%** | 734,108 | 763,864 | **-3.90%** |
+| app2 | 551,040 / 27,500 | 578,540 | **0.00%** | 581,698 | 606,040 | **-4.02%** |
+| end-users | 2,587,920 / 128,796 | 2,715,422 | **-0.05%** | 2,826,610 | 2,845,512 | **-0.66%** |
+
+Cost model used (read live from `maas-epp-config`, not hardcoded):
+`inputTokenWeight=1.0`, `outputTokenWeight=2.0`, `cachedInputTokenWeight=1.0`.
+
+**Verdict: PASS at X=10%.** Every cell above is within 10% both ways; the
+largest observed bias (app2's cost check, -4.02%) still has roughly 2.5x
+headroom under the threshold.
+
+**Picking X=10%, from this run's own data.** The two checks behave very
+differently, and that difference is itself the evidence for where to set the
+bar:
+
+- **Raw tokens (EPP's ungated core histograms vs. the client's own
+  usage-block totals) agree to within rounding** (0.00%, 0.00%, -0.05%).
+  Both sides read the same real `usage.prompt_tokens`/`completion_tokens`
+  values off the same responses, through independent code paths (the
+  client's own `grep` vs. the framework's `RecordInputTokens`/
+  `RecordOutputTokens`), so near-exact agreement is the expected result when
+  the EPP's accounting is correct, not a coincidence. A 10% bar on this check
+  has enormous headroom; it exists mainly to catch a real regression (a
+  server missing `--enable-force-include-usage`, or the two sides drifting
+  out of sync), not to tolerate expected noise.
+- **The cost-weighted, contention-gated check (`contended_service_tokens_total`
+  vs. the client's totals run through the cost formula) carries a real,
+  persistent, negative bias** of -3.9% to -4.0% for the two lower-volume
+  tenants (app1: 567 requests, app2: 449) and only -0.66% for the
+  high-volume one (end-users: 2,155 requests).
+
+**Explaining the bias -- and ruling out the ticket's own prediction.** The
+ticket flagged "the 4-bytes-per-token estimate" (`estimatedBytesPerToken: 4`,
+`cost.go`'s `estimatePromptTokens`) as a known source of bias. The data rules
+this out directly: `llm_d_epp_maas_fairness_requests_without_usage_total` --
+the counter that fires exactly when a completed request never got a real
+`Usage` block and its *dispatch-time estimate* (the bytes/4 prompt guess
+included) is booked permanently instead of a measured cost -- is **absent
+from both snapshots**, i.e. flat zero for the entire 240s run. Every
+completed request, success or otherwise, was trued up against real
+measured tokens; the bytes/4 estimate never once became the booked cost.
+(The 54 non-200 responses this run saw, 2/1/51 for app1/app2/end-users, also
+don't explain it: each group's `dispatch_total` delta matches its 200-count
+almost exactly -- app1 565 dispatches vs. 565 `200`s, app2 448 vs. 448,
+end-users 2,103 vs. 2,104 -- meaning those failures never reached the EPP's
+dispatch/accounting path at all, and are symmetrically excluded from the
+client ledger too, since `04-loadgen.yaml`'s `run.sh` only sums
+`prompt_tokens`/`completion_tokens` when the grep actually found them.)
+
+The real mechanism is `contended_service_tokens_total`'s own gate:
+`isContended` is a single flag per priority band, shared across every group
+in it, that only turns true once the EPP has observed *at least one instant*
+where two groups were backlogged simultaneously (`pkg/fairness/weightedlas/
+plugin.go`'s `isContended`/`lastContendedUnixNano`). At the very start of a
+run, before that first overlap is ever observed, every group's requests are
+still dispatched, still complete normally, and are still correctly measured
+and added to the *ungated* raw-token histograms -- but by `metrics.go`'s own
+documented definition ("share is only counted over the time a group
+actually had a queue while someone else did too"), they are correctly
+excluded from `contended_service_tokens_total`. This is the policy working
+as designed, not a bug -- but it does mean a whole-run client ledger, which
+has no notion of this gate, will always see the gated cost counter sitting
+slightly *below* "every real request's cost," never above. Because the
+size of that startup window is roughly fixed per run (set by how fast the
+very first cross-group overlap happens, not by how much traffic a given
+tenant sends over the full 240s), it is a much bigger fraction of a
+low-volume tenant's total (app1/app2, ~500-570 requests) than a high-volume
+one's (end-users, ~2,100) -- exactly the -4%/-4%/-0.66% pattern observed.
+This is a **persistent, structural, and explained** bias, not noise, and it
+should shrink (not grow) on a longer run, since the fixed startup window
+amortizes over more total requests.
+
+Given that, 10% was picked as X because it covers the only real, explained
+bias (max -4.02%) with ~2.5x margin, while still being tight enough that the
+near-zero raw-token check would catch a real regression (a missing
+`--enable-force-include-usage` flag, or the ledger mechanism itself
+breaking) immediately.
+
+**What surprised us.** The ticket's own candidate explanation (bytes/4
+estimate bias) turned out to be the wrong one for this run -- the actual
+cause is a structural property of the contention gate that has nothing to
+do with token-count estimation at all. Catching that required checking
+`requests_without_usage_total` directly rather than assuming the ticket's
+hint was the answer; a report that had simply computed "is the bias under
+X%" without explaining *why* would have shipped a plausible-sounding but
+wrong just-so story.
+
+**Cluster left as found.** This run patches nothing beyond the standard
+Job/ConfigMap cycle every scenario in this series uses; confirmed afterward:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs,pods -n maas-fairness-poc
+job.batch/maas-loadgen   Complete   1/1   4m19s   6m12s
+... (no stray/active pods, no orphaned `oc logs -f` processes -- checked via /proc/*/cmdline)
+$ # maas-epp-config's `epp` key, byte-for-byte, before vs. after this run: identical
+```
+
+Matches `deploy/llmisvc.yaml` (replicas) and `deploy/epp-config.yaml`
+(weights, cost model) exactly.
+
+**Raw results:** `results/20261101T192928Z-uni138-g2-ledger-full-contention/`
+(report JSON/MD with the new `ledger` section, loadgen log,
+`client-request-summary.jsonl`, metric before/after/timeseries snapshots,
+EPP container log).
+
+**Grafana time range** (padded +-60s around `run_start`/`run_end`):
+`from=1793561309000&to=1793561692000`
+
+https://grafana-grafana.apps.ocp.paladinaura.com/d/maas-fairness-gpu-epp/?orgId=1&from=1793561309000&to=1793561692000&var-group=All&var-window=2m
+
+**Not proven here:** a single 240s run at a single seed, not repeated for
+variance -- the -4% cost bias is explained mechanistically, not confirmed to
+be stable across repeats. The ledger check is only validated for a
+full-contention shape; it assumes the contended fraction of a run is close
+to 1.0 (nobody is ever offered without being contended), which does not hold
+for `solo`, `capped`, demand-light, or UNCONTENDED scenarios elsewhere in
+this series -- `--client-record-jsonl` was not wired into those invocations
+and should not be, without re-deriving the formula for a partially-contended
+run first. Cache-hit accounting (`cachedInputTokenWeight`) was not
+separately exercised here (`CACHE_SHAPE_*` left at default), so the ledger's
+cached-token term is small and mostly untested at scale; see UNI-136 for
+that dimension on its own.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

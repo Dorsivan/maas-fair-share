@@ -999,6 +999,83 @@ not a PASS/FAIL, and the weighted-split threshold is not the question this
 case is answering. See `docs/poc-results.md`'s UNI-136 section for the full
 result and what it says about the `cachedInputTokenWeight` decision.
 
+### Ledger cross-check (UNI-138)
+
+G2 asks a different question from every other case above: not "does the
+split match the configured weights," but "does the EPP's own accounting
+agree with what the client actually sent and received." `15-fairness-
+report.py` answers it with a `ledger` section -- additive, like the timeline
+section above, with its own `ledger.verdict` that never touches the
+top-level `verdict`.
+
+Two things had to be added to make the comparison possible, both already
+wired into `15-fairness-benchmark.sh`:
+
+- `snapshot_metrics()` now also captures `llm_d_epp_request_(input|output|
+  cached)_tokens_(sum|count)` -- the EPP's core, per-request token
+  histograms, `fairness_id`-labelled but owned by the framework, not the
+  fairness plugin (`pkg/fairness/weightedlas/metrics.go`'s own comment says
+  not to duplicate them). These are observed only from a real response
+  `Usage` block, never from the plugin's dispatch-time estimate, and are
+  **not** contention-gated -- the most direct check against the client's raw
+  totals. Before this ticket they were invisible to every report; a snapshot
+  taken by the pre-UNI-138 script still works, it just produces a report
+  with no `ledger` section (same "omit the flag, get the old shape" contract
+  as `--metrics-timeseries`).
+- The cost-model weights (`inputTokenWeight`/`outputTokenWeight`/
+  `cachedInputTokenWeight`) are read live from the `maas-epp-config`
+  ConfigMap and passed to the report as `--input-token-weight`/
+  `--output-token-weight`/`--cached-input-token-weight`. No metric exposes
+  these, and `contended_service_tokens_total` is denominated in that cost
+  unit, not raw tokens -- comparing it to raw client tokens directly would
+  read a deliberate cost-model choice (`outputTokenWeight: 2.0` live) as a
+  bug.
+
+Pass `--client-record-jsonl` (`15-fairness-benchmark.sh` always does, using
+the `client-request-summary.jsonl` the UNI-128 mechanism already produces)
+to get the section; omit it for the pre-UNI-138 report shape.
+`--ledger-tolerance-pct` (default 10, same default `15-fairness-benchmark.sh`
+sets via `LEDGER_TOLERANCE_PCT`) is the max absolute percent difference
+allowed, per tenant, on either of two checks:
+
+1. **Raw tokens**: EPP's `llm_d_epp_request_input_tokens_sum` +
+   `_output_tokens_sum` delta vs. the client's `prompt_tokens_total` +
+   `completion_tokens_total`. Both sides read the same real usage-block
+   values through independent code paths, so this should track to within
+   rounding; a real divergence here means a regression (a model server
+   missing `--enable-force-include-usage`, or the two accounting paths
+   drifting out of sync).
+2. **Cost**: EPP's `contended_service_tokens_total` delta vs. the client's
+   prompt/completion totals run through the live cost formula (the client
+   has no way to see cache hits, so the EPP's own measured
+   `_cached_tokens_sum` delta stands in for that term). Only meaningful for a
+   scenario shaped like full contention for (almost) the whole run, since
+   the gate and the client's whole-run total are treated as covering the
+   same set of requests.
+
+**Picking X=10%, from the live full-contention run:** raw tokens agreed to
+within 0.05% across all three tenants; the cost check carried a real,
+explained, persistent bias of -3.9% to -4.0% for the two lower-request-count
+tenants and -0.66% for the highest-volume one -- not the ticket's suspected
+"4-bytes-per-token estimate" (ruled out directly:
+`requests_without_usage_total` stayed at flat zero for the whole run, so no
+completed request was ever left on its dispatch-time estimate), but the
+contention gate's own startup transient: `isContended` only turns true once
+the EPP has observed the first cross-group backlog overlap, and the
+requests dispatched before that moment are real, fully measured, and
+correctly excluded from the gated cost counter by design, while still
+counted in a whole-run client total. That fixed-size startup window is a
+much bigger fraction of a low-volume tenant's total than a high-volume one's
+-- see `docs/poc-results.md`'s UNI-138 section for the full numbers and
+reasoning. 10% was picked to clear that explained bias with ~2.5x margin
+while still being tight enough to catch a real regression on the raw-token
+check.
+
+Only validated for full-contention; do not wire `--client-record-jsonl` into
+a `solo`/`capped`/demand-light/UNCONTENDED scenario without first re-deriving
+the cost-check formula for a run where the contended fraction is not close
+to 1.0.
+
 ---
 
 ## Load the fairness dashboard into the live Grafana

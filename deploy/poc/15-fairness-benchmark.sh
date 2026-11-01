@@ -199,6 +199,16 @@
 # pre-UNI-129 behaviour when unset. D5 (a path reaching the EPP with a
 # missing/empty x-maas-subscription) is NOT a 04-loadgen.yaml knob -- see
 # deploy/poc/16-loadgen-identity-variants.sh and the runbook section above.
+# UNI-138 harness addition (see docs/runbook.md "The client-side record" and
+# "G2: ledger cross-check" for the full story): LEDGER_TOLERANCE_PCT (default
+# 10) is the max absolute percent difference the report's ledger section
+# allows between the EPP's own accounting and 04-loadgen.yaml's client-side
+# CLIENT_RECORD_JSON before a group fails that cross-check. The cost-model
+# weights the ledger needs to compare against contended_service_tokens_total
+# (inputTokenWeight/outputTokenWeight/cachedInputTokenWeight) are not a
+# benchmark override -- they are read live from the maas-epp-config
+# ConfigMap below, since no metric exposes them and hardcoding them here
+# would silently go stale the next time that ConfigMap is retuned.
 set -euo pipefail
 
 SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold}"
@@ -210,6 +220,9 @@ EPP_SELECTOR="${EPP_SELECTOR:-app.kubernetes.io/component=llminferenceservice-ro
 EPP_CONTAINER="${EPP_CONTAINER:-main}"
 BACKEND="${BACKEND:-vllm-gpu (real)}"
 THRESHOLD_POINTS="${THRESHOLD_POINTS:-10}"
+# UNI-138 (G2): default picked and justified in docs/poc-results.md's G2
+# section from this ticket's own full-contention run -- not a guess.
+LEDGER_TOLERANCE_PCT="${LEDGER_TOLERANCE_PCT:-10}"
 JOB_NAME="maas-loadgen"
 DURATION="${DURATION:-240}"
 
@@ -520,8 +533,17 @@ if [ -z "$EPP_METRICS_SVC_IP" ]; then
   EPP_METRICS_SVC_IP="$($OC get svc maas-vllm-gpu-epp-service -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
 fi
 snapshot_metrics() {
+  # UNI-138 (G2): also capture the core, un-gated, un-weighted per-request
+  # token histograms' _sum/_count lines (fairness_id-labelled, but owned by
+  # the framework, not the fairness plugin -- see pkg/fairness/weightedlas/
+  # metrics.go's own "do not duplicate these" comment). The ledger
+  # cross-check needs them next to llm_d_epp_maas_fairness_* in the same
+  # before/after snapshot; omitting --client-record-jsonl downstream still
+  # works against a snapshot that only has the old prefix, so this is purely
+  # additive.
   curl -sS -m 10 -H "Authorization: Bearer $METRICS_TOKEN" "http://${EPP_METRICS_SVC_IP}:9090/metrics" \
-    | grep '^llm_d_epp_maas_fairness_' | grep -v '^#'
+    | grep -E '^llm_d_epp_maas_fairness_|^llm_d_epp_request_(input|output|cached)_tokens_(sum|count)\{' \
+    | grep -v '^#'
 }
 
 echo "[benchmark] metrics snapshot: before"
@@ -679,6 +701,24 @@ snapshot_metrics > "$METRICS_AFTER"
 RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 { echo "# ts=$RUN_END epoch=$(date +%s)"; cat "$METRICS_AFTER"; } >> "$METRICS_TS"
 
+# UNI-138 (G2): the ledger cross-check's cost formula needs the EPP's live
+# cost-model weights to translate the client's raw token counts into the
+# same unit contended_service_tokens_total is denominated in (pkg/fairness/
+# weightedlas/cost.go). No metric exposes these (metrics.go deliberately
+# ships only series that are not configuration), so read them straight out
+# of the ConfigMap rather than hardcoding deploy/epp-config.yaml's committed
+# defaults, which could have drifted from what is actually live. Fall back
+# to 1.0 (plain token sum) if a key is absent, same as the report script's
+# own CLI defaults.
+EPP_CONFIG_YAML="$($OC get configmap maas-epp-config -n "$NAMESPACE" -o jsonpath='{.data.epp}')"
+INPUT_TOKEN_WEIGHT="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*inputTokenWeight:\s*\K[0-9.]+' | head -1)"
+OUTPUT_TOKEN_WEIGHT="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*outputTokenWeight:\s*\K[0-9.]+' | head -1)"
+CACHED_INPUT_TOKEN_WEIGHT="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*cachedInputTokenWeight:\s*\K[0-9.]+' | head -1)"
+INPUT_TOKEN_WEIGHT="${INPUT_TOKEN_WEIGHT:-1.0}"
+OUTPUT_TOKEN_WEIGHT="${OUTPUT_TOKEN_WEIGHT:-1.0}"
+CACHED_INPUT_TOKEN_WEIGHT="${CACHED_INPUT_TOKEN_WEIGHT:-1.0}"
+echo "[benchmark] ledger cost model (live from maas-epp-config): input=$INPUT_TOKEN_WEIGHT output=$OUTPUT_TOKEN_WEIGHT cached=$CACHED_INPUT_TOKEN_WEIGHT"
+
 # --- Build the report; its exit code becomes this script's exit code -------
 set +e
 REPORT_ARGS=(
@@ -688,6 +728,9 @@ REPORT_ARGS=(
   --run-start "$RUN_START" --run-end "$RUN_END" --threshold-points "$THRESHOLD_POINTS"
   --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" --loadgen-log "$LOADGEN_LOG"
   --metrics-timeseries "$METRICS_TS" --timeline-config "$TIMELINE_CONFIG" --window-seconds "$WINDOW_SECONDS"
+  --client-record-jsonl "$CLIENT_RECORD_JSONL"
+  --input-token-weight "$INPUT_TOKEN_WEIGHT" --output-token-weight "$OUTPUT_TOKEN_WEIGHT"
+  --cached-input-token-weight "$CACHED_INPUT_TOKEN_WEIGHT" --ledger-tolerance-pct "$LEDGER_TOLERANCE_PCT"
   --out-json "$REPORT_JSON" --out-md "$REPORT_MD"
 )
 if [ "$IS_CONTROL" = "true" ]; then

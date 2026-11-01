@@ -36,11 +36,189 @@ data:
     WORKERS="${WORKERS:-12}"
     END=$(( $(date +%s) + DURATION ))
 
+    # UNI-128: per-request shape profile. Every knob below defaults to the
+    # single fixed shape this script used before this ticket (1200-word
+    # prompt, max_tokens=64, no stream, no abort, no oversized prompt) --
+    # that is the regression bar, not a suggestion. See docs/runbook.md
+    # "Request-shape profiles (UNI-128)" for the full story; this comment
+    # block is a pointer, not the source of truth.
+    # 1200 words = 300 repeats of the 4-word phrase below -- the exact prompt
+    # this script sent before UNI-128 (`for _ in $(seq 1 300); do PROMPT=...`).
+    PROMPT_WORDS_MIN="${PROMPT_WORDS_MIN:-1200}"
+    PROMPT_WORDS_MAX="${PROMPT_WORDS_MAX:-1200}"
+    MAX_TOKENS_DEFAULT="${MAX_TOKENS_DEFAULT:-64}"
+    MAX_TOKENS_OMIT_FRACTION="${MAX_TOKENS_OMIT_FRACTION:-0}"
+    MAX_TOKENS_HUGE_FRACTION="${MAX_TOKENS_HUGE_FRACTION:-0}"
+    MAX_TOKENS_HUGE_VALUE="${MAX_TOKENS_HUGE_VALUE:-32000}"
+    LONG_GEN_FRACTION="${LONG_GEN_FRACTION:-0}"
+    LONG_GEN_MAX_TOKENS="${LONG_GEN_MAX_TOKENS:-2000}"
+    STREAM_FRACTION="${STREAM_FRACTION:-0}"
+    ABORT_FRACTION="${ABORT_FRACTION:-0}"
+    ABORT_MIN_FRACTION="${ABORT_MIN_FRACTION:-0.1}"
+    ABORT_MAX_FRACTION="${ABORT_MAX_FRACTION:-0.6}"
+    OVERSIZED_FRACTION="${OVERSIZED_FRACTION:-0}"
+    OVERSIZED_PROMPT_WORDS="${OVERSIZED_PROMPT_WORDS:-12000}"
+    REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-300}"
+
+    # roll <fraction 0..1> -> prints 1 ("hit") or 0, using bash's own
+    # pseudo-random $RANDOM (0-32767). "$RANDOM" is re-read on every call, so
+    # every roll is independent.
+    roll() { awk -v f="$1" -v r="$RANDOM" 'BEGIN{printf "%d", (r/32767 < f)}'; }
+    rand_range() {
+      local lo="$1" hi="$2"
+      if [ "$lo" -ge "$hi" ]; then echo "$lo"; return; fi
+      echo $(( lo + RANDOM % (hi - lo + 1) ))
+    }
+
     # A prompt long enough that prompt tokens are not noise next to output
     # tokens, and long enough that the bytes/4 estimator is exercised on
-    # something realistic rather than a ten-word string.
-    PROMPT=""
-    for _ in $(seq 1 300); do PROMPT="${PROMPT}the quick brown fox "; done
+    # something realistic rather than a ten-word string ("words" here means
+    # one "the quick brown fox " repeat = 4 words).
+    build_prompt_words() {
+      local words="$1" reps out
+      reps=$(( (words + 3) / 4 ))
+      [ "$reps" -lt 1 ] && reps=1
+      out=""
+      for _ in $(seq 1 "$reps"); do out="${out}the quick brown fox "; done
+      printf '%s' "$out"
+    }
+
+    # Precompute the common case (fixed length, the only shape this script
+    # had before UNI-128) once, same as the original single PROMPT= line, so
+    # a default invocation pays no extra per-request cost. Only a
+    # PROMPT_WORDS_MIN != MAX profile builds a prompt per request.
+    FIXED_PROMPT=""
+    if [ "$PROMPT_WORDS_MIN" = "$PROMPT_WORDS_MAX" ]; then
+      FIXED_PROMPT="$(build_prompt_words "$PROMPT_WORDS_MIN")"
+    fi
+    # UNI-128 C6: deliberately oversized prompts that exceed the backend's
+    # context window (8192 tokens, see deploy/poc/09-vllm-gpu.yaml
+    # --max-model-len) and should get a 400, not a 200. Built once, up
+    # front, same reasoning as FIXED_PROMPT -- its length never varies.
+    OVERSIZED_PROMPT=""
+    if awk -v f="$OVERSIZED_FRACTION" 'BEGIN{exit !(f+0>0)}'; then
+      OVERSIZED_PROMPT="$(build_prompt_words "$OVERSIZED_PROMPT_WORDS")"
+    fi
+
+    pick_prompt() {
+      if [ -n "$OVERSIZED_PROMPT" ] && [ "$(roll "$OVERSIZED_FRACTION")" = "1" ]; then
+        printf '%s' "$OVERSIZED_PROMPT"
+        return
+      fi
+      if [ -n "$FIXED_PROMPT" ]; then
+        printf '%s' "$FIXED_PROMPT"
+        return
+      fi
+      build_prompt_words "$(rand_range "$PROMPT_WORDS_MIN" "$PROMPT_WORDS_MAX")"
+    }
+
+    # Echoes "<max_tokens value, or -1 for omitted> <kind>". Precedence is
+    # omit > huge > longgen > default -- a request can only have one shape,
+    # so when more than one fraction rolls a hit for the same request, the
+    # one listed first in this ticket's own prose wins. Independent rolls
+    # (not mutually exclusive buckets) keep each knob's fraction meaning
+    # exactly what it says: "this fraction of ALL requests", not "this
+    # fraction of requests not already claimed by an earlier knob".
+    pick_max_tokens() {
+      if [ "$(roll "$MAX_TOKENS_OMIT_FRACTION")" = "1" ]; then
+        echo "-1 omit"
+        return
+      fi
+      if [ "$(roll "$MAX_TOKENS_HUGE_FRACTION")" = "1" ]; then
+        echo "$MAX_TOKENS_HUGE_VALUE huge"
+        return
+      fi
+      if [ "$(roll "$LONG_GEN_FRACTION")" = "1" ]; then
+        echo "$LONG_GEN_MAX_TOKENS longgen"
+        return
+      fi
+      echo "$MAX_TOKENS_DEFAULT default"
+    }
+
+    # One request: builds the body from the profile knobs above, sends it,
+    # and -- for the ABORT_FRACTION draw -- cancels it client-side at a
+    # random point inside [ABORT_MIN_FRACTION, ABORT_MAX_FRACTION] of
+    # REQUEST_TIMEOUT_SECONDS ("a random cancel point", per the ticket).
+    # Usage (prompt_tokens/completion_tokens) is read from whatever body
+    # curl captured by grepping for the field names rather than parsing
+    # JSON -- this image has neither jq nor python3, and vLLM's
+    # --enable-force-include-usage (deploy/poc/09-vllm-gpu.yaml) means the
+    # same two field names appear exactly once, in the final chunk, whether
+    # the response was streamed or not -- so one grep path covers both.
+    send_one() {
+      local sub="$1" group="$2"
+      local prompt mt_value mt_kind max_tokens_json stream stream_json body
+      local tmp http_code latency start end aborted=0 curl_pid abort_flag="" canceller_pid=""
+      local -a curl_args
+      prompt="$(pick_prompt)"
+      read -r mt_value mt_kind <<< "$(pick_max_tokens)"
+      max_tokens_json=""
+      [ "$mt_kind" != "omit" ] && max_tokens_json="\"max_tokens\": ${mt_value}, "
+      stream=0
+      [ "$(roll "$STREAM_FRACTION")" = "1" ] && stream=1
+      stream_json=""
+      [ "$stream" = "1" ] && stream_json='"stream": true, '
+      body="{\"model\":\"llama-3-1-8b\", ${stream_json}${max_tokens_json}\"messages\":[{\"role\":\"user\",\"content\":\"${prompt}\"}]}"
+
+      tmp="$(mktemp)"
+      start=$(date +%s.%N)
+      curl_args=(-sS -o "$tmp" -m "$REQUEST_TIMEOUT_SECONDS" -w '%{http_code}' -X POST)
+      [ "$stream" = "1" ] && curl_args+=(-N)
+      curl "${curl_args[@]}" "$GW$MODELPATH/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer $(cat /keys/$sub)" \
+        -d "$body" > "${tmp}.code" 2>/dev/null &
+      curl_pid=$!
+
+      if [ "$(roll "$ABORT_FRACTION")" = "1" ]; then
+        abort_flag="$(mktemp)"
+        local cancel_at
+        cancel_at=$(awk -v lo="$ABORT_MIN_FRACTION" -v hi="$ABORT_MAX_FRACTION" \
+          -v t="$REQUEST_TIMEOUT_SECONDS" -v r="$RANDOM" \
+          'BEGIN{ frac = lo + (r/32767)*(hi-lo); printf "%.2f", frac*t }')
+        ( sleep "$cancel_at"
+          if kill -0 "$curl_pid" 2>/dev/null; then
+            kill -TERM "$curl_pid" 2>/dev/null
+            touch "$abort_flag"
+          fi
+        ) &
+        canceller_pid=$!
+      fi
+
+      wait "$curl_pid" 2>/dev/null
+      local curl_exit=$?
+      if [ -n "$canceller_pid" ]; then
+        kill "$canceller_pid" 2>/dev/null
+        wait "$canceller_pid" 2>/dev/null
+      fi
+      end=$(date +%s.%N)
+      latency=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.4f", e-s}')
+
+      http_code="000"
+      if [ -n "$abort_flag" ] && [ -f "$abort_flag" ]; then
+        aborted=1
+        http_code="ABORT"
+      elif [ "$curl_exit" -eq 0 ] && [ -s "${tmp}.code" ]; then
+        http_code="$(cat "${tmp}.code")"
+      fi
+      [ -n "$abort_flag" ] && rm -f "$abort_flag"
+
+      local ptok=-1 ctok=-1
+      if [ "$http_code" != "ABORT" ] && [ -s "$tmp" ]; then
+        ptok=$(grep -oP '"prompt_tokens"\s*:\s*\K[0-9]+' "$tmp" | tail -1)
+        ctok=$(grep -oP '"completion_tokens"\s*:\s*\K[0-9]+' "$tmp" | tail -1)
+        [ -z "$ptok" ] && ptok=-1
+        [ -z "$ctok" ] && ctok=-1
+      fi
+
+      # UNI-128 client-side record: code, latency(s), prompt_tokens,
+      # completion_tokens, aborted(0/1), max_tokens value sent (-1=omitted),
+      # max_tokens kind, stream(0/1). Columns 1-2 are exactly the original
+      # "code time_total" shape the closing table and 15-fairness-report.py
+      # already parse by position ($1, $2) -- everything after is additive.
+      echo "$http_code $latency $ptok $ctok $aborted $mt_value $mt_kind $stream" >> "$OUT/$group"
+      rm -f "$tmp" "${tmp}.code"
+    }
 
     # Every response's HTTP status is recorded. This is NOT optional bookkeeping:
     # `curl -sS` treats a 503 as a perfectly good request and says nothing, so a
@@ -86,20 +264,19 @@ data:
     # tests are latency tests, not throughput tests. "app1 is not throttled when
     # the pool is half empty" means its per-request latency matches its solo
     # baseline; a throughput number alone cannot distinguish "not throttled"
-    # from "throttled but asking for less".
+    # from "throttled but asking for less". UNI-128: send_one (defined above,
+    # before $OUT existed) now owns the actual request -- prompt, max_tokens,
+    # streaming, and client-abort all come from this run's profile knobs, and
+    # every default is the single fixed shape this loop sent before that
+    # ticket, so a plain invocation is unchanged.
     worker() {
-      local sub="$1" group="$2" start="$3" stop="$4" duty="$5" out
+      local sub="$1" group="$2" start="$3" stop="$4" duty="$5"
       while [ "$(date +%s)" -lt "$END" ]; do
         if ! tenant_active "$group" "$start" "$stop" "$duty"; then
           sleep 1
           continue
         fi
-        out=$(curl -sS -o /dev/null -m 300 -w '%{http_code} %{time_total}' -X POST "$GW$MODELPATH/v1/chat/completions" \
-          -H 'Content-Type: application/json' \
-          -H "Authorization: Bearer $(cat /keys/$sub)" \
-          -d "{\"model\":\"llama-3-1-8b\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" \
-          2>/dev/null) || out="000 0"
-        echo "$out" >> "$OUT/$group"
+        send_one "$sub" "$group"
       done
     }
 
@@ -175,6 +352,46 @@ data:
       printf '%-12s %-7s %-9s %-9s %s\n' "$(basename "$f")" "$n" $stats "$codes"
     done
     echo "A run is only meaningful if the statuses are overwhelmingly 200."
+    # Note: the STATUSES column above includes ABORT as a literal code (it is
+    # whatever $1 values appear in the file), but 15-fairness-report.py's
+    # STATUS_PAIR regex only extracts \d+=\d+ pairs into its structured
+    # status_tally, so a client abort is visible in this printed line and in
+    # the CLIENT_RECORD_JSON line below, but not in that report field. Out of
+    # this ticket's scope to change -- see docs/runbook.md.
+
+    # UNI-128: per-tenant client-side record, so G2 (ledger cross-check) can
+    # compare what the client actually sent/received against the EPP's own
+    # counters. One line per group, prefixed so 15-fairness-benchmark.sh can
+    # pull it out of this pod's log into the run's results directory without
+    # touching the TENANT/TOTAL/... table above.
+    emit_client_record() {
+      local group="$1" file="$2"
+      awk -v group="$group" '
+        {
+          total++
+          code=$1; ptok=$3; ctok=$4; aborted=$5; mtkind=$7; stream=$8
+          codecount[code]++
+          if (aborted=="1") aborts++
+          if (code=="000") errors++
+          if (ptok+0>0) ptok_total+=ptok
+          if (ctok+0>0) ctok_total+=ctok
+          if (stream=="1") stream_count++
+          if (mtkind=="omit") omit_count++
+          if (mtkind=="huge") huge_count++
+          if (mtkind=="longgen") longgen_count++
+        }
+        END {
+          printf "CLIENT_RECORD_JSON {\"group\":\"%s\",\"requests_sent\":%d,\"status_tally\":{", group, total+0
+          first=1
+          for (c in codecount) { if(!first) printf ","; printf "\"%s\":%d", c, codecount[c]; first=0 }
+          printf "},\"aborts\":%d,\"errors\":%d,\"prompt_tokens_total\":%d,\"completion_tokens_total\":%d,\"stream_requests\":%d,\"max_tokens_omitted\":%d,\"max_tokens_huge\":%d,\"long_generations\":%d}\n", \
+            aborts+0, errors+0, ptok_total+0, ctok_total+0, stream_count+0, omit_count+0, huge_count+0, longgen_count+0
+        }
+      ' "$file"
+    }
+    for f in "$OUT"/*; do
+      emit_client_record "$(basename "$f")" "$f"
+    done
 ---
 apiVersion: batch/v1
 kind: Job
@@ -235,6 +452,43 @@ spec:
             #   value: "240"
             # - name: END_USERS_DUTY
             #   value: "30/30"
+            # UNI-128: per-request shape profile. Every one of these defaults
+            # to the single fixed shape this Job sent before this ticket, so
+            # leaving all of them commented out (the shipped state) is the
+            # regression case. See docs/runbook.md "Request-shape profiles
+            # (UNI-128)" for what each fraction/value does and how they
+            # compose (independent per-request rolls, not mutually exclusive
+            # buckets).
+            # - name: PROMPT_WORDS_MIN
+            #   value: "200"
+            # - name: PROMPT_WORDS_MAX
+            #   value: "2000"
+            # - name: MAX_TOKENS_DEFAULT
+            #   value: "64"
+            # - name: MAX_TOKENS_OMIT_FRACTION
+            #   value: "0.1"
+            # - name: MAX_TOKENS_HUGE_FRACTION
+            #   value: "0.1"
+            # - name: MAX_TOKENS_HUGE_VALUE
+            #   value: "32000"
+            # - name: STREAM_FRACTION
+            #   value: "0.3"
+            # - name: ABORT_FRACTION
+            #   value: "0.05"
+            # - name: ABORT_MIN_FRACTION
+            #   value: "0.1"
+            # - name: ABORT_MAX_FRACTION
+            #   value: "0.6"
+            # - name: OVERSIZED_FRACTION
+            #   value: "0.02"
+            # - name: OVERSIZED_PROMPT_WORDS
+            #   value: "12000"
+            # - name: LONG_GEN_FRACTION
+            #   value: "0.05"
+            # - name: LONG_GEN_MAX_TOKENS
+            #   value: "2000"
+            # - name: REQUEST_TIMEOUT_SECONDS
+            #   value: "300"
             - name: DURATION
               # Several half-lives (halfLifeSeconds: 60). The tabs start empty
               # after every EPP restart, so a run shorter than ~3 half-lives

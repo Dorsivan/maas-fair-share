@@ -98,7 +98,14 @@
 #   CHAOS_SCALE_AT            scale LLMISVC_NAME (default maas-vllm-gpu) to 1
 #                             replica at t+<seconds>, restored after
 #                             CHAOS_SCALE_HOLD (default 30s).
-# All default to empty/off; a plain scenario invocation is unaffected.
+# UNI-128 harness additions (see docs/runbook.md "Request-shape profiles
+# (UNI-128)" for the full story -- this header is a pointer, not the source
+# of truth): PROMPT_WORDS_MIN/MAX, MAX_TOKENS_DEFAULT/OMIT_FRACTION/
+# HUGE_FRACTION/HUGE_VALUE, STREAM_FRACTION, ABORT_FRACTION/MIN_FRACTION/
+# MAX_FRACTION, OVERSIZED_FRACTION/PROMPT_WORDS, LONG_GEN_FRACTION/
+# MAX_TOKENS, REQUEST_TIMEOUT_SECONDS -- passed through to the Job unchanged
+# when set. All default to the single fixed request shape this benchmark
+# sent before this ticket; a plain scenario invocation is unaffected.
 set -euo pipefail
 
 SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone asymmetric-demand}"
@@ -132,6 +139,14 @@ CHAOS_SCALE_HOLD="${CHAOS_SCALE_HOLD//s/}"
 # what they mean. Unset (the default) reproduces the one, prior behaviour:
 # every offered tenant active for the whole run.
 TIMELINE_VARS="APP1_START APP1_STOP APP1_DUTY APP2_START APP2_STOP APP2_DUTY END_USERS_START END_USERS_STOP END_USERS_DUTY"
+
+# UNI-128: per-request shape profile knobs, passed straight through to the
+# Job when set -- see deploy/poc/04-loadgen.yaml's send_one()/pick_prompt()/
+# pick_max_tokens() for what each one means. Unset (the default for every
+# scenario above) reproduces the one, prior request shape: a fixed
+# 1200-word prompt, max_tokens=64, no streaming, no client aborts, no
+# oversized prompts.
+PROFILE_VARS="PROMPT_WORDS_MIN PROMPT_WORDS_MAX MAX_TOKENS_DEFAULT MAX_TOKENS_OMIT_FRACTION MAX_TOKENS_HUGE_FRACTION MAX_TOKENS_HUGE_VALUE STREAM_FRACTION ABORT_FRACTION ABORT_MIN_FRACTION ABORT_MAX_FRACTION OVERSIZED_FRACTION OVERSIZED_PROMPT_WORDS LONG_GEN_FRACTION LONG_GEN_MAX_TOKENS REQUEST_TIMEOUT_SECONDS"
 
 # UNI-103: is this scenario scored, or a named negative control that is
 # expected not to show the weighted split? Read by the report step below --
@@ -195,6 +210,7 @@ EPP_LOG="$ARTIFACT_DIR/epp-container.log"
 LOADGEN_LOG="$ARTIFACT_DIR/loadgen.log"
 REPORT_JSON="$ARTIFACT_DIR/fairness-report.json"
 REPORT_MD="$ARTIFACT_DIR/fairness-report.md"
+CLIENT_RECORD_JSONL="$ARTIFACT_DIR/client-request-summary.jsonl"
 
 # --- Resolve manifest with this scenario's overrides -----------------------
 SRC="$(dirname "$0")/04-loadgen.yaml"
@@ -248,6 +264,16 @@ for v in $TIMELINE_VARS; do
     TIMELINE_JSON_ENTRIES+=("$v=$val")
   fi
 done
+# UNI-128 profile pass-through: same shape as the timeline loop above, no
+# JSON side-channel needed -- the Job records what it actually did per
+# request itself (see the client-record extraction after the Job completes).
+for v in $PROFILE_VARS; do
+  val="${!v-}"
+  if [ -n "$val" ]; then
+    set_override "$v" "$val"
+  fi
+done
+
 TIMELINE_CONFIG="$ARTIFACT_DIR/timeline-config.json"
 python3 -I - "$TIMELINE_CONFIG" "${TIMELINE_JSON_ENTRIES[@]+"${TIMELINE_JSON_ENTRIES[@]}"}" << 'PYEOF'
 import json, sys
@@ -460,6 +486,13 @@ trap - EXIT
 LOADGEN_POD="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')"
 $OC logs "$LOADGEN_POD" -n "$NAMESPACE" > "$LOADGEN_LOG" 2>&1 || echo "[benchmark] WARNING: could not fetch loadgen pod log" >&2
 
+# UNI-128: pull this run's per-tenant client-side record (requests sent,
+# status tally, prompt/completion tokens actually received, aborts, errors)
+# out of the pod's own stdout and into the results directory, so G2 (ledger
+# cross-check) has it next to the EPP's before/after metric snapshots
+# without needing the pod to still exist.
+grep '^CLIENT_RECORD_JSON ' "$LOADGEN_LOG" | sed 's/^CLIENT_RECORD_JSON //' > "$CLIENT_RECORD_JSONL" || true
+
 echo "[benchmark] metrics snapshot: after"
 snapshot_metrics > "$METRICS_AFTER"
 RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -484,4 +517,5 @@ REPORT_EXIT=$?
 set -e
 
 echo "[benchmark] report: $REPORT_JSON , $REPORT_MD"
+echo "[benchmark] client-side request record: $CLIENT_RECORD_JSONL"
 exit "$REPORT_EXIT"

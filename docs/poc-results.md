@@ -1618,6 +1618,147 @@ hook also does not keep `epp-container.log` continuous across the delete
 replacement has a new one) — a known, documented limitation, not a defect
 introduced to hide.
 
+## UNI-128: request-shape profile harness, development only — no scored case
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan needs C1–C6, and every one
+of them depends on varying something about the request itself that this
+repo's loadgen never varied before: prompt length, `max_tokens` (omitted or
+huge), `stream: true`, a client that cancels mid-generation, a prompt that
+deliberately exceeds the context window, and a generation that runs for
+minutes. This ticket builds that capability into
+`deploy/poc/04-loadgen.yaml`'s `run.sh` and proves it does not change the
+one scenario already scored by [UNI-127](/UNI/issues/UNI-127) — **it does
+not run or score a C1–C6 case itself**, same scope boundary UNI-127 set.
+
+**Setup.** `send_one()` (new) owns every request: it draws a prompt length,
+a `max_tokens` value/omission, a stream flag, and an abort decision from a
+set of independently-rolled, per-request fractions (`PROMPT_WORDS_MIN/MAX`,
+`MAX_TOKENS_DEFAULT/OMIT_FRACTION/HUGE_FRACTION/HUGE_VALUE`,
+`STREAM_FRACTION`, `ABORT_FRACTION` with a random cancel point inside
+`[ABORT_MIN_FRACTION, ABORT_MAX_FRACTION]` of `REQUEST_TIMEOUT_SECONDS`,
+`OVERSIZED_FRACTION/PROMPT_WORDS`, `LONG_GEN_FRACTION/MAX_TOKENS`). Every
+fraction defaults to `0` and every length default reproduces the exact
+shape `run.sh` sent before this ticket (1200-word prompt, `max_tokens: 64`,
+no stream, no abort). Each request's outcome (status, latency,
+prompt/completion tokens from the usage block, aborted flag, what shape it
+was) is appended to the existing per-tenant raw log, and the run closes
+with one `CLIENT_RECORD_JSON` line per tenant — pulled by
+`15-fairness-benchmark.sh` into `client-request-summary.jsonl` in the
+results directory, for G2 (ledger cross-check) to use later. Full mechanism
+in `docs/runbook.md`'s "Request-shape profiles (UNI-128)".
+
+**Expected result:** a plain `full-contention` re-run with none of the new
+knobs set reproduces the UNI-103/UNI-127 baseline split and verdict, and
+the new knobs, when exercised, produce correctly-shaped evidence (streaming
+responses' usage read correctly, aborts recorded distinctly from a clean
+response or a backend error, oversized prompts rejected, omitted/huge
+`max_tokens` handled without crashing the generator).
+
+**Observed, both runs live against the GPU EPP (`llama-3-1-8b`), 2026-11-01
+(see the closing comment on this task for the merged commit SHA), EPP image
+digest `sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135`
+(unchanged from the UNI-97/UNI-98/UNI-127 pin):**
+
+1. **Regression — `full-contention`, no profile overrides**
+   (`results/20261101T161528Z-uni128-regression-full-contention/`):
+
+   | group | weight | observed % | expected % | deviation |
+   |---|---|---|---|---|
+   | app1 | 20 | 16.9% | 21.1% | -4.2 |
+   | app2 | 10 | 13.7% | 10.5% | +3.2 |
+   | end-users | 65 | 69.4% | 68.4% | +1.0 |
+
+   **PASS.** Deviations are within a point or two of both the UNI-103
+   baseline (-4.9/+2.3/+2.6) and the UNI-127 regression
+   (-4.5/+4.1/+0.4) — same scenario, same script invocation shape, verdict
+   and magnitude unchanged. `client-request-summary.jsonl` recorded exactly
+   what the pre-UNI-128 generator always sent: 0 aborts, 0 omitted/huge
+   `max_tokens`, 0 streamed requests across all 3153 requests, and a
+   completion-tokens total (app1: 33667 over 546 requests, 61.7/request)
+   consistent with `max_tokens: 64` (vLLM's own EOS sometimes stops a
+   little short of the cap). This is the regression bar this ticket set for
+   itself.
+
+2. **Smoke test — profile mechanics**
+   (`results/20261101T162157Z-uni128-profile-smoke/`, labelled, not
+   scored): `app1-alone` with `DURATION=90s`, `STREAM_FRACTION=0.3`,
+   `MAX_TOKENS_OMIT_FRACTION=0.15`, `MAX_TOKENS_HUGE_FRACTION=0.1`,
+   `ABORT_FRACTION=0.2` (cancel window 5–30% of a 120s
+   `REQUEST_TIMEOUT_SECONDS`), `OVERSIZED_FRACTION=0.1`,
+   `LONG_GEN_FRACTION=0.1`/`LONG_GEN_MAX_TOKENS=300`. Verdict came back
+   **FAIL** (expected and correct — rule 4: a FAIL from a deliberately
+   disruptive, unscored smoke run is still a valid, recorded result, not a
+   reason to mark this `blocked`): "app1 is the only offered group this run
+   ... but only 61.9% of its 454 requests succeeded, short of the 90% bar."
+   That drop is the deliberate point of this run, not a surprise — the
+   client record confirms every knob fired and was recorded correctly:
+
+   ```json
+   {"group":"app1","requests_sent":454,
+    "status_tally":{"200":281,"ABORT":91,"400":33,"000":32,"500":17},
+    "aborts":91,"errors":32,
+    "prompt_tokens_total":345630,"completion_tokens_total":18287,
+    "stream_requests":138,"max_tokens_omitted":75,"max_tokens_huge":39,
+    "long_generations":37}
+   ```
+
+   - **Aborts**: 91 requests recorded as `ABORT`, distinct from both a clean
+     `200` and a backend `500` — the client-side cancel fired and was told
+     apart from every other outcome.
+   - **Oversized prompts**: 33 `400`s (≈7.3% of 454, close to the
+     10% `OVERSIZED_FRACTION` draw once precedence with the other knobs is
+     accounted for) — the context-window-exceeding prompt was correctly
+     rejected, not silently truncated or hung.
+   - **Streaming**: 138 requests (≈30.4%, matches `STREAM_FRACTION=0.3`)
+     used `stream: true`; usage was readable from the same grep path as
+     non-streamed responses (see `docs/runbook.md`) — `prompt_tokens_total`/
+     `completion_tokens_total` are non-zero and request-count-plausible
+     (345630/454 ≈ 761 prompt tokens/request average, pulled down by the
+     33 oversized-prompt 400s that never got billed, and the many short
+     responses this scenario's mixed `max_tokens` profile produced).
+   - **`max_tokens` omitted/huge/long-gen**: 75/39/37 requests respectively
+     — all three non-default `max_tokens` kinds occurred and were tallied
+     under the precedence order (`omit` > `huge` > `longgen` > `default`)
+     documented in `docs/runbook.md`.
+   - **The 120s `REQUEST_TIMEOUT_SECONDS` was respected**: p95 latency was
+     exactly `120.01s` (loadgen.log) — huge/long-generation requests that
+     didn't finish in time were cut off by the client timeout, recorded as
+     `000`, not left to hang indefinitely.
+   - The 17 `500`s are consistent with the same low-rate backend noise seen
+     in the regression run above (5 and 23 out of several hundred/thousand
+     requests there too) — not something this ticket's changes introduced.
+
+**Cluster left as found.** This ticket's harness makes no replica or
+plugin-config changes at all — `send_one()` is a client request-shape
+change only, nothing it does touches the LLMInferenceService spec or the
+EPP's weights. `spec.replicas` on `maas-vllm-gpu` confirmed at `2`
+(matching `deploy/poc/09-vllm-gpu.yaml`) after both runs, both vLLM pods
+`1/1 Running` with 0 restarts, EPP scheduler `1/1 Running` with 0 restarts,
+`job/maas-loadgen` `Complete`:
+
+```
+$ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk    1/1     Running   0          40m
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-6gkq5   1/1   Running   0   40m
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           3m32s      5m50s
+```
+
+**Not proven here, by design:** no C1–C6 case was run or scored — every one
+is still pending its own ticket, same as UNI-127 left B1–B4/E1/E2 pending.
+`LONG_GEN_MAX_TOKENS`/`REQUEST_TIMEOUT_SECONDS` sizing for an actual 5–9
+minute generation is deliberately left to [UNI-150](/UNI/issues/UNI-150)
+(C4) rather than guessed here — this ticket proves the knob moves
+generation length in the right direction, not that it hits a specific
+wall-clock target. The existing report's `STATUS_PAIR` regex does not
+count `ABORT` in its structured `status_tally` (see `docs/runbook.md`) —
+a known, accepted gap, not a defect introduced to hide.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

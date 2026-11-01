@@ -640,6 +640,96 @@ python3 -I deploy/poc/15-fairness-report-test.py
 
 ---
 
+### Request-shape profiles (UNI-128)
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan needs more than a fixed
+request shape: C1-C6 each exercise a different dimension of what a single
+request can look like -- short vs. long prompts, missing or huge
+`max_tokens`, `stream: true`, a client that disappears mid-generation, a
+prompt too big for the context window, and generations that run for
+minutes. UNI-128 is the harness work those cases need -- **it does not
+itself run or score a case**, same scope boundary as UNI-127. Every knob
+below defaults to the single fixed shape `deploy/poc/04-loadgen.yaml` sent
+before this ticket (a 1200-word prompt, `max_tokens: 64`, no streaming, no
+client aborts, no oversized prompts), so a plain scenario invocation is
+unaffected.
+
+**The knobs**, all per-tenant-profile, independently rolled per request (not
+mutually exclusive buckets -- see `send_one()`'s precedence note for what
+happens when more than one fires on the same request):
+
+| env var | default | what it does |
+|---|---|---|
+| `PROMPT_WORDS_MIN` / `PROMPT_WORDS_MAX` | `1200` / `1200` | prompt length distribution, in words (uniform between the two; equal = fixed, the prior behaviour) |
+| `MAX_TOKENS_DEFAULT` | `64` | `max_tokens` sent on an otherwise-unmodified request |
+| `MAX_TOKENS_OMIT_FRACTION` | `0` | fraction of requests that omit `max_tokens` entirely (C2) |
+| `MAX_TOKENS_HUGE_FRACTION` / `MAX_TOKENS_HUGE_VALUE` | `0` / `32000` | fraction of requests that ask for a very large `max_tokens` (C2) |
+| `STREAM_FRACTION` | `0` | fraction of requests sent with `"stream": true` (C3) |
+| `ABORT_FRACTION` | `0` | fraction of requests the client cancels mid-flight, at a random point (C5) |
+| `ABORT_MIN_FRACTION` / `ABORT_MAX_FRACTION` | `0.1` / `0.6` | that cancel point, as a fraction of `REQUEST_TIMEOUT_SECONDS` (e.g. default: cancel somewhere between 10% and 60% of the way to the timeout) |
+| `OVERSIZED_FRACTION` / `OVERSIZED_PROMPT_WORDS` | `0` / `12000` | fraction of requests that send a prompt deliberately larger than the backend's context window, expecting a 400 (C6) |
+| `LONG_GEN_FRACTION` / `LONG_GEN_MAX_TOKENS` | `0` / `2000` | fraction of requests that ask for a long generation (C4); size `LONG_GEN_MAX_TOKENS` and `REQUEST_TIMEOUT_SECONDS` together for your target wall-clock duration -- see the note below |
+| `REQUEST_TIMEOUT_SECONDS` | `300` | per-request `curl -m` timeout; also the window `ABORT_MIN/MAX_FRACTION` are relative to |
+
+`15-fairness-benchmark.sh` passes all of these through unchanged when set in
+the environment, the same mechanism as UNI-127's timeline vars
+(`PROFILE_VARS`, next to `TIMELINE_VARS`):
+
+```sh
+STREAM_FRACTION=0.3 MAX_TOKENS_OMIT_FRACTION=0.1 MAX_TOKENS_HUGE_FRACTION=0.1 \
+ABORT_FRACTION=0.05 OVERSIZED_FRACTION=0.02 \
+  OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh full-contention profile-smoke
+```
+
+**Long generations, concretely.** "5-9 minutes" is a wall-clock target, not a
+token count -- this backend's actual tokens/sec depends on contention, batch
+size, and the model, so `LONG_GEN_MAX_TOKENS` has to be sized empirically for
+whatever scenario uses it, and `REQUEST_TIMEOUT_SECONDS` (the `curl -m` on
+every request, long-generation or not) has to be raised to clear your target
+plus a buffer, or the client kills its own long requests before the backend
+finishes them. [UNI-150](/UNI/issues/UNI-150) (C4, "near the 600s timeout")
+is exactly where that sizing gets pinned down against the real backend; this
+ticket only has to prove the knob moves generation length in the right
+direction, not calibrate it.
+
+**Usage, streamed or not, from one grep path.** `deploy/poc/09-vllm-gpu.yaml`
+already sets `--enable-force-include-usage`, which makes vLLM put the usage
+block in the final chunk of a streamed response the same as it would in a
+whole, non-streamed one. `send_one()` never parses JSON (this image ships
+neither `jq` nor `python3`) -- it greps the raw response body for
+`"prompt_tokens"`/`"completion_tokens"` and takes the last match, which is
+the right (and only) occurrence either way. A client abort has no usage to
+read (the fields never arrived), so `send_one()` skips the grep and records
+`-1`/`-1` for both, distinct from "the field was present and zero."
+
+**The client-side record.** Every request appends one line to its tenant's
+raw log inside the pod (`code latency prompt_tokens completion_tokens
+aborted max_tokens_value max_tokens_kind stream`) -- columns 1-2 are exactly
+the original "code time_total" shape the closing table and
+`15-fairness-report.py`'s `STATUS_PAIR` regex already parse by position, so
+that existing parsing is untouched. At the end of the run, `run.sh` also
+emits one `CLIENT_RECORD_JSON {...}` line per tenant to stdout: requests
+sent, status tally, total prompt/completion tokens actually received,
+aborts, and errors. `15-fairness-benchmark.sh` pulls those lines out of the
+pod's log and writes them to `client-request-summary.jsonl` in the run's
+results directory, so G2 (ledger cross-check) can diff client-recorded
+tokens against the EPP's own before/after counters without the pod needing
+to still exist. **Known gap:** the printed STATUSES column in the closing
+table includes `ABORT` as a literal code, but `15-fairness-report.py`'s
+`STATUS_PAIR` regex (`\d+=\d+`) only extracts digit-coded pairs into its
+structured `status_tally`, so an abort is visible in
+`client-request-summary.jsonl` and in the raw per-request log, but not in
+that report field. Out of this ticket's scope to change.
+
+**The regression bar.** A plain scenario invocation with none of the above
+set must produce the identical request shape this script sent before this
+ticket -- same 1200-word prompt (300 repeats of the 4-word phrase), same
+fixed `max_tokens: 64`, no streaming, no aborts. Evidence for this (a
+`full-contention` re-run, verdict and magnitude compared against the
+UNI-103/UNI-127 baselines) is in `docs/poc-results.md`'s UNI-128 section.
+
+---
+
 ## Load the fairness dashboard into the live Grafana
 
 `deploy/grafana-dashboard.yaml` ships the dashboard JSON as a ConfigMap

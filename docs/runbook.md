@@ -1111,6 +1111,69 @@ a `solo`/`capped`/demand-light/UNCONTENDED scenario without first re-deriving
 the cost-check formula for a run where the contended fraction is not close
 to 1.0.
 
+### Shed rate, EPP pick latency, and alert fire/clear (UNI-181)
+
+Three more additive report sections, for E3/E4 (UNI-157/158), H2/H3
+(UNI-168/167) and G1 (UNI-166). None of them touches `verdict`, `groups` or
+`sources`; a report built from the same inputs as before UNI-181 has
+byte-identical values in every pre-existing field (checked by rebuilding all
+54 committed `results/` runs with the old and new script). Each section
+always says which kind of empty it is: **never happened** (a measured
+zero) vs **not recorded** (unknown).
+
+**`shed`** -- always present; no new flag. Per offered group: client-observed
+429 and 503 counts from the loadgen status tally, shed rate, the group's
+weight share over offered groups, its share of everything shed, and shed
+share / weight share (above 1 = lost more of the shed than its weight). No
+PASS/FAIL: E3 and E4 judge it. A group with no 429/503 reads
+`0 (never shed)`; a group missing from the loadgen table reads `not recorded`.
+Per-group shed is client-side because the live EPP has no
+`fairness_id`-labelled shed counter: `llm_d_epp_flow_control_requests_total`
+has `outcome` but not `fairness_id`, and the per-`fairness_id`
+`flow_control_request_queue_duration_seconds` histogram in the v0.11.0
+source was absent from the live full scrape (uni140 soak). When that
+pool-wide counter is in the snapshots, the section adds the EPP's own shed
+total and splits the client's 429s: at most `RejectedCapacity + EvictedTTL`
+came from the EPP, so the rest came from elsewhere (Kuadrant, for E4).
+
+**`pick_latency`** -- p50/p99 over the run (after minus before, per bucket)
+of `llm_d_epp_scheduler_e2e_duration_seconds` (the scheduler's own
+per-request pick) and `llm_d_epp_flow_control_dispatch_cycle_duration_seconds`
+(one flow-control dispatch cycle, where the weighted-LAS policy runs). Both
+are unlabelled. States: `ok`, `no_observations` (captured, count did not
+move), `not_recorded` (absent from both snapshots).
+
+- `--pick-latency-baseline <fairness-report.json>`: express p50/p99 as a
+  ratio of another run's (use the 3-group full-contention run).
+- **Resolution caveat for H3:** buckets are 0.1/0.2/0.5/1/2/5/10/20/50/100 ms.
+  On the live uni140 soak both p50 and p99 fell inside the first bucket,
+  (0, 0.1 ms], so the printed 0.050/0.099 ms are interpolation, not
+  measurement. Read the bucket columns. A p99 above 100 ms prints as
+  `>= 100ms (above top bucket)`.
+- **Not captured by the benchmark yet.** `15-fairness-benchmark.sh`'s
+  `snapshot_metrics()` grep does not include either histogram (or
+  `flow_control_requests_total`), so today every benchmark report shows them
+  `not recorded`. Widening that grep is a separate change that needs a
+  sim-backend regression run.
+
+**`alerts`** -- needs an export, because nothing reads alert state live:
+`maas-fairness-alerts` was not applied to the cluster as of 2026-11-02
+(UNI-130, re-checked for UNI-181; UNI-49 owns the rule).
+
+- `--alerts-json <file>`: a Prometheus `/api/v1/query_range` result for
+  `ALERTS{alertname=~"MaasFairness.*"}` covering the run, either the raw
+  response or `{"result": [...], "end": <epoch>, "step_seconds": <s>,
+  "query": "..."}`. Omit it and the report says alert state is **unknown**,
+  not "none fired".
+- `--alert-rules deploy/prometheusrule.yaml`: every alert in the file gets
+  a row, so one that never appears in the export reads `never fired`.
+- `--alerts-step-seconds` (default 30): the query step, unless the file
+  carries `step_seconds`. Samples more than 1.5 steps apart start a new
+  episode. An episode clears one step after its last sample. An episode
+  whose last sample is the end of the export reads
+  `still active at export end` and has no clear time. Times are seconds from
+  `--run-start`. An episode that started after `--run-end` is flagged.
+
 ---
 
 ### Live enforce flip, and unconditional cleanup (UNI-174)

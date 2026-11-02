@@ -133,11 +133,30 @@ is the max absolute percent difference allowed on either check before a
 group fails the ledger cross-check. The result lives in
 `report["ledger"]["verdict"]`, separate from the top-level `verdict` --
 these are different invariants and a run can fail one without the other.
+
+UNI-181 adds three more purely additive sections, none of which reads or
+writes `verdict`:
+
+  - `shed`: per offered group, client-observed 429/503 counts and shed rate
+      set against the group's weight share; plus, when the snapshots carry
+      llm_d_epp_flow_control_requests_total, the EPP's own pool-wide shed
+      count and how many of the client's 429s it can account for.
+  - `pick_latency`: p50/p99 of the EPP's scheduler_e2e and flow-control
+      dispatch-cycle histograms over the run, optionally against a baseline
+      report (--pick-latency-baseline).
+  - `alerts`: fire/clear episodes, relative to run start, from an ALERTS
+      range-query export (--alerts-json), with every rule named in
+      --alert-rules listed even when it never fired.
+
+Every one of them distinguishes "never happened" (a measured zero) from "not
+recorded" (unknown) rather than printing a blank. See docs/runbook.md
+"Shed rate, EPP pick latency, and alert fire/clear (UNI-181)".
 """
 import argparse
 import json
 import re
 import sys
+from datetime import datetime, timezone
 
 METRIC_LINE = re.compile(r'^([^{\s]+)(?:\{(.*)\})?\s+([^\s]+)$')
 LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
@@ -335,6 +354,372 @@ def _counter_deltas(before_map, after_map, group_ids):
     return deltas, restarted
 
 
+# --- UNI-181: shed rate, EPP pick latency, alert fire/clear ------------------
+# parse_metrics_text above keeps only the fairness_id label, which collapses a
+# histogram's `le` buckets and an `outcome`-labelled counter into one value.
+# These three sections need the other labels, so they use their own parser
+# rather than changing the one every pre-existing section is built on.
+
+def parse_metrics_labeled(path):
+    """{metric_name: [(labels: dict, value: float)]} -- every label kept."""
+    series = {}
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            m = METRIC_LINE.match(line)
+            if not m:
+                continue
+            try:
+                value = float(m.group(3))
+            except ValueError:
+                continue
+            series.setdefault(m.group(1), []).append((dict(LABEL.findall(m.group(2) or '')), value))
+    return series
+
+
+# The EPP's own scheduling cost, separate from inference cost. Both are
+# unlabelled histograms in llm-d-router v0.11.0 (pkg/epp/metrics/
+# llm_d_router_metrics.go); names confirmed against a live full /metrics
+# scrape (results/20261101T224216Z-uni140-b6-full-contention-soak/
+# metrics-full-before.txt). scheduler_e2e is the pick itself (scheduler.go:
+# filter/score/pick for one request); dispatch_cycle is one flow-control
+# dispatch cycle, which is where the weighted-LAS fairness policy runs.
+PICK_LATENCY_HISTOGRAMS = (
+    ("scheduler_e2e", "llm_d_epp_scheduler_e2e_duration_seconds"),
+    ("flow_control_dispatch_cycle", "llm_d_epp_flow_control_dispatch_cycle_duration_seconds"),
+)
+
+# Pool-wide (no fairness_id label) flow-control outcome counter. Outcomes
+# that end in the EPP refusing the request, per pkg/epp/flowcontrol/types/
+# outcomes.go. EvictedContextCancelled is excluded: that is the client giving
+# up, not the EPP shedding. EPP_429_OUTCOMES is the subset translated to 429
+# rather than 503 (requestcontrol/admission.go translateFlowControlError);
+# EvictedTTL is 503 instead when the pool has no endpoints at that moment, so
+# treat their sum as an upper bound on EPP-originated 429s.
+FLOW_CONTROL_REQUESTS_TOTAL = "llm_d_epp_flow_control_requests_total"
+EPP_SHED_OUTCOMES = ("RejectedCapacity", "RejectedNoEndpoints", "RejectedOther",
+                     "EvictedTTL", "EvictedNoEndpoints", "EvictedOther")
+EPP_429_OUTCOMES = ("RejectedCapacity", "EvictedTTL")
+
+SHED_STATUSES = ("429", "503")
+
+
+def _histogram_buckets(labeled, name):
+    """{le: cumulative_count} for `name`, summed across any non-`le` labels,
+    or None if the histogram has no _bucket line at all in this snapshot."""
+    lines = labeled.get(name + "_bucket")
+    if not lines:
+        return None
+    buckets = {}
+    for labels, value in lines:
+        le = labels.get("le")
+        if le is None:
+            continue
+        bound = float("inf") if le == "+Inf" else float(le)
+        buckets[bound] = buckets.get(bound, 0.0) + value
+    return buckets or None
+
+
+def histogram_quantile(q, buckets):
+    """Prometheus histogram_quantile semantics over {upper_bound: cumulative
+    count}: linear interpolation inside the bucket the rank falls in, lower
+    bound 0 for the first bucket, and the highest finite bound when the rank
+    falls in +Inf. Returns (value, (lower, upper)) or (None, None) when the
+    histogram holds no observations."""
+    bounds = sorted(buckets)
+    if not bounds or bounds[-1] != float("inf"):
+        return None, None
+    total = buckets[float("inf")]
+    if total <= 0:
+        return None, None
+    rank = q * total
+    prev_bound, prev_count = 0.0, 0.0
+    for b in bounds:
+        count = buckets[b]
+        if count >= rank:
+            if b == float("inf"):
+                finite = [x for x in bounds if x != float("inf")]
+                top = finite[-1] if finite else None
+                return top, (top, b)
+            if count == prev_count:
+                return b, (prev_bound, b)
+            return prev_bound + (b - prev_bound) * (rank - prev_count) / (count - prev_count), (prev_bound, b)
+        prev_bound, prev_count = b, count
+    return None, None
+
+
+def _bucket_json(bucket):
+    # JSON has no infinity; spell the +Inf bucket the way Prometheus does.
+    if not bucket:
+        return None
+    return ["+Inf" if b == float("inf") else b for b in bucket]
+
+
+def compute_pick_latency(before_labeled, after_labeled, baseline=None):
+    """p50/p99 of each PICK_LATENCY_HISTOGRAMS entry over this run (after
+    minus before, bucket by bucket). Each entry says which of three states it
+    is in, never a bare blank:
+      - "not_recorded": no _bucket line in either snapshot. Unknown, not zero
+        -- the benchmark's snapshot filter did not capture the family (as of
+        UNI-181 15-fairness-benchmark.sh's snapshot_metrics does not), or the
+        EPP never scheduled anything in its lifetime.
+      - "no_observations": captured, but the count did not move during the run.
+      - "ok": p50/p99 computed.
+    `baseline` is another report's pick_latency section (UNI-181: the 3-group
+    run is the reference); when given, each ok entry also carries p50/p99 as
+    a ratio of the baseline's."""
+    histograms = {}
+    restarted = False
+    for key, name in PICK_LATENCY_HISTOGRAMS:
+        b = _histogram_buckets(before_labeled, name)
+        a = _histogram_buckets(after_labeled, name)
+        entry = {"metric": name, "state": None, "observations": None,
+                 "p50_seconds": None, "p99_seconds": None,
+                 "p50_bucket": None, "p99_bucket": None, "p99_at_histogram_ceiling": None,
+                 "baseline_p50_seconds": None, "baseline_p99_seconds": None,
+                 "p50_vs_baseline": None, "p99_vs_baseline": None}
+        if a is None and b is None:
+            entry["state"] = "not_recorded"
+            histograms[key] = entry
+            continue
+        a = a or {}
+        b = b or {}
+        delta = {}
+        went_backwards = False
+        for bound in set(a) | set(b):
+            d = a.get(bound, 0.0) - b.get(bound, 0.0)
+            if d < 0:
+                went_backwards = True
+                d = 0.0
+            delta[bound] = d
+        if went_backwards:
+            restarted = True
+            # A backwards bucket means the EPP restarted between snapshots, so
+            # the "after" histogram alone is this run's tail. Using it beats
+            # reporting a run-spanning subtraction that mixes two processes.
+            delta = dict(a)
+        count = delta.get(float("inf"), 0.0)
+        entry["observations"] = count
+        if count <= 0:
+            entry["state"] = "no_observations"
+            histograms[key] = entry
+            continue
+        p50, p50_bucket = histogram_quantile(0.50, delta)
+        p99, p99_bucket = histogram_quantile(0.99, delta)
+        finite = sorted(x for x in delta if x != float("inf"))
+        entry.update({
+            "state": "ok",
+            "p50_seconds": p50, "p99_seconds": p99,
+            "p50_bucket": _bucket_json(p50_bucket),
+            "p99_bucket": _bucket_json(p99_bucket),
+            # Above the top finite bucket the histogram can only say "at
+            # least this much" -- flag it rather than print a fake ceiling.
+            "p99_at_histogram_ceiling": bool(finite) and p99_bucket is not None and p99_bucket[1] == float("inf"),
+        })
+        base = (baseline or {}).get("histograms", {}).get(key)
+        if base and base.get("state") == "ok":
+            entry["baseline_p50_seconds"] = base.get("p50_seconds")
+            entry["baseline_p99_seconds"] = base.get("p99_seconds")
+            if base.get("p50_seconds"):
+                entry["p50_vs_baseline"] = p50 / base["p50_seconds"]
+            if base.get("p99_seconds"):
+                entry["p99_vs_baseline"] = p99 / base["p99_seconds"]
+        histograms[key] = entry
+    return {"histograms": histograms, "epp_restarted": restarted}
+
+
+def _outcome_deltas(before_labeled, after_labeled):
+    """{outcome: delta} for FLOW_CONTROL_REQUESTS_TOTAL summed over its other
+    labels, or None when the family is in neither snapshot. Once the family is
+    present, an outcome absent from both snapshots is 0 -- Prometheus only
+    materializes a label set on its first increment, so absent means it never
+    happened."""
+    b_lines = before_labeled.get(FLOW_CONTROL_REQUESTS_TOTAL)
+    a_lines = after_labeled.get(FLOW_CONTROL_REQUESTS_TOTAL)
+    if not b_lines and not a_lines:
+        return None, False
+
+    def by_outcome(lines):
+        out = {}
+        for labels, value in lines or []:
+            o = labels.get("outcome", "")
+            out[o] = out.get(o, 0.0) + value
+        return out
+
+    b, a = by_outcome(b_lines), by_outcome(a_lines)
+    deltas, restarted = {}, False
+    for o in set(a) | set(b):
+        d = a.get(o, 0.0) - b.get(o, 0.0)
+        if d < 0:
+            restarted = True
+            d = 0.0
+        deltas[o] = d
+    return deltas, restarted
+
+
+def compute_shed(offered_groups, loadgen_rows, weights, before_labeled, after_labeled):
+    """Per offered group: how many of its requests came back 429/503 and how
+    its share of all shed requests compares with its share of the configured
+    weight. No PASS/FAIL here -- what "shed fairly" means differs per edge
+    case (UNI-157 E3 vs UNI-158 E4's Kuadrant 429), so the consumers judge it.
+
+    Per-group shed comes from the client's own status tally because the live
+    EPP exposes no fairness_id-labelled shed counter (flow_control_requests_
+    total has outcome but no fairness_id). The EPP's pool-wide outcome counts
+    are reported alongside as a cross-check: client 429s beyond the EPP's own
+    429-producing outcomes did not come from the EPP (e.g. Kuadrant)."""
+    weight_total = sum(weights.get(g) or 0.0 for g in offered_groups)
+    rows = []
+    for g in offered_groups:
+        gen = loadgen_rows.get(g)
+        w = weights.get(g)
+        weight_share = 100.0 * w / weight_total if w is not None and weight_total > 0 else None
+        if gen is None:
+            rows.append({"group": g, "state": "not_recorded", "requests_total": None,
+                         "status_429": None, "status_503": None, "shed": None,
+                         "shed_rate_pct": None, "weight_share_pct": weight_share,
+                         "shed_share_pct": None, "shed_share_vs_weight_share": None})
+            continue
+        st = gen.get("statuses", {})
+        s429, s503 = st.get("429", 0), st.get("503", 0)
+        shed = s429 + s503
+        total = gen.get("total", 0)
+        rows.append({"group": g, "state": "shed" if shed > 0 else "never_shed",
+                     "requests_total": total, "status_429": s429, "status_503": s503,
+                     "shed": shed, "shed_rate_pct": 100.0 * shed / total if total > 0 else None,
+                     "weight_share_pct": weight_share,
+                     "shed_share_pct": None, "shed_share_vs_weight_share": None})
+    shed_total = sum(r["shed"] for r in rows if r["shed"] is not None)
+    for r in rows:
+        if r["shed"] is not None and shed_total > 0:
+            r["shed_share_pct"] = 100.0 * r["shed"] / shed_total
+            if r["weight_share_pct"]:
+                r["shed_share_vs_weight_share"] = r["shed_share_pct"] / r["weight_share_pct"]
+
+    outcomes, restarted = _outcome_deltas(before_labeled, after_labeled)
+    client_429 = sum(r["status_429"] for r in rows if r["status_429"] is not None)
+    epp = {"state": "not_recorded", "outcome_deltas": None, "epp_shed_total": None,
+           "epp_429_upper_bound": None, "client_429_total": client_429,
+           "non_epp_429_lower_bound": None, "epp_restarted": restarted}
+    if outcomes is not None:
+        epp_shed = sum(outcomes.get(o, 0.0) for o in EPP_SHED_OUTCOMES)
+        epp_429 = sum(outcomes.get(o, 0.0) for o in EPP_429_OUTCOMES)
+        epp.update({"state": "ok", "outcome_deltas": dict(sorted(outcomes.items())),
+                    "epp_shed_total": epp_shed, "epp_429_upper_bound": epp_429,
+                    "non_epp_429_lower_bound": max(0.0, client_429 - epp_429)})
+    return {"shed_statuses": list(SHED_STATUSES), "total_shed": shed_total,
+            "rows": rows, "epp_pool_wide": epp}
+
+
+ALERT_RULE_LINE = re.compile(r'^\s*-\s*alert:\s*(\S+)\s*$')
+
+
+def parse_alert_rule_names(path):
+    """Alert names in a PrometheusRule manifest (deploy/prometheusrule.yaml),
+    in file order. Line-matched rather than YAML-parsed: this file must keep
+    running with nothing beyond the standard library."""
+    names = []
+    with open(path) as f:
+        for line in f:
+            m = ALERT_RULE_LINE.match(line)
+            if m and m.group(1) not in names:
+                names.append(m.group(1))
+    return names
+
+
+def _iso_to_epoch(ts):
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_alerts(alerts_path, rule_names, run_start, run_end, step_seconds):
+    """Fire/clear episodes from a Prometheus range query over the ALERTS
+    series, relative to run start.
+
+    `alerts_path` is either the raw /api/v1/query_range response, or that
+    response's data.result list wrapped as {"result": [...], "end": <epoch>,
+    "step_seconds": <s>, "query": "..."}; the wrapper fields are optional and
+    override --alerts-step-seconds and the export end. ALERTS emits one sample
+    per evaluation while an alert is pending or firing and nothing once it
+    resolves, so an episode is a run of samples no more than 1.5 steps apart;
+    it cleared one step after its last sample, unless that sample is the
+    export's last one, in which case it was still firing when the export
+    ended and no clear time exists.
+
+    `rule_names` (from --alert-rules) lists every alert the run could have
+    seen; one that has no sample anywhere in the export gets a "never_fired"
+    row, so a run with no alerts says so instead of printing an empty table."""
+    with open(alerts_path) as f:
+        doc = json.load(f)
+    if isinstance(doc, dict) and isinstance(doc.get("data"), dict):
+        result = doc["data"].get("result", [])
+        export_end, step, query = None, step_seconds, None
+    else:
+        result = doc.get("result", []) if isinstance(doc, dict) else doc
+        export_end = doc.get("end") if isinstance(doc, dict) else None
+        step = (doc.get("step_seconds") if isinstance(doc, dict) else None) or step_seconds
+        query = doc.get("query") if isinstance(doc, dict) else None
+    step = float(step)
+    t0 = _iso_to_epoch(run_start)
+    t1 = _iso_to_epoch(run_end)
+    last_sample = max((float(v[0]) for s in result for v in s.get("values", [])), default=None)
+    end = float(export_end) if export_end is not None else last_sample
+
+    def rel(t):
+        return None if t is None or t0 is None else t - t0
+
+    episodes = []
+    for s in result:
+        metric = dict(s.get("metric", {}))
+        name = metric.pop("alertname", None)
+        state = metric.pop("alertstate", None)
+        metric.pop("__name__", None)
+        ts = sorted(float(v[0]) for v in s.get("values", []))
+        start = prev = None
+        runs = []
+        for t in ts:
+            if start is None:
+                start = prev = t
+            elif t - prev > 1.5 * step:
+                runs.append((start, prev))
+                start = prev = t
+            else:
+                prev = t
+        if start is not None:
+            runs.append((start, prev))
+        for a, b in runs:
+            still = end is not None and b >= end - 1e-9
+            cleared = None if still else b + step
+            episodes.append({
+                "alertname": name, "alertstate": state, "labels": metric,
+                "started_epoch": a, "cleared_epoch": cleared,
+                "started_s": rel(a), "cleared_s": rel(cleared),
+                "duration_s": (cleared - a) if cleared is not None else None,
+                "still_active_at_export_end": still,
+                "started_after_run_end": t1 is not None and a > t1,
+            })
+    episodes.sort(key=lambda e: (e["started_epoch"], e["alertname"] or "", e["alertstate"] or ""))
+
+    seen = {e["alertname"] for e in episodes}
+    fired = {e["alertname"] for e in episodes if e["alertstate"] == "firing"}
+    summary = []
+    for name in list(rule_names or []) + sorted(n for n in seen if n not in (rule_names or [])):
+        if name in fired:
+            status = "fired"
+        elif name in seen:
+            status = "pending_only"
+        else:
+            status = "never_fired"
+        summary.append({"alertname": name, "status": status,
+                        "in_rule_file": name in (rule_names or [])})
+    return {"query": query, "step_seconds": step, "export_end_epoch": end,
+            "run_start_epoch": t0, "episodes": episodes, "summary": summary}
+
+
 # --- UNI-127: timeline/windowed/convergence maths ---------------------------
 # Pure functions of (schedule, timeseries, weights) -- same no-cluster-access
 # contract as the rest of this file. See the module docstring for the shape
@@ -499,7 +884,9 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                   window_seconds=10.0,
                   client_record_jsonl_path=None,
                   input_token_weight=1.0, output_token_weight=1.0,
-                  cached_input_token_weight=1.0, ledger_tolerance_pct=10.0):
+                  cached_input_token_weight=1.0, ledger_tolerance_pct=10.0,
+                  pick_latency_baseline_path=None,
+                  alerts_path=None, alert_rules_path=None, alerts_step_seconds=30.0):
     before = parse_metrics(metrics_before_path)
     after = parse_metrics(metrics_after_path)
     offered_workers, loadgen_rows, logged_duration, generator = parse_loadgen_log(loadgen_log_path)
@@ -995,6 +1382,31 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             },
         }
 
+    # UNI-181: purely additive, like timeline/ledger above -- never reads or
+    # writes `verdict`, and adds no key to `groups`/`sources`, so every field
+    # a pre-UNI-181 report had is unchanged. Shed is always computed (its
+    # input, the loadgen status tally, is already required); pick latency
+    # reads the same before/after snapshots; alerts need --alerts-json.
+    before_labeled = parse_metrics_labeled(metrics_before_path)
+    after_labeled = parse_metrics_labeled(metrics_after_path)
+    weights_for_shed = {g: (weight_after.get(g) if weight_after.get(g) is not None else weight_before.get(g))
+                        for g in offered_groups}
+    shed_section = compute_shed(offered_groups, loadgen_rows, weights_for_shed, before_labeled, after_labeled)
+    baseline_pick = None
+    if pick_latency_baseline_path:
+        with open(pick_latency_baseline_path) as f:
+            baseline_pick = json.load(f).get("pick_latency")
+    pick_latency_section = compute_pick_latency(before_labeled, after_labeled, baseline_pick)
+    pick_latency_section["baseline_report"] = pick_latency_baseline_path
+    pick_latency_section["baseline_has_pick_latency"] = (
+        None if not pick_latency_baseline_path else baseline_pick is not None
+    )
+    alerts_section = None
+    if alerts_path:
+        rule_names = parse_alert_rule_names(alert_rules_path) if alert_rules_path else []
+        alerts_section = compute_alerts(alerts_path, rule_names, run_start, run_end, alerts_step_seconds)
+        alerts_section["rule_file"] = alert_rules_path
+
     report = {
         "schema": "uni54.fairness_benchmark_report.v1",
         "run": {
@@ -1056,8 +1468,144 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         },
         "timeline": timeline_section,
         "ledger": ledger_section,
+        "shed": shed_section,
+        "pick_latency": pick_latency_section,
+        "alerts": alerts_section,
     }
     return report
+
+
+def _render_uni181_sections(report):
+    """Shed / pick latency / alerts. Every empty case says which kind of
+    empty it is -- never happened vs. not recorded -- instead of a blank."""
+    def fmt(v, suffix="", spec=".1f"):
+        return "n/a" if v is None else f"{v:{spec}}{suffix}" if isinstance(v, float) else f"{v}{suffix}"
+
+    lines = [""]
+    lines.append("## Shed rate vs weight (UNI-181)")
+    lines.append("")
+    s = report.get("shed")
+    if not s:
+        lines.append("N/A: report predates UNI-181.")
+    else:
+        lines.append(
+            f"Shed = client-observed HTTP {'/'.join(s['shed_statuses'])}. Weight share is over offered "
+            "groups. Shed share / weight share above 1 means the group lost more of the shed than "
+            "its weight; no PASS/FAIL is applied here."
+        )
+        lines.append("")
+        if not s["rows"]:
+            lines.append("No group was offered load, so there is nothing to shed.")
+        else:
+            lines.append("| group | requests | 429 | 503 | shed | shed rate % | weight share % | "
+                         "shed share % | shed share / weight share |")
+            lines.append("|---|---|---|---|---|---|---|---|---|")
+            for r in s["rows"]:
+                if r["state"] == "not_recorded":
+                    lines.append(f"| {r['group']} | not recorded (no loadgen row) | n/a | n/a | n/a | n/a | "
+                                 f"{fmt(r['weight_share_pct'], '%')} | n/a | n/a |")
+                    continue
+                shed = "0 (never shed)" if r["state"] == "never_shed" else str(r["shed"])
+                share = fmt(r["shed_share_pct"], "%") if s["total_shed"] > 0 else "n/a (nothing shed)"
+                ratio = fmt(r["shed_share_vs_weight_share"], "", ".2f") if s["total_shed"] > 0 else "n/a (nothing shed)"
+                lines.append(
+                    f"| {r['group']} | {r['requests_total']} | {r['status_429']} | {r['status_503']} | "
+                    f"{shed} | {fmt(r['shed_rate_pct'], '%', '.2f')} | {fmt(r['weight_share_pct'], '%')} | "
+                    f"{share} | {ratio} |"
+                )
+        lines.append("")
+        e = s["epp_pool_wide"]
+        if e["state"] == "not_recorded":
+            lines.append(f"**EPP-side shed (pool-wide):** not recorded -- `{FLOW_CONTROL_REQUESTS_TOTAL}` is "
+                         "absent from both snapshots, so whether the EPP or something in front of it "
+                         "(Kuadrant) produced the client's 429s is unknown.")
+        else:
+            nonzero = ", ".join(f"{o}={v:g}" for o, v in e["outcome_deltas"].items() if v) or "no outcomes moved"
+            lines.append(
+                f"**EPP-side shed (pool-wide, no per-group label exists):** {e['epp_shed_total']:g} "
+                f"requests refused by the EPP ({nonzero}). Client saw {e['client_429_total']} x 429; at "
+                f"most {e['epp_429_upper_bound']:g} came from the EPP, so at least "
+                f"{e['non_epp_429_lower_bound']:g} came from elsewhere (e.g. Kuadrant)."
+                + (" EPP counter went backwards: restart mid-run, figures unreliable." if e["epp_restarted"] else "")
+            )
+
+    lines.append("")
+    lines.append("## EPP pick latency (UNI-181)")
+    lines.append("")
+    p = report.get("pick_latency")
+    if not p:
+        lines.append("N/A: report predates UNI-181.")
+    else:
+        if p.get("baseline_report"):
+            lines.append(f"Baseline: `{p['baseline_report']}`" +
+                         ("" if p.get("baseline_has_pick_latency") else " (has no pick_latency section)"))
+            lines.append("")
+        lines.append("| histogram | state | observations | p50 | p99 | p50 bucket | p99 bucket | "
+                     "p50 vs baseline | p99 vs baseline |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+
+        def ms(v):
+            return "n/a" if v is None else f"{v * 1000:.3f}ms"
+
+        def bucket(b):
+            if not b:
+                return "n/a"
+            lo, hi = (x if x == "+Inf" else f"{x * 1000:g}" for x in b)
+            return f"({lo}, {hi}]ms"
+
+        for key, h in p["histograms"].items():
+            state = {
+                "not_recorded": "not recorded (absent from both snapshots)",
+                "no_observations": "no picks during the run",
+            }.get(h["state"], "ok")
+            p99 = ms(h["p99_seconds"])
+            if h.get("p99_at_histogram_ceiling"):
+                p99 = f">= {p99} (above top bucket)"
+            lines.append(
+                f"| `{key}` | {state} | {fmt(h['observations'], '', '.0f')} | {ms(h['p50_seconds'])} | {p99} | "
+                f"{bucket(h['p50_bucket'])} | {bucket(h['p99_bucket'])} | "
+                f"{fmt(h['p50_vs_baseline'], 'x', '.2f')} | {fmt(h['p99_vs_baseline'], 'x', '.2f')} |"
+            )
+        lines.append("")
+        lines.append("Quantiles interpolate linearly inside a bucket (Prometheus `histogram_quantile`); "
+                     "the bucket bounds are the real precision.")
+        if p.get("epp_restarted"):
+            lines.append("")
+            lines.append("A histogram bucket went backwards between snapshots (EPP restart): quantiles "
+                         "use the post-restart histogram only.")
+
+    lines.append("")
+    lines.append("## Alerts (UNI-181)")
+    lines.append("")
+    a = report.get("alerts")
+    if not a:
+        lines.append("Not recorded: no `--alerts-json` was supplied, so whether any alert fired during "
+                     "this run is unknown (not \"none fired\").")
+    else:
+        lines.append(f"Source: ALERTS range export, step {a['step_seconds']:g}s"
+                     + (f", rules from `{a['rule_file']}`" if a.get("rule_file") else "")
+                     + (f", query `{a['query']}`" if a.get("query") else "") + ".")
+        lines.append("")
+        if not a["summary"]:
+            lines.append("No alert appeared in the export, and no rule file was given to list "
+                         "the alerts that could have fired.")
+        else:
+            label = {"fired": "fired", "pending_only": "pending, never fired", "never_fired": "never fired"}
+            for row in a["summary"]:
+                extra = "" if row["in_rule_file"] or not a.get("rule_file") else " (not in rule file)"
+                lines.append(f"- {row['alertname']}: {label[row['status']]}{extra}")
+        if a["episodes"]:
+            lines.append("")
+            lines.append("| alert | state | labels | started (s from run start) | cleared (s) | duration (s) |")
+            lines.append("|---|---|---|---|---|---|")
+            for ep in a["episodes"]:
+                labels = ", ".join(f"{k}={v}" for k, v in sorted(ep["labels"].items())) or "-"
+                cleared = ("still active at export end" if ep["still_active_at_export_end"]
+                           else fmt(ep["cleared_s"]))
+                started = fmt(ep["started_s"]) + (" (after run end)" if ep["started_after_run_end"] else "")
+                lines.append(f"| {ep['alertname']} | {ep['alertstate']} | {labels} | {started} | "
+                             f"{cleared} | {fmt(ep['duration_s'])} |")
+    return lines
 
 
 def render_markdown(report):
@@ -1205,6 +1753,7 @@ def render_markdown(report):
                 f"{lfmt(row['expected_cost_from_client'])} | {lfmt(row['cost_pct_diff'], '%')} | "
                 f"{row['within_tolerance']} |"
             )
+    lines.extend(_render_uni181_sections(report))
     lines.append("")
     lines.append("## Sources")
     lines.append("")
@@ -1269,6 +1818,27 @@ def main():
         help="UNI-138 (G2): max absolute percent difference between the EPP's accounting and "
              "the client-recorded ledger before a group fails the ledger cross-check.",
     )
+    p.add_argument(
+        "--pick-latency-baseline", default=None,
+        help="UNI-181: a previous run's fairness-report.json (the 3-group full-contention run is "
+             "the reference) to express this run's EPP pick latency p50/p99 against.",
+    )
+    p.add_argument(
+        "--alerts-json", default=None,
+        help="UNI-181: Prometheus /api/v1/query_range export of the ALERTS series covering the "
+             "run (raw response, or {\"result\": [...], \"end\": epoch, \"step_seconds\": s}). "
+             "Omit and the report says alert state is unknown for this run.",
+    )
+    p.add_argument(
+        "--alert-rules", default=None,
+        help="UNI-181: PrometheusRule manifest (deploy/prometheusrule.yaml) whose alert names "
+             "get an explicit 'never fired' row when absent from --alerts-json.",
+    )
+    p.add_argument(
+        "--alerts-step-seconds", type=float, default=30.0,
+        help="UNI-181: the query_range step used for --alerts-json (ignored if the file carries "
+             "its own step_seconds). Samples more than 1.5 steps apart start a new episode.",
+    )
     args = p.parse_args()
 
     report = build_report(
@@ -1295,6 +1865,10 @@ def main():
         output_token_weight=args.output_token_weight,
         cached_input_token_weight=args.cached_input_token_weight,
         ledger_tolerance_pct=args.ledger_tolerance_pct,
+        pick_latency_baseline_path=args.pick_latency_baseline,
+        alerts_path=args.alerts_json,
+        alert_rules_path=args.alert_rules,
+        alerts_step_seconds=args.alerts_step_seconds,
     )
 
     with open(args.out_json, "w") as f:

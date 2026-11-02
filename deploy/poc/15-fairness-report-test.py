@@ -1241,6 +1241,337 @@ def test_ledger_fails_when_offered_group_has_no_client_record():
         assert missing_row["within_tolerance"] is None
 
 
+# --- UNI-181: shed rate, EPP pick latency, alert fire/clear ------------------
+
+CONVERGED_TOKENS_BEFORE = (
+    'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 1000\n'
+    'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 1000\n'
+    'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 1000\n'
+)
+CONVERGED_TOKENS_AFTER = (
+    'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 3100\n'
+    'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 2000\n'
+    'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 7900\n'
+)
+
+
+def histogram_lines(name, cumulative):
+    """Prometheus text for an unlabelled histogram. `cumulative` is
+    [(le, count)], with le="+Inf" last."""
+    out = "".join(f'{name}_bucket{{le="{le}"}} {c}\n' for le, c in cumulative)
+    return out + f"{name}_count {cumulative[-1][1]}\n"
+
+
+def flow_outcomes(counts):
+    return "".join(
+        f'llm_d_epp_flow_control_requests_total{{inference_pool="maas-vllm-gpu-inference-pool",'
+        f'outcome="{o}",priority="0"}} {v}\n' for o, v in counts.items()
+    )
+
+
+def run_build_uni181(tmp, *, rows, extra_before="", extra_after="", tenants="app1 app2 end-users",
+                     **kwargs):
+    before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON + CONVERGED_TOKENS_BEFORE + extra_before)
+    after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON + CONVERGED_TOKENS_AFTER + extra_after)
+    log = write(tmp, "loadgen.log", loadgen_log(tenants, 32, 32, 32, 240, rows))
+    return fairness_report.build_report(
+        scenario="full-contention", enforce=True, duration_seconds=240, backend="vllm-gpu",
+        epp_image_digest="sha256:deadbeef", namespace="maas-fairness-poc",
+        epp_pod="maas-vllm-gpu-kserve-router-scheduler-test",
+        run_start="2026-11-01T00:00:00Z", run_end="2026-11-01T00:04:00Z", threshold_points=10.0,
+        metrics_before_path=before, metrics_after_path=after, loadgen_log_path=log, **kwargs,
+    )
+
+
+CLEAN_ROWS = [
+    ("app1", 500, "1.20", "2.40", "200=500"),
+    ("app2", 480, "1.30", "2.50", "200=480"),
+    ("end-users", 510, "1.10", "2.30", "200=510"),
+]
+
+
+def test_uni181_sections_are_additive_and_leave_existing_fields_unchanged():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS)
+        with tempfile.TemporaryDirectory() as tmp2:
+            baseline = run_build(
+                tmp2, tokens_before=CONVERGED_TOKENS_BEFORE, tokens_after=CONVERGED_TOKENS_AFTER,
+                tenants="app1 app2 end-users", w_app1=32, w_app2=32, w_end=32, rows=CLEAN_ROWS,
+                scenario="full-contention",
+            )
+        assert report["verdict"] == baseline["verdict"]
+        assert report["groups"] == baseline["groups"]
+        assert report["sources"] == baseline["sources"]
+        assert {"shed", "pick_latency", "alerts"} <= set(report)
+        for g in report["groups"]:
+            assert not any(k.startswith("shed") for k in g), g
+
+
+def test_shed_rate_per_group_against_weight_share():
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = [
+            ("app1", 500, "1.20", "2.40", "200=470 429=30"),
+            ("app2", 480, "1.30", "2.50", "200=420 429=50 503=10"),
+            ("end-users", 510, "1.10", "2.30", "200=510"),
+        ]
+        report = run_build_uni181(tmp, rows=rows)
+        s = report["shed"]
+        by = {r["group"]: r for r in s["rows"]}
+        assert s["total_shed"] == 90
+        assert by["app1"]["shed"] == 30 and by["app1"]["state"] == "shed"
+        assert abs(by["app1"]["shed_rate_pct"] - 6.0) < 1e-9
+        assert by["app2"]["status_429"] == 50 and by["app2"]["status_503"] == 10
+        # offered weight total 95: app2 weight share 10.53%, shed share 66.67% -> ~6.3x its weight
+        assert abs(by["app2"]["weight_share_pct"] - 100 * 10 / 95) < 1e-9
+        assert abs(by["app2"]["shed_share_pct"] - 100 * 60 / 90) < 1e-9
+        assert abs(by["app2"]["shed_share_vs_weight_share"] - (60 / 90) / (10 / 95)) < 1e-9
+        # Degenerate: a group with no shed events at all is a measured zero, not unknown.
+        assert by["end-users"]["state"] == "never_shed"
+        assert by["end-users"]["shed"] == 0 and by["end-users"]["shed_share_pct"] == 0.0
+        md = fairness_report.render_markdown(report)
+        assert "| end-users | 510 | 0 | 0 | 0 (never shed) |" in md, md
+        # The verdict stays the weighted-split verdict -- shed adds no PASS/FAIL.
+        assert report["verdict"]["result"] == "PASS"
+
+
+def test_shed_run_with_nothing_shed_says_so_rather_than_dividing_by_zero():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS)
+        s = report["shed"]
+        assert s["total_shed"] == 0
+        assert all(r["state"] == "never_shed" and r["shed_share_pct"] is None for r in s["rows"])
+        md = fairness_report.render_markdown(report)
+        assert "n/a (nothing shed)" in md
+
+
+def test_shed_group_missing_from_loadgen_table_is_not_recorded_not_zero():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS[:2])
+        by = {r["group"]: r for r in report["shed"]["rows"]}
+        assert by["end-users"]["state"] == "not_recorded"
+        assert by["end-users"]["shed"] is None
+        md = fairness_report.render_markdown(report)
+        assert "| end-users | not recorded (no loadgen row) |" in md
+
+
+def test_shed_epp_pool_wide_splits_epp_429_from_non_epp_429():
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = [
+            ("app1", 500, "1.20", "2.40", "200=470 429=30"),
+            ("app2", 480, "1.30", "2.50", "200=430 429=50"),
+            ("end-users", 510, "1.10", "2.30", "200=510"),
+        ]
+        report = run_build_uni181(
+            tmp, rows=rows,
+            extra_before=flow_outcomes({"Dispatched": 1000}),
+            # RejectedCapacity materialized during the run; EvictedTTL never did,
+            # so it is absent from both snapshots -- that must read as 0.
+            extra_after=flow_outcomes({"Dispatched": 2400, "RejectedCapacity": 20,
+                                       "EvictedContextCancelled": 7}),
+        )
+        e = report["shed"]["epp_pool_wide"]
+        assert e["state"] == "ok"
+        assert e["outcome_deltas"]["RejectedCapacity"] == 20
+        assert e["outcome_deltas"].get("EvictedTTL", 0) == 0
+        # Client cancellations are not the EPP shedding.
+        assert e["epp_shed_total"] == 20
+        assert e["client_429_total"] == 80
+        assert e["epp_429_upper_bound"] == 20
+        assert e["non_epp_429_lower_bound"] == 60
+        md = fairness_report.render_markdown(report)
+        assert "at least 60 came from elsewhere" in md
+
+
+def test_shed_epp_pool_wide_not_recorded_when_family_absent():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS)
+        e = report["shed"]["epp_pool_wide"]
+        assert e["state"] == "not_recorded" and e["epp_shed_total"] is None
+        assert "not recorded" in fairness_report.render_markdown(report)
+
+
+def test_histogram_quantile_matches_prometheus_interpolation():
+    inf = float("inf")
+    buckets = {0.001: 50.0, 0.002: 90.0, 0.005: 100.0, inf: 100.0}
+    v, b = fairness_report.histogram_quantile(0.5, buckets)
+    assert abs(v - 0.001) < 1e-12 and b == (0.0, 0.001)
+    v, b = fairness_report.histogram_quantile(0.7, buckets)
+    assert abs(v - 0.0015) < 1e-12 and b == (0.001, 0.002)
+    v, b = fairness_report.histogram_quantile(0.99, buckets)
+    assert abs(v - (0.002 + 0.003 * 9 / 10)) < 1e-12
+    # Rank in +Inf: highest finite bound, as Prometheus returns.
+    v, b = fairness_report.histogram_quantile(0.99, {0.001: 10.0, inf: 100.0})
+    assert v == 0.001 and b == (0.001, inf)
+    assert fairness_report.histogram_quantile(0.5, {0.001: 0.0, inf: 0.0}) == (None, None)
+
+
+SCHED = "llm_d_epp_scheduler_e2e_duration_seconds"
+CYCLE = "llm_d_epp_flow_control_dispatch_cycle_duration_seconds"
+
+
+def test_pick_latency_p50_p99_from_before_after_delta():
+    with tempfile.TemporaryDirectory() as tmp:
+        before = histogram_lines(SCHED, [("0.0001", 100), ("0.0002", 100), ("0.0005", 100), ("+Inf", 100)])
+        # This run adds 1000 picks: 500 <=0.1ms, 400 in (0.1,0.2], 100 in (0.2,0.5].
+        after = histogram_lines(SCHED, [("0.0001", 600), ("0.0002", 1000), ("0.0005", 1100), ("+Inf", 1100)])
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS, extra_before=before, extra_after=after)
+        h = report["pick_latency"]["histograms"]["scheduler_e2e"]
+        assert h["state"] == "ok" and h["observations"] == 1000
+        assert abs(h["p50_seconds"] - 0.0001) < 1e-12
+        assert abs(h["p99_seconds"] - (0.0002 + 0.0003 * 90 / 100)) < 1e-12
+        assert h["p99_bucket"] == [0.0002, 0.0005] and h["p99_at_histogram_ceiling"] is False
+        # The other histogram was not in either snapshot: unknown, not zero.
+        assert report["pick_latency"]["histograms"]["flow_control_dispatch_cycle"]["state"] == "not_recorded"
+        json.dumps(report, allow_nan=False)  # +Inf bucket bounds must stay valid JSON
+
+
+def test_pick_latency_missing_histogram_says_not_recorded():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS)
+        for h in report["pick_latency"]["histograms"].values():
+            assert h["state"] == "not_recorded" and h["p50_seconds"] is None
+        md = fairness_report.render_markdown(report)
+        assert "not recorded (absent from both snapshots)" in md
+
+
+def test_pick_latency_no_observations_during_run_is_distinct_from_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        same = histogram_lines(CYCLE, [("0.0001", 50), ("+Inf", 50)])
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS, extra_before=same, extra_after=same)
+        h = report["pick_latency"]["histograms"]["flow_control_dispatch_cycle"]
+        assert h["state"] == "no_observations" and h["observations"] == 0
+        assert "no picks during the run" in fairness_report.render_markdown(report)
+
+
+def test_pick_latency_flags_p99_above_top_bucket_and_compares_to_baseline():
+    with tempfile.TemporaryDirectory() as tmp:
+        base_after = histogram_lines(SCHED, [("0.0001", 900), ("0.0002", 1000), ("0.1", 1000), ("+Inf", 1000)])
+        base = run_build_uni181(tmp, rows=CLEAN_ROWS, extra_after=base_after)
+        base_path = write(tmp, "baseline.json", json.dumps(base))
+        slow_after = histogram_lines(SCHED, [("0.0001", 100), ("0.0002", 500), ("0.1", 900), ("+Inf", 1000)])
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS, extra_after=slow_after,
+                                  pick_latency_baseline_path=base_path)
+        h = report["pick_latency"]["histograms"]["scheduler_e2e"]
+        assert h["p99_at_histogram_ceiling"] is True and h["p99_seconds"] == 0.1
+        assert h["p99_bucket"] == [0.1, "+Inf"]
+        b = base["pick_latency"]["histograms"]["scheduler_e2e"]
+        assert abs(h["p50_vs_baseline"] - h["p50_seconds"] / b["p50_seconds"]) < 1e-12
+        assert report["pick_latency"]["baseline_has_pick_latency"] is True
+        assert "(above top bucket)" in fairness_report.render_markdown(report)
+
+
+def test_pick_latency_counter_reset_uses_post_restart_histogram():
+    with tempfile.TemporaryDirectory() as tmp:
+        before = histogram_lines(SCHED, [("0.0001", 5000), ("+Inf", 5000)])
+        after = histogram_lines(SCHED, [("0.0001", 10), ("0.0002", 20), ("+Inf", 20)])
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS, extra_before=before, extra_after=after)
+        assert report["pick_latency"]["epp_restarted"] is True
+        assert report["pick_latency"]["histograms"]["scheduler_e2e"]["observations"] == 20
+
+
+RUN0 = 1793491200  # 2026-11-01T00:00:00Z, run_build_uni181's run_start
+
+
+def alert_series(name, state, offsets, **labels):
+    return {"metric": {"__name__": "ALERTS", "alertname": name, "alertstate": state, **labels},
+            "values": [[RUN0 + o, "1"] for o in offsets]}
+
+
+def test_alerts_absent_means_unknown_not_none_fired():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS)
+        assert report["alerts"] is None
+        assert "unknown (not \"none fired\")" in fairness_report.render_markdown(report)
+
+
+def test_alerts_run_with_no_alerts_lists_every_rule_as_never_fired():
+    with tempfile.TemporaryDirectory() as tmp:
+        alerts = write(tmp, "alerts.json", json.dumps({"status": "success",
+                                                       "data": {"resultType": "matrix", "result": []}}))
+        rules = os.path.join(HERE, "..", "prometheusrule.yaml")
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS, alerts_path=alerts, alert_rules_path=rules)
+        a = report["alerts"]
+        assert a["episodes"] == []
+        names = [r["alertname"] for r in a["summary"]]
+        assert names == ["MaasFairnessNotConverging", "MaasFairnessClassificationBroken",
+                         "MaasFairnessBandSplit", "MaasFairnessSheddingIsRealAllocator",
+                         "MaasFairnessAccountingLeak"], names
+        assert all(r["status"] == "never_fired" for r in a["summary"])
+        assert "- MaasFairnessBandSplit: never fired" in fairness_report.render_markdown(report)
+
+
+def test_alerts_fire_and_clear_relative_to_run_start():
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = {
+            "query": 'ALERTS{alertname=~"MaasFairness.*"}', "step_seconds": 30, "end": RUN0 + 600,
+            "result": [
+                alert_series("MaasFairnessBandSplit", "pending", [60, 90, 120]),
+                alert_series("MaasFairnessBandSplit", "firing", [150, 180, 210]),
+                # Two separate episodes: a gap wider than 1.5 steps between them.
+                alert_series("MaasFairnessNotConverging", "firing", [300, 330, 450, 480, 510]),
+                # Still firing at the last sample of the export: no clear time.
+                alert_series("MaasFairnessAccountingLeak", "firing", [540, 570, 600], fairness_id="app2"),
+                alert_series("MaasFairnessClassificationBroken", "pending", [200, 230]),
+            ],
+        }
+        alerts = write(tmp, "alerts.json", json.dumps(doc))
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS, alerts_path=alerts)
+        eps = report["alerts"]["episodes"]
+        band = [e for e in eps if e["alertname"] == "MaasFairnessBandSplit" and e["alertstate"] == "firing"]
+        assert len(band) == 1 and band[0]["started_s"] == 150 and band[0]["cleared_s"] == 240
+        assert band[0]["duration_s"] == 90
+        nc = [e for e in eps if e["alertname"] == "MaasFairnessNotConverging"]
+        assert [(e["started_s"], e["cleared_s"]) for e in nc] == [(300, 360), (450, 540)]
+        leak = next(e for e in eps if e["alertname"] == "MaasFairnessAccountingLeak")
+        assert leak["still_active_at_export_end"] is True and leak["cleared_s"] is None
+        assert leak["labels"] == {"fairness_id": "app2"}
+        # 600s is past the 240s run end -- a fire after the run is flagged, not hidden.
+        assert leak["started_after_run_end"] is True
+        status = {r["alertname"]: r["status"] for r in report["alerts"]["summary"]}
+        assert status["MaasFairnessClassificationBroken"] == "pending_only"
+        assert status["MaasFairnessBandSplit"] == "fired"
+        md = fairness_report.render_markdown(report)
+        assert "still active at export end" in md
+        assert "MaasFairnessClassificationBroken: pending, never fired" in md
+
+
+def test_alerts_raw_query_range_response_uses_step_flag():
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = {"status": "success", "data": {"resultType": "matrix", "result": [
+            alert_series("MaasFairnessBandSplit", "firing", [0, 15, 30]),
+            alert_series("MaasFairnessBandSplit", "firing", [100, 115], fairness_id="x"),
+        ]}}
+        alerts = write(tmp, "alerts.json", json.dumps(raw))
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS, alerts_path=alerts, alerts_step_seconds=15)
+        first = next(e for e in report["alerts"]["episodes"] if not e["labels"])
+        # Without an explicit "end", the export's last sample (115) bounds it; this one cleared.
+        assert first["cleared_s"] == 45 and first["still_active_at_export_end"] is False
+
+
+def test_cli_accepts_uni181_flags_end_to_end():
+    with tempfile.TemporaryDirectory() as tmp:
+        before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON + CONVERGED_TOKENS_BEFORE)
+        after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON + CONVERGED_TOKENS_AFTER
+                      + histogram_lines(SCHED, [("0.0001", 10), ("+Inf", 10)]))
+        log = write(tmp, "loadgen.log", loadgen_log("app1 app2 end-users", 32, 32, 32, 240, CLEAN_ROWS))
+        alerts = write(tmp, "alerts.json", json.dumps({"result": [], "step_seconds": 30}))
+        out_json, out_md = os.path.join(tmp, "r.json"), os.path.join(tmp, "r.md")
+        proc = subprocess.run(
+            [sys.executable, "-I", os.path.join(HERE, "15-fairness-report.py"),
+             "--scenario", "full-contention", "--enforce", "true", "--backend", "sim",
+             "--epp-image-digest", "sha256:x", "--namespace", "ns", "--epp-pod", "p",
+             "--run-start", "2026-11-01T00:00:00Z", "--run-end", "2026-11-01T00:04:00Z",
+             "--metrics-before", before, "--metrics-after", after, "--loadgen-log", log,
+             "--alerts-json", alerts, "--alert-rules", os.path.join(HERE, "..", "prometheusrule.yaml"),
+             "--alerts-step-seconds", "15", "--out-json", out_json, "--out-md", out_md],
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        report = json.load(open(out_json))
+        assert report["pick_latency"]["histograms"]["scheduler_e2e"]["state"] == "ok"
+        assert len(report["alerts"]["summary"]) == 5
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

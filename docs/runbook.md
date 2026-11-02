@@ -953,6 +953,7 @@ live in `secret/maas-loadgen-keys` in `maas-fairness-poc`:
 | `end-user-beta` | `end-user-beta` | pre-existing (UNI-29 era) | not re-verified this ticket |
 | `end-user-gen01` .. `end-user-gen20` | alternating `end-user-alpha`/`end-user-beta` (odd=alpha, even=beta) | 2026-11-01 (this ticket) | 2026-12-01 (30d) |
 | `enduser-foo` | `enduser-foo` (new `MaaSSubscription`, owner group `maas-end-users`, deliberately outside the `end-user-` prefix match) | 2026-11-02 (this ticket) | 2026-12-02 (30d) |
+| `app3` .. `app20` | `app3` .. `app20` (one key each, key name = subscription name; owner group `maas-poc-users`; UNI-187) | **pending** -- minted by `deploy/maas/mint-loadgen-keys.sh`, fill in on mint | 30d from mint |
 
 `end-user-gen01`..`20` are 20 distinct `sk-oai-` credentials for D1 -- 20
 keys, 2 real subscriptions, which is what API key *rotation* actually means
@@ -1171,6 +1172,83 @@ groups (2-key app3, oversize on app4 only, app5 inside its 10-30s window), and
 20 groups x 50 workers = 960 workers. That last run dispatched in 0.32s, all
 200s, and the 19 identically-sized groups landed within ±2.3% of each other
 in requests sent. Full numbers are in the UNI-179 closing comment.
+
+### N-group identities and EPP tables (UNI-187)
+
+UNI-179 made the loadgen take any number of groups, but `app3`+ also need two
+things on the cluster side. UNI-187 provides both, so the 6-group (UNI-165)
+and 20-group (UNI-167) cases only have to run and measure.
+
+**One name, four places.** For `appN` (N >= 3), the `MaaSSubscription` name,
+the key file in `secret/maas-loadgen-keys`, the EPP `groups:` exact-match value
+and the `LOADGEN_GROUPS` group name are all the bare string `appN`. The loadgen
+maps a group with no built-in to `/keys/<group>`, and the EPP matches the
+subscription name MaaS injects, so a single string leaves nothing to keep in
+step. `app1`/`app2` keep their historical `app1-production`/`app2-batch`.
+
+**Subscriptions.** `app3`..`app20` live in `deploy/maas/08-tenants.yaml` with the
+label `maas-fair-share/tenant-set=n-group`. Apply only those:
+
+```sh
+oc apply -f deploy/maas/08-tenants.yaml -l maas-fair-share/tenant-set=n-group
+```
+
+A whole-file apply would also touch the Groups and the `MaaSAuthPolicy`, and
+`poc-agent` can write neither. The same limit is why the owner group is the
+existing `maas-poc-users` (already a subject of the AuthPolicy) and not a new
+group per tenant: `poc-agent` can create `MaaSSubscription`s but not
+`user.openshift.io` Groups. Each new subscription references both
+`maas-vllm-gpu` and `maas-vllm-cpu`, so it can be smoke-tested off the GPU. The
+four original subscriptions reference only the GPU model. Adding subscriptions
+makes `maas-controller` regenerate `maas-trlp-maas-vllm-{gpu,cpu}`, which is a
+live Kuadrant change, so apply with no benchmark running.
+
+**Keys.** `deploy/maas/mint-loadgen-keys.sh app3 app4 ... app20` mints one key
+per subscription into `secret/maas-loadgen-keys`, named after the subscription.
+It skips names already present. The raw mint response stays in a 0600 temp
+file and never reaches stdout, and only `id`/`name`/`subscription`/`expiresAt`
+are printed. Record those, names only, in the key inventory above.
+
+**EPP tables.** `deploy/poc/00-config.yaml` stays the 3-group default that
+every case restores to. `deploy/poc/epp-groups/render.py` prints a copy of it
+with only the `groups:` list swapped, so every other parameter matches the
+default at the moment you render:
+
+```sh
+deploy/poc/epp-groups/render.py 6  --weights graded | oc apply -f -   # UNI-165
+deploy/poc/epp-groups/render.py 20                  | oc apply -f -   # UNI-167
+oc apply -f deploy/poc/00-config.yaml                                 # restore
+deploy/poc/epp-groups/render.py --verify    # committed renders still match 00-config.yaml
+```
+
+The weight sets are `equal` (default), `graded` 40/20/15/10/10/5, `dominant`
+90/2/2/2/2/2 and `pow2` 32/16/8/4/2/1. Only `equal` exists for 20 groups. The
+equal renders for 6 and 20 groups are committed beside the script for review.
+Between runs, one weight in a live table can be moved with the benchmark's
+`epp-weight:<group>` target (UNI-180); its regex matches `name: app1,` exactly,
+so it never also hits `app10`..`app19`. **Applying a table to `maas-epp-config`
+recreates BOTH EPPs, because the CPU and GPU LLMISVCs read the same
+ConfigMap,** and zeroes their per-group counters. So apply a table only from
+the case that owns the GPU queue, before its run and never during one.
+
+**Off-GPU smoke.** `deploy/poc/20-n-group-smoke.sh`, run as `poc-agent`:
+
+1. Refuses to start if any Job in the namespace is active, or if any of
+   `app3`..`app8` has no key.
+2. Repoints only `maas-vllm-cpu`'s scheduler at its own `maas-epp-config-smoke`,
+   which carries `app3`..`app8` at equal weight. It uses `app3`..`app8` because
+   `app1-production`/`app2-batch` are not authorised on the CPU model.
+3. Scales `maas-vllm-cpu` from 0 to 1 and runs a short `maas-loadgen-smoke` Job
+   against `/maas-fairness-poc/maas-vllm-cpu`.
+4. Quotes the `load: UNI-179` lines and passes only if every group has a
+   configured weight and a non-zero `dispatch_total` delta, with zero
+   `unclassified` dispatches and zero `unmatched_subscriptions_total` delta.
+5. An exit trap restores the LLMISVC's `config.ref` and replica count and
+   deletes the smoke ConfigMap and Job.
+
+The GPU workers carry no taint, so the CPU pod (2 CPU / 8Gi request) may
+schedule onto one. That is harmless with the pool idle and is the reason for
+the active-Job check.
 
 ### Ledger cross-check (UNI-138)
 

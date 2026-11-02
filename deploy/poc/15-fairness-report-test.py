@@ -151,6 +151,86 @@ def test_converged_run_passes():
         assert by_group["unclassified"]["observed_share_pct"] is None
 
 
+def test_request_share_pct_matches_token_share_when_requests_are_uniform():
+    # UNI-146 (C1): when every group's per-request token cost is the same
+    # (every scenario before this ticket), request count and delivered
+    # tokens scale together, so the request-count split and the
+    # weighted-token split should be the same number. 100 tokens/request for
+    # all three groups: token deltas 2100/1000/6900 (sum 10000) imply
+    # requests 21/10/69 (sum 100).
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2100\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 1000\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 6900\n'
+        )
+        rows = [
+            ("app1", 21, "1.20", "2.40", "200=21"),
+            ("app2", 10, "1.30", "2.50", "200=10"),
+            ("end-users", 69, "1.10", "2.30", "200=69"),
+        ]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 app2 end-users", w_app1=32, w_app2=32, w_end=32, rows=rows,
+        )
+        assert report["verdict"]["result"] == "PASS", report["verdict"]
+        by_group = {g["group"]: g for g in report["groups"]}
+        for gid in ("app1", "app2", "end-users"):
+            assert by_group[gid]["request_share_pct"] is not None
+            assert abs(by_group[gid]["request_share_pct"] - by_group[gid]["observed_share_pct"]) < 1.0
+            assert abs(by_group[gid]["request_share_deviation_pts"] - by_group[gid]["deviation_pts"]) < 1.0
+
+
+def test_request_share_pct_diverges_from_token_share_on_asymmetric_requests():
+    # UNI-146's actual case: app1 sends few, expensive (long-prompt) requests
+    # and end-users sends many, cheap-looking (short-prompt) requests, but
+    # end-users' completions are long enough that it still earns the
+    # majority of weighted tokens. Request count alone would say the split
+    # went the other way -- exactly the cost-model error this ticket exists
+    # to catch, and exactly why a report that only showed request count
+    # would hide it.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+        )
+        # app1: weight 20, end-users: weight 65 -- renormalized target
+        # 23.5%/76.5%. Token delta matches that target closely.
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2350\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 7650\n'
+        )
+        # But app1 sent far MORE requests than end-users (short completions,
+        # fast turnaround) while delivering fewer weighted tokens -- request
+        # count alone would say app1 dominates (90%), the opposite of the
+        # token-weighted truth.
+        rows = [
+            ("app1", 900, "0.40", "0.80", "200=900"),
+            ("end-users", 100, "6.00", "9.00", "200=100"),
+        ]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 end-users", w_app1=32, w_app2=0, w_end=104, rows=rows,
+        )
+        assert report["verdict"]["result"] == "PASS", report["verdict"]
+        by_group = {g["group"]: g for g in report["groups"]}
+        # Token-weighted split meets the target within a couple of points.
+        assert abs(by_group["app1"]["deviation_pts"]) < 2
+        assert abs(by_group["end-users"]["deviation_pts"]) < 2
+        # Request-count split tells a completely different, and wrong, story.
+        assert by_group["app1"]["request_share_pct"] == 90.0
+        assert by_group["end-users"]["request_share_pct"] == 10.0
+        assert by_group["app1"]["request_share_deviation_pts"] > 60
+        assert by_group["end-users"]["request_share_deviation_pts"] < -60
+        # The two methods must actually disagree here, which is the point.
+        assert abs(by_group["app1"]["request_share_pct"] - by_group["app1"]["observed_share_pct"]) > 50
+
+
 def test_skewed_run_fails_and_cli_exits_nonzero():
     # Deliberately skewed input: app1 (weight 20) captures almost everything,
     # end-users (weight 65) is nearly starved -- the kind of result that

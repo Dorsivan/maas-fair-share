@@ -1039,6 +1039,15 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         if g not in capped_groups
     )
     offered_tokens_total = sum(deltas.get(g) or 0.0 for g in offered_groups)
+    # UNI-146 (C1): the same share question as expected_pct/observed_pct
+    # above, but against the client's own request COUNT instead of the EPP's
+    # weighted-token accounting -- every scenario before this ticket used
+    # uniform requests, where the two splits are identical by construction
+    # and this number would add nothing. It is reported for comparison only;
+    # the scored verdict below is the weighted-token split, never this one.
+    offered_requests_total = sum(
+        loadgen_rows.get(g, {"total": 0}).get("total", 0) for g in offered_groups
+    )
 
     rows = []
     deviations_for_verdict = []
@@ -1050,6 +1059,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         expected_pct = None
         observed_pct = None
         deviation_pts = None
+        request_share_pct = None
+        request_share_deviation_pts = None
         if is_offered and gid != solo and gid not in capped_groups:
             if offered_weight_total > 0 and weight is not None:
                 expected_pct = 100.0 * weight / offered_weight_total
@@ -1061,6 +1072,21 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             if expected_pct is not None and observed_pct is not None:
                 deviation_pts = observed_pct - expected_pct
                 deviations_for_verdict.append((gid, deviation_pts))
+            # UNI-146 (C1): same expected_pct target, but against this
+            # group's share of total REQUEST COUNT rather than weighted
+            # tokens -- informational only, never fed into
+            # deviations_for_verdict/the scored verdict below. A scenario
+            # with asymmetric per-request cost (long-vs-short prompt/output)
+            # is exactly where this is expected to diverge from
+            # observed_share_pct; a scenario with uniform requests should
+            # show the two numbers agree.
+            requests_for_pct = loadgen_rows.get(gid, {"total": 0}).get("total", 0)
+            if offered_requests_total > 0:
+                request_share_pct = 100.0 * requests_for_pct / offered_requests_total
+            else:
+                request_share_pct = 0.0
+            if expected_pct is not None:
+                request_share_deviation_pts = request_share_pct - expected_pct
 
         delivered_tokens = deltas.get(gid)
         gen_row = loadgen_rows.get(gid, {"total": 0, "p50_sec": None, "p95_sec": None, "statuses": {}})
@@ -1077,6 +1103,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "expected_share_pct": expected_pct,
             "observed_share_pct": observed_pct,
             "deviation_pts": deviation_pts,
+            "request_share_pct": request_share_pct,
+            "request_share_deviation_pts": request_share_deviation_pts,
             "contended_seconds": contended_seconds_deltas.get(gid),
             "prompt_tokens_cached_ratio": cached_ratio_after.get(gid),
             "dispatch_total": dispatch_deltas.get(gid),
@@ -1481,6 +1509,14 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                 "count is scored on a dedicated 'did it get served' check instead, not folded "
                 "into the other groups' expected-share denominator."
             ),
+            "request_share_pct": (
+                "UNI-146 (C1): the SAME expected_share target above, scored against "
+                "requests_total (plain request count, from the loadgen log) instead of "
+                "delivered weighted tokens -- informational only, never part of the verdict. "
+                "Equal to observed_share_pct when every offered group's requests are uniform "
+                "cost (every scenario before this ticket); expected to diverge when request "
+                "cost is asymmetric across groups."
+            ),
         },
         "timeline": timeline_section,
         "ledger": ledger_section,
@@ -1664,13 +1700,26 @@ def render_markdown(report):
     lines.append("")
     lines.append("## Per-group result")
     lines.append("")
+    lines.append(
+        "`observed %`/`deviation (pts)` are the scored split, by weighted "
+        "tokens (`contended_service_tokens_total`). `request-count %`/"
+        "`request-count deviation (pts)` (UNI-146) are the same expected-"
+        "share target scored against plain request COUNT instead -- "
+        "informational only, never part of the verdict below. The two agree "
+        "when every offered group sends uniform requests (every scenario "
+        "before UNI-146) and are expected to diverge whenever request cost "
+        "is asymmetric across groups (e.g. long-prompt/short-output vs. "
+        "short-prompt/long-output)."
+    )
+    lines.append("")
     offered_col = "offered req/s" if r.get("generator") == "open-loop" else "offered workers"
     lines.append(
         f"| group | weight | {offered_col} | requests | statuses | p50s | p95s | "
-        "delivered tokens | expected % | observed % | deviation (pts) | contended_seconds | "
+        "delivered tokens | expected % | observed % | deviation (pts) | "
+        "request-count % | request-count deviation (pts) | contended_seconds | "
         "cached ratio | dispatch_total |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for g in report["groups"]:
         def fmt(v, suffix=""):
             return "n/a" if v is None else f"{v:.1f}{suffix}" if isinstance(v, float) else f"{v}{suffix}"
@@ -1682,6 +1731,7 @@ def render_markdown(report):
             f"{g['requests_total']} | {statuses} | {fmt(g['p50_sec'])} | {fmt(g['p95_sec'])} | "
             f"{fmt(g['delivered_tokens'])} | {fmt(g['expected_share_pct'], '%')} | "
             f"{fmt(g['observed_share_pct'], '%')} | {fmt(g['deviation_pts'])} | "
+            f"{fmt(g['request_share_pct'], '%')} | {fmt(g['request_share_deviation_pts'])} | "
             f"{fmt(g['contended_seconds'], 's')} | {fmt(cached_pct, '%')} | "
             f"{fmt(g['dispatch_total'])} |"
         )

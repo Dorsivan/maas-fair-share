@@ -290,7 +290,7 @@
 # set/restore wrapper (UNI-180)" for the full mechanism and its known gaps.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -902,8 +902,35 @@ case "$SCENARIO" in
     PER_TENANT_OVERRIDES=(WORKERS_APP1=64 WORKERS_APP2=32 CACHE_SHAPE_APP1=hot CACHE_SHAPE_APP2=cold)
     IS_CONTROL="true"
     ;;
+  asymmetric-request-shapes)
+    # UNI-146: C1, "asymmetric request shapes -- split by weighted tokens,
+    # not request count". Same app1/end-users pairing and 32/104 worker
+    # sizing as app2-idle -- already proven to over-offer this exact 20:65
+    # weight ratio -- with the "longgen" MAX_TOKENS_MODE_* value
+    # (04-loadgen.yaml, this ticket) paired with the per-group
+    # PROMPT_WORDS_MIN/MAX_<TOKEN> knob (GROUP_KNOBS, UNI-179) to give the
+    # two tenants opposite request shapes: app1 sends this script's long,
+    # 1200-word default prompt with a short (MAX_TOKENS_DEFAULT=64)
+    # completion; end-users sends a short, fixed 30-word prompt with a long
+    # (LONG_GEN_MAX_TOKENS) completion. Both over-offer the pool at these
+    # worker counts regardless of per-request duration -- a closed-loop
+    # worker that is mid-generation on a long completion is still occupying
+    # a concurrent slot, which is exactly the backlog this benchmark needs.
+    #
+    # LONG_GEN_MAX_TOKENS=1500 (not the 2000 UNI-128 default, and nowhere
+    # near C4/UNI-150's near-timeout target): just needs to be "long"
+    # relative to app1's 64-token completions so the two cost models
+    # (request count vs. weighted tokens) visibly disagree, same headroom
+    # reasoning as UNI-145's MAX_TOKENS_HUGE_VALUE=4096 -- 1500 completion
+    # tokens plus a 30-word (~40-token) prompt stays comfortably under this
+    # cluster's real --max-model-len 8192, with REQUEST_TIMEOUT_SECONDS'
+    # default 300s giving ample margin to actually finish generating it
+    # under contention.
+    TENANTS="app1 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_END_USERS=104 PROMPT_WORDS_MIN_END_USERS=30 PROMPT_WORDS_MAX_END_USERS=30 MAX_TOKENS_MODE_END_USERS=longgen LONG_GEN_MAX_TOKENS=1500)
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes)" >&2
     exit 1
     ;;
 esac

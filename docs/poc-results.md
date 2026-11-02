@@ -4122,6 +4122,188 @@ had to flip, which is a narrow enough condition that it went unnoticed
 until a case that specifically needs flight-recorder content (this one)
 went looking for it.
 
+## UNI-146: C1, `asymmetric-request-shapes` — split by weighted tokens, not request count
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, second of the C-series.
+Every scored scenario before this ticket used uniform requests (same
+prompt length, same `max_tokens`, for every tenant), so the delivered
+split by weighted tokens and the delivered split by plain request count
+were identical by construction — this case is the first one where they
+can legitimately disagree, which is exactly the kind of cost-model bug a
+request-count-only view would hide.
+
+**Setup:** `app1`/`end-users` pair (20:65 weight ratio, renormalized
+23.5%/76.5%), the same 32/104 worker sizing already proven to over-offer
+this ratio in `app2-idle`, live against `maas-vllm-gpu` (2 replicas,
+llama-3-1-8b), `ENFORCE_LIVE=true`, `halfLifeSeconds: 60`, 240s. `app1`
+keeps every global default: the long ~1200-word prompt, short
+(`MAX_TOKENS_DEFAULT=64`) completion. `end-users` gets two new
+`deploy/poc/04-loadgen.yaml` knobs (this ticket):
+`PROMPT_WORDS_MIN/MAX_END_USERS=30` (a short, fixed prompt, independent of
+the global `PROMPT_WORDS_MIN/MAX` every other tenant still uses) and a
+third `MAX_TOKENS_MODE_*` value, `longgen` (`LONG_GEN_MAX_TOKENS=1500`).
+Both tenants over-offer the pool regardless of per-request duration — a
+worker mid-generation on a long completion still occupies a concurrent
+slot.
+
+**First attempt found a confound, not a result (discarded, not in
+`results/`).** Setting `max_tokens=1500` alone does not make a completion
+long: vLLM stops at its own EOS token regardless of the cap, and the
+first live run of this scenario averaged **~67 completion tokens** per
+`end-users` request against a requested `max_tokens` of 1500 — nowhere
+near "long". Fixed by adding vLLM's `min_tokens`/`ignore_eos`
+chat-completions extensions to the `longgen` mode (`04-loadgen.yaml`):
+`min_tokens` forces the same floor as `max_tokens`, and `ignore_eos`
+disables early stopping, so `longgen` now means long, unconditionally.
+Confirmed on the second attempt: `end-users` averaged ~1250-1310
+completion tokens/request against the 1500 target, `long_generations`
+tallying 100% of its requests in the client record.
+
+**Second attempt also found a confound, this one in how I ran it, not in
+the code.** `ENFORCE_LIVE=true` is this chain's own established
+convention (every C-series case from UNI-145 on) for actually bringing
+the fairness policy under test — the ticket's pass criterion ("the
+delivered split by weighted tokens meets the target") is about the
+*enforced* policy's dispatch decision, not about plain FCFS. I launched
+the first complete run of this scenario without it, producing a
+technically-valid but off-topic shadow-mode (`enforce: false`) result.
+Caught before anything was committed; re-run with `ENFORCE_LIVE=true` is
+the result below. (The shadow-mode run turned out to be useful anyway —
+see the contention finding, which reproduced identically in both modes —
+but it is not the scored artifact for this ticket.)
+
+**Verdict: UNCONTENDED** (`max_abs_deviation_points: 9.72`, just under the
+10-point threshold, but not scored against it — see below).
+
+- Every offered group's `contended_seconds_total` delta stayed at ~0.2s
+  (app1=0.20s, end-users=0.20s), an order of magnitude below the ~9s a
+  genuinely-contending tenant accrues in a 240s full-contention run — so
+  by this report's existing UNCONTENDED gate, nobody was ever backlogged
+  alongside anyone else, and the weighted-split deviation check does not
+  formally apply.
+
+**This UNCONTENDED result is itself the finding, and it is a surprising
+one.** 32+104=136 workers against this pool's ~16 concurrent GPU slots
+(2 replicas × `--max-num-seqs 8`) is blatant oversubscription by any
+worker-count measure — `app2-idle` at the *same* 32/104 sizing but with
+uniform (short, ~11-19s) requests measured 1.6s of real contention per
+group and a clean PASS. Here, per-request latency ballooned to 100-300s
+(app1 p50 100.9s/p95 300.0s, end-users p50 169.8s/p95 202.9s) because
+`longgen` genuinely held GPU slots for the full forced generation. Longer
+per-request occupancy means admission ("pick") events — the moments the
+EPP's weighted-fairness plugin actually has to choose between candidates
+from different groups — become far sparser in time: slots free up one at
+a time, spaced out by the long generations occupying them, so the two
+groups' pending requests rarely land in the scheduler's view at the same
+instant even though the system is continuously saturated by worker count.
+**Confirmed this is a property of the request shape, not of whether
+enforcement is active:** the discarded shadow-mode attempt (`enforce:
+false` throughout) measured essentially the same near-zero contention
+(0.27s/0.27s) and the same ~11.5-point weighted-split deviation. This is
+the first case in this chain where the UNCONTENDED gate — built to catch
+genuinely under-saturated runs masquerading as unfair ones (see
+[UNI-135](/UNI/issues/UNI-135)) — instead hides a run that *is* saturated,
+because duration asymmetry rather than request volume is what's driving
+it. Worth a note in `docs/runbook.md`'s Known Gaps for whoever designs
+the next duration-asymmetric case in this series (C3-C6).
+
+**The split-by-weighted-tokens vs split-by-request-count comparison this
+ticket asks for, reported for the record even though the run is
+UNCONTENDED and neither side is scored:**
+
+| group | weight | requests | delivered tokens | expected % | observed % (weighted tokens) | deviation (pts) | observed % (request count) | deviation (pts) |
+|---|---|---|---|---|---|---|---|---|
+| app1 | 20.0 | 92 | 102071 | 23.5% | 13.8% | -9.7 | 25.4% | +1.9 |
+| end-users | 65.0 | 270 | 636896 | 76.5% | 86.2% | +9.7 | 74.6% | -1.9 |
+
+This is exactly the hidden cost-model error the ticket describes: judged
+by request count alone, this run looks like a clean pass (±1.9pts,
+nowhere near the 10-point threshold). Judged by the metric the policy
+actually optimizes — weighted tokens — the same run sits at ±9.7pts, a
+hair under the fail line itself. `app2-idle` at the same worker sizing but uniform requests shows the two
+splits agreeing to within a point by construction (626/3159=19.8% of
+requests vs. its reported 19.0% of weighted tokens for `app1` — see its
+own section), confirming the divergence here is real and shape-driven,
+not report noise.
+
+**Ledger cross-check (UNI-138/G2): FAIL for `end-users`** (cost diff
+-13.0%, outside the 10% tolerance) while the *raw* token counts agree
+exactly between the client and the EPP (0.0% diff: 373318 tokens both
+sides). So the EPP is not missing or inventing tokens — it is
+under-crediting the *weighted cost* of tokens it does agree were
+delivered. Working hypothesis, not confirmed this ticket: `end-users`'
+longest requests ran right up against `REQUEST_TIMEOUT_SECONDS` (one
+`app1` request hit exactly 300.01s; `end-users` p95 is 202.9s), and a
+request whose generation actually completes (real `usage` in the response
+body, counted by the client) but is marked `500` by something downstream
+of vLLM after the EPP's own provisional-charge accounting already wrote
+it off as abandoned would reproduce exactly this signature — real tokens
+on the client side, short-changed cost on the EPP side. `app1`'s own
+ledger check is too noisy on ~90-95 requests to use as a second data
+point (it flipped between -31.2% FAIL on the discarded shadow run and
++4.8% PASS here). Flagging for whichever later case in this series
+(C3/C6 look like the closest fit) specifically exercises
+near-timeout requests.
+
+**Elevated error rates, not seen in any uniform-shape case in this
+chain.** `app1`: 72/92 (78.3%) `200`, 17×`000` (connection-level
+failure/curl never got a status line) + 3×`500`. `end-users`: 239/270
+(88.5%) `200`, 31×`500`. `app2-idle` at the identical 32/104 worker sizing
+but uniform requests measured 100% `200` for both groups. Not
+investigated further this ticket — plausibly the same long-GPU-occupancy
+mechanism as the contention finding above (slots held 100-300s under 136
+workers of demand create more opportunities for a request to be preempted
+or time out somewhere in the stack), but worth keeping in mind as its own
+line of investigation if a later case needs clean success rates to trust
+its numbers.
+
+**Cluster left as found.**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce'
+      enforce: false
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           7m24s      14m
+```
+
+`ENFORCE_LIVE=true` flipped `enforce` to `true` for the run and the
+harness's own `revert_enforce_live` reverted it afterward, confirmed via
+`llm_d_epp_maas_fairness_enforcing` on both EPPs at flip (`1` at
+14:34:22Z) and revert (`0` at 14:43:03Z). Also found and fixed in-place
+during this ticket, unrelated to the scenario itself: an earlier attempt
+at this same run was interrupted by an adapter crash while
+`ENFORCE_LIVE=true` was live, and the harness's own crash-recovery
+(`revert_enforce_live` called from the `on_exit` trap) did not fire —
+the process was killed outright, not given a chance to run its trap. That
+left `enforce: true` live on the cluster, undetected, for about 21
+minutes before this session's resume caught it via a direct
+`oc get configmap` check and reverted it by hand using the same
+flip/patch mechanism the script itself uses, then confirmed
+`llm_d_epp_maas_fairness_enforcing=0` before doing anything else. No
+orphaned loadgen/capture processes survived the same crash. This is a gap
+in the harness's own safety net (a hard kill bypasses bash traps
+entirely) worth a follow-up ticket; out of scope to fix here.
+
+Raw results: `results/20261102T143309Z-uni-146-c1-asymmetric-request-shapes-enforced/` —
+`fairness-report.{md,json}`, `loadgen.log`, `epp-container.log`,
+`metrics-{before,after,timeseries}.txt`, `client-request-summary.jsonl`,
+`04-loadgen.patched.yaml`, `enforce-events.log`.
+
+**What surprised me:** that the contention detector itself, not just the
+weighted split, can be fooled by request-shape asymmetry — 136 workers
+against ~16 GPU slots is about as oversubscribed as this chain gets, and
+it still measured as `UNCONTENDED`, for a structural reason (admission
+events spaced out by long per-request occupancy) that has nothing to do
+with whether the pool is actually saturated. Second: catching my own
+process mistake (running without `ENFORCE_LIVE=true` first) only because
+the chain's own convention from UNI-145 onward made it obviously
+wrong — a good argument for making `ENFORCE_LIVE=true` the default for
+every named scenario except an explicit shadow-mode control, rather than
+an opt-in flag every invocation has to remember.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

@@ -87,7 +87,13 @@ data:
     # tenant on "always omits max_tokens" and another on "always sends
     # MAX_TOKENS_HUGE_VALUE" in the same run. Unset (the default) means "use
     # the global roll logic for this tenant", same contract as
-    # CACHE_SHAPE_APP1/APP2/END_USERS above. Values: "omit" or "huge".
+    # CACHE_SHAPE_APP1/APP2/END_USERS above. Values: "omit", "huge", or
+    # "longgen" (UNI-146: always LONG_GEN_MAX_TOKENS, unconditionally --
+    # unlike the global LONG_GEN_FRACTION roll below, which only ever hits a
+    # fraction of every tenant's requests the same way). PROMPT_WORDS_MIN/MAX
+    # is already a per-group knob via GROUP_KNOBS (UNI-179); pairing it with
+    # MAX_TOKENS_MODE_<TOKEN>=longgen on one group and leaving another on the
+    # global default is exactly UNI-146's asymmetric-request-shapes case.
     MAX_TOKENS_MODE_APP1="${MAX_TOKENS_MODE_APP1:-}"
     MAX_TOKENS_MODE_APP2="${MAX_TOKENS_MODE_APP2:-}"
     MAX_TOKENS_MODE_END_USERS="${MAX_TOKENS_MODE_END_USERS:-}"
@@ -325,6 +331,12 @@ data:
       case "$mode" in
         omit) echo "-1 omit"; return ;;
         huge) echo "${GK[MAX_TOKENS_HUGE_VALUE|$group]} huge"; return ;;
+        # UNI-146 (C1): unlike the LONG_GEN_FRACTION roll below (a fraction
+        # of every group's requests), an explicit MAX_TOKENS_MODE_<TOKEN>=longgen
+        # makes EVERY request from this group long -- needed to put one
+        # whole tenant on "short prompt / long output" opposite another on
+        # "long prompt / short output" in the same run.
+        longgen) echo "${GK[LONG_GEN_MAX_TOKENS|$group]} longgen"; return ;;
       esac
       if [ "$(roll "${GK[MAX_TOKENS_OMIT_FRACTION|$group]}")" = "1" ]; then
         echo "-1 omit"
@@ -361,6 +373,16 @@ data:
       read -r mt_value mt_kind <<< "$(pick_max_tokens "$group")"
       max_tokens_json=""
       [ "$mt_kind" != "omit" ] && max_tokens_json="\"max_tokens\": ${mt_value}, "
+      # UNI-146: "longgen" alone is not enough -- vLLM stops at the model's
+      # own EOS token regardless of max_tokens, so a short/generic prompt
+      # with no reason to ramble produces a short completion no matter how
+      # high max_tokens is set (confirmed live: the first
+      # asymmetric-request-shapes attempt averaged ~68 completion tokens
+      # against a requested max_tokens of 1500). vLLM's chat completions
+      # endpoint accepts "min_tokens"/"ignore_eos" as server-specific
+      # extensions beyond the OpenAI schema; forcing both here is what
+      # actually makes "long generation" mean long.
+      [ "$mt_kind" = "longgen" ] && max_tokens_json="${max_tokens_json}\"min_tokens\": ${mt_value}, \"ignore_eos\": true, "
       stream=0
       [ "$(roll "${GK[STREAM_FRACTION|$group]}")" = "1" ] && stream=1
       stream_json=""
@@ -796,15 +818,28 @@ spec:
             # - name: CACHE_SHAPE_END_USERS
             #   value: "hot"
             # UNI-145 (C2): per-tenant max_tokens shape -- "omit" (no
-            # max_tokens field at all) or "huge" (MAX_TOKENS_HUGE_VALUE).
-            # Unset = use the global MAX_TOKENS_OMIT_FRACTION/HUGE_FRACTION
-            # rolls above for that tenant, unchanged.
+            # max_tokens field at all), "huge" (MAX_TOKENS_HUGE_VALUE), or
+            # "longgen" (UNI-146: always LONG_GEN_MAX_TOKENS, with
+            # min_tokens/ignore_eos forcing a genuinely long completion).
+            # Unset = use the global MAX_TOKENS_OMIT_FRACTION/HUGE_FRACTION/
+            # LONG_GEN_FRACTION rolls above for that tenant, unchanged.
+            # Combine with the per-group PROMPT_WORDS_MIN/MAX_<TOKEN> knob
+            # (GROUP_KNOBS, UNI-179) to put one tenant on "short prompt/long
+            # output" opposite another on "long prompt/short output" --
+            # UNI-146's own asymmetric-request-shapes scenario does exactly
+            # this: end-users short (30-word) prompt + longgen, app1 left on
+            # every global default (long prompt, short MAX_TOKENS_DEFAULT
+            # output).
             # - name: MAX_TOKENS_MODE_APP1
             #   value: "omit"
             # - name: MAX_TOKENS_MODE_APP2
             #   value: "huge"
             # - name: MAX_TOKENS_MODE_END_USERS
-            #   value: "omit"
+            #   value: "longgen"
+            # - name: PROMPT_WORDS_MIN_END_USERS
+            #   value: "30"
+            # - name: PROMPT_WORDS_MAX_END_USERS
+            #   value: "30"
             - name: DURATION
               # Several half-lives (halfLifeSeconds: 60). The tabs start empty
               # after every EPP restart, so a run shorter than ~3 half-lives

@@ -953,7 +953,7 @@ live in `secret/maas-loadgen-keys` in `maas-fairness-poc`:
 | `end-user-beta` | `end-user-beta` | pre-existing (UNI-29 era) | not re-verified this ticket |
 | `end-user-gen01` .. `end-user-gen20` | alternating `end-user-alpha`/`end-user-beta` (odd=alpha, even=beta) | 2026-11-01 (this ticket) | 2026-12-01 (30d) |
 | `enduser-foo` | `enduser-foo` (new `MaaSSubscription`, owner group `maas-end-users`, deliberately outside the `end-user-` prefix match) | 2026-11-02 (this ticket) | 2026-12-02 (30d) |
-| `app3` .. `app20` | `app3` .. `app20` (one key each, key name = subscription name; owner group `maas-poc-users`; UNI-187) | **pending** -- minted by `deploy/maas/mint-loadgen-keys.sh`, fill in on mint | 30d from mint |
+| `app3` .. `app20` | `app3` .. `app20` (one key each, key name = subscription name; owner group `maas-poc-users`; UNI-187) | 2026-11-02 (UNI-189) | 2026-12-02 (30d) |
 
 `end-user-gen01`..`20` are 20 distinct `sk-oai-` credentials for D1 -- 20
 keys, 2 real subscriptions, which is what API key *rotation* actually means

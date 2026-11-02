@@ -1770,13 +1770,26 @@ score a D1/D2/D3/D5 case itself**, same scope boundary UNI-127/128 set. Full
 mechanism in `docs/runbook.md`'s "Identity-variant harness (UNI-129)".
 
 **Provisioning check (rule 5), done first.** This role can mint new MaaS API
-keys — confirmed live, and used for D1 below — but cannot create new
-`MaaSSubscription` objects: `oc auth can-i create maassubscriptions -n
-models-as-a-service` and the same check in `maas-fairness-poc` both return
-`no`. D1 and D3 need no new subscriptions (they reuse the existing
-`end-user-alpha`/`end-user-beta`/`app1-production` identities), so they are
-fully built. D2 needs a subscription literally named `enduser-foo` to exist
-and does not — see "Blocked: D2" below.
+keys — confirmed live, and used for D1 below — but at the time D1/D3/D5 were
+built, could not create new `MaaSSubscription` objects: `oc auth can-i create
+maassubscriptions -n models-as-a-service` and the same check in
+`maas-fairness-poc` both returned `no`. D1 and D3 need no new subscriptions
+(they reuse the existing `end-user-alpha`/`end-user-beta`/`app1-production`
+identities), so they were built first. D2 needed a subscription literally
+named `enduser-foo` to exist; that gap was raised to the board (approval
+[710871b2](/UNI/approvals/710871b2-3030-44c1-a6cb-21386b04a216), approved
+2026-11-02T08:34:48Z) and resolved by granting `create`/`get`/`list`/`watch`
+on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` to this
+role's ServiceAccount (`poc-agent`) — narrowly scoped, no write verbs, one
+namespace, one resource. **One identity trap cost a full round trip and is
+worth recording:** this environment's `oc` context defaults to a
+`poc-viewer` identity distinct from the `poc-agent` ServiceAccount
+`OPENSHIFT_TOKEN` actually authenticates as, so a bare `oc auth can-i`
+silently answers for the wrong account. Always run `oc whoami` first, and
+when in doubt pass `--token="$OPENSHIFT_TOKEN"` explicitly rather than
+trusting the ambient context. With the grant confirmed against the right
+identity, `enduser-foo` was created and D2's specific case closed — see
+below, "D2" is no longer blocked.
 
 **D1 — key rotation, live evidence.** 20 new `sk-oai-` keys
 (`end-user-gen01`..`end-user-gen20`) were minted directly against
@@ -1787,16 +1800,31 @@ round-robinning across 3 of the new keys all returned `200`, and the EPP's
 own `fairness_id="end-users"` counter matched exactly (68) — the widened
 key list collapses to the one flow correctly.
 
-**D2 — generic mechanism built, specific identity blocked.** The new
-`custom` pseudo-tenant was smoke-tested live against an existing identity
-(`CUSTOM_SUBSCRIPTION_NAME=app1-production`): 34 requests, all `200`, and
-the EPP's `fairness_id="app1"` counter read exactly 34 — the plumbing
-works end to end. The ticket's specific case, a subscription literally
-named `enduser-foo` (no hyphen, so it should fall outside the `end-user-`
-prefix match into `unclassified`), could not be built: minting a key
-against that name was tried directly and rejected at the gateway
-(`400 invalid_subscription`) because no such `MaaSSubscription` exists, and
-creating one is outside this role's grant (see "Blocked: D2").
+**D2 — generic mechanism and the specific identity, both live-verified.**
+The `custom` pseudo-tenant was first smoke-tested against an existing
+identity (`CUSTOM_SUBSCRIPTION_NAME=app1-production`): 34 requests, all
+`200`, and the EPP's `fairness_id="app1"` counter read exactly 34 — the
+plumbing works end to end. With the board-approved RBAC grant landed
+(2026-11-02), the ticket's actual specific case was then built and run:
+`MaaSSubscription enduser-foo` was created (owner group `maas-end-users`,
+same model ref and token-rate-limit shape as the other GPU subscriptions —
+reusing an existing, already-permitted group rather than provisioning a new
+`Group`/`MaaSAuthPolicy`, since this role has no grant to create or modify
+either), a key was minted against it directly (`201`, non-secret fields only
+ever read — see "Mint a MaaS API key" in the runbook), and a 25s/2-worker
+smoke Job ran 70 requests through it. All 70 came back `200`— confirmed by
+the job's own per-tenant table and `CLIENT_RECORD_JSON`
+(`{"group":"custom","requests_sent":70,"status_tally":{"200":70},...}`) —
+and the EPP's own metrics confirm classification landed exactly where D2
+predicts: a fresh `fairness_id="unclassified"` series appeared
+(`llm_d_epp_maas_fairness_dispatch_total{fairness_id="unclassified"}=70`),
+and — the sharpest piece of evidence — the EPP's own regression-detector
+counter for exactly this situation,
+`llm_d_epp_maas_fairness_unmatched_subscriptions_total`, moved from `0` to
+`70`, one for one with the 70 requests sent. `enduser-foo` not matching the
+`end-user-` prefix (no hyphen after "end") or either app's exact name, and
+therefore free-riding the `unclassified` catch-all weight (5 of the 100
+total), is proven live, not just read off the ConfigMap.
 
 **D3 — forged header, live evidence the defense holds.** The same 68-request
 run above set `FORGE_FAIRNESS_ID_FRACTION=0.5` (36 of the 68 end-users
@@ -1850,35 +1878,54 @@ AuthPolicy, is `x-maas-subscription` (no `-id`) — `design.md`'s Part 2 config
 block has carried the wrong name since this POC's early days, and this
 ticket's documentation above uses the real one throughout.
 
-**Blocked: D2.** Exact gap: `create` on
+**D2, resolved.** Originally blocked on `create` on
 `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` (also
-checked and denied in `maas-fairness-poc`). Verified with `oc auth can-i`,
-not inferred from role tables. Needed to create a `MaaSSubscription` named
-`enduser-foo` so a key minted against it produces a real, authenticatable
-identity that falls outside the `end-user-` prefix match. Raised to the
-board per this chain's standing practice (see the closing comment on this
-task) rather than worked around.
+checked and denied in `maas-fairness-poc`), verified with `oc auth can-i`
+rather than inferred from role tables, and raised to the board per this
+chain's standing practice. The board approved a narrow `Role`/`RoleBinding`
+(`poc-agent-maassubscriptions`, one namespace, one API group, one resource,
+`create`/`get`/`list`/`watch` only — no `update`/`patch`/`delete`, since the
+five pre-existing subscriptions back live keys and an accidental overwrite
+there is expensive) rather than having someone else create the one object.
+The first live re-check after the grant still read `no` — not because the
+grant was missing, but because this environment's default `oc` identity
+(`poc-viewer`) is not the ServiceAccount (`poc-agent`) the grant was made to;
+re-running the same check with `OPENSHIFT_TOKEN` passed explicitly
+confirmed `yes`. `enduser-foo` was then created directly (see "D2" above) —
+no workaround was used for the provisioning step itself, only for the
+RBAC-identity confusion while verifying it.
 
 **Cluster left as found.** This ticket's harness makes no replica or
 plugin-config changes — the new knobs and the D5 probe are client-side
 (request headers, auth material, which credential file is read) and never
-touch the LLMInferenceService spec or the EPP's weights. A short smoke-test
-Job (`TENANTS="end-users custom"`, `DURATION=25s`, `WORKERS=2`) was run to
-produce the live evidence above and cleaned up immediately after;
-`spec.replicas` on `maas-vllm-gpu` confirmed at `2` (matching
-`deploy/poc/09-vllm-gpu.yaml`), both vLLM pods and the EPP scheduler
-`1/1 Running` with 0 restarts, and no `job` left in the namespace:
+touch the LLMInferenceService spec or the EPP's weights. Two short
+smoke-test Jobs ran to produce the live evidence above and were deleted
+immediately after each: the first (`TENANTS="end-users custom"`,
+`DURATION=25s`, `WORKERS=2`, 2026-11-01, before the RBAC grant) against
+`app1-production`; the second (`TENANTS="custom"`, `DURATION=25s`,
+`WORKERS_CUSTOM=2`, 2026-11-02, under a distinct Job name so it could not
+collide with or mutate the first run's completed Job record) against
+`enduser-foo` once it existed (deleted immediately via its distinct Job
+name, confirmed below). `spec.replicas` on `maas-vllm-gpu` confirmed at `2`
+(matching `deploy/poc/09-vllm-gpu.yaml`), both vLLM pods and the EPP
+scheduler `1/1 Running` with 0 restarts. Freshly re-checked 2026-11-02 after
+the D2 smoke run and cleanup, not carried over from the 2026-11-01 snapshot
+(pod names differ — the scheduler pod has since restarted for an unrelated
+reason, 0 restarts on the current one): the only `Job` present is
+`maas-loadgen`, `Complete`, age 7h17m — that predates this session (it is
+the benchmark chain's own run, not this ticket's) and was left untouched:
 
 ```
 $ oc get llmisvc maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
 replicas=2
 $ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
-NAME                                                      READY   STATUS    RESTARTS   AGE
-maas-vllm-gpu-kserve-74d8dd69bd-69gqk                     1/1     Running   0          66m
-maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                     1/1     Running   0          14d
-maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-6gkq5    1/1     Running   0          67m
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          17h
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-676fd97cd-c5s8g    1/1     Running   0          7h26m
 $ oc get jobs -n maas-fairness-poc
-No resources found in maas-fairness-poc namespace.
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           15m        7h17m
 ```
 
 One self-inflicted near-miss during this work, recorded for the next
@@ -1893,10 +1940,10 @@ time outside of any actual benchmark ticket.
 
 **Not proven here, by design:** no D1–D5 case was run or scored as a named,
 reportable scenario — every one is still pending its own ticket, same as
-UNI-127/128 left their cases pending. The smoke tests above exist to prove
-the harness mechanism works and produces correct EPP-side classification,
-not to produce a scenario verdict. D2's `enduser-foo` instance specifically
-cannot be attempted at all until the board resolves the missing grant.
+UNI-127/128 left their cases pending. The smoke tests above (including the
+D2 `enduser-foo` one) exist to prove the harness mechanism works and
+produces correct EPP-side classification, not to produce a scenario
+verdict.
 
 ## UNI-131: A1, `app2-alone` — the lowest-weight tenant gets the whole pool when alone
 
@@ -3595,7 +3642,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Resize `full-contention`/`end-users-idle` to over-offer per tenant, re-run all four + a named control (UNI-103)~~ | **Done, 4/5 green.** Per-tenant `WORKERS_APP1`/`WORKERS_APP2`/`WORKERS_END_USERS` replace the single global `WORKERS` in both scenarios; `equal-workers-control` keeps the original equal-worker shape alive as a permanent, explicitly-unscored negative control (`--control`, verdict `INFO`). Live re-run 2026-10-29: `full-contention` now PASSES (16.2/12.8/71.0% vs 21.1/10.5/68.4%), `app1-alone` and `asymmetric-demand` still PASS, `equal-workers-control` reproduces the original artifact as expected (INFO, 29.7pt max deviation). `end-users-idle` still FAILs, now in the opposite direction (app1 82.4% vs a 66.7% target) -- see "UNI-103," below, for the full table and the suspected cause | follow-up: [UNI-104](/UNI/issues/UNI-104), tune the app1:app2 over-offer ratio |
 | — | ~~Retune `end-users-idle`'s app1:app2 worker ratio to match its 2:1 target, re-run (UNI-104)~~ | **Done, PASS.** `WORKERS_APP1` moved from 128 to 64 (keeping `WORKERS_APP2=32`), matching the offered-worker ratio to the pair's actual 2:1 target share ratio instead of reusing `full-contention`'s 4:1 dominant-tenant figure. Live re-run 2026-10-29: 68.4/31.6% against a 66.7/33.3% target (1.8pt max deviation) -- **PASS**. `contended_seconds_total` deltas (app1 1.46s, app2 1.50s) confirm both tenants were genuinely contending. Why the 4:1 ratio overshot so much more than 2:1 undershoots remains unexplained, same as UNI-103 left it -- see "UNI-104," below | root cause of the ratio's exact sensitivity: pending [UNI-100](/UNI/issues/UNI-100)'s scope decision |
 | — | ~~Build the timeline/chaos harness for the edge-case plan (UNI-127)~~ | **Done, development only.** Per-tenant join/leave + duty-cycle timing, EPP-pod-delete and vLLM-scale chaos hooks, windowed per-tenant share, and a time-to-converge figure -- see "UNI-127," above, for the full story including the live finding that a chaos scale-restore's actual capacity recovery (~3m39s on this backend) lags its patch by far more than a short `CHAOS_SCALE_HOLD` accounts for. `full-contention` regression confirmed the whole-run verdict is unchanged. No B1-B4/E1/E2 case was run or scored -- that is every ticket after this one in the chain | the board's edge-case cases themselves (B1-B4, E1, E2, "app3 joins at saturation"), each its own ticket |
-| 17 | **`MaaSSubscription` named `enduser-foo` for D2 (UNI-129)** | D2's harness mechanism (an arbitrary/custom subscription identity) is built and smoke-tested live against an existing identity, but the ticket's specific case -- a subscription named `enduser-foo` (no hyphen, deliberately outside the `end-user-` prefix match) -- cannot be created: `oc auth can-i create maassubscriptions -n models-as-a-service` returns `no`, confirmed live, not inferred. Minting a key against that name directly was also tried and rejected (`400 invalid_subscription`) since no such object exists | `create` on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` -- operator-level approval |
+| — | ~~`MaaSSubscription` named `enduser-foo` for D2 (UNI-129)~~ | **Done.** Board approved and granted `create`/`get`/`list`/`watch` on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` to this role (narrowly, no write verbs). `enduser-foo` created, a key minted against it, and D2's specific case smoke-tested live: 70/70 requests `200`, `llm_d_epp_maas_fairness_unmatched_subscriptions_total` moved `0` -> `70`, confirming classification into `unclassified` | — |
 
 ## Reproducing
 

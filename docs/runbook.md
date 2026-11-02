@@ -824,15 +824,19 @@ mean anything. The key inventory below adds 20 (`end-user-gen01` ..
 default -- there is no one arbitrary name to default to), with
 `WORKERS_CUSTOM`/`CUSTOM_START`/`CUSTOM_STOP`/`CUSTOM_DUTY` following the same
 pattern as the three built-in tenants. This is the generic mechanism the
-case needs; **the specific identity the ticket names, `enduser-foo` (no
-hyphen after "end," so it deliberately falls outside the `end-user-` prefix
-match and should land in `unclassified`), could not be provisioned** -- see
-"Blocked: D2" below. The mechanism itself is smoke-tested against an
-existing identity instead (`CUSTOM_SUBSCRIPTION_NAME=app1-production`):
-live on 2026-11-01, 34 `custom`-tenant requests all returned 200 and the
-EPP's own `llm_d_epp_flow_control_request_enqueue_duration_seconds_count{
+case needs; the mechanism itself was first smoke-tested against an existing
+identity (`CUSTOM_SUBSCRIPTION_NAME=app1-production`): live on 2026-11-01,
+34 `custom`-tenant requests all returned 200 and the EPP's own
+`llm_d_epp_flow_control_request_enqueue_duration_seconds_count{
 fairness_id="app1"}` showed exactly 34 -- the generic plumbing classifies
-correctly end to end, only the specific `enduser-foo` instance is blocked.
+correctly end to end. **The specific identity the ticket names, `enduser-foo`
+(no hyphen after "end," so it deliberately falls outside the `end-user-`
+prefix match and lands in `unclassified`), was provisioned once the board
+granted this role `create` on `maassubscriptions` (2026-11-02) -- see "D2,
+resolved" below** for the grant, the identity gotcha that briefly hid it,
+and the live classification proof (`CUSTOM_SUBSCRIPTION_NAME=enduser-foo`,
+70/70 requests `200`, all 70 counted by the EPP's own
+`unmatched_subscriptions_total` regression detector).
 
 **D3 -- forged fairness-id header.** `FORGE_FAIRNESS_ID_FRACTION` (default
 `0`) and `FORGE_FAIRNESS_ID_VALUE` (default `app1`) add
@@ -896,17 +900,47 @@ to zero, see "Restore `maas-vllm-cpu` from zero" above); a 0-replica probe
 fails at the connection level, which must not be misread as "the path is
 closed."
 
-**Blocked: D2.** Minting the `enduser-foo` key needed the subscription
-`enduser-foo` to exist as a real `MaaSSubscription` object (confirmed by
-testing the mint call directly: naming a non-existent subscription returns
-`400 invalid_subscription`, not a silently-accepted key). Creating one needs
-`create` on `maassubscriptions.maas.opendatahub.io` in the
-`models-as-a-service` namespace. `oc auth can-i create maassubscriptions -n
-models-as-a-service` returns `no` for this role, and the same check in
-`maas-fairness-poc` also returns `no` -- there is no RoleBinding anywhere
-that grants it. This is the exact resource/API/permission rule 5 asks be
-named precisely; raised to the board per this chain's standing practice
-(see the closing comment on this ticket).
+**D2, resolved (2026-11-02).** Minting the `enduser-foo` key needed the
+subscription `enduser-foo` to exist as a real `MaaSSubscription` object
+(confirmed by testing the mint call directly: naming a non-existent
+subscription returns `400 invalid_subscription`, not a silently-accepted
+key). Creating one needed `create` on `maassubscriptions.maas.opendatahub.io`
+in the `models-as-a-service` namespace, which this role did not have --
+raised to the board (approval
+[710871b2](/UNI/approvals/710871b2-3030-44c1-a6cb-21386b04a216)) rather than
+worked around.
+
+The board granted it: `Role`/`RoleBinding` `poc-agent-maassubscriptions` in
+`models-as-a-service`, scoped to `maassubscriptions.maas.opendatahub.io`
+only, `create`/`get`/`list`/`watch` (no `update`/`patch`/`delete` -- the five
+pre-existing subscriptions back live keys, so write access to them was
+deliberately withheld), bound to `ServiceAccount paperclip/poc-agent`.
+**Gotcha that cost a round trip:** this environment's default `oc` context
+authenticates as `system:serviceaccount:paperclip:poc-viewer`, a different
+identity from `poc-agent` -- so a bare `oc auth can-i create maassubscriptions
+-n models-as-a-service` kept returning `no` even after the grant landed.
+Always run `oc whoami` first; here, re-running the same check with
+`--token="$OPENSHIFT_TOKEN"` (which authenticates as `poc-agent`) explicitly
+confirmed `yes`. For a subresource check use `can-i create
+pods --subresource=exec`, not `can-i create pods/exec` -- the slash form
+parses as TYPE/NAME ("may I create a pod *named* exec") and silently
+misleads in both directions; did not come up here but is the same class of
+identity/permission-checking trap.
+
+With the grant confirmed against the right identity, `MaaSSubscription
+enduser-foo` was created directly (`oc create -f -`, owner group
+`maas-end-users` -- reusing an existing group already permitted on
+`maas-vllm-gpu`, rather than creating a new `Group` or touching
+`MaaSAuthPolicy`, neither of which this role can do: `oc auth can-i create
+groups.user.openshift.io` is `no`, and `maasauthpolicies` is not even
+listable by this role). A key was minted against it the same direct way as
+D1's keys (see "Mint a MaaS API key" above) and stored in
+`secret/maas-loadgen-keys` as `enduser-foo`. Live-verified: a 25s/2-worker
+smoke run sent 70 requests, all `200`, and the EPP's own
+`llm_d_epp_maas_fairness_unmatched_subscriptions_total` counter moved `0` ->
+`70` -- the exact regression-detector metric design.md calls out for "a typo
+silently falls into `unclassified`" -- confirming `enduser-foo` lands in
+`unclassified`, not some accidental match.
 
 **Key inventory (names and subscriptions only -- never values).** All keys
 live in `secret/maas-loadgen-keys` in `maas-fairness-poc`:
@@ -918,6 +952,7 @@ live in `secret/maas-loadgen-keys` in `maas-fairness-poc`:
 | `end-user-alpha` | `end-user-alpha` | pre-existing (UNI-29 era) | not re-verified this ticket |
 | `end-user-beta` | `end-user-beta` | pre-existing (UNI-29 era) | not re-verified this ticket |
 | `end-user-gen01` .. `end-user-gen20` | alternating `end-user-alpha`/`end-user-beta` (odd=alpha, even=beta) | 2026-11-01 (this ticket) | 2026-12-01 (30d) |
+| `enduser-foo` | `enduser-foo` (new `MaaSSubscription`, owner group `maas-end-users`, deliberately outside the `end-user-` prefix match) | 2026-11-02 (this ticket) | 2026-12-02 (30d) |
 
 `end-user-gen01`..`20` are 20 distinct `sk-oai-` credentials for D1 -- 20
 keys, 2 real subscriptions, which is what API key *rotation* actually means

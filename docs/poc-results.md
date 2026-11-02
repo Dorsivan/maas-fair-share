@@ -4434,6 +4434,78 @@ before/after/timeseries metric snapshots).
 `2026-11-02T15:15:34Z` (revert confirmed). Run itself: `2026-11-02T15:10:02Z`
 – `2026-11-02T15:14:24Z`.
 
+## UNI-186: confirmed root cause of the UNI-147 raw-token inflation
+
+UNI-147 found the ~58x inflation and filed this ticket with an unconfirmed
+hypothesis ("upstream's core-metrics instrumentation isn't `EndOfStream`-gated,
+not vendored so not read"). Read the vendored upstream source
+(`/paperclip/go/pkg/mod/github.com/llm-d/llm-d-router@v0.11.0`, already
+module-cached locally — no dependency-graph pull needed after all) and
+reproduced the mechanism directly against the live `maas-vllm-gpu` backend.
+Both halves of the hypothesis turn out to be wrong, but the net conclusion
+(don't trust the raw counters for a streaming tenant) stands and is now
+confirmed rather than inferred.
+
+**The router's accounting is not the bug.** `pkg/epp/handlers/response.go`'s
+`HandleResponseBody` dedupes correctly by design — `mergeUsage` only updates
+a `Usage` field when the current chunk actually carries a non-zero value for
+it, and the router's own test suite
+(`TestHandleResponseBodyModelStreaming_AnthropicUsageAccumulation`,
+`response_test.go:472`) asserts exactly one histogram observation per field
+across a multi-chunk Anthropic stream where prompt tokens and completion
+tokens arrive in separate events. The comment at `response.go:92` ("a field
+already reported by an earlier chunk would otherwise be observed a second
+time") describes a real, tested guarantee, not an oversight.
+
+**The actual cause is vLLM's streaming behavior, not llm-d-router's.**
+Confirmed live by sending one small streaming chat-completion request
+straight to the `maas-vllm-gpu` pod (bypassing the EPP, `curl -sk https://
+localhost:8000/v1/chat/completions` with `stream: true, stream_options:
+{include_usage: true}` — same flags `--enable-force-include-usage` forces
+server-side):
+
+```
+$ grep -c '"usage":{' raw-stream.txt   # non-null usage blocks
+53
+$ grep -c '^data:' raw-stream.txt      # total SSE data events
+54
+```
+
+53 of 54 streamed chunks carried a real, non-null `usage` object — not just
+the final one before `[DONE]`, contrary to the OpenAI streaming contract
+`openai.go:605-615` documents and the router's own parser is written
+against. The values are a running cumulative total, not per-chunk deltas:
+
+```
+"usage":{"prompt_tokens":43,"total_tokens":43,"completion_tokens":0}
+"usage":{"prompt_tokens":43,"total_tokens":44,"completion_tokens":1}
+...
+"usage":{"prompt_tokens":43,"total_tokens":94,"completion_tokens":51}   # final, correct total
+```
+
+Because `HandleResponseBody` observes "the value this chunk carried" on
+every chunk where `Usage != nil` (correct under the assumed contract — a
+field is only non-zero once), and vLLM here hands it a non-zero, growing
+value on every single chunk, `RecordInputTokens`/`RecordOutputTokens` fire
+53 times instead of once per request, each time with that chunk's live
+cumulative count. Sum of this one request's `completion_tokens` across all
+chunks: 0+1+2+...+51 ≈ 1,326 against a true total of 51 (~26x); constant
+`prompt_tokens=43` repeated 53 times ≈ 2,279 against a true total of 43
+(~53x). Response length varies the chunk count and therefore the exact
+ratio — consistent with UNI-147's observed ~58x on real traffic.
+
+**Disposition:** this repo doesn't fork or vendor `llm-d-router`
+(`docs/version-pinning.md` §2.1), so a patch isn't ours to carry, and the
+behavior under test is vLLM's, one layer further out than the dependency
+this ticket scoped to reading. Per the ticket's ask, documenting the caveat
+is the correct minimum action — done in `docs/design.md` (metrics table)
+and `docs/runbook.md` (G2 ledger cross-check, UNI-138). Reporting the
+contract violation upstream (either against `llm-d-router`'s parser
+assumptions or against vLLM's `--enable-force-include-usage` chunking) is a
+reasonable next step but is an external, public action outside this
+ticket's authority to take unprompted — raised to the CEO as a
+recommendation rather than filed directly.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

@@ -1215,9 +1215,21 @@ allowed, per tenant, on either of two checks:
    `_output_tokens_sum` delta vs. the client's `prompt_tokens_total` +
    `completion_tokens_total`. Both sides read the same real usage-block
    values through independent code paths, so this should track to within
-   rounding; a real divergence here means a regression (a model server
-   missing `--enable-force-include-usage`, or the two accounting paths
-   drifting out of sync).
+   rounding **for an all-non-streaming run**; a real divergence here means a
+   regression (a model server missing `--enable-force-include-usage`, or the
+   two accounting paths drifting out of sync).
+
+   **Does not hold if any tenant in the run streams.** [UNI-186](/UNI/issues/UNI-186)
+   confirmed live against `maas-vllm-gpu` that `--enable-force-include-usage`
+   makes vLLM emit a real, non-null, cumulatively-growing `usage` block on
+   *every* SSE chunk of a streamed response rather than only the final one;
+   the EPP observes each chunk's value, so the raw sum for a streaming
+   tenant inflates by roughly its chunk count (~58x on the UNI-147
+   full-contention benchmark). Expect this check to FAIL for a streaming
+   tenant regardless of regression status, and do not raise
+   `--ledger-tolerance-pct` to paper over it — the **cost** check below is
+   unaffected and is the one that should gate `ledger.verdict` for a
+   streaming scenario.
 2. **Cost**: EPP's `contended_service_tokens_total` delta vs. the client's
    prompt/completion totals run through the live cost formula (the client
    has no way to see cache hits, so the EPP's own measured

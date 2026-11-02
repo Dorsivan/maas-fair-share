@@ -377,6 +377,19 @@ Two defenses, both needed:
 - **Per-tenant metrics already labelled `fairness_id`** — `llm_d_epp_request_input_tokens`,
   `_output_tokens`, `_cached_tokens`, `llm_d_epp_flow_control_queue_size`,
   `_request_queue_duration_seconds`. Do not duplicate these.
+  **Caveat ([UNI-186](/UNI/issues/UNI-186)):** `_input_tokens_sum`/`_output_tokens_sum`
+  are **not trustworthy as a per-tenant raw-usage audit trail for any tenant that
+  streams any of its traffic.** Confirmed live against `maas-vllm-gpu`: with
+  `--enable-force-include-usage`, vLLM puts a real, non-null, cumulatively-growing
+  `usage` block on *every* SSE chunk of a streamed response, not just the final one.
+  The router observes that chunk's value on every chunk it's non-nil
+  (`pkg/epp/handlers/response.go:90-95` — correct under the OpenAI contract that
+  usage appears once; wrong under what vLLM actually sends), so a single streamed
+  response's token counts get summed into the histogram dozens of times over,
+  inflating the raw sum by roughly the chunk count (~58x observed on the UNI-147
+  benchmark). This does **not** affect `contended_service_tokens_total` or the
+  fairness policy itself — this repo's own true-up is gated on `!response.EndOfStream`
+  and is unaffected. It only affects these two raw, un-gated upstream counters.
 - **`/debug/plugins/state`** (`pkg/epp/server/plugin_state_debug.go`, documented in
   `docs/plugin_debug.md`) — implement `StateDumper` and the live table is served on the
   admin port under existing auth.
@@ -912,6 +925,10 @@ llm_d_epp_flow_control_pool_saturation{stage="effective"}              # confirm
 sum by (fairness_id) (llm_d_epp_flow_control_queue_size)               # confirm a backlog exists
 rate(llm_d_epp_flow_control_request_queue_duration_seconds_count[2m])  # if shedding, TTL rations, not us
 ```
+
+If any of A/B/C stream, the first query is unreliable — see the
+[UNI-186](/UNI/issues/UNI-186) caveat above — and `_contended_service_tokens_total`
+(gated, this plugin's own metric) should be used for the share instead.
 
 Two controls: run P2 with `fairnessPolicyRef: globalstrict` (expect ~1:1 — proves the
 plugin does something), and with `provisionalCharge: false` (quantifies what the

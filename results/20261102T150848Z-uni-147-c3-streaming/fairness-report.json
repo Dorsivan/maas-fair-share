@@ -1,0 +1,1130 @@
+{
+  "schema": "uni54.fairness_benchmark_report.v1",
+  "run": {
+    "scenario": "full-contention",
+    "label": "uni-147-c3-streaming",
+    "control": false,
+    "generator": "closed-loop",
+    "namespace": "maas-fairness-poc",
+    "enforce": true,
+    "duration_seconds": 240,
+    "backend": "vllm-gpu (real)",
+    "epp_image_digest": "quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135",
+    "epp_pod": "maas-vllm-gpu-kserve-router-scheduler-676fd97cd-wshqk",
+    "run_start": "2026-11-02T15:10:02Z",
+    "run_end": "2026-11-02T15:14:24Z"
+  },
+  "groups": [
+    {
+      "group": "app1",
+      "configured_weight": 20.0,
+      "offered": true,
+      "offered_workers": 32,
+      "requests_total": 573,
+      "status_tally": {
+        "200": 559,
+        "500": 14
+      },
+      "p50_sec": 13.54,
+      "p95_sec": 22.0,
+      "delivered_tokens": 742998.0,
+      "expected_share_pct": 21.05263157894737,
+      "observed_share_pct": 18.213074424264292,
+      "deviation_pts": -2.839557154683078,
+      "request_share_pct": 18.155893536121674,
+      "request_share_deviation_pts": -2.896738042825696,
+      "contended_seconds": 2.692242923999995,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 557.0
+    },
+    {
+      "group": "app2",
+      "configured_weight": 10.0,
+      "offered": true,
+      "offered_workers": 32,
+      "requests_total": 462,
+      "status_tally": {
+        "200": 452,
+        "500": 10
+      },
+      "p50_sec": 23.95,
+      "p95_sec": 28.05,
+      "delivered_tokens": 586090.0,
+      "expected_share_pct": 10.526315789473685,
+      "observed_share_pct": 14.366796127737974,
+      "deviation_pts": 3.840480338264289,
+      "request_share_pct": 14.638783269961976,
+      "request_share_deviation_pts": 4.1124674804882915,
+      "contended_seconds": 1.7589260199999974,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 449.0
+    },
+    {
+      "group": "end-users",
+      "configured_weight": 65.0,
+      "offered": true,
+      "offered_workers": 128,
+      "requests_total": 2121,
+      "status_tally": {
+        "200": 2078,
+        "500": 43
+      },
+      "p50_sec": 14.48,
+      "p95_sec": 20.15,
+      "delivered_tokens": 2750388.0,
+      "expected_share_pct": 68.42105263157895,
+      "observed_share_pct": 67.42012944799774,
+      "deviation_pts": -1.0009231835812074,
+      "request_share_pct": 67.20532319391636,
+      "request_share_deviation_pts": -1.2157294376625885,
+      "contended_seconds": 2.3219102019999958,
+      "prompt_tokens_cached_ratio": 0.00047759318172891876,
+      "dispatch_total": 2070.0
+    },
+    {
+      "group": "unclassified",
+      "configured_weight": 5.0,
+      "offered": false,
+      "offered_workers": 0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": 17580.0,
+      "expected_share_pct": null,
+      "observed_share_pct": null,
+      "deviation_pts": null,
+      "request_share_pct": null,
+      "request_share_deviation_pts": null,
+      "contended_seconds": 0.07467039900000004,
+      "prompt_tokens_cached_ratio": 0.3802376485303315,
+      "dispatch_total": 13.0
+    }
+  ],
+  "verdict": {
+    "result": "PASS",
+    "threshold_points": 10.0,
+    "max_abs_deviation_points": 3.840480338264289,
+    "reasons": [],
+    "epp_restarted_mid_run": false,
+    "solo_group": null,
+    "capped_groups": [],
+    "uncontended_threshold_seconds": 1.0
+  },
+  "sources": {
+    "delivered_tokens_and_observed_share": "llm_d_epp_maas_fairness_contended_service_tokens_total, scraped directly from the EPP's /metrics immediately before and after the run (same mechanism as deploy/poc/13-loadgen-poisson.sh). This is the EPP's own accounting -- the generator cannot see token usage. Reused unmodified from the SLI deploy/grafana-dashboard.yaml (UNI-50) already defines; this report does not invent a second definition of delivered share.",
+    "offered_and_delivered_requests": "deploy/poc/04-loadgen.yaml's own run.sh: the 'load: tenants=...' line for offered worker counts, and the TENANT/TOTAL/P50_SEC/P95_SEC/STATUSES table for delivered requests, status tally, and latency.",
+    "expected_share": "each offered group's configured_weight divided by the sum of configured_weight over OFFERED groups only (excludes the never-offered 'unclassified' catch-all and any group this scenario left idle), so a work-conserving policy absorbing an idle group's share is not scored as a deviation. Also excludes any 'capped_groups' entry (UNI-134's app2-trickle): a group offered but structurally unable to reach a weight-proportional share at its own worker count is scored on a dedicated 'did it get served' check instead, not folded into the other groups' expected-share denominator.",
+    "request_share_pct": "UNI-146 (C1): the SAME expected_share target above, scored against requests_total (plain request count, from the loadgen log) instead of delivered weighted tokens -- informational only, never part of the verdict. Equal to observed_share_pct when every offered group's requests are uniform cost (every scenario before this ticket); expected to diverge when request cost is asymmetric across groups."
+  },
+  "timeline": {
+    "window_seconds": 10.0,
+    "schedule": {
+      "app1": {
+        "start": 0.0,
+        "stop": 240.0,
+        "duty_on": null,
+        "duty_off": null
+      },
+      "app2": {
+        "start": 0.0,
+        "stop": 240.0,
+        "duty_on": null,
+        "duty_off": null
+      },
+      "end-users": {
+        "start": 0.0,
+        "stop": 240.0,
+        "duty_on": null,
+        "duty_off": null
+      }
+    },
+    "chaos_events": [],
+    "phase_edges": [
+      0.0,
+      240.0
+    ],
+    "windows": [
+      {
+        "start_s": 0.0,
+        "end_s": 10.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 5370.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 8.646229149223933,
+            "deviation_pts": -12.406402429723437
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 10804.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 17.39550460488182,
+            "deviation_pts": 6.869188815408133
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 45934.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 73.95826624589425,
+            "deviation_pts": 5.537213614315306
+          }
+        ]
+      },
+      {
+        "start_s": 10.0,
+        "end_s": 20.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 31128.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 18.100200027910873,
+            "deviation_pts": -2.952431551036497
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 20320.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 11.81560217704796,
+            "deviation_pts": 1.2892863875742755
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 120528.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 70.08419779504116,
+            "deviation_pts": 1.663145163462218
+          }
+        ]
+      },
+      {
+        "start_s": 20.0,
+        "end_s": 30.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 32540.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 20.90668448510704,
+            "deviation_pts": -0.14594709384033067
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 16236.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 10.431497519981496,
+            "deviation_pts": -0.09481826949218863
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 106868.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 68.66181799491146,
+            "deviation_pts": 0.24076536333251397
+          }
+        ]
+      },
+      {
+        "start_s": 30.0,
+        "end_s": 40.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 33874.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 19.886343622679615,
+            "deviation_pts": -1.1662879562677553
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 41952.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 24.62867944909533,
+            "deviation_pts": 14.102363659621645
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 94512.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 55.48497692822506,
+            "deviation_pts": -12.936075703353886
+          }
+        ]
+      },
+      {
+        "start_s": 40.0,
+        "end_s": 50.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 12160.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 7.188120684763076,
+            "deviation_pts": -13.864510894184294
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 157008.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 92.81187931523692,
+            "deviation_pts": 24.390826683657977
+          }
+        ]
+      },
+      {
+        "start_s": 50.0,
+        "end_s": 60.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 43298.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 25.79872490019663,
+            "deviation_pts": 4.746093321249258
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 59514.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 35.46088303640589,
+            "deviation_pts": 24.934567246932204
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 65018.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 38.740392063397486,
+            "deviation_pts": -29.68066056818146
+          }
+        ]
+      },
+      {
+        "start_s": 60.0,
+        "end_s": 70.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 36466.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 23.672457220015062,
+            "deviation_pts": 2.619825641067692
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 5432.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 3.5262652229233207,
+            "deviation_pts": -7.000050566550364
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 112146.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 72.80127755706162,
+            "deviation_pts": 4.380224925482679
+          }
+        ]
+      },
+      {
+        "start_s": 70.0,
+        "end_s": 80.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 6766.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 4.001230055943891,
+            "deviation_pts": -17.051401523003477
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 162332.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 95.99876994405611,
+            "deviation_pts": 27.577717312477162
+          }
+        ]
+      },
+      {
+        "start_s": 80.0,
+        "end_s": 90.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 51380.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 30.372892577616987,
+            "deviation_pts": 9.320260998669617
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 60952.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 36.03130689744863,
+            "deviation_pts": 25.504991107974945
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 56832.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 33.59580052493438,
+            "deviation_pts": -34.82525210664456
+          }
+        ]
+      },
+      {
+        "start_s": 90.0,
+        "end_s": 100.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 31078.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 20.514885470988183,
+            "deviation_pts": -0.5377461079591868
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 120412.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 79.48511452901181,
+            "deviation_pts": 11.064061897432865
+          }
+        ]
+      },
+      {
+        "start_s": 100.0,
+        "end_s": 110.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 1358.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 0.7968735330015961,
+            "deviation_pts": -20.255758045945775
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 169058.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 99.2031264669984,
+            "deviation_pts": 30.782073835419453
+          }
+        ]
+      },
+      {
+        "start_s": 110.0,
+        "end_s": 120.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 55556.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 34.17905305640319,
+            "deviation_pts": 13.126421477455821
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 63666.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 39.16847130623093,
+            "deviation_pts": 28.642155516757242
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 43322.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 26.65247563736588,
+            "deviation_pts": -41.76857699421306
+          }
+        ]
+      },
+      {
+        "start_s": 120.0,
+        "end_s": 130.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 28492.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 17.396082645435452,
+            "deviation_pts": -3.6565489335119175
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 1358.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.8291408196160797,
+            "deviation_pts": -9.697174969857606
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 133934.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 81.77477653494847,
+            "deviation_pts": 13.353723903369527
+          }
+        ]
+      },
+      {
+        "start_s": 130.0,
+        "end_s": 140.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 5372.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 3.480852718201257,
+            "deviation_pts": -17.571778860746115
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 2700.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 1.7494978293267673,
+            "deviation_pts": -8.776817960146918
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 146258.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 94.76964945247198,
+            "deviation_pts": 26.348596820893036
+          }
+        ]
+      },
+      {
+        "start_s": 140.0,
+        "end_s": 150.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 55508.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 32.544940723976595,
+            "deviation_pts": 11.492309145029225
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 59560.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 34.92067214671842,
+            "deviation_pts": 24.39435635724473
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 55490.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 32.53438712930499,
+            "deviation_pts": -35.88666550227396
+          }
+        ]
+      },
+      {
+        "start_s": 150.0,
+        "end_s": 160.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 22972.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 13.926982163859687,
+            "deviation_pts": -7.125649415087683
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 141974.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 86.07301783614031,
+            "deviation_pts": 17.651965204561364
+          }
+        ]
+      },
+      {
+        "start_s": 160.0,
+        "end_s": 170.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 31130.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 20.529967289226548,
+            "deviation_pts": -0.5226642897208222
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 14884.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 9.815870001055186,
+            "deviation_pts": -0.7104457884184985
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 105618.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 69.65416270971826,
+            "deviation_pts": 1.233110078139319
+          }
+        ]
+      },
+      {
+        "start_s": 170.0,
+        "end_s": 180.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 37938.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 22.796264916898007,
+            "deviation_pts": 1.7436333379506372
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 48766.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 29.30261624064126,
+            "deviation_pts": 18.776300451167575
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 79718.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 47.90111884246073,
+            "deviation_pts": -20.519933789118213
+          }
+        ]
+      },
+      {
+        "start_s": 180.0,
+        "end_s": 190.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 16248.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 9.67799578285265,
+            "deviation_pts": -11.37463579609472
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 2712.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 1.615381866266395,
+            "deviation_pts": -8.91093392320729
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 148926.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 88.70662235088095,
+            "deviation_pts": 20.285569719302003
+          }
+        ]
+      },
+      {
+        "start_s": 190.0,
+        "end_s": 200.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 41980.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 26.07809762824734,
+            "deviation_pts": 5.025466049299968
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 43200.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 26.83596516294152,
+            "deviation_pts": 16.309649373467835
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 75798.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 47.08593720881114,
+            "deviation_pts": -21.335115422767807
+          }
+        ]
+      },
+      {
+        "start_s": 200.0,
+        "end_s": 210.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 32466.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 20.16772269847186,
+            "deviation_pts": -0.8849088804755105
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 27084.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 16.82445024226612,
+            "deviation_pts": 6.298134452792436
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 101430.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 63.00782705926202,
+            "deviation_pts": -5.413225572316925
+          }
+        ]
+      },
+      {
+        "start_s": 210.0,
+        "end_s": 220.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 5412.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 3.3066940391524304,
+            "deviation_pts": -17.74593753979494
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 158256.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 96.69330596084757,
+            "deviation_pts": 28.272253329268622
+          }
+        ]
+      },
+      {
+        "start_s": 220.0,
+        "end_s": 230.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 44672.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 26.837444579283165,
+            "deviation_pts": 5.784813000335795
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 62254.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 37.400122556381945,
+            "deviation_pts": 26.87380676690826
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 59528.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 35.76243286433489,
+            "deviation_pts": -32.658619767244055
+          }
+        ]
+      },
+      {
+        "start_s": 230.0,
+        "end_s": 240.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 35212.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 23.44465750506019,
+            "deviation_pts": 2.3920259261128187
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 1334.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.8881964418877171,
+            "deviation_pts": -9.638119347585969
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 113646.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 75.6671460530521,
+            "deviation_pts": 7.246093421473148
+          }
+        ]
+      },
+      {
+        "start_s": 240.0,
+        "end_s": 250.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 6768.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 1358.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 160962.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 250.0,
+        "end_s": 260.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 37854.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 42004.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 14880.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 260.0,
+        "end_s": 262.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      }
+    ],
+    "convergence": [
+      {
+        "phase_edge_s": 0.0,
+        "converged_at_s": 230.0,
+        "seconds_to_converge": 230.0
+      },
+      {
+        "phase_edge_s": 240.0,
+        "converged_at_s": null,
+        "seconds_to_converge": null
+      }
+    ],
+    "epp_restarted_during_windows": false
+  },
+  "ledger": {
+    "tolerance_pct": 10.0,
+    "cost_model": {
+      "input_token_weight": 1.0,
+      "output_token_weight": 2.0,
+      "cached_input_token_weight": 1.0
+    },
+    "rows": [
+      {
+        "group": "app1",
+        "client_prompt_tokens": 687570,
+        "client_completion_tokens": 34455,
+        "client_requests_sent": 573,
+        "client_aborts": 0,
+        "client_errors": 0,
+        "epp_total_input_tokens_delta": 685110.0,
+        "epp_total_output_tokens_delta": 34336.0,
+        "epp_total_cached_tokens_delta": 677312.0,
+        "epp_total_raw_tokens_delta": 719446.0,
+        "raw_tokens_pct_diff": -0.357189847996953,
+        "epp_contended_cost_delta": 742998.0,
+        "expected_cost_from_client": 756480.0,
+        "cost_pct_diff": -1.7822017766497462,
+        "within_tolerance": true
+      },
+      {
+        "group": "app2",
+        "client_prompt_tokens": 555960,
+        "client_completion_tokens": 27950,
+        "client_requests_sent": 462,
+        "client_aborts": 0,
+        "client_errors": 0,
+        "epp_total_input_tokens_delta": 552270.0,
+        "epp_total_output_tokens_delta": 27769.0,
+        "epp_total_cached_tokens_delta": 545984.0,
+        "epp_total_raw_tokens_delta": 580039.0,
+        "raw_tokens_pct_diff": -0.6629446318782004,
+        "epp_contended_cost_delta": 586090.0,
+        "expected_cost_from_client": 611860.0,
+        "cost_pct_diff": -4.211747785441114,
+        "within_tolerance": true
+      },
+      {
+        "group": "end-users",
+        "client_prompt_tokens": 2555940,
+        "client_completion_tokens": 127719,
+        "client_requests_sent": 2121,
+        "client_aborts": 0,
+        "client_errors": 0,
+        "epp_total_input_tokens_delta": 152909910.0,
+        "epp_total_output_tokens_delta": 3900973.0,
+        "epp_total_cached_tokens_delta": 1216.0,
+        "epp_total_raw_tokens_delta": 156810883.0,
+        "raw_tokens_pct_diff": 5743.174673086261,
+        "epp_contended_cost_delta": 2750388.0,
+        "expected_cost_from_client": 2811378.0,
+        "cost_pct_diff": -2.169398778819497,
+        "within_tolerance": false
+      }
+    ],
+    "verdict": {
+      "result": "FAIL",
+      "reasons": [
+        "end-users exceeded the 10% ledger tolerance: raw tokens +5743.2%"
+      ]
+    }
+  },
+  "shed": {
+    "shed_statuses": [
+      "429",
+      "503"
+    ],
+    "total_shed": 0,
+    "rows": [
+      {
+        "group": "app1",
+        "state": "never_shed",
+        "requests_total": 573,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 21.05263157894737,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      },
+      {
+        "group": "app2",
+        "state": "never_shed",
+        "requests_total": 462,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 10.526315789473685,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      },
+      {
+        "group": "end-users",
+        "state": "never_shed",
+        "requests_total": 2121,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 68.42105263157895,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      }
+    ],
+    "epp_pool_wide": {
+      "state": "not_recorded",
+      "outcome_deltas": null,
+      "epp_shed_total": null,
+      "epp_429_upper_bound": null,
+      "client_429_total": 0,
+      "non_epp_429_lower_bound": null,
+      "epp_restarted": false
+    }
+  },
+  "pick_latency": {
+    "histograms": {
+      "scheduler_e2e": {
+        "metric": "llm_d_epp_scheduler_e2e_duration_seconds",
+        "state": "not_recorded",
+        "observations": null,
+        "p50_seconds": null,
+        "p99_seconds": null,
+        "p50_bucket": null,
+        "p99_bucket": null,
+        "p99_at_histogram_ceiling": null,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      },
+      "flow_control_dispatch_cycle": {
+        "metric": "llm_d_epp_flow_control_dispatch_cycle_duration_seconds",
+        "state": "not_recorded",
+        "observations": null,
+        "p50_seconds": null,
+        "p99_seconds": null,
+        "p50_bucket": null,
+        "p99_bucket": null,
+        "p99_at_histogram_ceiling": null,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      }
+    },
+    "epp_restarted": false,
+    "baseline_report": null,
+    "baseline_has_pick_latency": null
+  },
+  "alerts": null
+}

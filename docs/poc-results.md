@@ -4304,6 +4304,136 @@ wrong — a good argument for making `ENFORCE_LIVE=true` the default for
 every named scenario except an explicit shadow-mode control, rather than
 an opt-in flag every invocation has to remember.
 
+## UNI-147: C3, `streaming` — usage captured and trued
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, third of the C-series. Covers
+part of Outstanding #15: whether a streamed OpenAI-style response's usage
+block reaches the fairness plugin at all, and whether the weighted split
+holds once one tenant is streaming and the others aren't.
+
+**Setup:** full-contention (`app1`/`app2`/`end-users`, 32/32/128 workers —
+this chain's standard full-contention sizing), live against `maas-vllm-gpu`
+(2 replicas, llama-3-1-8b), `ENFORCE_LIVE=true`, `halfLifeSeconds: 60`, 240s.
+`end-users` streams every request (`STREAM_FRACTION_END_USERS=1`, the
+[UNI-128](/UNI/issues/UNI-128) harness knob); `app1`/`app2` are unchanged
+(no streaming). `--enable-force-include-usage` has been on the vLLM
+containers since UNI-128 and was never touched this ticket.
+
+**Expected split:** app1 21.1% / app2 10.5% / end-users 68.4% (weights
+20/10/65 renormalized over the three offered groups).
+
+**Observed split (by weighted tokens, the scored metric):**
+
+| group | weight | requests | streamed | expected % | observed % | deviation (pts) | contended_seconds |
+|---|---|---|---|---|---|---|---|
+| app1 | 20.0 | 573 | 0 | 21.1% | 18.2% | -2.8 | 2.7s |
+| app2 | 10.0 | 462 | 0 | 10.5% | 14.4% | +3.8 | 1.8s |
+| end-users | 65.0 | 2121 | 2120 | 68.4% | 67.4% | -1.0 | 2.3s |
+
+**Verdict: PASS on both of this ticket's named criteria.**
+
+- **Split holds.** Max absolute deviation 3.8pts, well inside the 10-point
+  threshold. All three groups show non-trivial `contended_seconds_total`
+  (1.8-2.7s), so — unlike [UNI-146](/UNI/issues/UNI-146) — this run was
+  genuinely contended and the PASS is not an artifact of the UNCONTENDED
+  gate.
+- **`requests_without_usage_total` stayed flat.** The metric (reported as
+  `llm_d_epp_maas_fairness_requests_without_usage_total` in the dashboard,
+  `requests_without_usage_total` in the runbook's metric table) is absent
+  from every scrape this run took — before, after, and every 10s timeseries
+  point in between, for all three `fairness_id` values. A Prometheus
+  counter that has never incremented for a label emits no series at all for
+  that label, so "absent everywhere" here means the same thing as "flat
+  zero everywhere," not "unknown": across all 2120 streamed `end-users`
+  requests (plus every app1/app2 request), the fairness plugin's true-up
+  path (`plugin.go`'s `ResponseBody` hook, gated on `resp.EndOfStream`) saw
+  a real `Usage` block on every single response and never fell back to the
+  dispatch-time estimate. `--enable-force-include-usage` behaves identically
+  whether or not the client set `stream_options.include_usage` — confirmed
+  live, not just by the UNI-128 harness smoke test.
+
+**What surprised me: a severe, streaming-only anomaly in a metric this
+ticket doesn't score, found only because the harness's G2 ledger
+cross-check ([UNI-138](/UNI/issues/UNI-138)) runs on every benchmark
+invocation.**
+
+| group | client tokens (prompt+completion) | EPP raw tokens (`request_{input,output}_tokens_sum`) | raw diff % | EPP contended cost | expected cost | cost diff % | ledger verdict |
+|---|---|---|---|---|---|---|---|
+| app1 | 722,025 | 719,446 | -0.4% | 742,998 | 756,480 | -1.8% | PASS |
+| app2 | 583,910 | 580,039 | -0.7% | 586,090 | 611,860 | -4.2% | PASS |
+| end-users | 2,683,659 | **156,810,883** | **+5,743.2%** | 2,750,388 | 2,811,378 | -2.2% | **FAIL** |
+
+`end-users`' raw EPP token count is ~58x its own client-observed total,
+while `app1`/`app2` (both non-streaming, same run) land within a point of
+their client totals — matching [UNI-138](/UNI/issues/UNI-138)'s own
+no-streaming baseline (0.00%/0.00%/-0.05% raw diff) almost exactly.
+Streaming is the only variable that changed between "agrees to the
+rounding error" and "58x over." Note the split: the metric this ticket is
+actually scored on — `contended_service_tokens_total`, the fairness
+plugin's own cost tab — is fine for `end-users` too (-2.2%, inside the 10%
+ledger tolerance). Only the raw, un-gated counters are affected.
+
+**Why, with evidence, not just a guess:** `request_input_tokens`/
+`_output_tokens` are explicitly *not* this repo's own metrics —
+`pkg/fairness/weightedlas/metrics.go` documents them as "the EPP's own
+fairness_id-labelled core metrics," sourced from
+`github.com/llm-d/llm-d-router/pkg/epp/metrics` (the pinned upstream
+dependency's core-metrics-extractor), and this repo's plugin code never
+writes to them. By contrast, this repo's own true-up — the thing that
+produces `contended_service_tokens_total`, which stayed accurate — is
+explicitly gated on `!response.EndOfStream` (`plugin.go:551`, "non-final
+chunks must not move service," `docs/design.md` Part on streaming). The
+simplest explanation consistent with both facts: upstream's core-metrics
+instrumentation records a response's token counts without the same
+EndOfStream discipline our plugin enforces for its own accounting, so a
+streamed response — which arrives as many chunks, not one — gets counted
+more than once. I have not read the upstream source to confirm the exact
+mechanism (not vendored into this repo, and pulling the whole dependency
+graph to read one file felt like more than this ticket's scope); filed as
+[UNI-186](/UNI/issues/UNI-186) for whoever picks it up next to confirm and
+decide whether it needs a patch, an upstream report, or just a
+documented limitation on trusting those two raw counters for any
+streaming tenant.
+
+**Not a concern for the policy itself:** the weighted-split enforcement
+and the design's documented true-up contract both hold for streaming
+traffic. This is a ledger/billing-visibility gap, not a fairness-policy
+bug — but it does mean nobody should trust
+`request_{input,output}_tokens_sum` as a per-tenant raw-usage audit trail
+today if that tenant streams any of its traffic.
+
+**Error rates:** app1 559/573 (97.6%) `200`, app2 452/462 (97.8%) `200`,
+end-users 2078/2121 (98.0%) `200` — all three groups landed within a point
+of each other, including the streaming one, and nowhere near the
+10-20%+ `500` rates [UNI-146](/UNI/issues/UNI-146) saw under forced
+long-generation. Not investigated further; looks like this run's ordinary
+background error rate rather than anything streaming-specific.
+
+**Cluster left as found** — confirmed via `oc get` immediately after the
+run:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|halfLifeSeconds:'
+      enforce: false
+      halfLifeSeconds: 60
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m19s      9m34s
+```
+
+Weights unchanged (app1=20, app2=10, end-users=65, unclassified=5). No
+orphaned `oc logs -f` capture processes left running.
+
+**Raw results:** `results/20261102T150848Z-uni-147-c3-streaming/` (report
+JSON/MD, loadgen log, `client-request-summary.jsonl`, EPP container log,
+before/after/timeseries metric snapshots).
+
+**Grafana time range:** `2026-11-02T15:08:50Z` (enforce flip requested) to
+`2026-11-02T15:15:34Z` (revert confirmed). Run itself: `2026-11-02T15:10:02Z`
+– `2026-11-02T15:14:24Z`.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

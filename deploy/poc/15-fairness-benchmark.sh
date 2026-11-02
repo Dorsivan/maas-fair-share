@@ -228,6 +228,14 @@
 # state for the report, exactly as before this ticket. See docs/runbook.md
 # "Live enforce flip (UNI-174)" for the full mechanism and why a flag+trap
 # in this script was chosen over a separate flip/revert wrapper.
+# UNI-179 harness additions (see docs/runbook.md "Per-group configuration
+# (UNI-179)" -- this header is a pointer, not the source of truth):
+# LOADGEN_GROUPS (the group table, any N; unset = the scenario's TENANTS),
+# and per-group WORKERS_<TOKEN>, <TOKEN>_KEYS, <TOKEN>_START/STOP/DUTY and
+# <KNOB>_<TOKEN> for every 04-loadgen.yaml GROUP_KNOBS knob (e.g.
+# STREAM_FRACTION_APP2=1), passed through when set. The names that already
+# existed before UNI-179 keep their old route (scenario-owned or one of the
+# lists above), so a plain scenario invocation is unaffected.
 set -euo pipefail
 
 SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew}"
@@ -607,7 +615,7 @@ cp "$SRC" "$PATCHED"
 
 set_override() {
   local var="$1" val="$2"
-  python3 -I - "$PATCHED" "$var" "$val" << 'PYEOF'
+  python3 -I - "$PATCHED" "$var" "$val" "${GROUP_VAR_PREFIXES:-}" << 'PYEOF'
 import sys, re
 path, var, val = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(path).read()
@@ -625,6 +633,18 @@ if n == 0:
         indent = m.group('indent')
         return f'{indent}- name: {var}\n{indent}  value: "{val}"\n'
     new_text, n = commented.subn(repl, text, count=1)
+if n == 0 and re.fullmatch(r'[A-Z0-9_]+', var) and var.startswith(tuple(sys.argv[4].split())):
+    # UNI-179: a per-group knob for a group 04-loadgen.yaml has no
+    # placeholder for (app3..appN, or a new <KNOB>_<TOKEN> name). Only names
+    # that start with a declared group token or a per-group knob prefix get
+    # here; anything else still fails loudly as a typo.
+    envline = re.compile(r'^(?P<indent>[ \t]*)env:\n', re.M)
+    m = envline.search(text)
+    if m:
+        indent = m.group('indent') + '  '
+        insert = f'{indent}- name: {var}\n{indent}  value: "{val}"\n'
+        new_text = text[:m.end()] + insert + text[m.end():]
+        n = 1
 if n == 0:
     sys.exit(f"override target not found for {var} in {path}")
 open(path, "w").write(new_text)
@@ -669,19 +689,66 @@ for v in $IDENTITY_VARS; do
   fi
 done
 
+# --- UNI-179 per-group pass-through, for any declared group set. The loadgen
+# resolves every group's settings from <KNOB>_<TOKEN> / WORKERS_<TOKEN> /
+# <TOKEN>_KEYS / <TOKEN>_START|STOP|DUTY env vars (see 04-loadgen.yaml's
+# group table); this forwards whichever of those are set in the caller's
+# environment. Names that already had a route before UNI-179 are skipped so
+# they keep it: the built-ins' WORKERS_/CACHE_SHAPE_/MAX_TOKENS_MODE_ (a
+# scenario's PER_TENANT_OVERRIDES owns those -- forwarding a stray env copy
+# would silently change an existing scenario) and the TIMELINE_VARS/
+# IDENTITY_VARS lists above (already forwarded). LOADGEN_GROUPS itself is
+# forwarded as-is; unset, the loadgen falls back to TENANTS. -------------
+GROUP_KNOBS="$(grep -oP '^    GROUP_KNOBS="\K[^"]+' "$SRC")"
+PREEXISTING_GROUP_VARS="WORKERS_APP1 WORKERS_APP2 WORKERS_END_USERS CACHE_SHAPE_APP1 CACHE_SHAPE_APP2 CACHE_SHAPE_END_USERS MAX_TOKENS_MODE_APP1 MAX_TOKENS_MODE_APP2 MAX_TOKENS_MODE_END_USERS $TIMELINE_VARS $IDENTITY_VARS"
+BENCH_GROUPS="${LOADGEN_GROUPS:-$TENANTS}"
+TIMELINE_TOKMAP="APP1=app1 APP2=app2 END_USERS=end-users"
+GROUP_VAR_PREFIXES="WORKERS_"
+for k in $GROUP_KNOBS; do GROUP_VAR_PREFIXES="$GROUP_VAR_PREFIXES ${k}_"; done
+for spec in $BENCH_GROUPS; do
+  g="${spec%%:*}"
+  tok="$(printf '%s' "$g" | tr 'a-z' 'A-Z' | sed 's/[^A-Z0-9]/_/g')"
+  GROUP_VAR_PREFIXES="$GROUP_VAR_PREFIXES ${tok}_"
+  case " $TIMELINE_TOKMAP " in *" $tok="*) ;; *) TIMELINE_TOKMAP="$TIMELINE_TOKMAP $tok=$g" ;; esac
+done
+if [ -n "${LOADGEN_GROUPS-}" ]; then
+  set_override LOADGEN_GROUPS "$LOADGEN_GROUPS"
+fi
+for spec in $BENCH_GROUPS; do
+  g="${spec%%:*}"
+  tok="$(printf '%s' "$g" | tr 'a-z' 'A-Z' | sed 's/[^A-Z0-9]/_/g')"
+  for v in "WORKERS_$tok" "${tok}_KEYS" $(for k in $GROUP_KNOBS; do printf '%s ' "${k}_$tok"; done) \
+           "${tok}_START" "${tok}_STOP" "${tok}_DUTY"; do
+    case " $PREEXISTING_GROUP_VARS " in *" $v "*) continue ;; esac
+    val="${!v-}"
+    [ -n "$val" ] || continue
+    case "$v" in
+      *_START|*_STOP|*_DUTY)
+        val="${val//s/}"
+        TIMELINE_JSON_ENTRIES+=("$v=$val") ;;
+    esac
+    set_override "$v" "$val"
+  done
+done
+
 TIMELINE_CONFIG="$ARTIFACT_DIR/timeline-config.json"
-python3 -I - "$TIMELINE_CONFIG" "${TIMELINE_JSON_ENTRIES[@]+"${TIMELINE_JSON_ENTRIES[@]}"}" << 'PYEOF'
-import json, sys
+TIMELINE_TOKMAP="$TIMELINE_TOKMAP" python3 -I - "$TIMELINE_CONFIG" "${TIMELINE_JSON_ENTRIES[@]+"${TIMELINE_JSON_ENTRIES[@]}"}" << 'PYEOF'
+import json, os, sys
 out_path, entries = sys.argv[1], sys.argv[2:]
+# UNI-179: TOKEN=group pairs for every declared group (the built-ins plus
+# whatever LOADGEN_GROUPS adds), longest token first so END_USERS_ is never
+# mistaken for a shorter token's prefix.
+tokmap = dict(kv.split("=", 1) for kv in os.environ["TIMELINE_TOKMAP"].split())
 by_tenant = {}
 for e in entries:
     var, val = e.split("=", 1)
-    if var.startswith("APP1_"):
-        tenant, field = "app1", var[len("APP1_"):]
-    elif var.startswith("APP2_"):
-        tenant, field = "app2", var[len("APP2_"):]
-    else:
-        tenant, field = "end-users", var[len("END_USERS_"):]
+    tenant = field = None
+    for tok in sorted(tokmap, key=len, reverse=True):
+        if var.startswith(tok + "_") and var[len(tok) + 1:] in ("START", "STOP", "DUTY"):
+            tenant, field = tokmap[tok], var[len(tok) + 1:]
+            break
+    if tenant is None:
+        sys.exit(f"timeline var {var} matches no declared group")
     entry = by_tenant.setdefault(tenant, {})
     if field == "START":
         entry["start"] = float(val)

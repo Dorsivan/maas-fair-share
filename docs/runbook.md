@@ -1034,6 +1034,144 @@ not a PASS/FAIL, and the weighted-split threshold is not the question this
 case is answering. See `docs/poc-results.md`'s UNI-136 section for the full
 result and what it says about the `cachedInputTokenWeight` decision.
 
+### Per-group configuration (UNI-179)
+
+Before this ticket `deploy/poc/04-loadgen.yaml` hardcoded three groups
+(`app1`, `app2`, `end-users`), and every UNI-128 request-shape knob applied to
+all of them at once. That meant C1 could not give app1 short prompts and long
+outputs while app2 did the reverse, and C3/C5/C6 could not stream, abort or
+oversize one tenant while the others stayed clean. UNI-179 swaps the
+hardcoded ladder for a group table. Like UNI-127/128 it is **harness work
+only and does not run or score a case**. Unset, the table is exactly the old
+three groups, so existing scenarios are unchanged (see "The regression bar"
+below).
+
+**The group table.** `LOADGEN_GROUPS` is a space-separated list, one entry per
+group:
+
+    <name>[:<workers>[:<key>,<key>,...]]
+
+It defaults to `TENANTS`, so a scenario that only sets `TENANTS` runs the
+same groups as before. `<name>` is also the label the run records the group
+under: the closing TENANT table row, the `CLIENT_RECORD_JSON` `"group"`, and
+the report's rows. `15-fairness-report.py` joins those to the EPP's
+per-group metrics by name, so **the name must be the fairness id the group's
+keys classify to.** Names are lowercase letters, digits and `-`. The variable
+is not called `GROUPS` because that is a bash special variable, and bash
+silently drops any value assigned to it.
+
+**Per-group overrides.** Each setting resolves in this order: the group's own
+env var, then the inline field, then the global/built-in default. The env var
+name is built from the group's TOKEN, which is the name upper-cased with `-`
+turned into `_` (`end-users` -> `END_USERS`, `app3` -> `APP3`):
+
+| setting | per-group env var | fallback |
+|---|---|---|
+| worker count | `WORKERS_<TOKEN>` | inline `<workers>`, then `WORKERS` |
+| keys | `<TOKEN>_KEYS` (space-separated) | inline `<key>,...`, then built-in (below) |
+| timeline (UNI-127) | `<TOKEN>_START` / `_STOP` / `_DUTY` | `0` / `DURATION` / no cycling |
+| every request-shape knob | `<KNOB>_<TOKEN>` | the global `<KNOB>` |
+
+The request-shape knobs that can be set per group are all of the UNI-128
+table above, plus the two that were already per-group, plus the D3 forge pair:
+`PROMPT_WORDS_MIN/MAX`, `MAX_TOKENS_DEFAULT`, `MAX_TOKENS_OMIT_FRACTION`,
+`MAX_TOKENS_HUGE_FRACTION/VALUE`, `LONG_GEN_FRACTION`, `LONG_GEN_MAX_TOKENS`,
+`STREAM_FRACTION`, `ABORT_FRACTION`, `ABORT_MIN/MAX_FRACTION`,
+`OVERSIZED_FRACTION`, `OVERSIZED_PROMPT_WORDS`, `REQUEST_TIMEOUT_SECONDS`,
+`FORGE_FAIRNESS_ID_FRACTION/VALUE`, `CACHE_SHAPE` and `MAX_TOKENS_MODE`. The
+authoritative list is `GROUP_KNOBS` in `run.sh`. The older per-group names
+(`WORKERS_APP1`, `END_USERS_KEYS`, `APP2_DUTY`, `CACHE_SHAPE_END_USERS`,
+`MAX_TOKENS_MODE_APP2`, ...) are now ordinary instances of this rule and work
+as before. `CACHE_SHAPE` and `MAX_TOKENS_MODE` also gained a global form; it
+is unset by default, so no group gets those shapes unless asked.
+
+Built-in keys: `app1` -> `app1-production`, `app2` -> `app2-batch`,
+`end-users` -> `end-user-alpha end-user-beta`, `custom` ->
+`CUSTOM_SUBSCRIPTION_NAME` (required). Any other group defaults to a key
+file with the group's own name (`/keys/app3`). When a group has several keys
+they are round-robined across its workers, which is UNI-129 D1's end-users
+model. Every key must collapse to the one group by the prefix rule. A missing
+key file now **fails the run at start-up** with the file named, where it used
+to show up as a column of 401s.
+
+Examples:
+
+```sh
+# C1 shape: app1 short prompts / long outputs, app2 the reverse
+PROMPT_WORDS_MIN_APP1=100 PROMPT_WORDS_MAX_APP1=200 MAX_TOKENS_DEFAULT_APP1=512 \
+PROMPT_WORDS_MIN_APP2=3000 PROMPT_WORDS_MAX_APP2=3000 MAX_TOKENS_DEFAULT_APP2=16 \
+  OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh full-contention c1-shape
+
+# C3/C5: only end-users streams and aborts; app1/app2 stay clean
+STREAM_FRACTION_END_USERS=1 ABORT_FRACTION_END_USERS=0.2 ...
+
+# six groups, app3 on two keys, app4 oversizes half its prompts, app5 joins at 10s
+LOADGEN_GROUPS="app1 app2 end-users app3:16:app3-key-a,app3-key-b app4:16 app5:16" \
+OVERSIZED_FRACTION_APP4=0.5 APP5_START=10 APP5_STOP=30 ...
+```
+
+**Through `15-fairness-benchmark.sh`.** The benchmark forwards
+`LOADGEN_GROUPS` and, for every declared group, any `WORKERS_<TOKEN>`,
+`<TOKEN>_KEYS`, `<TOKEN>_START/STOP/DUTY` and `<KNOB>_<TOKEN>` that is set in
+its environment. For a group `04-loadgen.yaml` has no placeholder for, it
+adds the env entry to the Job. Two caveats:
+
+- **The scenario still owns the built-ins' worker counts.** Every scenario
+  sets `WORKERS_APP1/APP2/END_USERS` through `PER_TENANT_OVERRIDES`. An env
+  var beats an inline count, so in `LOADGEN_GROUPS="app1:6 ..."` run
+  through a scenario, app1 still gets the scenario's count, not 6. The same
+  goes for `WORKERS_APP1` etc. set in your shell: the scenario's value is
+  used, the same as before this ticket. Inline counts take full effect only
+  for `app3`+ groups (or when you run `run.sh` directly).
+- Overrides are only forwarded for **declared** groups.
+  `STREAM_FRACTION_APP9=1` with no `app9` in `LOADGEN_GROUPS` is quietly
+  dropped. A misspelt knob name is also dropped quietly, because it is simply
+  never looked up. Check the `load: UNI-179 group ...` lines (below) to
+  confirm what each group actually resolved to.
+
+**What the run logs.** The first five `load:` lines are unchanged for a
+3-group run, because the report parses the first one. After them come one
+`load: UNI-179 groups=[app1=12 app2=12 ...] total-workers=N` line, one
+`load: UNI-179 group <name> token=... workers=... keys=[...] timeline=...
+overrides=[...]` line per group (`overrides` lists only knobs that differ
+from the global value, so a default run says `overrides=[]`), and
+`load: UNI-179 dispatched N workers in Xs`. `15-fairness-report.py` reads the
+`groups=` line to add `app3`..`appN` to its table rows and to the G2 ledger.
+An `appN` that was offered load but has no client record therefore FAILs the
+ledger instead of vanishing. `custom` is never added from that line, because
+its fairness id belongs to its subscription, not to the literal name.
+
+**Start barrier.** Every worker blocks on a FIFO until the dispatcher has
+forked them all, then all of them read the same run clock and start
+together. At 1000 workers in a CPU-limited pod, forking is slow enough that
+early groups would otherwise get a head start, which looks exactly like
+unfairness. Note that `<TOKEN>_START` still has 1-second resolution (the
+integer `date +%s` clock, unchanged from UNI-127), so a group can start up to
+about 1s before its nominal offset.
+
+**For 6 and 20 groups on the GPU** the extra groups need real MaaS keys and
+subscriptions for `app3`+. That provisioning belongs to
+[UNI-165](/UNI/issues/UNI-165), not to this harness.
+
+**The regression bar, and the evidence.** These were checked against a
+host-side OpenAI-compatible stub, which logs each request's key, prompt
+length and hash, `max_tokens`, `stream` and forged header. It is **not** the
+llm-d simulator image: the agent host has no container runtime. For
+pre-UNI-179 vs post-UNI-179 `run.sh` with no knobs set, the first five log
+lines are byte-identical, every request was the same 1200-word prompt
+(same hash) with `max_tokens: 64` and no stream, and `end-users` alternated
+alpha/beta. The same holds with the legacy knobs set (`TENANTS` subset,
+`WORKERS_*`, 3-key `END_USERS_KEYS`, `CACHE_SHAPE_APP1=hot`,
+`MAX_TOKENS_MODE_END_USERS=huge`, global stream/abort/oversize/forge,
+`APP1_DUTY`) and for a `custom` tenant: the shape mix and the start lines
+matched. The pre-UNI-179 `15-fairness-report.py` parses all of these logs
+identically to the new one, and the offline tests pass. N-group runs: 3
+groups with per-group shapes (only the targeted group changed shape), 6
+groups (2-key app3, oversize on app4 only, app5 inside its 10-30s window), and
+20 groups x 50 workers = 960 workers. That last run dispatched in 0.32s, all
+200s, and the 19 identically-sized groups landed within ±2.3% of each other
+in requests sent. Full numbers are in the UNI-179 closing comment.
+
 ### Ledger cross-check (UNI-138)
 
 G2 asks a different question from every other case above: not "does the

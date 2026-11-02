@@ -189,6 +189,16 @@ OPEN_LOOP_ROW = re.compile(
 
 GROUPS = ("app1", "app2", "end-users")
 
+# UNI-179: 04-loadgen.yaml's run.sh now dispatches any declared group set
+# (LOADGEN_GROUPS) and logs it as one extra line. TENANTS_LINE above still
+# carries the three built-ins (byte-identical for a 3-group run); this line is
+# how a 6- or 20-group run tells the report about app3..appN, so their table
+# rows and G2 ledger rows are not silently dropped. "custom" is never added
+# from it: that group's fairness id is whatever its arbitrary subscription
+# classifies to, not the literal name, so it stays out exactly as before.
+GROUPS_LINE = re.compile(r'load: UNI-179 groups=\[(?P<groups>[^\]]*)\]')
+GROUPS_ENTRY = re.compile(r'(?P<name>[a-z0-9-]+)=(?P<workers>\d+)')
+
 
 def parse_metrics_text(text):
     """{metric_name: {fairness_id_or_None: value}} from a Prometheus text
@@ -270,6 +280,12 @@ def parse_loadgen_log(path):
             if g in tenants:
                 offered_workers[g] = int(by_name[g])
         duration = int(m.group('duration'))
+        gm = GROUPS_LINE.search(text)
+        if gm:
+            for entry in GROUPS_ENTRY.finditer(gm.group('groups')):
+                name = entry.group('name')
+                if name not in GROUPS and name != "custom":
+                    offered_workers[name] = int(entry.group('workers'))
     else:
         m = OPEN_LOOP_TENANTS_LINE.search(text)
         if m:
@@ -288,7 +304,7 @@ def parse_loadgen_log(path):
             if not row or row.group(1) == "TENANT":
                 continue
             group, total, p50, p95, statuses_raw = row.groups()
-            if group not in GROUPS:
+            if group not in offered_workers:
                 continue
             rows[group] = {
                 "total": int(total),
@@ -738,7 +754,7 @@ def resolve_schedule(timeline_tenants, offered_groups, run_duration):
     either."""
     schedule = {}
     timeline_tenants = timeline_tenants or {}
-    for g in GROUPS:
+    for g in list(GROUPS) + [g for g in offered_groups if g not in GROUPS]:
         if g in timeline_tenants:
             e = timeline_tenants[g]
             stop = e.get("stop")
@@ -931,7 +947,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     cached_tokens_after = after.get("llm_d_epp_request_cached_tokens_sum", {})
 
     all_group_ids = sorted(
-        g for g in set(weight_before) | set(weight_after) | set(GROUPS)
+        g for g in set(weight_before) | set(weight_after) | set(offered_workers)
         if g is not None
     )
 
@@ -996,7 +1012,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     if _restarted_in or _restarted_out or _restarted_cached:
         epp_restarted = True
 
-    offered_groups = [g for g in GROUPS if offered_workers.get(g, 0) > 0]
+    offered_groups = [g for g in offered_workers if offered_workers[g] > 0]
     # A single offered group is never "contended" by definition (metrics.go:
     # contended_service_tokens_total only accrues while another group in the
     # same band is also backlogged), so it legitimately scrapes at a flat

@@ -35,9 +35,11 @@ def write(tmp, name, content):
     return path
 
 
-def loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows, w_custom=None):
+def loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows, w_custom=None, groups_line=None):
     custom_field = f"custom={w_custom} " if w_custom is not None else ""
     lines = [f"load: tenants=[{tenants}] workers app1={w_app1} app2={w_app2} end-users={w_end} {custom_field}duration={duration}s"]
+    if groups_line is not None:
+        lines.append(groups_line)
     lines.append("load: done.")
     lines.append(f"{'TENANT':<12} {'TOTAL':<7} {'P50_SEC':<9} {'P95_SEC':<9} STATUSES")
     for group, total, p50, p95, statuses in rows:
@@ -1095,17 +1097,19 @@ def run_build_with_ledger(tmp, *, tenants, w_app1, w_app2, w_end, rows,
                            contended_cost, input_tokens, output_tokens, cached_tokens,
                            client_records, input_token_weight=1.0, output_token_weight=2.0,
                            cached_input_token_weight=1.0, ledger_tolerance_pct=10.0,
-                           duration=240, scenario="full-contention"):
+                           duration=240, scenario="full-contention",
+                           groups_line=None, extra_weights=""):
     def series(name, values):
         return "".join(f'{name}{{fairness_id="{g}"}} {v}\n' for g, v in values.items())
 
-    before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON)
-    after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON
+    before = write(tmp, "before.txt", CONFIGURED_WEIGHT + extra_weights + ENFORCING_ON)
+    after = write(tmp, "after.txt", CONFIGURED_WEIGHT + extra_weights + ENFORCING_ON
                   + series("llm_d_epp_maas_fairness_contended_service_tokens_total", contended_cost)
                   + series("llm_d_epp_request_input_tokens_sum", input_tokens)
                   + series("llm_d_epp_request_output_tokens_sum", output_tokens)
                   + series("llm_d_epp_request_cached_tokens_sum", cached_tokens))
-    log = write(tmp, "loadgen.log", loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows))
+    log = write(tmp, "loadgen.log", loadgen_log(tenants, w_app1, w_app2, w_end, duration, rows,
+                                                groups_line=groups_line))
     client_path = write(tmp, "client-request-summary.jsonl", client_record_jsonl(client_records))
     return fairness_report.build_report(
         scenario=scenario,
@@ -1570,6 +1574,74 @@ def test_cli_accepts_uni181_flags_end_to_end():
         report = json.load(open(out_json))
         assert report["pick_latency"]["histograms"]["scheduler_e2e"]["state"] == "ok"
         assert len(report["alerts"]["summary"]) == 5
+
+
+# UNI-179: 04-loadgen.yaml's run.sh logs "load: UNI-179 groups=[...]" for
+# any declared group set. For the default three groups that line must change
+# nothing; for N groups it must bring app3..appN into the table rows and the
+# G2 ledger, and must never bring in "custom" (its fairness id is its
+# subscription's, not the literal name).
+def test_default_groups_line_changes_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        kwargs = dict(tenants=LEDGER_TENANTS, w_app1=32, w_app2=32, w_end=128, rows=LEDGER_ROWS,
+                      contended_cost=LEDGER_CONTENDED_COST, input_tokens=LEDGER_INPUT_TOKENS,
+                      output_tokens=LEDGER_OUTPUT_TOKENS, cached_tokens=LEDGER_CACHED_TOKENS,
+                      client_records=LEDGER_CLIENT_RECORDS)
+        without = run_build_with_ledger(tmp, **kwargs)
+        with_line = run_build_with_ledger(
+            tmp, groups_line="load: UNI-179 groups=[app1=32 app2=32 end-users=128] total-workers=192", **kwargs)
+        assert json.dumps(without, sort_keys=True) == json.dumps(with_line, sort_keys=True)
+        assert fairness_report.render_markdown(without) == fairness_report.render_markdown(with_line)
+
+
+def test_n_groups_line_extends_rows_and_ledger_but_not_custom():
+    extra = ["app3", "app4", "app5"]
+    rows = LEDGER_ROWS + [(g, 1000, 0.80, 1.00, "200=1000") for g in extra] + [("custom", 50, 0.8, 1.0, "200=50")]
+    records = list(LEDGER_CLIENT_RECORDS) + [
+        dict(LEDGER_CLIENT_RECORDS[0], group=g) for g in extra
+    ] + [dict(LEDGER_CLIENT_RECORDS[0], group="custom", requests_sent=50)]
+    per = lambda base, v: dict(base, **{g: v for g in extra})
+    weights = "".join(f'llm_d_epp_maas_fairness_configured_weight{{fairness_id="{g}"}} 20\n' for g in extra)
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_with_ledger(
+            tmp, tenants="app1 app2 end-users app3 app4 app5 custom", w_app1=32, w_app2=32, w_end=128,
+            rows=rows,
+            contended_cost=per(LEDGER_CONTENDED_COST, 140000),
+            input_tokens=per(LEDGER_INPUT_TOKENS, 100000),
+            output_tokens=per(LEDGER_OUTPUT_TOKENS, 20000),
+            cached_tokens=per(LEDGER_CACHED_TOKENS, 0),
+            client_records=records,
+            groups_line="load: UNI-179 groups=[app1=32 app2=32 end-users=128 app3=16 app4=16 app5=16 custom=4] total-workers=244",
+            extra_weights=weights,
+        )
+        ledger_groups = [r["group"] for r in report["ledger"]["rows"]]
+        assert ledger_groups == ["app1", "app2", "end-users", "app3", "app4", "app5"], ledger_groups
+        assert report["ledger"]["verdict"]["result"] == "PASS", report["ledger"]["verdict"]["reasons"]
+        md = fairness_report.render_markdown(report)
+        for g in extra:
+            assert g in md, g
+        assert "custom" not in ledger_groups
+
+
+def test_n_groups_line_missing_client_record_fails_ledger():
+    # The point of extending the group set: an app4 that was offered load but
+    # whose client record went missing must FAIL the ledger, not vanish.
+    extra = ["app3", "app4"]
+    rows = LEDGER_ROWS + [(g, 1000, 0.80, 1.00, "200=1000") for g in extra]
+    records = list(LEDGER_CLIENT_RECORDS) + [dict(LEDGER_CLIENT_RECORDS[0], group="app3")]
+    per = lambda base, v: dict(base, **{g: v for g in extra})
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_with_ledger(
+            tmp, tenants="app1 app2 end-users app3 app4", w_app1=32, w_app2=32, w_end=128, rows=rows,
+            contended_cost=per(LEDGER_CONTENDED_COST, 140000),
+            input_tokens=per(LEDGER_INPUT_TOKENS, 100000),
+            output_tokens=per(LEDGER_OUTPUT_TOKENS, 20000),
+            cached_tokens=per(LEDGER_CACHED_TOKENS, 0),
+            client_records=records,
+            groups_line="load: UNI-179 groups=[app1=32 app2=32 end-users=128 app3=16 app4=16] total-workers=224",
+        )
+        assert report["ledger"]["verdict"]["result"] == "FAIL"
+        assert any("app4" in r for r in report["ledger"]["verdict"]["reasons"]), report["ledger"]["verdict"]["reasons"]
 
 
 def main():

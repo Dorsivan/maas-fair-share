@@ -4655,6 +4655,99 @@ should change unilaterally; the design rationale for charging the estimate
 outright on a no-usage response (`plugin.go:576-594`) was deliberate and
 predates this evidence.
 
+## UNI-190: the EPP/client ~300s outcome-timing gap is a stuck gateway reply path, not retry amplification
+
+[UNI-148](/UNI/issues/UNI-148) (C6, above) found two things and flagged both for
+follow-up rather than deciding or chasing them itself. This ticket's scope is
+finding 2, the ~300s EPP/client timing gap, plus surfacing finding 1 as an
+explicit policy decision (see "Policy ask," below) rather than changing it
+unilaterally.
+
+**What was ruled out.** The open hypothesis on UNI-148 was "a router-level
+retry against a second backend replica after the first's fast rejection,"
+which — if true — would mean finding 1's 9-10x charge understates the real
+leak (one client request, multiple provisional charges). Re-examining the
+archived run's own `epp-container.log` for one `app2` request
+(`x-request-id 410b154a-...`) shows a single, complete EPP lifecycle in 28ms
+(`received` at `.822Z` -> `sent response body back to proxy` at `.850Z`) — one
+dispatch, one scheduling decision, no second attempt. No retry evidence exists
+anywhere in the archived artifacts.
+
+**Live repro, this session.** Sent one fresh oversized request (48,000-word
+prompt, same context-length-rejection shape as UNI-148's `OVERSIZED_FRACTION`
+load) directly at the Route
+(`https://maas-gateway-maas-fairness-poc.apps.ocp.paladinaura.com/maas-fairness-poc/maas-vllm-gpu/v1/chat/completions`,
+`app2-batch` key from the existing `maas-loadgen-keys` secret — no new key
+minted), with `oc logs -f` tailing both the gateway (`istio-proxy`) pod and the
+EPP (`maas-vllm-gpu-kserve-router-scheduler`) pod for the duration:
+
+- **vLLM** (`maas-vllm-gpu-kserve-74d8dd69bd-69gqk`, uvicorn access log):
+  `"POST /v1/chat/completions HTTP/1.1" 400 Bad Request` — one line, one
+  source IP (the gateway pod), logged the way uvicorn only logs *after* a
+  response is fully written. vLLM believes it sent a complete response.
+- **EPP**: `received` -> `sent request body response(s)` -> `no usage block`
+  -> `sent response body back to proxy`, all within **100ms**
+  (`16:11:25.873Z` -> `16:11:25.973Z`). Matches the archived run's ~9s-for-32-
+  requests pattern — EPP is fast, not the bottleneck.
+- **Client (curl)**: `TIME_STARTTRANSFER=0.198s` (headers arrived almost
+  instantly: `HTTP/1.1 400 Bad Request`, `transfer-encoding: chunked`,
+  `x-maas-fairness-queue-ms: 0.6`) but then **zero body bytes** were ever
+  received. The connection died at `TIME_TOTAL=50.2s` with `curl: (56) OpenSSL
+  SSL_read: unexpected eof while reading` — not a clean close, not the
+  request-level timeout (which the Route's `03-gateway.yaml` disables:
+  `backendRequest: 0s`, `request: 0s`), but some other connection-level
+  teardown. `-o` captured zero bytes.
+- **Gateway access log**: no line at all for this request's `x-request-id`
+  while the connection was still open — Envoy only emits the access-log entry
+  on stream completion, and for this request that never cleanly happened.
+
+**Control, same session.** An immediately-following small, valid request
+(`max_tokens: 4`, normal prompt) through the same path: `200 OK`, also
+`transfer-encoding: chunked`, full body delivered, `TIME_TOTAL=0.13s`. So
+"chunked" framing alone doesn't explain the hang — the 200 path with identical
+framing works. The defect is specific to the context-length-rejection (400)
+response path, not Envoy/ext_proc's handling of chunked responses in general.
+
+**Conclusion.** The gap is a **stuck reply-path connection between the
+gateway (Envoy/Istio) and the downstream client**, occurring *after* vLLM has
+already written a complete response and *after* the EPP's `ResponseBody`
+ext_proc hook has already approved it — i.e., downstream of every component
+this repo controls. The request is **not** amplified: exactly one upstream
+hit, one EPP charge, matching finding 1 as stated (not an understatement).
+What specifically breaks inside the gateway's relay of this particular
+response shape (chunked, 400, likely a short JSON error body) to the client
+is not fully bottomed out — that would need Envoy debug/trace-level logging
+or a packet capture across repeated reproductions, both more invasive than
+this ticket's budget — but the component boundary is now evidence-backed, not
+speculative: **gateway data-plane bug in the chunked-error-response relay, not
+EPP/fairness-plugin behavior, not backend retry, not a vLLM hang.**
+
+Live repro used the public Route, which has an edge timeout shorter than the
+in-cluster path's ~300s client timeout (observed here: ~50s vs. the archived
+run's 300.4s/300.8s) — same stuck-connection signature, different outer
+timeout cutting it off. The single diagnostic request added one more
+provisional charge to `app2`'s ledger tab under the same by-design mechanism
+as finding 1; `enforce` was confirmed `false` throughout (no scheduling
+impact), and the charge self-decays on the configured 60s half-life like any
+other, so no cluster state needed reverting. No configmap, manifest, or
+cluster config was changed by this investigation.
+
+**Policy ask (finding 1, unchanged from UNI-148):** still a board decision,
+not something resolved by this ticket — see row 17 of the Outstanding work
+table, below, and UNI-148's own framing above. This ticket's contribution is
+narrowing finding 2 enough to answer UNI-148's own open question about
+whether finding 1 understates the leak: **it does not** — the mechanism is
+confirmed single-charge-per-request, not retry-amplified.
+
+**Not reproduced further:** repeat timing variance (n=1 here vs. the archived
+run's n=32), root-causing the exact Envoy-side defect (processing mode,
+buffering, or a specific chunked-response-without-`Content-Length` code path),
+and whether the archived run's `500` responses (which *did* reach the client)
+share any framing difference from the `400`s that hung, worth a follow-up
+ticket if the gateway maintainers want to chase it further; not attempted here
+given the risk/cost of repeatedly triggering cluster-side connection hangs to
+gather a larger sample.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -4688,7 +4781,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Retune `end-users-idle`'s app1:app2 worker ratio to match its 2:1 target, re-run (UNI-104)~~ | **Done, PASS.** `WORKERS_APP1` moved from 128 to 64 (keeping `WORKERS_APP2=32`), matching the offered-worker ratio to the pair's actual 2:1 target share ratio instead of reusing `full-contention`'s 4:1 dominant-tenant figure. Live re-run 2026-10-29: 68.4/31.6% against a 66.7/33.3% target (1.8pt max deviation) -- **PASS**. `contended_seconds_total` deltas (app1 1.46s, app2 1.50s) confirm both tenants were genuinely contending. Why the 4:1 ratio overshot so much more than 2:1 undershoots remains unexplained, same as UNI-103 left it -- see "UNI-104," below | root cause of the ratio's exact sensitivity: pending [UNI-100](/UNI/issues/UNI-100)'s scope decision |
 | — | ~~Build the timeline/chaos harness for the edge-case plan (UNI-127)~~ | **Done, development only.** Per-tenant join/leave + duty-cycle timing, EPP-pod-delete and vLLM-scale chaos hooks, windowed per-tenant share, and a time-to-converge figure -- see "UNI-127," above, for the full story including the live finding that a chaos scale-restore's actual capacity recovery (~3m39s on this backend) lags its patch by far more than a short `CHAOS_SCALE_HOLD` accounts for. `full-contention` regression confirmed the whole-run verdict is unchanged. No B1-B4/E1/E2 case was run or scored -- that is every ticket after this one in the chain | the board's edge-case cases themselves (B1-B4, E1, E2, "app3 joins at saturation"), each its own ticket |
 | — | ~~`MaaSSubscription` named `enduser-foo` for D2 (UNI-129)~~ | **Done.** Board approved and granted `create`/`get`/`list`/`watch` on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` to this role (narrowly, no write verbs). `enduser-foo` created, a key minted against it, and D2's specific case smoke-tested live: 70/70 requests `200`, `llm_d_epp_maas_fairness_unmatched_subscriptions_total` moved `0` -> `70`, confirming classification into `unclassified` | — |
-| 17 | **Decide whether terminally-unservable requests should be exempted/capped from provisional charging** | [UNI-148](/UNI/issues/UNI-148) (C6) found context-length rejections charged ~9-10x a normal request's cost, permanently (the ledger's own G2 cross-check flags it FAIL) -- by design, not a bug in the strict sense, but the design predates this evidence. Also open: why the EPP resolves these requests in ~9s while the client sees a ~300s timeout on the exact same requests -- see "UNI-148," above | [UNI-190](/UNI/issues/UNI-190), a policy decision |
+| 17 | **Decide whether terminally-unservable requests should be exempted/capped from provisional charging** | [UNI-148](/UNI/issues/UNI-148) (C6) found context-length rejections charged ~9-10x a normal request's cost, permanently (the ledger's own G2 cross-check flags it FAIL) -- by design, not a bug in the strict sense, but the design predates this evidence. The ~300s EPP/client timing gap this raised is now resolved: [UNI-190](/UNI/issues/UNI-190) live-reproduced it as a stuck gateway (Envoy/Istio) reply-path connection downstream of both vLLM and the EPP, confirmed **not** retry-amplified (one charge per request, same as finding 1 above) -- see "UNI-190," above | a policy decision |
 
 ## Reproducing
 

@@ -1316,6 +1316,20 @@ allowed, per tenant, on either of two checks:
    the gate and the client's whole-run total are treated as covering the
    same set of requests.
 
+   **Expect this check to FAIL for a tenant sending context-length-rejected
+   (oversized) prompts.** [UNI-148](/UNI/issues/UNI-148) found that a request
+   the backend never usefully answers still gets charged: `PreRequest`
+   books a provisional estimate from the request's own (here, huge) size at
+   dispatch, and if no usage block ever arrives, `ResponseBody`'s no-usage
+   branch (`plugin.go:576-594`) makes that estimate the permanent cost by
+   design -- there is no "the backend rejected this, refund it" path. On the
+   UNI-148 run this meant ~13,238 cost-units charged per rejected request
+   (~9-10x a normal served request) against zero client-recorded tokens, an
+   infinite percent deviation. This is a real, reproducible ledger gap, not
+   a cost-model nuance like the streaming one above -- see
+   `docs/poc-results.md`'s UNI-148 section and the policy question filed as
+   [UNI-190](/UNI/issues/UNI-190).
+
 **Picking X=10%, from the live full-contention run:** raw tokens agreed to
 within 0.05% across all three tenants; the cost check carried a real,
 explained, persistent bias of -3.9% to -4.0% for the two lower-request-count

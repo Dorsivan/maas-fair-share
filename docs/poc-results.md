@@ -4506,6 +4506,155 @@ reasonable next step but is an external, public action outside this
 ticket's authority to take unprompted — raised to the CEO as a
 recommendation rather than filed directly.
 
+## UNI-148: C6, `context-length-errors` — rejected requests ARE charged, and the ledger leaks
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, sixth and last of the C-series.
+Setup: one tenant (`app2`) sends only prompts that exceed the backend's
+context window; pass criteria are "errored requests are not charged, or
+charged minimally (report how much)," "the provisional ledger does not
+leak," and "the other tenants are unaffected."
+
+**Setup:** full-contention (`app1`/`app2`/`end-users`, 32/32/128 workers —
+this chain's standard sizing), live against `maas-vllm-gpu` (2 replicas,
+llama-3-1-8b, `--max-model-len 8192`), `ENFORCE_LIVE=true`,
+`halfLifeSeconds: 60`, 240s. `app2` sends **100%** oversized prompts
+(`OVERSIZED_FRACTION_APP2=1`, `OVERSIZED_PROMPT_WORDS_APP2=12000` — the
+[UNI-128](/UNI/issues/UNI-128) harness knob, default word count, already
+well over the 8192-token window at this plugin's own 4-bytes/token
+estimate); `app1`/`end-users` are unchanged (the chain's standard fixed
+1200-word/`max_tokens: 64` shape). 100%, not a partial share, to isolate the
+effect cleanly — the same choice [UNI-145](/UNI/issues/UNI-145) and
+[UNI-146](/UNI/issues/UNI-146) made for their own per-tenant knobs.
+
+**Expected split:** app1 21.1% / app2 10.5% / end-users 68.4% (weights
+20/10/65 renormalized over the three offered groups) — informational only;
+this case is not primarily a split test, see Verdict below.
+
+**Observed split (by weighted tokens, the scored metric):**
+
+| group | weight | requests | statuses | expected % | observed % | deviation (pts) | dispatch_total |
+|---|---|---|---|---|---|---|---|
+| app1 | 20.0 | 545 | 200=535, 500=10 | 21.1% | 15.2% | -5.9 | 532 |
+| app2 | 10.0 | 49 | 000=32, 400=3, 500=14 | 10.5% | 9.3% | -1.3 | 32 |
+| end-users | 65.0 | 2650 | 200=2604, 500=46 | 68.4% | 75.5% | +7.1 | 2595 |
+
+The benchmark script's own headline verdict is **PASS** (max deviation
+7.1pts, under the 10-point threshold) — but that verdict only scores the
+symmetric weighted-split bar, not this ticket's own named criteria. Scored
+against what UNI-148 actually asked for:
+
+**Verdict: FAIL on this ticket's named criteria.** Rule 4 applies — a FAIL
+from a measurement that ran and was recorded is a valid, `done` result, not
+a reason for `blocked`.
+
+1. **Errored requests are charged, not minimally.** Of `app2`'s 49 oversized
+   requests, only 3 got the expected clean `400`; 14 got `500`, and 32 never
+   got a response at all from the client's point of view (`000`, the client's
+   own `REQUEST_TIMEOUT_SECONDS` elapsed — see "What surprised me" below).
+   `dispatch_total{app2}=32` and `requests_without_usage_total{app2}=32`
+   match that `000` count exactly: every request that reached the EPP's own
+   scheduling pipeline was charged a provisional estimate at dispatch
+   (`PreRequest`, `pkg/fairness/weightedlas/plugin.go:496-520`) and, because
+   no usage block ever arrived to true it up, that estimate became the
+   permanent charge by design (`ResponseBody`'s no-usage branch,
+   `plugin.go:576-594`: "the estimate IS the cost actually charged — book it
+   now... or it is never counted at all"). `contended_service_tokens_total{app2}`
+   moved `0 -> 423612` over exactly those 32 requests: **~13,238 cost-units
+   charged per rejected request**, computed from each oversized prompt's own
+   (huge) `RequestSizeBytes`, not from anything the backend actually
+   produced. For comparison, a normal, fully-served `app1` request this same
+   run cost `695296/532 ≈ 1,307` cost-units. A context-length rejection is
+   charged **roughly 9-10x a successful request**, the opposite of
+   "minimally."
+2. **The provisional ledger leaks.** The harness's own G2 cross-check
+   (`15-fairness-report.py`, UNI-138) catches this without any extra
+   instrumentation: `app2`'s client-recorded tokens are `0` prompt / `0`
+   completion (none of its 49 requests ever returned a usable response), but
+   the EPP's own `contended cost` for `app2` is `423612` — an
+   un-computable (infinite) percent deviation. The ledger table marks `app2`
+   **FAIL**, the only FAIL among the three offered groups; `app1`/`end-users`
+   both pass their own cross-checks (-3.9% / -1.8%, inside the 10% tolerance).
+   The charge is not a transient counter either — the EPP's own flight
+   recorder shows `app2`'s `attainedService` decaying on the configured
+   60s half-life for several minutes after the last request resolved
+   (`41862 -> 35201 -> 31361` across three ~15s ticks,
+   `epp-container.log`), i.e. it sits in the same real, scheduling-relevant
+   tab balance as any legitimately-served request's charge would.
+3. **The other tenants are not clearly unaffected.** Both pass their own
+   ledger cross-check and the overall symmetric-split threshold still holds,
+   so neither is pushed into an outright FAIL. But `app2`'s phantom 9.3%
+   share (manufactured entirely from charged-but-undelivered dispatches) is
+   large enough to be a plausible contributor to `app1`'s and `end-users`'
+   larger-than-[UNI-147](/UNI/issues/UNI-147)'s-baseline deviations in this
+   run (-5.9/+7.1pts here vs. -2.8/-1.0pts on UNI-147's otherwise-comparable
+   full-contention/`ENFORCE_LIVE=true` run) — `app2`'s renormalized 10.5%
+   target is money that would otherwise be absorbed by `app1`/`end-users`
+   under work conservation. **Not proven**: isolating this would need a
+   paired control run (e.g. the same scenario with `app2` idle instead of
+   all-oversized) this ticket didn't budget for; the correlation is reported,
+   not the causation.
+
+**What surprised me: the EPP's view of "this request is done" and the
+client's view disagree by nearly 300 seconds, for the exact same 32
+requests.** `epp-container.log`'s 32 `app2` "no usage block" events (which
+drive the charge above) all land within the run's **first ~9 seconds**
+(`15:38:37.850Z` – `15:38:46.257Z`), clustered in bursts — the EPP believed
+these requests resolved almost instantly. The client, independently,
+recorded those same 32 requests as `000` with `p50`/`p95` latency of
+`300.4s`/`300.8s` — essentially the full `REQUEST_TIMEOUT_SECONDS` (300s
+default), i.e. the real caller got **no response at all** and gave up five
+minutes later. Both observations are from the same run's own artifacts and
+are not in question individually; what produces the gap between them (a
+router-level retry against a second backend replica after the first's fast
+rejection, a stuck connection on the reply path, or something else) is
+**not confirmed** — out of this ticket's scope to chase further. Flagged as
+[UNI-190](/UNI/issues/UNI-190) for whoever picks it up next, since if this
+is a retry-amplification mechanism it would mean a single client request
+can generate more than one provisional charge, which would make finding 1
+above an understatement, not an overstatement.
+
+**Error rates:** `app1` 535/545 (98.2%) `200`, `end-users` 2604/2650 (98.3%)
+`200` — both close to the ~97-98% background rate seen on
+[UNI-147](/UNI/issues/UNI-147)'s comparable run, not obviously worse.
+`app2` 0/49 (0%) `200`, entirely by design (every request was built to be
+rejected).
+
+**Cluster left as found** — confirmed via `oc get` immediately after the
+run:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|halfLifeSeconds:'
+      enforce: false
+      halfLifeSeconds: 60
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           5m13s      9m16s
+```
+
+Weights unchanged (app1=20, app2=10, end-users=65, unclassified=5). Both
+`maas-vllm-gpu` pods unchanged at 0 restarts (the enforce flip recreates
+only the EPP scheduler pod, same as every other ticket in this chain that
+sets `ENFORCE_LIVE=true`). No orphaned `oc logs -f` capture processes left
+running.
+
+**Raw results:** `results/20261102T153717Z-uni-148-c6-context-length-errors/`
+(report JSON/MD, loadgen log, `client-request-summary.jsonl`, EPP container
+log, before/after/timeseries metric snapshots).
+
+**Grafana time range:** `2026-11-02T15:37:19Z` (enforce flip requested) to
+`2026-11-02T15:44:57Z` (revert confirmed). Run itself: `2026-11-02T15:38:33Z`
+– `2026-11-02T15:43:47Z`.
+
+**Follow-up filed:** [UNI-190](/UNI/issues/UNI-190) — whether
+context-length-rejected (or more generally, any terminally-unservable)
+requests should be exempted from provisional charging, or capped, is a
+policy decision for the board, not something this characterization ticket
+should change unilaterally; the design rationale for charging the estimate
+outright on a no-usage response (`plugin.go:576-594`) was deliberate and
+predates this evidence.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -4539,6 +4688,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Retune `end-users-idle`'s app1:app2 worker ratio to match its 2:1 target, re-run (UNI-104)~~ | **Done, PASS.** `WORKERS_APP1` moved from 128 to 64 (keeping `WORKERS_APP2=32`), matching the offered-worker ratio to the pair's actual 2:1 target share ratio instead of reusing `full-contention`'s 4:1 dominant-tenant figure. Live re-run 2026-10-29: 68.4/31.6% against a 66.7/33.3% target (1.8pt max deviation) -- **PASS**. `contended_seconds_total` deltas (app1 1.46s, app2 1.50s) confirm both tenants were genuinely contending. Why the 4:1 ratio overshot so much more than 2:1 undershoots remains unexplained, same as UNI-103 left it -- see "UNI-104," below | root cause of the ratio's exact sensitivity: pending [UNI-100](/UNI/issues/UNI-100)'s scope decision |
 | — | ~~Build the timeline/chaos harness for the edge-case plan (UNI-127)~~ | **Done, development only.** Per-tenant join/leave + duty-cycle timing, EPP-pod-delete and vLLM-scale chaos hooks, windowed per-tenant share, and a time-to-converge figure -- see "UNI-127," above, for the full story including the live finding that a chaos scale-restore's actual capacity recovery (~3m39s on this backend) lags its patch by far more than a short `CHAOS_SCALE_HOLD` accounts for. `full-contention` regression confirmed the whole-run verdict is unchanged. No B1-B4/E1/E2 case was run or scored -- that is every ticket after this one in the chain | the board's edge-case cases themselves (B1-B4, E1, E2, "app3 joins at saturation"), each its own ticket |
 | — | ~~`MaaSSubscription` named `enduser-foo` for D2 (UNI-129)~~ | **Done.** Board approved and granted `create`/`get`/`list`/`watch` on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` to this role (narrowly, no write verbs). `enduser-foo` created, a key minted against it, and D2's specific case smoke-tested live: 70/70 requests `200`, `llm_d_epp_maas_fairness_unmatched_subscriptions_total` moved `0` -> `70`, confirming classification into `unclassified` | — |
+| 17 | **Decide whether terminally-unservable requests should be exempted/capped from provisional charging** | [UNI-148](/UNI/issues/UNI-148) (C6) found context-length rejections charged ~9-10x a normal request's cost, permanently (the ledger's own G2 cross-check flags it FAIL) -- by design, not a bug in the strict sense, but the design predates this evidence. Also open: why the EPP resolves these requests in ~9s while the client sees a ~300s timeout on the exact same requests -- see "UNI-148," above | [UNI-190](/UNI/issues/UNI-190), a policy decision |
 
 ## Reproducing
 

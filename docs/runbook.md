@@ -1397,6 +1397,136 @@ see the comment next to it in each script.
 
 ---
 
+### Generic live-config set/restore wrapper (UNI-180)
+
+ENFORCE_LIVE, CHAOS_EPP_DELETE_AT and CHAOS_SCALE_AT (above) were three
+hand-rolled patch/compare/revert pairs, each touching the same ConfigMap and
+the same `on_exit` trap. The edge-case board needs more of these: weights and
+`newcomerClamp` ([UNI-158](/UNI/issues/UNI-158), [UNI-159](/UNI/issues/UNI-159)),
+a Kuadrant `TokenRateLimitPolicy` ([UNI-160](/UNI/issues/UNI-160),
+[UNI-162](/UNI/issues/UNI-162)), and a generic "patch something at t+N and
+observe whether it applies without a restart" hook
+([UNI-163](/UNI/issues/UNI-163), F6). Three more bespoke pairs was the most
+likely way one of them leaves the cluster dirty, so `15-fairness-benchmark.sh`
+now has one mechanism underneath all of it: `live_config_set`/
+`live_config_restore`. **This ticket is the harness work alone** — it does not
+itself run or score any of the cases above, same scope boundary as UNI-127/
+UNI-128/UNI-129.
+
+**Target specs.** A target is a string naming WHAT to change:
+
+| Spec | Meaning | Used by |
+|---|---|---|
+| `epp-key:<key>` | A scalar key in `maas-epp-config`'s `data.epp` (e.g. `enforce`, `newcomerClamp`, `halfLifeSeconds`) | ENFORCE_LIVE |
+| `epp-weight:<group>` | That group's `weight:` in the same file's `groups:` list (`app1`, `app2`, `end-users`), or `defaultGroup` for `unclassified` | future: UNI-158 |
+| `field:<resource>:<name>:<dotted-path>` | A JSON field on any named namespaced resource, applied via `oc patch --type=merge` (e.g. `field:llmisvc:maas-vllm-gpu:spec.replicas`, or a `TokenRateLimitPolicy`'s `spec.limits.<name>.rates`) | CHAOS_SCALE_AT; future: UNI-160/162 |
+
+`live_config_set <id> <spec> <new-value>` reads the target's CURRENT scalar
+value (never a whole resource body, so before/applied/current are always
+comparable like-for-like), writes it to
+`results/<run>/live-config/<id>.before`, applies the change, and records what
+it applied to `<id>.applied`. `live_config_restore <id>` re-reads the live
+value: if it still equals what this wrapper applied, it patches the `before`
+value back; if not (an earlier restore — explicit call, a held `field:`
+target's own chaos-loop restore, or the `on_exit` trap — already happened),
+it is a no-op. Either way it writes `<id>.post-restore.yaml`
+(`oc get <resource> -o yaml`) — the proof the edge-case series' "leave the
+cluster as you found it" rule asks for, so a case's closing comment can cite
+a file instead of re-deriving the state by hand.
+
+**Why files, not bash variables, for this state.** CHAOS_SCALE_AT and the new
+LIVE_SET_AT (below) fire from the `chaos_loop` background subshell
+(`chaos_loop &`), and a subshell's variables never make it back to the parent
+shell that runs the `on_exit` trap — but its writes to `$ARTIFACT_DIR` do. The
+same idempotency check `live_config_restore` uses (re-read the live value,
+compare to what was applied) is exactly the "query, don't trust a flag"
+pattern the pre-UNI-180 `revert_enforce_live`/`restore_chaos_scale` already
+used for the same reason; this ticket generalizes that pattern instead of
+replacing it.
+
+**ENFORCE_LIVE and CHAOS_SCALE_AT are unchanged from the outside.** Both env
+vars keep their names and semantics; internally they now call
+`live_config_set`/`live_config_restore` with `epp-key:enforce` and
+`field:llmisvc:$LLMISVC_NAME:spec.replicas` respectively. CHAOS_EPP_DELETE_AT
+is untouched — a pod delete has no value to restore, so it does not fit the
+set/restore shape and stays its own one-shot `oc delete pod`.
+
+**The new generic hook:**
+
+| Var | Meaning |
+|---|---|
+| `LIVE_SET_AT` | Seconds-offset to apply `LIVE_SET_TARGET`/`LIVE_SET_VALUE` (same `"120s"` or bare `120` shorthand as the chaos hooks). Unset (default): fires nothing. |
+| `LIVE_SET_TARGET` | A target spec, as above. |
+| `LIVE_SET_VALUE` | The new value — a bare scalar for `epp-key:`/`epp-weight:`; for `field:`, tried as JSON first (so `1`, `"a-string"`, `[{"a":1}]` all work) and used literally if that fails. |
+| `LIVE_SET_HOLD` | Optional seconds-offset AFTER `LIVE_SET_AT` to restore at, like `CHAOS_SCALE_HOLD`. |
+
+All four are unset by default, so a plain invocation of any existing scenario
+is unaffected — this is the regression bar this ticket has to clear, not a
+suggestion.
+
+**LIVE_SET_HOLD is only honored for a `field:` target.** An `epp-key:`/
+`epp-weight:` target recreates the EPP pod on restore, exactly like
+ENFORCE_LIVE's own revert does (see "Live enforce flip" above) — restoring
+one WHILE the Job is still running would zero the run's fairness counters
+*mid-measurement* instead of just starting a fresh run at zero, which is
+strictly worse than the hazard UNI-143 (B4) already found for ENFORCE_LIVE.
+So that kind always waits for the same post-metrics-after point
+`revert_enforce_live` uses, `LIVE_SET_HOLD` or not; the script logs this
+explicitly at startup (`LIVE_SET_HOLD is ignored for an epp-key/epp-weight
+target`) rather than silently doing something different from what was asked.
+A `field:` target (e.g. a mid-run LLMISVC field, not metrics-bearing) restores
+at `LIVE_SET_AT + LIVE_SET_HOLD` from inside the chaos loop, same timing as
+CHAOS_SCALE_AT/CHAOS_SCALE_HOLD.
+
+**Recorded on the timeline the same way the chaos events are.** `live_set`/
+`live_restore` entries land in `timeline-config.json`'s `chaos_events` list
+next to `epp_delete`/`scale_down`/`scale_restore`, each with the same generic
+`at_seconds` key. `15-fairness-report.py`'s phase-edge maths
+(`compute_phase_edges`) only ever reads that one key — it needed no change
+for this ticket, and the markdown render already lists any event's extra
+fields (`target`, `value`) generically.
+
+**Known gap, not claimed as solved.** If `LIVE_SET_TARGET` is an
+`epp-key:`/`epp-weight:` target, applying it mid-run recreates the EPP pod
+exactly like ENFORCE_LIVE's flip does at run start — but ENFORCE_LIVE's call
+site re-resolves `$EPP_POD` (and re-points the log-capture loop and the
+restart detector at it) immediately afterward, in the SAME process, before
+the Job starts. A `LIVE_SET_AT` firing *during* the run does this from the
+`chaos_loop` background subshell, which cannot update `$EPP_POD` in the
+parent process's (or the capture loop's own, separately-forked) view — so the
+log-capture loop keeps following the OLD pod name, which the EPP delete chaos
+hook already documents as a known limitation (UNI-127's note above), not
+something this ticket silently fixes. F6 (UNI-163) needs to either accept
+that gap, target a `field:` resource instead, or close it itself.
+
+**Verified (2026-11-02), without a GPU or a loadgen Job** (rule 1 of this
+ticket's own harness-set context forbids applying `04-loadgen.yaml`): a
+standalone driver script sourced the wrapper functions directly out of
+`15-fairness-benchmark.sh` and exercised all three target kinds against the
+real cluster's already-live resources (no new provisioning):
+
+- `field:llmisvc:maas-vllm-cpu:spec.replicas` (CPU LLMISVC was already idle at
+  0 replicas, so this touches nothing GPU-serving) — set 0→1, then `kill
+  -TERM` the driver mid-hold to prove the `EXIT`/`TERM` trap restores it to 0
+  without an explicit restore call.
+- `epp-key:newcomerClamp` — set `true`→`false`, explicit restore, confirmed
+  back to `true` via `oc get configmap maas-epp-config -o yaml`.
+- `epp-weight:app2` — set `10`→`11`, explicit restore, confirmed back to `10`
+  the same way.
+
+The sim backend (`deploy/poc/01-sim-backend.yaml` + `02-epp.yaml`) was NOT
+used for this verification: it is not currently deployed, and `02-epp.yaml`
+provisions a `ClusterRoleBinding`, which rule 6 of this ticket's context
+forbids provisioning fresh. The EPP ConfigMap is shared across every backend
+(GPU, CPU, and the sim's own `maas-epp` Deployment alike — see
+`deploy/poc/02-epp.yaml`'s header comment), so the `epp-key`/`epp-weight`
+mechanism verified above against the already-live GPU/CPU EPPs is the same
+mechanism a sim-backed run would exercise; only the pod-recreation path
+(KServe-managed roll vs. a plain Deployment with no live-reload) differs, and
+that distinction is exactly the "known gap" two paragraphs up.
+
+---
+
 ## Load the fairness dashboard into the live Grafana
 
 `deploy/grafana-dashboard.yaml` ships the dashboard JSON as a ConfigMap

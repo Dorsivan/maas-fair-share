@@ -236,6 +236,58 @@
 # STREAM_FRACTION_APP2=1), passed through when set. The names that already
 # existed before UNI-179 keep their old route (scenario-owned or one of the
 # lists above), so a plain scenario invocation is unaffected.
+#
+# UNI-180 harness addition: ENFORCE_LIVE, CHAOS_EPP_DELETE_AT and
+# CHAOS_SCALE_AT (above) were three hand-rolled patch/compare/revert pairs
+# touching the same ConfigMap and the same `on_exit` trap -- UNI-158/159/160/
+# 162 each needing their own flip for a DIFFERENT live value (weights,
+# newcomerClamp, a Kuadrant TokenRateLimitPolicy) would have made that four
+# or five, each with its own chance to leave the cluster dirty. All three now
+# sit on top of one generic set/restore wrapper (`live_config_set`/
+# `live_config_restore`, defined below) instead -- same env var names, same
+# behaviour, just one mechanism underneath. The wrapper also backs a new,
+# generic mid-run hook for anything that isn't already a named knob:
+#   LIVE_SET_AT       seconds-offset to apply LIVE_SET_TARGET/LIVE_SET_VALUE,
+#                      same "120s or bare 120" shorthand as the chaos hooks.
+#   LIVE_SET_TARGET   what to change -- one of:
+#                        epp-key:<key>             scalar key in
+#                                                   maas-epp-config's data.epp
+#                                                   (e.g. newcomerClamp,
+#                                                   halfLifeSeconds)
+#                        epp-weight:<group>        that group's `weight:` in
+#                                                   the same file's `groups:`
+#                                                   list (app1, app2,
+#                                                   end-users) or
+#                                                   `defaultGroup`
+#                                                   (unclassified)
+#                        field:<res>:<name>:<path>  a dotted JSON field on any
+#                                                   named namespaced resource,
+#                                                   via `oc patch --type=merge`
+#                                                   (e.g.
+#                                                   field:llmisvc:maas-vllm-gpu:spec.replicas,
+#                                                   or a Kuadrant
+#                                                   TokenRateLimitPolicy's
+#                                                   spec.limits.<name>.rates)
+#   LIVE_SET_VALUE    the new value (a bare scalar for epp-key/epp-weight; a
+#                      JSON scalar/array/object, or a bare string, for
+#                      field: -- it is tried as JSON first and used literally
+#                      if that fails).
+#   LIVE_SET_HOLD     optional seconds-offset AFTER LIVE_SET_AT to restore at,
+#                      like CHAOS_SCALE_HOLD. Only honored for a `field:`
+#                      target -- an epp-key/epp-weight target recreates the
+#                      EPP pod and zeroes its fairness counters (the same
+#                      hazard ENFORCE_LIVE's own revert avoids), so restoring
+#                      one WHILE the Job is still running would corrupt a
+#                      live measurement instead of just starting one at zero.
+#                      That kind always restores at the same post-metrics-after
+#                      point ENFORCE_LIVE's revert uses, LIVE_SET_HOLD or not.
+# All four are unset by default, so a plain invocation is unaffected. Every
+# live-config change this wrapper makes is also recorded as a `live_set`/
+# `live_restore` entry in timeline-config.json's chaos_events, the same list
+# CHAOS_EPP_DELETE_AT/CHAOS_SCALE_AT already populate -- 15-fairness-report.py's
+# phase-edge maths only ever reads an event's generic `at_seconds`, so this
+# needed no report-side change. See docs/runbook.md "Generic live-config
+# set/restore wrapper (UNI-180)" for the full mechanism and its known gaps.
 set -euo pipefail
 
 SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew}"
@@ -280,6 +332,24 @@ CHAOS_SCALE_AT="${CHAOS_SCALE_AT:-}"
 CHAOS_SCALE_AT="${CHAOS_SCALE_AT//s/}"
 CHAOS_SCALE_HOLD="${CHAOS_SCALE_HOLD:-30s}"
 CHAOS_SCALE_HOLD="${CHAOS_SCALE_HOLD//s/}"
+
+# UNI-180: generic mid-run live-config hook -- see the header comment above
+# for what each knob means. Empty LIVE_SET_AT (the default) means this fires
+# nothing, same as the chaos hooks above.
+LIVE_SET_AT="${LIVE_SET_AT:-}"
+LIVE_SET_AT="${LIVE_SET_AT//s/}"
+LIVE_SET_TARGET="${LIVE_SET_TARGET:-}"
+LIVE_SET_VALUE="${LIVE_SET_VALUE:-}"
+LIVE_SET_HOLD="${LIVE_SET_HOLD:-}"
+LIVE_SET_HOLD="${LIVE_SET_HOLD//s/}"
+if [ -n "$LIVE_SET_AT" ] && { [ -z "$LIVE_SET_TARGET" ] || [ -z "$LIVE_SET_VALUE" ]; }; then
+  echo "[benchmark] FATAL: LIVE_SET_AT requires both LIVE_SET_TARGET and LIVE_SET_VALUE to be set" >&2
+  exit 1
+fi
+if [ -z "$LIVE_SET_AT" ] && { [ -n "$LIVE_SET_TARGET" ] || [ -n "$LIVE_SET_VALUE" ] || [ -n "$LIVE_SET_HOLD" ]; }; then
+  echo "[benchmark] FATAL: LIVE_SET_TARGET/LIVE_SET_VALUE/LIVE_SET_HOLD have no effect without LIVE_SET_AT -- set all of LIVE_SET_AT/LIVE_SET_TARGET/LIVE_SET_VALUE together" >&2
+  exit 1
+fi
 
 # UNI-174: live `enforce` flip, owned end-to-end by this script -- see the
 # header comment above. false/unset leaves this run purely observational
@@ -346,19 +416,6 @@ wait_for_enforcing() {
   done
 }
 
-flip_enforce_value() {
-  # $1 = source file (current data.epp text), $2 = output file, $3 = "true"|"false"
-  python3 -I - "$1" "$2" "$3" << 'PYEOF'
-import sys, re
-src, dst, want = sys.argv[1], sys.argv[2], sys.argv[3]
-text = open(src).read()
-new, n = re.subn(r'(^\s*enforce:\s*)(true|false)', lambda m: m.group(1) + want, text, count=1, flags=re.MULTILINE)
-if n == 0:
-    sys.exit("enforce: key not found in maas-epp-config's data.epp")
-open(dst, "w").write(new)
-PYEOF
-}
-
 patch_configmap_epp() {
   # $1 = file containing the new data.epp value. Merge-patches only that one
   # key (confirmed the ONLY key in this ConfigMap's .data, but a merge patch
@@ -374,21 +431,264 @@ PYEOF
   $OC patch configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" --type=merge --patch-file="$patch_file" >/dev/null
 }
 
+# --- UNI-180: generic live-config set/restore wrapper -----------------------
+# One mechanism for "patch something live, remember what it was, put it back"
+# used by ENFORCE_LIVE, CHAOS_SCALE_AT and LIVE_SET_AT alike -- see the header
+# comment above for the target-spec grammar (epp-key:/epp-weight:/field:).
+#
+# State lives in files under $ARTIFACT_DIR/live-config/, not bash variables,
+# on purpose: LIVE_SET_AT and CHAOS_SCALE_AT fire from the chaos_loop
+# background subshell (`chaos_loop &` below), and a subshell's variables never
+# make it back to the parent shell that runs the `on_exit` trap -- but its
+# writes to $ARTIFACT_DIR do. live_config_restore is therefore idempotent by
+# re-reading the live value and comparing it to what it last applied, the same
+# "query, don't trust a flag" pattern the pre-UNI-180 revert_enforce_live/
+# restore_chaos_scale already used -- it is safe to call from the chaos-loop
+# subshell, the explicit post-run call, AND the on_exit trap without
+# double-reverting.
+live_config_dir() {
+  mkdir -p "$ARTIFACT_DIR/live-config"
+  echo "$ARTIFACT_DIR/live-config"
+}
+
+LIVE_CONFIG_LOG="$ARTIFACT_DIR/live-config-events.log"
+: > "$LIVE_CONFIG_LOG"
+live_config_log() {
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" | tee -a "$LIVE_CONFIG_LOG"
+}
+
+extract_epp_key() {
+  # $1 = key. Current scalar value of that key, read fresh from the LIVE
+  # ConfigMap every call (never cached) so a restore computed against a stale
+  # blob can't clobber an unrelated concurrent edit. Deliberately captures the
+  # REST OF THE LINE verbatim, including a trailing inline comment if the key
+  # has one (e.g. deploy/epp-config.yaml's `outputTokenWeight: 2.0   #
+  # PLACEHOLDER until calibrated`) -- that is what round-trips losslessly
+  # through live_config_set/_restore's before/apply/restore cycle. It does
+  # mean a `LIVE_SET_VALUE` for such a key is compared against (and, while
+  # applied, replaces) a value WITH that comment text; write LIVE_SET_VALUE
+  # without a comment of your own and this still restores the original
+  # comment correctly, it just won't be live while the new value is.
+  # The ConfigMap text goes into a FILE, read by argv path, not piped into
+  # this python call's own stdin -- `cmd | python3 -I - << 'EOF'` would make
+  # the heredoc BOTH the script python reads itself from AND (once that read
+  # hits EOF) what sys.stdin.read() sees inside the script, i.e. nothing ever
+  # arrives from the pipe. Confirmed live on 2026-11-02: an earlier version of
+  # this function that piped into the heredoc always read an empty string,
+  # which made extract_epp_key report "key not found" for a key that was
+  # plainly present, and worse, made live_config_restore's idempotency check
+  # treat "could not read" the same as "nothing to revert" -- a real run left
+  # newcomerClamp stuck at the SET value instead of restoring it. Every other
+  # oc-output-into-python call in this script already uses this file-argv
+  # pattern (see patch_configmap_epp); this just brings extract_epp_key/
+  # extract_epp_weight in line with it instead of introducing a second one.
+  local tmp
+  tmp="$(live_config_dir)/.scratch-read.yaml"
+  $OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}' > "$tmp"
+  python3 -I - "$tmp" "$1" << 'PYEOF'
+import sys, re
+path, key = sys.argv[1], sys.argv[2]
+text = open(path).read()
+m = re.search(r'^[ \t]*' + re.escape(key) + r':[ \t]*(\S.*)$', text, re.MULTILINE)
+if not m:
+    sys.exit(f"{key}: key not found in maas-epp-config's data.epp")
+print(m.group(1))
+PYEOF
+}
+
+extract_epp_weight() {
+  # $1 = group name. Current `weight:` number for that group's entry in the
+  # live ConfigMap's `groups:` list, or its `defaultGroup:` mapping if the
+  # name is "unclassified" -- see deploy/epp-config.yaml.
+  # See extract_epp_key's comment: file-argv, never piped into this command's
+  # own heredoc stdin.
+  local tmp
+  tmp="$(live_config_dir)/.scratch-read.yaml"
+  $OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}' > "$tmp"
+  python3 -I - "$tmp" "$1" << 'PYEOF'
+import sys, re
+path, group = sys.argv[1], sys.argv[2]
+text = open(path).read()
+m = re.search(r'\{\s*name:\s*' + re.escape(group) + r',\s*weight:\s*([0-9.]+)', text)
+if not m:
+    m = re.search(r'defaultGroup:\s*\{\s*name:\s*' + re.escape(group) + r',\s*weight:\s*([0-9.]+)', text)
+if not m:
+    sys.exit(f"group {group}: weight entry not found in maas-epp-config's data.epp")
+print(m.group(1))
+PYEOF
+}
+
+patch_epp_text_key() {
+  # $1=src $2=dst $3=key $4=value. Generalizes the pre-UNI-180
+  # flip_enforce_value to any scalar key, not just `enforce`.
+  python3 -I - "$1" "$2" "$3" "$4" << 'PYEOF'
+import sys, re
+src, dst, key, val = sys.argv[1:5]
+text = open(src).read()
+pat = re.compile(r'(^[ \t]*' + re.escape(key) + r':[ \t]*)\S.*$', re.MULTILINE)
+new, n = pat.subn(lambda m: m.group(1) + val, text, count=1)
+if n == 0:
+    sys.exit(f"{key}: key not found in maas-epp-config's data.epp")
+open(dst, "w").write(new)
+PYEOF
+}
+
+patch_epp_text_weight() {
+  # $1=src $2=dst $3=group-name $4=new-weight
+  python3 -I - "$1" "$2" "$3" "$4" << 'PYEOF'
+import sys, re
+src, dst, group, val = sys.argv[1:5]
+text = open(src).read()
+pat = re.compile(r'(\{\s*name:\s*' + re.escape(group) + r',\s*weight:\s*)[0-9.]+')
+new, n = pat.subn(lambda m: m.group(1) + val, text, count=1)
+if n == 0:
+    pat2 = re.compile(r'(defaultGroup:\s*\{\s*name:\s*' + re.escape(group) + r',\s*weight:\s*)[0-9.]+')
+    new, n = pat2.subn(lambda m: m.group(1) + val, text, count=1)
+if n == 0:
+    sys.exit(f"group {group}: weight entry not found in maas-epp-config's data.epp")
+open(dst, "w").write(new)
+PYEOF
+}
+
+# $1 = target spec. Prints the CURRENT scalar value named by the spec --
+# never a whole resource body, so before/applied/current are always
+# comparable like-for-like regardless of target kind.
+live_config_read() {
+  local spec="$1" kind="${1%%:*}" rest="${1#*:}" res name path
+  case "$kind" in
+    epp-key) extract_epp_key "$rest" ;;
+    epp-weight) extract_epp_weight "$rest" ;;
+    field)
+      IFS=: read -r res name path <<<"$rest"
+      $OC get "$res" "$name" -n "$NAMESPACE" -o jsonpath="{.${path}}"
+      ;;
+    *)
+      echo "live_config_read: unknown target kind '$kind' in spec '$spec'" >&2
+      return 1
+      ;;
+  esac
+}
+
+# $1 = target spec, $2 = new value. Applies it; does no before/after
+# bookkeeping of its own -- live_config_set/live_config_restore own that.
+live_config_apply() {
+  local spec="$1" new_value="$2" kind="${1%%:*}" rest="${1#*:}" dir res name path patch_file
+  dir="$(live_config_dir)"
+  case "$kind" in
+    epp-key)
+      $OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}' > "$dir/.scratch-src.yaml"
+      patch_epp_text_key "$dir/.scratch-src.yaml" "$dir/.scratch-dst.yaml" "$rest" "$new_value"
+      patch_configmap_epp "$dir/.scratch-dst.yaml"
+      ;;
+    epp-weight)
+      $OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}' > "$dir/.scratch-src.yaml"
+      patch_epp_text_weight "$dir/.scratch-src.yaml" "$dir/.scratch-dst.yaml" "$rest" "$new_value"
+      patch_configmap_epp "$dir/.scratch-dst.yaml"
+      ;;
+    field)
+      IFS=: read -r res name path <<<"$rest"
+      patch_file="$dir/.scratch-field-patch.json"
+      python3 -I - "$path" "$new_value" "$patch_file" << 'PYEOF'
+import sys, json
+path, value, out = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    value = json.loads(value)
+except (json.JSONDecodeError, ValueError):
+    pass
+body = value
+for key in reversed(path.split(".")):
+    body = {key: body}
+json.dump(body, open(out, "w"))
+PYEOF
+      $OC patch "$res" "$name" -n "$NAMESPACE" --type=merge --patch-file="$patch_file" >/dev/null
+      ;;
+    *)
+      echo "live_config_apply: unknown target kind '$kind' in spec '$spec'" >&2
+      return 1
+      ;;
+  esac
+}
+
+# $1=id $2=target-spec $3=new-value. Records the pre-change value, applies
+# the change, and remembers both (plus the spec) under $id so
+# live_config_restore can put it back later from anywhere -- the explicit
+# post-run call, the chaos-loop subshell (for a held field: target), or the
+# on_exit trap.
+live_config_set() {
+  local id="$1" spec="$2" new_value="$3" dir before
+  dir="$(live_config_dir)"
+  before="$(live_config_read "$spec")"
+  printf '%s' "$before" > "$dir/$id.before"
+  printf '%s' "$spec" > "$dir/$id.spec"
+  live_config_apply "$spec" "$new_value"
+  printf '%s' "$new_value" > "$dir/$id.applied"
+  live_config_log "set $id ($spec): ${before:0:80} -> $new_value"
+}
+
+# $1=id. No-op if $id was never set (no .before file) -- the common case for
+# every id this script knows about when its matching env var is unset. Also
+# a no-op, but NOT an error, if the live value no longer matches what this
+# wrapper last applied for $id: that means an earlier restore (explicit call,
+# chaos-loop hold, or trap) already happened, and reverting again would
+# clobber whatever is live now. Either way, (re)writes the id's post-restore
+# `oc get` proof -- the one the edge-case series' "leave the cluster as you
+# found it" rule asks for -- so a case's closing comment can cite a file
+# instead of re-deriving the state by hand.
+live_config_restore() {
+  local id="$1" dir spec before applied current
+  dir="$(live_config_dir)"
+  [ -f "$dir/$id.before" ] || return 0
+  spec="$(cat "$dir/$id.spec")"
+  before="$(cat "$dir/$id.before")"
+  applied="$(cat "$dir/$id.applied")"
+  # A read failure (resource gone, API hiccup) is NOT the same as "already
+  # restored" -- log it distinctly rather than letting it fall through to the
+  # generic "nothing to do" branch below as an empty string that happens not
+  # to match $applied.
+  if ! current="$(live_config_read "$spec" 2>/dev/null)"; then
+    live_config_log "restore $id ($spec): could not read the current live value -- not re-patching blind; treating as already-restored or gone"
+    current=""
+  fi
+  if [ "$current" = "$applied" ]; then
+    live_config_apply "$spec" "$before"
+    live_config_log "restored $id ($spec) -> ${before:0:80}"
+  else
+    live_config_log "restore $id ($spec): already at ${current:0:80}, nothing to do"
+  fi
+  live_config_proof "$id" "$spec"
+}
+
+# $1=id $2=target spec. `oc get -o yaml` on whatever resource that spec
+# names, written once per id.
+live_config_proof() {
+  local id="$1" spec="$2" dir kind="${2%%:*}" rest="${2#*:}" res name
+  dir="$(live_config_dir)"
+  case "$kind" in
+    epp-key|epp-weight) res="configmap"; name="$CONFIGMAP_NAME" ;;
+    field) IFS=: read -r res name _ <<<"$rest" ;;
+  esac
+  $OC get "$res" "$name" -n "$NAMESPACE" -o yaml > "$dir/$id.post-restore.yaml" 2>&1 || true
+}
+
+# Only a `field:` target is safe to restore WHILE the Job is still running --
+# see the LIVE_SET_HOLD note in the header comment above.
+live_set_restore_at_hold() {
+  case "$LIVE_SET_TARGET" in
+    field:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 revert_enforce_live() {
   # Idempotent and self-contained: safe to call more than once (the explicit
   # post-run call below, and again from the trap as a backstop) and safe to
   # call even if the flip never happened (ENFORCE_FLIPPED stays "false").
+  # ENFORCE_FLIPPED guards WHETHER this run owns the revert at all (a run
+  # that found enforce already true never flips it and must not touch it);
+  # live_config_restore's own current-vs-applied check guards against
+  # double-reverting once this run does own it.
   [ "$ENFORCE_FLIPPED" = "true" ] || return 0
-  local cur
-  cur="$($OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}' 2>/dev/null || true)"
-  if [ -z "$cur" ] || ! printf '%s' "$cur" | grep -qE '^[[:space:]]*enforce:[[:space:]]*true'; then
-    ENFORCE_FLIPPED="false"
-    return 0
-  fi
-  echo "[benchmark] safety-net restore: reverting $CONFIGMAP_NAME enforce -> false" >&2
-  printf '%s' "$cur" > "$ARTIFACT_DIR/.enforce-cur.yaml"
-  flip_enforce_value "$ARTIFACT_DIR/.enforce-cur.yaml" "$ARTIFACT_DIR/.enforce-reverted.yaml" "false"
-  patch_configmap_epp "$ARTIFACT_DIR/.enforce-reverted.yaml"
+  live_config_restore enforce-live
   # Best-effort verification: log it either way, but never let a slow/dead
   # EPP keep a dying script from actually exiting.
   wait_for_enforcing "0" || true
@@ -397,12 +697,20 @@ revert_enforce_live() {
 
 restore_chaos_scale() {
   [ -n "$CHAOS_SCALE_AT" ] || return 0
-  local cur
-  cur="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
-  if [ -n "$cur" ] && [ -n "$ORIGINAL_REPLICAS" ] && [ "$cur" != "$ORIGINAL_REPLICAS" ]; then
-    echo "[benchmark] safety-net restore: $LLMISVC_NAME replicas $cur -> $ORIGINAL_REPLICAS" >&2
-    $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"replicas\":$ORIGINAL_REPLICAS}}" >/dev/null 2>&1 || true
-  fi
+  live_config_restore chaos-scale
+}
+
+restore_live_set() {
+  # Deliberately NOT called until after the final metrics snapshot (see the
+  # explicit post-run call site below) -- an epp-key/epp-weight LIVE_SET_AT
+  # target recreates the EPP pod on restore exactly like ENFORCE_LIVE's own
+  # revert does, so reverting any earlier would zero the run's fairness
+  # counters before they are read, same hazard UNI-143 (B4) found for
+  # ENFORCE_LIVE. A `field:` target with LIVE_SET_HOLD set has usually
+  # already been restored by the chaos loop by this point; this call is then
+  # just the idempotent backstop, same as restore_chaos_scale.
+  [ -n "$LIVE_SET_AT" ] || return 0
+  live_config_restore live-set
 }
 
 stop_background_loops() {
@@ -416,16 +724,18 @@ stop_background_loops() {
 # script anymore) -- it stays armed through Job polling, log/metrics
 # collection, and report generation alike, so none of that ~100-line
 # post-processing tail runs without a safety net. Each piece it restores
-# (stop_background_loops, restore_chaos_scale, revert_enforce_live) is
-# idempotent and checks live cluster state before acting, so calling this
-# again at actual process exit after the explicit mid-script call below (see
-# "Stop capture/timeseries/chaos" further down) is always a safe no-op, not
-# a double-revert. SIGKILL (-9) cannot be trapped by this or any process, so
-# a `kill -9` or an OOM-kill still leaves the cluster enforcing with no
-# automatic recovery -- that gap is real and is not closed by anything below.
+# (stop_background_loops, restore_chaos_scale, restore_live_set,
+# revert_enforce_live) is idempotent and checks live cluster state before
+# acting, so calling this again at actual process exit after the explicit
+# mid-script call below (see "Stop capture/timeseries/chaos" further down) is
+# always a safe no-op, not a double-revert. SIGKILL (-9) cannot be trapped by
+# this or any process, so a `kill -9` or an OOM-kill still leaves the cluster
+# enforcing (or whatever LIVE_SET_AT last touched) with no automatic recovery
+# -- that gap is real and is not closed by anything below.
 on_exit() {
   stop_background_loops
   restore_chaos_scale
+  restore_live_set
   revert_enforce_live
 }
 trap on_exit EXIT
@@ -761,16 +1071,31 @@ for e in entries:
 json.dump({"tenants": by_tenant, "chaos_events": []}, open(out_path, "w"), indent=2)
 PYEOF
 
-# --- UNI-127 chaos hooks: queue up what this run will do to the live system,
-# for the trap/chaos loop below and for the report's phase-edge math. Empty
-# unless CHAOS_EPP_DELETE_AT / CHAOS_SCALE_AT are set. --------------------
+# --- UNI-127 chaos hooks (plus UNI-180's generic LIVE_SET_AT hook): queue up
+# what this run will do to the live system, for the trap/chaos loop below and
+# for the report's phase-edge math. Empty unless CHAOS_EPP_DELETE_AT /
+# CHAOS_SCALE_AT / LIVE_SET_AT are set. --------------------
 CHAOS_RESTORE_AT=""
 if [ -n "$CHAOS_SCALE_AT" ]; then
   CHAOS_RESTORE_AT=$(( CHAOS_SCALE_AT + CHAOS_SCALE_HOLD ))
 fi
-python3 -I - "$TIMELINE_CONFIG" "$CHAOS_EPP_DELETE_AT" "$CHAOS_SCALE_AT" "$CHAOS_RESTORE_AT" "$LLMISVC_NAME" << 'PYEOF'
+# UNI-180: if LIVE_SET_HOLD applies (field: target only -- see
+# live_set_restore_at_hold), the restore fires at that offset; otherwise it
+# fires at run end, after the final metrics snapshot, which DURATION is the
+# nearest known offset for -- see restore_live_set's own comment for why that
+# can't be an exact live-measured second ahead of time.
+LIVE_SET_RESTORE_AT=""
+if [ -n "$LIVE_SET_AT" ]; then
+  if [ -n "$LIVE_SET_HOLD" ] && live_set_restore_at_hold; then
+    LIVE_SET_RESTORE_AT=$(( LIVE_SET_AT + LIVE_SET_HOLD ))
+  else
+    LIVE_SET_RESTORE_AT="$DURATION"
+  fi
+fi
+python3 -I - "$TIMELINE_CONFIG" "$CHAOS_EPP_DELETE_AT" "$CHAOS_SCALE_AT" "$CHAOS_RESTORE_AT" "$LLMISVC_NAME" \
+  "$LIVE_SET_AT" "$LIVE_SET_TARGET" "$LIVE_SET_VALUE" "$LIVE_SET_RESTORE_AT" << 'PYEOF'
 import json, sys
-path, delete_at, scale_at, restore_at, llmisvc = sys.argv[1:6]
+path, delete_at, scale_at, restore_at, llmisvc, live_at, live_target, live_value, live_restore_at = sys.argv[1:10]
 cfg = json.load(open(path))
 events = []
 if delete_at:
@@ -778,6 +1103,9 @@ if delete_at:
 if scale_at:
     events.append({"type": "scale_down", "at_seconds": float(scale_at), "target": llmisvc, "to": 1})
     events.append({"type": "scale_restore", "at_seconds": float(restore_at), "target": llmisvc})
+if live_at:
+    events.append({"type": "live_set", "at_seconds": float(live_at), "target": live_target, "value": live_value})
+    events.append({"type": "live_restore", "at_seconds": float(live_restore_at), "target": live_target})
 cfg["chaos_events"] = events
 json.dump(cfg, open(path, "w"), indent=2)
 PYEOF
@@ -805,6 +1133,15 @@ fi
 if [ -n "$CHAOS_EPP_DELETE_AT" ]; then
   echo "[benchmark] chaos: will delete EPP pod $EPP_POD at t+${CHAOS_EPP_DELETE_AT}s"
 fi
+if [ -n "$LIVE_SET_AT" ]; then
+  if [ -n "$LIVE_SET_HOLD" ] && live_set_restore_at_hold; then
+    echo "[benchmark] live-config: will set $LIVE_SET_TARGET -> $LIVE_SET_VALUE at t+${LIVE_SET_AT}s, restore after ${LIVE_SET_HOLD}s hold"
+  elif [ -n "$LIVE_SET_HOLD" ]; then
+    echo "[benchmark] live-config: will set $LIVE_SET_TARGET -> $LIVE_SET_VALUE at t+${LIVE_SET_AT}s -- LIVE_SET_HOLD is ignored for an epp-key/epp-weight target (always restores after the final metrics snapshot, never mid-run); restoring at run end"
+  else
+    echo "[benchmark] live-config: will set $LIVE_SET_TARGET -> $LIVE_SET_VALUE at t+${LIVE_SET_AT}s, restore at run end (after the final metrics snapshot)"
+  fi
+fi
 
 METRICS_TOKEN="$($OC get secret maas-epp-metrics-reader-token -n "$NAMESPACE" -o jsonpath='{.data.token}' | base64 -d)"
 EPP_METRICS_SVC_IP="${EPP_METRICS_SVC_IP:-}"
@@ -824,10 +1161,11 @@ if [ "$ENFORCE_LIVE" = "true" ]; then
   if printf '%s' "$CUR_EPP_YAML" | grep -qE '^[[:space:]]*enforce:[[:space:]]*true'; then
     enforce_log "enforce already true in $CONFIGMAP_NAME -- nothing to flip; this run will NOT revert it on exit (it did not cause the enabled state)"
   else
-    printf '%s' "$CUR_EPP_YAML" > "$ARTIFACT_DIR/.enforce-cur.yaml"
-    flip_enforce_value "$ARTIFACT_DIR/.enforce-cur.yaml" "$ARTIFACT_DIR/.enforce-flipped.yaml" "true"
+    # UNI-180: re-expressed on top of live_config_set -- same ConfigMap edit,
+    # same before-value capture, same merge-patch, just the shared mechanism
+    # instead of a dedicated flip_enforce_value/patch_configmap_epp pair.
+    live_config_set enforce-live "epp-key:enforce" "true"
     enforce_log "flipping $CONFIGMAP_NAME enforce false -> true"
-    patch_configmap_epp "$ARTIFACT_DIR/.enforce-flipped.yaml"
     # Set BEFORE waiting: if the patch above succeeded but this script dies
     # on the next line, on_exit must still know to revert it. A successful
     # patch call, not a confirmed metric read, is what creates the
@@ -934,7 +1272,8 @@ chaos_log() {
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" | tee -a "$CHAOS_LOG"
 }
 chaos_loop() {
-  local delete_done=false scale_down_done=false scale_up_done=false elapsed
+  local delete_done=false scale_down_done=false scale_up_done=false \
+        live_set_done=false live_restore_done=false elapsed
   while kill -0 "$$" 2>/dev/null; do
     elapsed=$(( $(date +%s) - RUN_START_EPOCH ))
     if [ -n "$CHAOS_EPP_DELETE_AT" ] && [ "$delete_done" = false ] && [ "$elapsed" -ge "$CHAOS_EPP_DELETE_AT" ]; then
@@ -942,15 +1281,32 @@ chaos_loop() {
       chaos_log "chaos: deleted EPP scheduler pod $EPP_POD (t+${elapsed}s, target was t+${CHAOS_EPP_DELETE_AT}s)"
       delete_done=true
     fi
+    # UNI-180: re-expressed on top of live_config_set/live_config_restore --
+    # same scale-to-1-and-back, same ORIGINAL_REPLICAS, just the shared
+    # mechanism instead of two bespoke `oc patch` calls.
     if [ -n "$CHAOS_SCALE_AT" ] && [ "$scale_down_done" = false ] && [ "$elapsed" -ge "$CHAOS_SCALE_AT" ]; then
-      $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p '{"spec":{"replicas":1}}' >/dev/null
+      live_config_set chaos-scale "field:llmisvc:$LLMISVC_NAME:spec.replicas" "1"
       chaos_log "chaos: scaled $LLMISVC_NAME replicas $ORIGINAL_REPLICAS -> 1 (t+${elapsed}s, target was t+${CHAOS_SCALE_AT}s)"
       scale_down_done=true
     fi
     if [ "$scale_down_done" = true ] && [ "$scale_up_done" = false ] && [ "$elapsed" -ge "$CHAOS_RESTORE_AT" ]; then
-      $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"replicas\":$ORIGINAL_REPLICAS}}" >/dev/null
+      live_config_restore chaos-scale
       chaos_log "chaos: restored $LLMISVC_NAME replicas 1 -> $ORIGINAL_REPLICAS (t+${elapsed}s, target was t+${CHAOS_RESTORE_AT}s)"
       scale_up_done=true
+    fi
+    # UNI-180: the generic mid-run hook. Restoring here (rather than waiting
+    # for restore_live_set after the run) only happens for a `field:` target
+    # with LIVE_SET_HOLD set -- see live_set_restore_at_hold.
+    if [ -n "$LIVE_SET_AT" ] && [ "$live_set_done" = false ] && [ "$elapsed" -ge "$LIVE_SET_AT" ]; then
+      live_config_set live-set "$LIVE_SET_TARGET" "$LIVE_SET_VALUE"
+      chaos_log "live-config: set $LIVE_SET_TARGET -> $LIVE_SET_VALUE (t+${elapsed}s, target was t+${LIVE_SET_AT}s)"
+      live_set_done=true
+    fi
+    if [ "$live_set_done" = true ] && [ "$live_restore_done" = false ] && [ -n "$LIVE_SET_HOLD" ] \
+       && live_set_restore_at_hold && [ "$elapsed" -ge "$LIVE_SET_RESTORE_AT" ]; then
+      live_config_restore live-set
+      chaos_log "live-config: restored $LIVE_SET_TARGET (t+${elapsed}s, target was t+${LIVE_SET_RESTORE_AT}s)"
+      live_restore_done=true
     fi
     sleep 1
   done
@@ -992,8 +1348,9 @@ fi
 # --- Stop capture/timeseries/chaos now (promptly, rather than leaving them
 # running through report-building below) and restore a drifted replica
 # count, via the SAME functions the on_exit trap uses, called explicitly
-# here for the common (non-crash) case. revert_enforce_live is deliberately
-# NOT called yet -- see the note below the metrics-after snapshot.
+# here for the common (non-crash) case. restore_live_set/revert_enforce_live
+# are deliberately NOT called yet -- see the note below the metrics-after
+# snapshot.
 stop_background_loops
 restore_chaos_scale
 
@@ -1032,6 +1389,12 @@ RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # the pod on record for that run no longer existed afterward; a new pod
 # under the same ReplicaSet hash had replaced it, age-zero at revert time.
 revert_enforce_live
+# UNI-180: restore_live_set shares the exact same hazard and is called here
+# for the exact same reason -- an epp-key/epp-weight LIVE_SET_AT target
+# recreates the EPP pod on restore too. A held field: target has usually
+# already self-restored from the chaos loop by now; this is that case's
+# idempotent backstop, not its primary restore path.
+restore_live_set
 
 # UNI-138 (G2): the ledger cross-check's cost formula needs the EPP's live
 # cost-model weights to translate the client's raw token counts into the

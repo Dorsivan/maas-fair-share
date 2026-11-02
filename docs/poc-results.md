@@ -3269,6 +3269,133 @@ measured count), and whether a still-longer soak (beyond this ticket's
 90–120-minute scope) would eventually trigger eviction activity that this
 one did not.
 
+## UNI-141: B2, `tenant-leaves-mid-run` — work conservation in time
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, next in the B-series after
+the soak (UNI-140). Asks a different question than the steady-state cases:
+not "does the split match the weights," but "how fast does it get there
+after the mix of offered tenants changes mid-run."
+
+**Setup:** `full-contention` (`app1`/`app2`/`end-users` offered 32/32/128
+workers), 240s total, live against `maas-vllm-gpu` (2 replicas,
+llama-3-1-8b), `enforce: true`, `halfLifeSeconds: 60`. `end-users` stops
+offering load at t=120s (`deploy/poc/04-loadgen.yaml`'s per-tenant
+timeline: `end-users: active 0s-120s`); `app1` and `app2` run the full
+240s. Expected split: 21.1/10.5/68.4% (app1/app2/end-users) for 0-120s,
+then 66.7/33.3% (app1/app2, end-users' weight removed from the
+denominator since it is no longer offered) for 120-240s.
+
+**Pass criteria (from the ticket):** app1 and app2 absorb the freed pool
+within about one half-life (60s) of t=120s, holding their 2:1 ratio, with
+no dip in total throughput.
+
+**Verdict: FAIL**, on both halves of the criterion — but not for the
+reason the script's own top-line number suggests.
+
+The report's own whole-run verdict line reads "`end-users` deviated -34.0
+points," which looks damning but is a measurement artifact, not a
+post-leave failure: that -34pt figure averages `end-users`' 0% share
+*after* it stopped offering load (120-240s) together with its ~65-70%
+share *before* (0-120s) against a single expected-% figure computed as if
+it were offered the whole 240s. `end-users` correctly got 0% once it
+stopped asking for anything; the number is not evidence either way about
+how app1/app2 behaved. The windowed timeline (UNI-127) is phase-aware and
+is what this case's own criteria have to be read against.
+
+**Time-to-converge, post-leave:** 110s (edge at 120.0s, windowed deviation
+for both app1 and app2 finally stays under the 10-point threshold from
+230.0s onward) — against a 60s half-life, that is ~1.8 half-lives, not
+"about one." Worse, the 110s is not a clean decay: the per-window
+deviation oscillates past the threshold repeatedly on the way there
+(±14-24 points at 130-140s, 150-190s, 200-230s) rather than settling
+monotonically, including one window (190-200s, -6.9/+6.9) that looks
+converged and then diverges again (210-220s, -24.2/+24.2) before finally
+holding at 230-240s (-9.1/+9.1). A single "converged at 230s" number
+understates how unsettled the ratio was for most of the second phase.
+
+**Total throughput: a real dip at the transition, not just noise.**
+Summing app1+app2 delivered tokens per 10s window: phase-1 (3-tenant)
+windows ran noisy but centered around 150k-170k tokens/10s. The first
+post-leave window (120-130s) delivered 71,672 — roughly 45% of the
+pre-leave level — before recovering over the next one to two windows and
+then overshooting to a new steady state around 200k-220k tokens/10s
+(expected: the same pool capacity split two ways instead of three, once
+app1/app2's closed-loop queues refill to re-saturate it). The dip is
+real and lasts about 20-30s; it is not visible at all in the whole-run
+totals the top-line verdict uses, only in the window-by-window table.
+
+| window (s) | app1+app2 tokens | vs. phase-1 typical (~160k) |
+|---|---|---|
+| 110-120 (last phase-1) | 44,494 | lower-than-typical phase-1 window |
+| 120-130 (first post-leave) | 71,672 | ~45% |
+| 130-140 | 104,128 | ~65% |
+| 140-150 | 215,082 | ~135% (overshoot begins) |
+| 150-160 onward | 200k-230k/window | steady post-leave state |
+
+Final per-group result (whole run, for the record — see the caveat above
+on why this isn't the right number to judge this case by):
+
+| group | weight | expected % | observed % | deviation (pts) |
+|---|---|---|---|---|
+| app1 | 20 | 21.1% | 33.9% | +12.8 |
+| app2 | 10 | 10.5% | 31.7% | +21.2 |
+| end-users | 65 | 68.4% | 34.4% | -34.0 |
+
+Ledger cross-check (UNI-138/G2): **PASS**, all three groups within 10% —
+2000+ requests delivered 0%-3.6% off the client's own reported token
+counts, so the EPP's accounting of the run is trustworthy even though the
+fairness outcome it describes failed.
+
+**Cluster left as found.** This case sets no chaos event and the
+benchmark never patches the LLMInferenceService spec or the EPP weight
+config:
+
+```
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m8s       9m5s
+# live ConfigMap (maas-epp-config), unchanged by this ticket:
+groups: app1=20, app2=10, end-users=65 (prefix end-user-), defaultGroup unclassified=5
+enforce: true, halfLifeSeconds: 60
+```
+
+`replicas: 2` matches `deploy/poc/09-vllm-gpu.yaml`. Weights, `enforce`,
+and `halfLifeSeconds` match the live values stated on this issue exactly.
+`enforce: true` live vs. the committed `deploy/epp-config.yaml`'s
+documented `enforce: false` shadow-mode default is the same pre-existing
+drift noted on UNI-139's and UNI-140's own "Cluster left as found"
+sections — this ticket did not touch that patch either way. The
+`maas-loadgen` Job completing and staying in `Complete` state is
+`15-fairness-benchmark.sh`'s normal behavior (it deletes the previous
+run's Job at the *start* of the next invocation, not its own exit — see
+the script's "Clean up any previous run of the same Job name" step), not
+something left over from a problem with this run.
+
+Raw results: `results/20261102T004033Z-uni141-b2-tenant-leaves-mid-run/`
+— `fairness-report.{md,json}`, `loadgen.log`, `epp-container.log`,
+`metrics-{before,after}.txt`, `metrics-timeseries.txt`,
+`client-request-summary.jsonl`, `04-loadgen.patched.yaml`.
+
+**What surprised me:** the whole-run deviation number the script
+headlines (`end-users` at -34.0 points) is the wrong number for this
+case's own question, because it isn't phase-aware — it will flag any
+scenario where a tenant stops offering load partway through as a large
+"failure" regardless of how well the remaining tenants absorbed the
+freed capacity. The windowed table (UNI-127) already contains everything
+needed to answer the real question, but nothing currently extracts
+"time-to-converge against a stated half-life" or "pre/post-transition
+total throughput" as a first-class computed verdict the way it does for
+the steady-state split — both had to be derived from the window table by
+hand for this case. If more mid-run-transition cases are planned, a
+small follow-on to `15-fairness-report.py` that phase-splits the
+expected/observed % by the active-tenant set (already known from
+`timeline-config.json`) and reports convergence-vs-half-life as a
+computed pass/fail would remove that hand-derivation step and the risk
+of misreading the top-line verdict the way this report's own headline
+invites.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

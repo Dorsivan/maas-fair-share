@@ -721,6 +721,26 @@ def test_compute_phase_edges_covers_start_stop_duty_and_chaos():
     assert edges == sorted(set(edges))
 
 
+def test_compute_phase_edges_treats_live_set_events_like_any_other_chaos_event():
+    # UNI-180: 15-fairness-benchmark.sh's generic LIVE_SET_AT hook records
+    # "live_set"/"live_restore" timeline entries with the same `at_seconds`
+    # key the existing "epp_delete"/"scale_down"/"scale_restore" events use --
+    # compute_phase_edges never switches on `type`, so a new event type needs
+    # no report-side change to be picked up as a phase edge. This test is the
+    # evidence for that claim, not a new capability.
+    schedule = {"app1": {"start": 0.0, "stop": 240.0}}
+    edges = fairness_report.compute_phase_edges(
+        schedule,
+        chaos_events=[
+            {"type": "live_set", "at_seconds": 60, "target": "epp-key:newcomerClamp", "value": "false"},
+            {"type": "live_restore", "at_seconds": 180, "target": "epp-key:newcomerClamp"},
+        ],
+        run_duration=240,
+    )
+    assert 60.0 in edges
+    assert 180.0 in edges
+
+
 def test_compute_windows_matches_whole_run_math_over_one_window():
     # A single window spanning the whole run must reproduce the same
     # expected/observed share the whole-run (before/after) calculation would,

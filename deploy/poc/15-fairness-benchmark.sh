@@ -230,7 +230,7 @@
 # in this script was chosen over a separate flip/revert wrapper.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -550,6 +550,30 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=6 WORKERS_APP2=6 WORKERS_END_USERS=26)
     ;;
+  max-tokens-skew)
+    # UNI-145: C2, "no max_tokens / huge max_tokens". Same app1/app2 pairing
+    # and 64/32 worker sizing as end-users-idle -- already proven to
+    # over-offer this exact 20:10 weight ratio -- with the new UNI-145
+    # per-tenant knob forcing app1's requests to omit max_tokens entirely
+    # (exercises the 512/per-group-EWMA fallback) and app2's to always send
+    # a large-but-serveable max_tokens (exercises the min(max_tokens, ewma)
+    # cap and over-charge truing on whichever side the provisional estimate
+    # misses).
+    #
+    # MAX_TOKENS_HUGE_VALUE's own default (32000) is NOT usable here: this
+    # cluster's real GPU backend is started with `--max-model-len 8192`
+    # (deploy/poc/09-vllm-gpu.yaml), and vLLM 400s any request whose
+    # prompt_tokens + max_tokens exceeds that -- confirmed live on
+    # 2026-11-02, every app2 request got "400 Bad Request" with 32000, zero
+    # completions. 4096 leaves ~4000 tokens of headroom under the 1200-word
+    # default prompt (~1650 tokens at this plugin's own 4-bytes/token
+    # estimate) and is still a large, over-offering cap relative to this
+    # corpus's typical ~70-token completions (see docs/poc-results.md's C2
+    # section), so the over-charge-truing mechanism this case exists to
+    # exercise still fires.
+    TENANTS="app1 app2"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=64 WORKERS_APP2=32 MAX_TOKENS_MODE_APP1=omit MAX_TOKENS_MODE_APP2=huge MAX_TOKENS_HUGE_VALUE=4096)
+    ;;
   cache-heavy-vs-cache-cold)
     # UNI-136: C8. Same app1:app2 pairing and 64/32 sizing as end-users-idle
     # (the only existing scenario already proven to over-offer both sides of
@@ -561,7 +585,7 @@ case "$SCENARIO" in
     IS_CONTROL="true"
     ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew)" >&2
     exit 1
     ;;
 esac
@@ -746,6 +770,22 @@ if [ "$ENFORCE_LIVE" = "true" ]; then
       echo "[benchmark] FATAL: enforce flip did not take effect on both EPPs within ${ENFORCE_WAIT_TIMEOUT_SECONDS}s -- aborting before a shadow-mode measurement gets mislabeled as enforcing (the exit trap will still revert the ConfigMap edit)" >&2
       exit 1
     fi
+    # UNI-145: this plugin has no live-reload path (see the note on
+    # revert_enforce_live below) -- the flip just confirmed above deleted
+    # $EPP_POD and replaced it with a new pod under a new name. Every use of
+    # $EPP_POD from here on (the log-capture loop, the mid-run restart
+    # detector) silently targeted a pod that no longer existed until this
+    # re-resolve was added: "oc logs -f" against a gone pod fails in under a
+    # second and the capture loop's own retry-forever design (UNI-169) just
+    # masked it as an empty log file instead of an error, and the restart
+    # detector's "|| echo $START_RESTARTS" fallback made a gone pod look
+    # identical to a steady one. Confirmed live on 2026-11-02: an
+    # ENFORCE_LIVE=true run's epp-container.log was 100% "(re)attaching /
+    # exited" scaffolding, zero actual EPP lines, for its entire duration.
+    EPP_POD="$($OC get pods -n "$NAMESPACE" -l "$EPP_SELECTOR" -o jsonpath='{.items[0].metadata.name}')"
+    EPP_IMAGE_DIGEST="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath="{.status.containerStatuses[?(@.name=='$EPP_CONTAINER')].imageID}")"
+    START_RESTARTS="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+    echo "[benchmark] enforce flip replaced the EPP pod (no live-reload): target pod is now $EPP_POD (restarts so far: $START_RESTARTS)"
   fi
 fi
 

@@ -3921,6 +3921,207 @@ UNI-141/142/143) guarantees the windowed data never shows a converged
 share, which is sufficient on its own to fail the "windowed shares stay
 within threshold" half of the bar regardless of which tenant is favored.
 
+## UNI-145: C2, `max-tokens-skew` — no `max_tokens` / huge `max_tokens`
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, first of the C-series
+(request-shape cases). One tenant omits `max_tokens` entirely (exercises
+the `defaultEstimatedOutputTokens`/per-group-EWMA fallback); another
+always sends a large `max_tokens` (exercises the `min(max_tokens, ewma)`
+cap and over-charge truing). Both over-offer the pool.
+
+**Setup:** `app1`/`app2` pair (same 20:10 weight ratio, renormalized
+66.7/33.3%, and the same 64/32 worker sizing already proven to over-offer
+it in `end-users-idle`), live against `maas-vllm-gpu` (2 replicas,
+llama-3-1-8b), `enforce: true` (`ENFORCE_LIVE=true`), `halfLifeSeconds:
+60`, 240s. New `deploy/poc/04-loadgen.yaml` knob
+(`MAX_TOKENS_MODE_APP1`/`APP2`/`END_USERS`, this ticket): app1's requests
+always omit `max_tokens`; app2's always send a fixed huge value. New
+`15-fairness-benchmark.sh` scenario: `max-tokens-skew`.
+
+**First attempt found a confound, not a result.** The obvious choice for
+"huge" is `MAX_TOKENS_HUGE_VALUE`'s own default, 32000 (from UNI-128). On
+this cluster the GPU backend runs with `--max-model-len 8192`
+(`deploy/poc/09-vllm-gpu.yaml`), and vLLM 400s any request whose
+`prompt_tokens + max_tokens` exceeds that. The first live run confirmed
+it: app2 got **zero** successful completions (32× client timeout, 21×
+400, 4×500 across 57 requests) while app1 (omit mode, uncapped) ran
+normally — a different failure (context-length rejection, the C6 case
+elsewhere in this plan) masquerading as a C2 result, and the report
+correctly called it `UNCONTENDED` because almost nothing was ever
+charged. Re-run with `MAX_TOKENS_HUGE_VALUE=4096` (comfortably under
+8192 even stacked on the full 1200-word default prompt, and still large
+relative to this corpus's ~70-token mean completion) — now the scenario
+override in `15-fairness-benchmark.sh` sets this explicitly rather than
+relying on the global default. The discarded first run is not in
+`results/`.
+
+**Second finding, this one in the shared harness, not the scenario.**
+`ENFORCE_LIVE=true` resolves `$EPP_POD` once, *before* flipping
+`enforce` — but this plugin has no live-reload path (established on
+UNI-143/174: a ConfigMap edit deletes and recreates the EPP pod), so the
+flip itself invalidates `$EPP_POD` immediately. Every later use of that
+variable — the `oc logs -f` capture loop and the mid-run restart detector
+— silently targeted a pod that no longer existed. The capture loop's own
+retry-forever design (UNI-169) hid the failure as an empty-looking log
+file (`oc logs -f` against a gone pod exits in under a second,
+indistinguishable at a glance from "no fairness-state lines because the
+run is idle") instead of a visible error; the restart detector's
+`|| echo "$START_RESTARTS"` fallback made a permanently-gone pod read
+identically to a perfectly steady one. Confirmed on the second run before
+the fix: `epp-container.log` was 100% `(re)attaching`/`exited` scaffolding
+and zero real EPP lines for the entire 240s. Checked every prior run's
+`epp-container.log` in `results/`: the bug only bites a run whose
+`enforce-events.log` shows an actual `flipping ... false -> true` line
+(i.e. `ENFORCE_LIVE=true` found `enforce: false` and had to flip it) --
+**UNI-143 and UNI-144 both match that and both have zero real
+`"fairness state"` lines in their `epp-container.log`.** UNI-139/140/141/142
+have an empty or absent `enforce-events.log` (no flip happened -- either
+`ENFORCE_LIVE` wasn't set, or `enforce` was already `true` going in) and
+all have real flight-recorder content, so they were never exposed to this
+bug. Split/ledger verdicts for UNI-143/144 are unaffected either way
+(Prometheus-scraped, not log-scraped), but both tickets' `epp-container.log`
+files should be treated as having no real EPP log coverage, which matters
+if anyone revisits them for flight-recorder-level detail. Fixed in
+`15-fairness-benchmark.sh`: when the flip actually executes, re-resolve
+`$EPP_POD`/image digest/restart baseline from the post-flip pod before
+the capture loop starts. The third run (below) is the first
+`ENFORCE_LIVE=true`-with-an-actual-flip run in this chain with genuine
+flight-recorder log content.
+
+**Pass criteria (from the ticket):** `truing_error_tokens` stays bounded,
+the split still holds, and the provisional charge settles to zero after
+traffic stops.
+
+**Verdict: PASS** on every criterion with direct evidence; the
+provisional-settle-to-zero criterion is inferred rather than directly
+observed, for a structural reason explained below.
+
+**Split holds.** Whole-run deviations are small and symmetric:
+
+| group | weight | offered workers | requests | expected % | observed % | deviation (pts) |
+|---|---|---|---|---|---|---|
+| app1 (omit) | 20 | 64 | 1937 (200=1922, 500=15) | 66.7% | 70.2% | +3.5 |
+| app2 (huge=4096) | 10 | 32 | 821 (200=806, 500=15) | 33.3% | 29.8% | -3.5 |
+
+Both well inside the 10-point threshold. As in every closed-loop run in
+this chain, the 10s windows are far lumpier (individual windows swing as
+far as +30.7/-30.7, same scrape-cadence artifact as
+[[process_windowed_report_lumpiness_at_10s_resolution]]) — not a new
+finding, and the whole-run average is the right number to judge this
+case by since no timeline/duty-cycle knobs are in play here.
+
+**`truing_error_tokens` is bounded and, surprisingly, indistinguishable
+between the omit and huge tenants.** Mean per-request truing error:
+app1 (omit) -278.4 tokens (-535130/1922), app2 (huge=4096) -311.2 tokens
+(-250788/806) — both EPP counters started at zero (fresh pod from the
+enforce flip), so these before/after deltas are the whole run. The
+histogram is tight for both groups, no fat tail: app1 has 1915/1922
+(99.6%) of requests in the single `(-1000,-100]` bucket, app2 806 the
+same shape (803/806); neither group has any mass beyond `(-10000,-1000]`
+in either direction. The two groups' means land within 11% of each other
+despite one omitting `max_tokens` (uncapped estimate) and the other
+capping at 4096 — because actual completions average only ~70-76 tokens
+for both (`completion_tokens_total/requests_sent`: 147449/1937=76.1,
+58940/821=71.8), the EWMA (which reaches `ewmaWarm:true` within one
+5-second flight-recorder tick in this corpus, average ~61-80 throughout
+the run per `epp-container.log`) stays far below both the `huge` cap and
+`∞`, so `min(max_tokens, ewma)` resolves to the EWMA in both cases
+regardless of what `max_tokens` says. The bias that *is* present (~280-310
+tokens, ~20% of a request's total weighted cost) is the known, accepted
+input-side one (`estimatedBytesPerToken=4` on a long fixed prompt,
+flagged in `docs/calibrating-output-token-weight.md` and `design.md`),
+not anything specific to the omit/huge split this case targets — this run
+is a clean demonstration that "`max_tokens` as a cap, never as the
+estimate" (the explicit design rule in `design.md`) holds in practice
+even when a tenant sets it far above what it ever uses.
+
+**Provisional charge settling to zero: inferred, not directly observed
+— a structural gap, same category C5 already has per
+`docs/runbook.md`'s Known Gaps.** `provisionalCharge` is debug-only
+(flight-recorder log, not a metric). With the `$EPP_POD` fix above the
+log now has real content (136 "fairness state" lines, 5s cadence,
+confirming `stateLogIntervalSeconds: 5` live vs. `30` in the repo
+manifest — a pre-existing, unrelated drift, see below), and it shows
+`provisionalCharge` tracking `inFlight` tightly for both groups
+throughout the run (e.g. app2 tick 29: `inFlight=2` ->
+`provisionalCharge=3302`; tick 28 two ticks earlier, `inFlight=16` ->
+`provisionalCharge=26384`) — no runaway or decoupled growth. Because a
+`provisionalCharge` is, by construction, the sum of currently-stashed
+per-dispatch estimates for in-flight requests (not a decaying
+accumulator), and a Job cannot report `Complete` while any of its
+requests are still in flight, `provisionalCharge` for both groups must
+already be exactly zero the instant `maas-loadgen` succeeds. But the
+shared harness calls `revert_enforce_live` immediately after the
+after-snapshot (UNI-143's fix, correctly ordered relative to metrics),
+and that ConfigMap edit deletes and recreates the EPP pod on this
+no-live-reload plugin — wiping state before a live post-traffic idle tick
+can be captured. The last captured ticks (job detected `succeeded=1`
+~20s after the last flight-recorder line in the log) still show
+double-digit `inFlight`, consistent with the closed-loop generator's
+workers still cycling requests right up to `DURATION`, not with a
+decay-to-zero tail existing to observe. **Recommendation for whichever
+case needs a live zero-read (C5 is the next one that does):** an
+optional `SETTLE_SECONDS` delay in the harness, between job completion
+and `stop_background_loops`/`revert_enforce_live`, so the capture loop
+observes a genuine idle tail before the pod is recycled. Not added here
+— out of scope for what C2 itself needs, since the structural argument
+above already closes the question for this case.
+
+Ledger cross-check (UNI-138/G2): **PASS**, both groups within tolerance
+(app1 -3.2%, app2 -1.4%) — the EPP's own accounting matches the client's
+observed tokens, corroborating that whatever per-request truing bias
+exists nets out correctly in aggregate rather than leaking.
+
+**Cluster left as found.**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce|halfLifeSeconds'
+      enforce: false
+      halfLifeSeconds: 60
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m12s      8m36s
+```
+
+`ENFORCE_LIVE=true` flipped `enforce` to `true` for the run's duration
+and reverted it afterward, confirmed via `llm_d_epp_maas_fairness_enforcing`
+on both EPPs at flip and revert (`enforce-events.log`: `1` at 12:47:31Z,
+`0` at 12:53:02Z), and independently by diffing the live ConfigMap
+captured immediately before this run's flip against the live ConfigMap
+read after the revert: byte-identical except the `enforce:` line itself.
+That diff also surfaced a **pre-existing drift, unrelated to this run**,
+between the live ConfigMap and the repo manifest
+(`deploy/epp-config.yaml`): `stateLogIntervalSeconds: 5` live vs. `30` in
+the repo, `flowControl.defaultRequestTTL: 300s` live vs. `60s` in the
+repo, plus restructured comments. Confirmed this predates this session
+(the pre-flip and post-revert live captures match each other exactly
+apart from `enforce`, so nothing in this run touched those fields) —
+worth a follow-up ticket to reconcile the manifest with what's actually
+deployed, but out of scope here.
+
+Raw results: `results/20261102T124620Z-uni-145-c2-max-tokens-skew/` —
+`fairness-report.{md,json}`, `loadgen.log`, `epp-container.log` (now with
+real flight-recorder content), `metrics-{before,after,timeseries}.txt`,
+`client-request-summary.jsonl`, `04-loadgen.patched.yaml`,
+`enforce-events.log`.
+
+**What surprised me:** two things, both already folded into the sections
+above because they changed what the result means. First, that the
+"huge `max_tokens`" tenant and the "omit `max_tokens`" tenant show
+*indistinguishable* truing-error magnitude — I expected the huge-cap
+tenant to show a visibly different (likely more negative/over-charged)
+bias than the omit tenant, and instead the EWMA dominates both so
+completely that the `max_tokens` value barely matters once it's warm,
+which is exactly the system behaving as designed rather than a null
+result. Second, that `$EPP_POD` staleness under `ENFORCE_LIVE=true` had already
+silently broken EPP log capture twice in this chain (UNI-143, UNI-144) —
+not every `ENFORCE_LIVE=true` run, only the ones where `enforce` actually
+had to flip, which is a narrow enough condition that it went unnoticed
+until a case that specifically needs flight-recorder content (this one)
+went looking for it.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

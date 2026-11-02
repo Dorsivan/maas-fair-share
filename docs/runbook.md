@@ -1499,31 +1499,73 @@ hook already documents as a known limitation (UNI-127's note above), not
 something this ticket silently fixes. F6 (UNI-163) needs to either accept
 that gap, target a `field:` resource instead, or close it itself.
 
-**Verified (2026-11-02), without a GPU or a loadgen Job** (rule 1 of this
-ticket's own harness-set context forbids applying `04-loadgen.yaml`): a
-standalone driver script sourced the wrapper functions directly out of
-`15-fairness-benchmark.sh` and exercised all three target kinds against the
-real cluster's already-live resources (no new provisioning):
+**Verified (2026-11-02), without a GPU or a loadgen Job.** Rule 1 of this
+ticket's own harness-set context forbids applying `04-loadgen.yaml`, and a
+real edge-case-chain GPU benchmark (`TENANTS="app1 end-users"`,
+`ENFORCE_LIVE=true`) happened to be running against this same cluster for
+part of this work, which made it doubly off-limits (applying
+`04-loadgen.yaml` would have deleted that run's `maas-loadgen` Job — the name
+is not scenario-qualified). Two separate things were verified instead, both
+without touching `04-loadgen.yaml`:
+
+*Set/restore/trap mechanics*, against the real cluster's already-live
+resources (no new provisioning) via a standalone driver script that sourced
+the wrapper functions directly out of `15-fairness-benchmark.sh`:
 
 - `field:llmisvc:maas-vllm-cpu:spec.replicas` (CPU LLMISVC was already idle at
-  0 replicas, so this touches nothing GPU-serving) — set 0→1, then `kill
-  -TERM` the driver mid-hold to prove the `EXIT`/`TERM` trap restores it to 0
-  without an explicit restore call.
-- `epp-key:newcomerClamp` — set `true`→`false`, explicit restore, confirmed
-  back to `true` via `oc get configmap maas-epp-config -o yaml`.
-- `epp-weight:app2` — set `10`→`11`, explicit restore, confirmed back to `10`
-  the same way.
+  0 replicas, so this touches nothing GPU-serving) — set 0→1, confirmed live,
+  then `kill -TERM` the driver mid-hold to prove the `EXIT`/`TERM` trap
+  restores it to 0 without an explicit restore call.
+- `epp-key:newcomerClamp` — set `true`→`false`, confirmed live, explicit
+  restore, confirmed back to `true` via `oc get configmap maas-epp-config -o
+  yaml`.
+- `epp-weight:app2` — set `10`→`11`, confirmed live, explicit restore,
+  confirmed back to `10` the same way.
 
-The sim backend (`deploy/poc/01-sim-backend.yaml` + `02-epp.yaml`) was NOT
-used for this verification: it is not currently deployed, and `02-epp.yaml`
-provisions a `ClusterRoleBinding`, which rule 6 of this ticket's context
-forbids provisioning fresh. The EPP ConfigMap is shared across every backend
-(GPU, CPU, and the sim's own `maas-epp` Deployment alike — see
+This caught a real bug before it reached anyone: the first cut of
+`extract_epp_key`/`extract_epp_weight` piped the ConfigMap's text into
+`python3 -I - "$key" << 'PYEOF'` and had the script read it via
+`sys.stdin.read()`. That pipe and that heredoc both target the SAME fd —
+the heredoc wins, so python's own script source consumes it and
+`sys.stdin.read()` inside the script sees EOF, never the piped ConfigMap
+text. The live symptom: `extract_epp_key newcomerClamp` reported "key not
+found" for a key that was plainly present, and worse, `live_config_restore`'s
+idempotency check read that failure as an already-empty "current" value,
+concluded nothing needed reverting, and left `newcomerClamp` stuck at `false`
+on the real cluster instead of restoring it to `true`. Fixed by writing the
+ConfigMap text to a file and passing the file path as an argv argument
+instead (the same pattern `patch_configmap_epp` already used) — never piping
+into a command that also has a heredoc attached to its stdin. The cluster was
+restored by hand (`live_config_apply "epp-key:newcomerClamp" "true"`, the
+corrected code path) and the fixed version was re-verified end to end before
+moving on; see the restore function's own comment for the detail. The sim
+backend (`deploy/poc/01-sim-backend.yaml` + `02-epp.yaml`) was NOT used for
+this verification: it is not currently deployed, and `02-epp.yaml` provisions
+a `ClusterRoleBinding`, which rule 6 of this ticket's context forbids
+provisioning fresh. The EPP ConfigMap is shared across every backend (GPU,
+CPU, and the sim's own `maas-epp` Deployment alike — see
 `deploy/poc/02-epp.yaml`'s header comment), so the `epp-key`/`epp-weight`
 mechanism verified above against the already-live GPU/CPU EPPs is the same
 mechanism a sim-backed run would exercise; only the pod-recreation path
 (KServe-managed roll vs. a plain Deployment with no live-reload) differs, and
 that distinction is exactly the "known gap" two paragraphs up.
+
+*Rule 4 regression (default behaviour unchanged)*, done entirely offline with
+no `oc` calls at all, since no Job could safely be applied while the chain's
+GPU run was in flight: both `origin/main`'s pre-UNI-180
+`15-fairness-benchmark.sh` and this branch's version were each truncated
+right before their first `$OC` call (the same technique UNI-179 used in
+`artifacts/uni-179/bench/bench-trunc.sh`), then run for all twelve scenarios
+with no extra env vars against the same, unmodified `04-loadgen.yaml`. Every
+scenario's patched manifest (`04-loadgen.patched.yaml`) and
+`timeline-config.json` came out byte-identical between the two versions —
+the default behaviour this ticket must not change literally produces the
+same bytes, not just "the same shape." `LIVE_SET_AT`/`TARGET`/`VALUE`/`HOLD`
+were also exercised through the same offline harness: confirmed a
+`field:`-kind target restores at `AT + HOLD` while an `epp-key:`-kind target
+ignores `HOLD` and restores at `DURATION` instead (per the hazard rule
+above), and confirmed both FATAL validation branches (`LIVE_SET_AT` without
+a target/value, and a target/value without `LIVE_SET_AT`) actually fire.
 
 ---
 

@@ -883,17 +883,12 @@ if [ "$PHASE" != "done" ]; then
 fi
 
 # --- Stop capture/timeseries/chaos now (promptly, rather than leaving them
-# running through report-building below), restore a drifted replica count,
-# and revert the enforce flip -- all via the SAME functions the on_exit trap
-# uses, called explicitly here for the common (non-crash) case. The trap
-# itself is deliberately left armed (no `trap - EXIT`): every function below
-# is idempotent, so the trap firing again at actual process exit after this
-# point is a confirmed no-op, not a second, racing revert. This is exactly
-# what keeps the ~100 lines of loadgen-log/metrics/report work below covered,
-# which a bare `trap - EXIT` here used to leave completely unprotected.
+# running through report-building below) and restore a drifted replica
+# count, via the SAME functions the on_exit trap uses, called explicitly
+# here for the common (non-crash) case. revert_enforce_live is deliberately
+# NOT called yet -- see the note below the metrics-after snapshot.
 stop_background_loops
 restore_chaos_scale
-revert_enforce_live
 
 LOADGEN_POD="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')"
 $OC logs "$LOADGEN_POD" -n "$NAMESPACE" > "$LOADGEN_LOG" 2>&1 || echo "[benchmark] WARNING: could not fetch loadgen pod log" >&2
@@ -909,6 +904,27 @@ echo "[benchmark] metrics snapshot: after"
 snapshot_metrics > "$METRICS_AFTER"
 RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 { echo "# ts=$RUN_END epoch=$(date +%s)"; cat "$METRICS_AFTER"; } >> "$METRICS_TS"
+
+# UNI-143 (B4 investigation): revert_enforce_live is called here -- AFTER the
+# after-snapshot, not before. This plugin's config has no live-reload path
+# (pkg/fairness/weightedlas/plugin.go's v4Logger comment: "Factory decodes it
+# once, at construction"), so every maas-epp-config edit this script makes,
+# including the revert, is actually applied by the LLMInferenceService
+# controller DELETING AND RECREATING the EPP pod -- same Deployment/
+# ReplicaSet, new pod, fresh Prometheus registry. The pod's container
+# restartCount is unaffected (it is a new pod, not a restarted container),
+# so the mid-run-restart check above cannot see this. Reverting before this
+# snapshot silently zeroes every llm_d_epp_maas_fairness_contended_* and
+# dispatch_total series the report depends on -- the run still completes and
+# a report still gets written, but every group's contended_seconds comes
+# back null and the verdict reads UNCONTENDED regardless of what actually
+# happened. Caught on uni-143-b4-long-idle-return's first attempt: the
+# timeseries capture showed real, growing contended_seconds_total through
+# the run, and both metrics-before.txt/metrics-after.txt dropped to the same
+# 6 static lines the instant enforce flipped. Confirmed via `oc get pods`:
+# the pod on record for that run no longer existed afterward; a new pod
+# under the same ReplicaSet hash had replaced it, age-zero at revert time.
+revert_enforce_live
 
 # UNI-138 (G2): the ledger cross-check's cost formula needs the EPP's live
 # cost-model weights to translate the client's raw token counts into the

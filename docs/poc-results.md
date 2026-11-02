@@ -3617,6 +3617,165 @@ and never settles into one dominant value," the fix is coarser windows
 for the actual UWM scrape interval, not more runs at the current
 10s granularity.
 
+## UNI-143: B4, `short vs long idle return` — long idle earns no extra credit
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, fourth and last case in the
+B-series. Asks whether a longer idle period changes how a returning tenant
+re-enters the split — specifically, whether it gets anything resembling a
+"boost" for having waited longer (design claim (a)), by comparing two
+idle durations for the same tenant in the same scenario shape.
+
+**Setup:** `full-contention` (`app1`/`app2`/`end-users` offered 32/32/128
+workers, the same sizing as every other case in this series), live against
+`maas-vllm-gpu` (2 replicas, llama-3-1-8b), `enforce: true`,
+`halfLifeSeconds: 60`. Two separate runs, both via
+`deploy/poc/15-fairness-benchmark.sh full-contention` with
+`APP1_DUTY=<on>/<off>`: app1 active 150s, idle, then active again for the
+remainder. **Short:** 30s idle (0.5×halfLife), 320s total. **Long:** 600s
+idle (10×halfLife), 890s total — pre- and post-idle active windows kept at
+the same 150s/140s shape as the short run so the only deliberately varied
+input between the two runs is the idle duration itself. Expected split
+throughout both runs (app1 offered the whole time, just not always
+contending): 21.1/10.5/68.4% (app1/app2/end-users).
+
+**Pass criteria (from the ticket):** both returns reach share without
+lapping the others, and the two returns look the same — a long idle earns
+no extra credit.
+
+**Verdict: FAIL** on "the two returns look the same." No evidence of extra
+credit either way — if anything the long return is worse, not better,
+which answers part (a) of the design claim but not the case's actual pass
+bar.
+
+**Whole-run verdict, both runs:**
+
+| run | app1 | app2 | end-users | max \|dev\| | result |
+|---|---|---|---|---|---|
+| short idle (30s) | -5.3 | +3.6 | +1.6 | 5.3 (app1) | **PASS** |
+| long idle (600s) | -15.5 | +4.8 | +10.7 | 15.5 (app1) | **FAIL** |
+
+| group | weight | expected % | short obs % | short dev | long obs % | long dev |
+|---|---|---|---|---|---|---|
+| app1 | 20 | 21.1% | 15.8% | -5.3 | 5.5% | -15.5 |
+| app2 | 10 | 10.5% | 14.1% | +3.6 | 15.3% | +4.8 |
+| end-users | 65 | 68.4% | 70.1% | +1.6 | 79.1% | +10.7 |
+
+Ledger cross-check (UNI-138/G2): **PASS on both runs**, every group within
+tolerance (short: -4.7%/-5.2%/-0.7%; long: -5.1%/-1.9%/-0.5%) — the EPP's
+accounting is trustworthy on both, so the difference between the two
+whole-run verdicts is a real measured difference in fairness outcome, not
+an artifact of the accounting.
+
+**Windowed return behaviour — nearly identical settling time, clearly
+different noise level.** Reading app1's windowed deviation from the
+moment it returns (180.0s short, 750.0s long) through the end of each
+run's 140s post-return window:
+
+| | short idle | long idle |
+|---|---|---|
+| first window back | -21.1 pts (0% observed — cold start) | -19.4 pts (1.7% observed) |
+| last window before run end | +7.5 pts | +6.5 pts |
+| first point after which every later window stays within ±10pts | 311.0s (131s after return) | 882.0s (132s after return) |
+| mean \|deviation\| across all post-return windows | 9.8 pts | 13.4 pts |
+
+The settling time is the headline similarity: both returns take almost
+exactly the same ~131-132s before the last window of the available data
+reads within threshold. Neither run's 140s post-return window is actually
+long enough to confirm the ratio *stays* converged rather than coincidentally
+landing in-threshold right at the point the run happens to end — that
+would need a longer post-return tail than this case's own symmetric design
+(matching short's 140s) provides, and is worth naming as a gap rather than
+overstating "settled."
+
+Where the two runs diverge is the noise in between: the long run's mean
+absolute deviation across its post-return windows (13.4 pts) is about 36%
+higher than the short run's (9.8 pts), and it spends more of its post-return
+windows outside ±10pts (9 of 14, vs 6 of 14 for the short run) — including
+a 45.6%-observed overshoot at 762s (+24.6 pts) that has no counterpart of
+that magnitude anywhere in the short run's return. That is the concrete
+sense in which "the two returns look the same" fails: not a monopolisation
+burst and not a slow crawl back to share (the qualitative shape — a few
+near-zero windows before the ratio starts bracketing the target — matches
+between the two), but the long return is measurably noisier and its
+whole-run aggregate crosses the 10-point bar the short return stays under.
+Whether that is the longer idle itself (e.g. a colder KV cache or request
+queue on return) or just this run's share of the same scrape-cadence
+lumpiness documented on UNI-142 landing harder by chance is not
+distinguished by this data — a repeat of the long case, or a
+longer-than-140s post-return tail, would be needed to tell the two apart.
+
+**A real script defect, found and fixed before this case could be measured
+at all: the UNI-174 enforce-revert ordering silently zeroed every
+per-group metric this report depends on.** The long run's first attempt
+(discarded, not committed) produced a report with every group's
+`contended_seconds`/`contended_service_tokens_total`/`dispatch_total`
+reading `null` and the verdict reading `UNCONTENDED`, despite the
+loadgen's own client-side record showing 11,143 real requests delivered
+and `metrics-timeseries.txt` showing real, growing `contended_seconds_total`
+values throughout the run. Root cause: `pkg/fairness/weightedlas/plugin.go`
+has "no live-reload path" for this plugin's config (`Factory decodes it
+once, at construction`) — every `maas-epp-config` edit, including
+[UNI-174](/UNI/issues/UNI-174)'s own enforce-revert, is actually applied by
+the LLMInferenceService controller **deleting and recreating the EPP
+pod**, not hot-reloading it in place. The recreated pod's container
+`restartCount` is 0 (it is a new pod under the same ReplicaSet, not a
+restarted container), so the script's own mid-run-restart detector cannot
+see this. UNI-174 landed `revert_enforce_live` immediately after job
+completion but *before* the metrics-after snapshot; by the time that
+snapshot ran, the pod that had served the whole benchmark was already
+gone (confirmed via `oc get pods`: the recorded pod name 404s minutes
+later, replaced by a fresh one, age-zero at revert time) and every
+per-group counter had reset to a brand-new process's empty registry.
+Fixed in `deploy/poc/15-fairness-benchmark.sh`: moved the
+`revert_enforce_live` call to after the after-snapshot is captured and
+appended to the timeseries file, with a comment at the call site
+explaining why the order matters. This affects every future
+`ENFORCE_LIVE=true` run, not just this ticket — any such run before this
+fix would have silently scored `UNCONTENDED` regardless of what actually
+happened. Verified fixed by re-running the long case afterward: real
+`contended_seconds` values in both the before and after snapshot, matching
+the timeseries capture.
+
+**Cluster left as found.**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce|halfLifeSeconds'
+      enforce: false
+      halfLifeSeconds: 60
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           15m        16m
+$ curl -s .../api/v1/query?query=kserve_llm_d_epp_maas_fairness_enforcing
+maas-vllm-gpu 0   maas-vllm-cpu 0
+```
+
+Both runs used `ENFORCE_LIVE=true` (new in [UNI-174](/UNI/issues/UNI-174)),
+so the script itself flipped `enforce` to `true` for the duration of each
+run and reverted it afterward — confirmed via the metric on both EPPs
+(they share this one ConfigMap), not by reading the ConfigMap, since
+nothing mounts it as a volume or env var. Weights and `halfLifeSeconds`
+are unchanged from the live values stated on this issue.
+
+Raw results: `results/20261102T010644Z-uni-143-b4-short-idle-return/` and
+`results/20261102T112948Z-uni-143-b4-long-idle-return/` —
+`fairness-report.{md,json}`, `loadgen.log`, `epp-container.log`,
+`metrics-{before,after}.txt`, `metrics-timeseries.txt`,
+`client-request-summary.jsonl`, `04-loadgen.patched.yaml` in each.
+
+**What surprised me:** that the near-miss on measuring this case at all
+came from the ticket chain's own prior fix, not from anything specific to
+a long idle period. UNI-174 was written to make cleanup unconditional
+after three prior runs on this same ticket crashed mid-benchmark and left
+`enforce: true` stuck live; it succeeded at that, but introduced a second,
+quieter failure mode (silently-null metrics reading as a clean
+`UNCONTENDED` instead of an error) that would have been easy to mistake
+for a real negative result instead of an instrumentation bug, had the
+timeseries file not independently preserved the real values for
+comparison. The actual substantive finding — long idle does not earn
+app1 any extra credit, and if anything degrades its return — came out
+fairly cleanly once that was fixed; the reproducibility risk was almost
+entirely in the harness, not in the system under test.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

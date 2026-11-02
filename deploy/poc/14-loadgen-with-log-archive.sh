@@ -34,6 +34,14 @@
 # the base manifest (asymmetric-demand etc.) -- naming and selecting those
 # scenarios is UNI-54's job, not this one. Edit 04-loadgen.yaml directly for
 # those runs, same as before this script existed.
+#
+# UNI-174: the log-capture cleanup trap now covers SIGINT/SIGTERM/SIGHUP, not
+# just normal/EXIT, and stays armed for the whole script (no more `trap -
+# EXIT` partway through) -- see the trap registration below for why. This
+# script has no other live-cluster state to revert: it leaves the completed
+# Job in place (deleted by the next invocation's own `--ignore-not-found`
+# cleanup, same as before) and never touches maas-epp-config or replica
+# counts.
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -117,10 +125,25 @@ capture_loop() {
 }
 capture_loop &
 CAPTURE_PID=$!
-trap '
+# UNI-174: EXIT only (as this trap used to be) misses SIGINT/SIGTERM/SIGHUP --
+# a killed run left this exact orphan every time, which is how the
+# five-process pileup in [[process_capture_loop_leaks_orphaned_oc_logs]] was
+# found. stop_capture is idempotent (safe to call twice), so it is never
+# unregistered either -- unlike the old `trap - EXIT` below, it now stays
+# armed through the loadgen-log-fetch/manifest-write tail, too. SIGKILL (-9)
+# still cannot be trapped by any process; an orphan from that path is not
+# prevented by anything here.
+stop_capture() {
   kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" 2>/dev/null || true
   wait "$CAPTURE_PID" 2>/dev/null || true
-' EXIT
+}
+trap stop_capture EXIT
+# A trap on INT/TERM/HUP alone does not terminate the process once its
+# command returns -- bash just resumes the script (confirmed empirically
+# while testing this exact pattern in 15-fairness-benchmark.sh for UNI-174).
+# `exit` is what actually ends it; that still fires the EXIT trap above, so
+# stop_capture runs once per signal either way.
+trap 'exit 1' INT TERM HUP
 
 # --- Apply the (possibly patched) Job and poll to completion ----------------
 $OC apply -f "$PATCHED" -n "$NAMESPACE"
@@ -147,9 +170,9 @@ if [ "$PHASE" != "done" ]; then
 fi
 
 # --- Stop capture, collect loadgen's own log, finalize manifest ------------
-kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" 2>/dev/null || true
-wait "$CAPTURE_PID" 2>/dev/null || true
-trap - EXIT
+# Calls the same idempotent function the trap above uses; the trap is left
+# armed (no `trap - EXIT`) as a backstop for the manifest-write tail below.
+stop_capture
 
 LOADGEN_POD="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')"
 $OC logs "$LOADGEN_POD" -n "$NAMESPACE" > "$LOADGEN_LOG" 2>&1 || echo "[archive] WARNING: could not fetch loadgen pod log" >&2

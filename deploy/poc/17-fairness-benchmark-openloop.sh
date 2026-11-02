@@ -32,6 +32,16 @@
 #
 # Overrides: NAMESPACE, OPENSHIFT_SERVER, EPP_SELECTOR, EPP_CONTAINER,
 # BACKEND, THRESHOLD_POINTS (default 10), SEED (default 1).
+#
+# UNI-174 inventory: this wrapper itself creates no Job, ConfigMap, pod, or
+# replica change, and starts no background process of its own -- it runs
+# 13-loadgen-poisson.sh synchronously in the foreground and only reads
+# cluster state (the active-Job check above, the EPP pod lookup below). There
+# is nothing here for an exit trap to revert. The one piece of state a crash
+# mid-run could leave behind (an orphaned `oc logs -f` against the EPP) is
+# 13-loadgen-poisson.sh's own, and that script now carries its own
+# EXIT/INT/TERM/HUP-trapped guarantee -- see the trap in 13-loadgen-poisson.sh
+# for why -- so this script does not duplicate it.
 set -euo pipefail
 
 SCENARIO="${1:?usage: $0 <scenario> [label]; set RATE_APP1/RATE_APP2/RATE_END_USERS and DURATION}"

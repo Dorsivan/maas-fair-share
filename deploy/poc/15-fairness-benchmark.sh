@@ -209,10 +209,42 @@
 # benchmark override -- they are read live from the maas-epp-config
 # ConfigMap below, since no metric exposes them and hardcoding them here
 # would silently go stale the next time that ConfigMap is retuned.
+# UNI-174 harness addition: ENFORCE_LIVE (default false). Until this ticket,
+# flipping the live maas-epp-config ConfigMap's `enforce` key from false to
+# true was a manual `oc` step the operator did around the run (see
+# docs/poc-results.md's "Reproduce:" paragraph) -- which meant nothing ever
+# reverted it if the run died first. ENFORCE_LIVE=true brings that flip under
+# this script's own ownership: it patches the ConfigMap, confirms both EPPs
+# (maas-vllm-gpu AND maas-vllm-cpu share this one ConfigMap -- see
+# deploy/poc/09-vllm-gpu.yaml and 07-vllm-cpu.yaml's identical
+# scheduler.config.ref) report llm_d_epp_maas_fairness_enforcing=1 before
+# proceeding, and reverts it -- checked via the same metric, not the
+# ConfigMap -- on every exit path this script has: normal completion, any
+# `exit`, and SIGINT/SIGTERM/SIGHUP. It CANNOT revert on SIGKILL (-9): that
+# signal is not trappable by any process, bash included, so a `kill -9` on
+# this script (or its unattended death, e.g. an OOM) still leaves the
+# cluster enforcing with nothing to fix it automatically. Default (unset) is
+# unaffected: a plain invocation only ever reads the live ConfigMap's current
+# state for the report, exactly as before this ticket. See docs/runbook.md
+# "Live enforce flip (UNI-174)" for the full mechanism and why a flag+trap
+# in this script was chosen over a separate flip/revert wrapper.
 set -euo pipefail
 
 SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold}"
 LABEL="${2:-$SCENARIO}"
+
+# UNI-174: computed this early (rather than just before the manifest-resolve
+# step, where it used to live) so the exit trap registered below -- and the
+# enforce-flip/revert functions it owns -- have a results directory to write
+# their log and scratch files into no matter how early a crash happens.
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+ARTIFACT_DIR="$(pwd)/results/${TS}-${LABEL}"
+mkdir -p "$ARTIFACT_DIR"
+ENFORCE_LOG="$ARTIFACT_DIR/enforce-events.log"
+: > "$ENFORCE_LOG"
+enforce_log() {
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" | tee -a "$ENFORCE_LOG"
+}
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
 OC="oc --token=${OPENSHIFT_TOKEN:?set OPENSHIFT_TOKEN} --server=${OPENSHIFT_SERVER:-https://api.ocp.paladinaura.com:6443}"
@@ -240,6 +272,166 @@ CHAOS_SCALE_AT="${CHAOS_SCALE_AT:-}"
 CHAOS_SCALE_AT="${CHAOS_SCALE_AT//s/}"
 CHAOS_SCALE_HOLD="${CHAOS_SCALE_HOLD:-30s}"
 CHAOS_SCALE_HOLD="${CHAOS_SCALE_HOLD//s/}"
+
+# UNI-174: live `enforce` flip, owned end-to-end by this script -- see the
+# header comment above. false/unset leaves this run purely observational
+# (reads whatever `enforce` currently is, same as every invocation before
+# this ticket).
+# 180s default: measured on 2026-11-02 against this cluster's real
+# LLMInferenceService-managed scheduler Deployment, a ConfigMap-triggered
+# roll (new pod, not an in-place config reload) took ~50-90s end to end
+# (old pod Terminating -> new pod Running -> Service endpoints updated ->
+# scrapeable) for a SINGLE EPP, and this waits on both. 60s timed out on that
+# measurement run even though the flip itself was correct -- see
+# docs/runbook.md "Live enforce flip (UNI-174)" for the full kill-test
+# evidence. Not tunable down safely without re-measuring this cluster's
+# rollout latency.
+ENFORCE_LIVE="${ENFORCE_LIVE:-false}"
+ENFORCE_WAIT_TIMEOUT_SECONDS="${ENFORCE_WAIT_TIMEOUT_SECONDS:-180}"
+CONFIGMAP_NAME="maas-epp-config"
+CPU_EPP_METRICS_SVC="${CPU_EPP_METRICS_SVC:-maas-vllm-cpu-epp-service}"
+
+# --- UNI-174: every variable the exit trap below can reference must already
+# exist by the time the trap is registered -- `set -u` turns a reference to
+# an as-yet-unset one into a hard failure, which is exactly the kind of crash
+# this ticket is about making survivable, not a second way to cause it. The
+# trap is registered a few lines down, before anything that actually mutates
+# cluster state (the Job delete right after this block is the first mutation
+# in the script), so it is live for the entire run -- including a crash
+# inside the mutating calls themselves, not just the window after them.
+CAPTURE_PID=""
+CAPTURE_OC_PIDFILE=""
+TS_PID=""
+CHAOS_PID=""
+ORIGINAL_REPLICAS=""
+ENFORCE_FLIPPED="false"
+METRICS_TOKEN=""
+EPP_METRICS_SVC_IP=""
+CPU_EPP_METRICS_SVC_IP=""
+
+read_enforcing() {
+  # $1 = EPP metrics ClusterIP. Prints 0/1, or nothing if the scrape failed
+  # (treated as "not yet confirmed", never as a success).
+  curl -sS -m 10 -H "Authorization: Bearer $METRICS_TOKEN" "http://$1:9090/metrics" 2>/dev/null \
+    | awk '/^llm_d_epp_maas_fairness_enforcing/ {print ($2==1)?"1":"0"}'
+}
+
+wait_for_enforcing() {
+  # $1 = desired value, "1" or "0". Polls both EPPs (they share one
+  # ConfigMap -- see the UNI-174 header note) every 2s up to
+  # ENFORCE_WAIT_TIMEOUT_SECONDS. Logs the outcome either way; the caller
+  # decides whether a timeout is fatal.
+  local want="$1" gpu_val cpu_val waited=0
+  while :; do
+    gpu_val="$(read_enforcing "$EPP_METRICS_SVC_IP")"
+    cpu_val="$(read_enforcing "$CPU_EPP_METRICS_SVC_IP")"
+    if [ "$gpu_val" = "$want" ] && [ "$cpu_val" = "$want" ]; then
+      enforce_log "confirmed: llm_d_epp_maas_fairness_enforcing=$want on both EPPs (gpu=$gpu_val cpu=$cpu_val)"
+      return 0
+    fi
+    if [ "$waited" -ge "$ENFORCE_WAIT_TIMEOUT_SECONDS" ]; then
+      enforce_log "WARNING: timed out after ${ENFORCE_WAIT_TIMEOUT_SECONDS}s waiting for enforcing=$want (gpu=${gpu_val:-?} cpu=${cpu_val:-?})"
+      return 1
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
+flip_enforce_value() {
+  # $1 = source file (current data.epp text), $2 = output file, $3 = "true"|"false"
+  python3 -I - "$1" "$2" "$3" << 'PYEOF'
+import sys, re
+src, dst, want = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(src).read()
+new, n = re.subn(r'(^\s*enforce:\s*)(true|false)', lambda m: m.group(1) + want, text, count=1, flags=re.MULTILINE)
+if n == 0:
+    sys.exit("enforce: key not found in maas-epp-config's data.epp")
+open(dst, "w").write(new)
+PYEOF
+}
+
+patch_configmap_epp() {
+  # $1 = file containing the new data.epp value. Merge-patches only that one
+  # key (confirmed the ONLY key in this ConfigMap's .data, but a merge patch
+  # leaves any others alone regardless) via a file so python owns the JSON
+  # string-escaping of a multi-line YAML blob instead of shell quoting it.
+  local body_file="$1" patch_file="$ARTIFACT_DIR/.enforce-patch.json"
+  python3 -I - "$body_file" "$patch_file" << 'PYEOF'
+import sys, json
+body_file, patch_file = sys.argv[1], sys.argv[2]
+body = open(body_file).read()
+json.dump({"data": {"epp": body}}, open(patch_file, "w"))
+PYEOF
+  $OC patch configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" --type=merge --patch-file="$patch_file" >/dev/null
+}
+
+revert_enforce_live() {
+  # Idempotent and self-contained: safe to call more than once (the explicit
+  # post-run call below, and again from the trap as a backstop) and safe to
+  # call even if the flip never happened (ENFORCE_FLIPPED stays "false").
+  [ "$ENFORCE_FLIPPED" = "true" ] || return 0
+  local cur
+  cur="$($OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}' 2>/dev/null || true)"
+  if [ -z "$cur" ] || ! printf '%s' "$cur" | grep -qE '^[[:space:]]*enforce:[[:space:]]*true'; then
+    ENFORCE_FLIPPED="false"
+    return 0
+  fi
+  echo "[benchmark] safety-net restore: reverting $CONFIGMAP_NAME enforce -> false" >&2
+  printf '%s' "$cur" > "$ARTIFACT_DIR/.enforce-cur.yaml"
+  flip_enforce_value "$ARTIFACT_DIR/.enforce-cur.yaml" "$ARTIFACT_DIR/.enforce-reverted.yaml" "false"
+  patch_configmap_epp "$ARTIFACT_DIR/.enforce-reverted.yaml"
+  # Best-effort verification: log it either way, but never let a slow/dead
+  # EPP keep a dying script from actually exiting.
+  wait_for_enforcing "0" || true
+  ENFORCE_FLIPPED="false"
+}
+
+restore_chaos_scale() {
+  [ -n "$CHAOS_SCALE_AT" ] || return 0
+  local cur
+  cur="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  if [ -n "$cur" ] && [ -n "$ORIGINAL_REPLICAS" ] && [ "$cur" != "$ORIGINAL_REPLICAS" ]; then
+    echo "[benchmark] safety-net restore: $LLMISVC_NAME replicas $cur -> $ORIGINAL_REPLICAS" >&2
+    $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"replicas\":$ORIGINAL_REPLICAS}}" >/dev/null 2>&1 || true
+  fi
+}
+
+stop_background_loops() {
+  kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+  wait "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+}
+
+# UNI-174: the single, unconditional owner of every piece of live cluster
+# state this run can leave behind. Registered now, before the first mutating
+# `oc` call below, and NEVER cleared (no `trap - EXIT` anywhere in this
+# script anymore) -- it stays armed through Job polling, log/metrics
+# collection, and report generation alike, so none of that ~100-line
+# post-processing tail runs without a safety net. Each piece it restores
+# (stop_background_loops, restore_chaos_scale, revert_enforce_live) is
+# idempotent and checks live cluster state before acting, so calling this
+# again at actual process exit after the explicit mid-script call below (see
+# "Stop capture/timeseries/chaos" further down) is always a safe no-op, not
+# a double-revert. SIGKILL (-9) cannot be trapped by this or any process, so
+# a `kill -9` or an OOM-kill still leaves the cluster enforcing with no
+# automatic recovery -- that gap is real and is not closed by anything below.
+on_exit() {
+  stop_background_loops
+  restore_chaos_scale
+  revert_enforce_live
+}
+trap on_exit EXIT
+# A trap registered on INT/TERM/HUP alone only RUNS its command when the
+# signal arrives -- unlike letting the signal's default disposition kill the
+# process, bash does NOT terminate on its own afterward, so a handler that
+# just called on_exit here would clean up correctly and then silently resume
+# running the rest of the script (confirmed live during this ticket's own
+# kill-test: the first attempt kept polling the Job for a full minute after
+# SIGTERM). `exit` inside the handler is what actually ends the process; that
+# in turn fires the EXIT trap above, so on_exit still runs exactly once per
+# signal, not zero and not twice.
+trap 'exit 1' INT TERM HUP
+
 # Per-tenant timeline (START/STOP/DUTY), passed straight through to the
 # loadgen Job when set -- see deploy/poc/04-loadgen.yaml's tenant_active() for
 # what they mean. Unset (the default) reproduces the one, prior behaviour:
@@ -374,9 +566,6 @@ case "$SCENARIO" in
     ;;
 esac
 
-TS="$(date -u +%Y%m%dT%H%M%SZ)"
-ARTIFACT_DIR="$(pwd)/results/${TS}-${LABEL}"
-mkdir -p "$ARTIFACT_DIR"
 echo "[benchmark] scenario: $SCENARIO  artifact dir: $ARTIFACT_DIR"
 
 METRICS_BEFORE="$ARTIFACT_DIR/metrics-before.txt"
@@ -518,7 +707,6 @@ echo "[benchmark] target pod: $EPP_POD  image: $EPP_IMAGE_DIGEST  (restarts so f
 # UNI-127: capture the LLMInferenceService's current replica count before any
 # chaos runs, so a scale-down can be restored to what was actually there --
 # not a hardcoded 2 -- whether or not the chaos loop gets to do it itself.
-ORIGINAL_REPLICAS=""
 if [ -n "$CHAOS_SCALE_AT" ]; then
   ORIGINAL_REPLICAS="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')"
   echo "[benchmark] chaos: will scale $LLMISVC_NAME $ORIGINAL_REPLICAS -> 1 -> $ORIGINAL_REPLICAS at t+${CHAOS_SCALE_AT}s (hold ${CHAOS_SCALE_HOLD}s)"
@@ -532,6 +720,35 @@ EPP_METRICS_SVC_IP="${EPP_METRICS_SVC_IP:-}"
 if [ -z "$EPP_METRICS_SVC_IP" ]; then
   EPP_METRICS_SVC_IP="$($OC get svc maas-vllm-gpu-epp-service -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
 fi
+
+if [ "$ENFORCE_LIVE" = "true" ]; then
+  # UNI-174: both EPPs resolve scheduler.config.ref to this same ConfigMap
+  # (see the header note), so confirming the flip means confirming it on
+  # both, not just the one this run's own EPP_SELECTOR targets. Resolved only
+  # in this branch -- an invocation that doesn't set ENFORCE_LIVE must not
+  # gain a new way to fail (or a new RBAC/topology dependency) just because
+  # some other environment lacks a CPU EPP Service.
+  CPU_EPP_METRICS_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+  CUR_EPP_YAML="$($OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}')"
+  if printf '%s' "$CUR_EPP_YAML" | grep -qE '^[[:space:]]*enforce:[[:space:]]*true'; then
+    enforce_log "enforce already true in $CONFIGMAP_NAME -- nothing to flip; this run will NOT revert it on exit (it did not cause the enabled state)"
+  else
+    printf '%s' "$CUR_EPP_YAML" > "$ARTIFACT_DIR/.enforce-cur.yaml"
+    flip_enforce_value "$ARTIFACT_DIR/.enforce-cur.yaml" "$ARTIFACT_DIR/.enforce-flipped.yaml" "true"
+    enforce_log "flipping $CONFIGMAP_NAME enforce false -> true"
+    patch_configmap_epp "$ARTIFACT_DIR/.enforce-flipped.yaml"
+    # Set BEFORE waiting: if the patch above succeeded but this script dies
+    # on the next line, on_exit must still know to revert it. A successful
+    # patch call, not a confirmed metric read, is what creates the
+    # obligation to revert.
+    ENFORCE_FLIPPED="true"
+    if ! wait_for_enforcing "1"; then
+      echo "[benchmark] FATAL: enforce flip did not take effect on both EPPs within ${ENFORCE_WAIT_TIMEOUT_SECONDS}s -- aborting before a shadow-mode measurement gets mislabeled as enforcing (the exit trap will still revert the ConfigMap edit)" >&2
+      exit 1
+    fi
+  fi
+fi
+
 snapshot_metrics() {
   # UNI-138 (G2): also capture the core, un-gated, un-weighted per-request
   # token histograms' _sum/_count lines (fairness_id-labelled, but owned by
@@ -634,17 +851,12 @@ chaos_loop() {
 chaos_loop &
 CHAOS_PID=$!
 
-trap '
-  kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
-  wait "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
-  if [ -n "$CHAOS_SCALE_AT" ]; then
-    CUR_REPLICAS="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath="{.spec.replicas}" 2>/dev/null || true)"
-    if [ -n "$CUR_REPLICAS" ] && [ "$CUR_REPLICAS" != "$ORIGINAL_REPLICAS" ]; then
-      echo "[benchmark] safety-net restore: $LLMISVC_NAME replicas $CUR_REPLICAS -> $ORIGINAL_REPLICAS (chaos loop did not finish)" >&2
-      $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"replicas\":$ORIGINAL_REPLICAS}}" >/dev/null 2>&1 || true
-    fi
-  fi
-' EXIT
+# UNI-174: the EXIT/INT/TERM/HUP trap registered earlier (on_exit, before the
+# first cluster mutation in this script) already covers stop_background_loops
+# and restore_chaos_scale -- CAPTURE_PID/TS_PID/CHAOS_PID and ORIGINAL_REPLICAS
+# are now all set, so from this point on that trap is fully armed for a crash
+# during Job polling, not just for the post-processing tail below. No
+# second, narrower trap is registered here anymore.
 
 # --- Apply the patched Job and poll to completion ---------------------------
 $OC apply -f "$PATCHED" -n "$NAMESPACE"
@@ -670,21 +882,18 @@ if [ "$PHASE" != "done" ]; then
   echo "[benchmark] WARNING: polling timed out before the Job reported completion" >&2
 fi
 
-# --- Stop capture/timeseries/chaos, collect loadgen's own log, snapshot
-# metrics after. Run the same restore check the EXIT trap would, THEN clear
-# the trap -- clearing it first would leave a misconfigured chaos run with no
-# safety net at all, since the run ends normally from here, not via the trap.
-kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
-wait "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
-if [ -n "$CHAOS_SCALE_AT" ]; then
-  CUR_REPLICAS="$($OC get llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
-  if [ -n "$CUR_REPLICAS" ] && [ "$CUR_REPLICAS" != "$ORIGINAL_REPLICAS" ]; then
-    echo "[benchmark] safety-net restore: $LLMISVC_NAME replicas $CUR_REPLICAS -> $ORIGINAL_REPLICAS (chaos loop did not finish before the Job did)" >&2
-    $OC patch llmisvc "$LLMISVC_NAME" -n "$NAMESPACE" --type=merge -p "{\"spec\":{\"replicas\":$ORIGINAL_REPLICAS}}" >/dev/null
-    chaos_log "chaos: safety-net restore $LLMISVC_NAME replicas $CUR_REPLICAS -> $ORIGINAL_REPLICAS"
-  fi
-fi
-trap - EXIT
+# --- Stop capture/timeseries/chaos now (promptly, rather than leaving them
+# running through report-building below), restore a drifted replica count,
+# and revert the enforce flip -- all via the SAME functions the on_exit trap
+# uses, called explicitly here for the common (non-crash) case. The trap
+# itself is deliberately left armed (no `trap - EXIT`): every function below
+# is idempotent, so the trap firing again at actual process exit after this
+# point is a confirmed no-op, not a second, racing revert. This is exactly
+# what keeps the ~100 lines of loadgen-log/metrics/report work below covered,
+# which a bare `trap - EXIT` here used to leave completely unprotected.
+stop_background_loops
+restore_chaos_scale
+revert_enforce_live
 
 LOADGEN_POD="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')"
 $OC logs "$LOADGEN_POD" -n "$NAMESPACE" > "$LOADGEN_LOG" 2>&1 || echo "[benchmark] WARNING: could not fetch loadgen pod log" >&2

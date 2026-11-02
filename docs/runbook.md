@@ -1113,6 +1113,89 @@ to 1.0.
 
 ---
 
+### Live enforce flip, and unconditional cleanup (UNI-174)
+
+Before this ticket, moving `maas-epp-config`'s `enforce` key from `false` to
+`true` for an enforce-mode run was a manual `oc` step the operator did around
+`15-fairness-benchmark.sh` (see `docs/poc-results.md`'s "Reproduce:"
+paragraph) -- the script only read whatever state it found, for the report's
+`--enforce` label. Nothing reverted that edit if the run died first, and a
+dead run with enforce stuck `true` makes every subsequent shadow-mode
+measurement meaningless until someone notices and flips it back by hand --
+exactly what blocked [UNI-143](/UNI/issues/UNI-143)'s first two recovery
+attempts.
+
+**Mechanism chosen: a flag plus one trap, inside `15-fairness-benchmark.sh`
+itself, not a separate flip/revert wrapper script.** `ENFORCE_LIVE=true`
+makes the script patch the ConfigMap, wait for both EPPs to confirm
+`llm_d_epp_maas_fairness_enforcing=1`, and revert it through the same
+`on_exit` function that already restores the chaos-scale replica count
+(UNI-127) and kills the background capture/timeseries/chaos loops. One
+trap owning every piece of this run's live cluster state was preferred over
+a second script with its own trap: two traps racing to own the same
+ConfigMap on the same crash is a new way to get this wrong, not a
+simplification. Default (`ENFORCE_LIVE` unset) is unchanged from before this
+ticket -- a plain invocation only observes.
+
+**Why both EPPs:** `deploy/poc/09-vllm-gpu.yaml` and `deploy/poc/07-vllm-cpu.yaml`
+both point `scheduler.config.ref` at the same `{name: maas-epp-config, key:
+epp}` (`docs/design.md` "the KServe controller watches ConfigMaps ...
+re-resolves `scheduler.config.ref`... and rolls the pod automatically" --
+same section as "Turn on the V(4) per-request tier" above). One ConfigMap
+edit reaches both `maas-vllm-gpu-kserve-router-scheduler-*` and
+`maas-vllm-cpu-kserve-router-scheduler-*`, and both roll themselves
+automatically -- no manual pod restart, same as that section documents.
+Verify the flip (and the revert) against
+`llm_d_epp_maas_fairness_enforcing` on **both** EPPs' `/metrics`
+(`maas-vllm-gpu-epp-service` and `maas-vllm-cpu-epp-service`,
+`maas-epp-metrics-reader-token` as the bearer), never against the ConfigMap
+alone -- the ConfigMap says what was requested, the metric says what is
+actually in force, and nothing mounts this ConfigMap as a volume or env var
+for a process restart to prove the point instead.
+
+**What the trap covers, and what it cannot:** `on_exit` is registered on
+`EXIT INT TERM HUP` before the first cluster-mutating call in the script, and
+is never unregistered (`trap - EXIT` doesn't appear in this script anymore --
+removing it was half of this fix) -- the only way it skips is **SIGKILL
+(`-9`)**, which no process, trapped or not, can catch, and an unattended OOM
+kill behaves identically. Both leave `enforce: true` live with nothing to
+revert it automatically; after either, confirm and flip back by hand the
+same way this ticket describes under "Reproduce:" in `docs/poc-results.md`,
+then re-check `llm_d_epp_maas_fairness_enforcing=0` on both EPPs before
+starting the next run.
+
+**A run that didn't cause the enabled state doesn't revert it.** If
+`ENFORCE_LIVE=true` finds `enforce` already `true` when it starts, it does
+not flip anything and will not touch it on exit -- only a flip this run
+itself performed is this run's obligation to undo.
+
+**Kill-test evidence (2026-11-02):** ran `ENFORCE_LIVE=true DURATION=180
+15-fairness-benchmark.sh app1-alone`, let it flip and confirm, then
+`kill -TERM` the script mid-run (while `maas-loadgen` was actively
+`Running`), with `llm_d_epp_maas_fairness_enforcing` read independently via
+`curl` at each step (not taken from the script's own log):
+
+| when | gpu | cpu | timestamp (UTC) |
+|---|---|---|---|
+| before the flip | 0 | 0 | 2026-11-02T09:53:08Z |
+| during the run (enforcing) | 1 | 1 | 2026-11-02T09:54:50Z |
+| after `kill -TERM` (self-reverted) | 0 | 0 | 2026-11-02T09:56:30Z |
+
+`kill -TERM` was sent at 09:54:50Z; the script's own `enforce-events.log`
+shows it logged the safety-net revert immediately and confirmed
+`enforcing=0` on both EPPs at 09:56:13Z (the gap is the ConfigMap-triggered
+pod roll taking ~80s for both EPPs, not a delay in the revert being
+*issued*) -- consistent with the independent reading above. An earlier
+attempt at this same test exposed a real bug in the first cut of this
+mechanism: trapping `INT TERM HUP` with a handler that doesn't itself call
+`exit` runs the cleanup correctly but then lets bash resume the rest of the
+script instead of terminating (confirmed live -- the script kept polling the
+Job for a full minute after the signal). The fix is the separate `trap 'exit
+1' INT TERM HUP` now in all three scripts that register one of these traps;
+see the comment next to it in each script.
+
+---
+
 ## Load the fairness dashboard into the live Grafana
 
 `deploy/grafana-dashboard.yaml` ships the dashboard JSON as a ConfigMap

@@ -663,6 +663,13 @@ and for an SLA," above) while scraping
 `llm_d_epp_maas_fairness_contended_service_tokens_total` before and after via
 the `maas-epp-metrics-reader-token` secret.
 
+(This is the manual procedure the three runs above actually used. As of
+[UNI-174](/UNI/issues/UNI-174), running `deploy/poc/15-fairness-benchmark.sh`
+with `ENFORCE_LIVE=true` does the flip, the wait, and the guaranteed
+revert-on-exit itself — see `docs/runbook.md` "Live enforce flip (UNI-174)".
+The manual steps above still work and are what a non-15 run, or a flip with
+no benchmark attached, should use.)
+
 ### The EPP image above was not transferable, and `main` didn't deploy it — now fixed
 
 The digest the three runs above used,

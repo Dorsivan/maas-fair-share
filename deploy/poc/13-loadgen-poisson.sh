@@ -61,7 +61,19 @@ cleanup() {
 }
 
 KEYS="$(mktemp -d)"
+# UNI-174: EXIT only used to miss SIGINT/SIGTERM/SIGHUP, leaving the
+# background `oc logs -f` (and the $KEYS tempdir) to leak if this script was
+# killed rather than left to finish or fail on its own -- same class of bug
+# as 15-fairness-benchmark.sh's capture loop (UNI-169) and
+# 14-loadgen-with-log-archive.sh's (UNI-170). cleanup() is already idempotent
+# (kill -0 guards against a second kill of an already-dead PID). A trap on
+# INT/TERM/HUP alone would not terminate the process once cleanup() returns
+# (bash just resumes the script -- confirmed empirically on
+# 15-fairness-benchmark.sh's identical pattern), so those three go to a
+# separate trap that calls `exit`, which in turn fires the EXIT trap below
+# exactly once. SIGKILL (-9) still cannot be trapped by any process.
 trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
 for k in app1-production app2-batch end-user-alpha end-user-beta; do
   $OC get secret maas-loadgen-keys -n "$NAMESPACE" -o jsonpath="{.data.$k}" | base64 -d > "$KEYS/$k"
 done

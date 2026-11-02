@@ -4,6 +4,16 @@ A fairness policy plugin for the **llm-d Router (EPP)** that guarantees each Maa
 subscription a minimum share of a shared model's token throughput **when the model is
 saturated**, and imposes no limit at all when it isn't.
 
+> ### 📦 Deploying this somewhere new — especially a disconnected network?
+>
+> **Start at [AIRGAP-HANDOFF.md](AIRGAP-HANDOFF.md), not here.** It is the single entry
+> point for an operator who has the repository and nothing else: what must already exist
+> around this plugin, what has to cross the air-gap boundary (with the two blocking items),
+> the deploy order, a five-rung test ladder for the first run, and the list of
+> healthy-looking outcomes that are actually failures.
+>
+> This README explains *what the plugin is*. That document explains *how to stand it up*.
+
 > Status: **implemented, and validated end to end on a GPU-free OpenShift cluster.**
 >
 > The plugin builds into a custom EPP image, loads, and under real contention

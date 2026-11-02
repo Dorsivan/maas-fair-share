@@ -3776,6 +3776,151 @@ app1 any extra credit, and if anything degrades its return — came out
 fairly cleanly once that was fixed; the reproducibility risk was almost
 entirely in the harness, not in the system under test.
 
+## UNI-144: B3, `on/off duty cycle shorter than the half-life` — the newcomer, not the incumbents, eats the shortfall
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, third in the B-series.
+Where UNI-141 (B2) and UNI-142/143 (B1/B4) each had one transition
+followed by a long settle, this case asks what happens when transitions
+never stop: app1 duty-cycles on/off every 30s against a 60s half-life, so
+the system never gets a quiet phase longer than half a half-life to
+settle into before the next edge arrives.
+
+**Setup:** `full-contention` (`app1`/`app2`/`end-users` offered 32/32/128
+workers, the same sizing as every other case in this series), live
+against `maas-vllm-gpu` (2 replicas, llama-3-1-8b), `enforce: true`,
+`halfLifeSeconds: 60`. `APP1_DUTY=30/30` (30s on, 30s off, repeating for
+the whole run) via `deploy/poc/15-fairness-benchmark.sh full-contention`;
+app2 and end-users offered HARD (unchanged, active 0-360s) the entire
+360s run — 5 full on/off cycles for app1 after the initial on-phase.
+Expected split while app1 is on (all three contending): 21.1/10.5/68.4%
+(app1/app2/end-users). Expected split while app1 is off (renormalized
+over app2/end-users only): 13.3/86.7%.
+
+**Pass criteria (from the ticket):** the other tenants' (app2,
+end-users) floors hold on every "on" edge, and windowed shares stay
+within the 10-point threshold. Report the worst window.
+
+**Verdict: FAIL**, but the two halves of the criterion point in opposite
+directions, and conflating them would misreport which one actually broke.
+
+**Windowed shares do not stay within threshold — badly, and throughout
+the run, not just at edges.** Of 90 scored (window, group) pairs, 57
+(63%) exceed ±10 points. The worst single window:
+
+| window (s) | group | expected % | observed % | deviation (pts) |
+|---|---|---|---|---|
+| 260.0-270.0 | end-users | 68.4% | 33.1% | **-35.3** |
+
+(app1 and app2 were both over-share in the same window: +9.6 and +25.8
+respectively.) Nine other windows exceed ±25 points in either direction,
+spread across both on-phases and off-phases — this is not concentrated at
+the literal instant of a duty-cycle edge, it is the whole run. The
+convergence table makes the same point structurally: of the 12 duty-cycle
+edges in this run, only 3 (t=30, 210, 300) ever reach "every active
+tenant within threshold and staying there" before the next edge arrives
+(20s to converge each time); the other 9 report `n/a` — the phase simply
+ends before the system settles. Against this series' own previously
+measured settling time after a single transition (110-132s, UNI-141/142/143),
+a 30s phase was never going to be long enough — this run's duty cycle
+*is* shorter than the system's own settling time, which is exactly the
+condition the ticket set out to exercise, and the windowed data shows
+plainly that it breaks the "stays within threshold" half of the pass bar.
+
+**The other tenants' floors do hold — it's app1 that pays for every
+re-entry, not app2 or end-users.** The raw 10s windows are too noisy to
+read edge-by-edge (consistent with the scrape-cadence artifact in
+[[process_windowed_report_lumpiness_at_10s_resolution]]), so averaging
+over each full 30s phase (3 windows) to smooth it out:
+
+| on-phase (edge, s) | app1 mean dev | app2 mean dev | end-users mean dev |
+|---|---|---|---|
+| 60 | -12.6 | +1.6 | +11.0 |
+| 120 | -8.3 | +4.9 | +3.4 |
+| 180 | -12.3 | -1.3 | +13.5 |
+| 240 | -10.8 | +10.8 | +0.0 |
+| 300 | -5.3 | +2.3 | +3.0 |
+
+app1 — the tenant whose own duty cycle creates the repeated
+empty→non-empty edge — has a negative phase-mean deviation on **every
+single one** of its 5 on-phases (-5.3 to -12.6 points). app2 and
+end-users never show a sustained negative phase-mean on any on-phase;
+where they're off their floor at all, it's on the positive side (getting
+more than their weighted share while app1 is still ramping back up from
+the clamp), and the two phase-means that nominally cross ±10 (end-users
++13.5 at edge 180, app2 +10.8 at edge 240) are both over-floor, not
+under. The off-phase phase-means (app2/end-users alone, renormalized
+13.3/86.7) are smaller still, never exceeding ±8.7. So the floor-holding
+half of the pass criterion reads as a clean PASS: nobody but the
+duty-cycling tenant itself is pushed below its weighted floor by the
+repeated edges, on any cycle.
+
+**`newcomer_clamps_total` confirms the clamp is doing exactly this, and
+confirms it is not edge-specific.** All three groups accumulate clamps
+steadily across the whole run (app1: 0→21, app2: 0→32, end-users: 0→29
+over 360s, sampled every ~10-20s in `metrics-timeseries.txt`) rather than
+in sharp bursts timed to app1's 5 off→on transitions — this metric fires
+on a finer-grained notion of "newcomer" (a group's queue going from empty
+to non-empty at the request level) than the duty-cycle edge itself, so it
+is corroborating evidence that the clamp mechanism is active and general,
+not proof that it fires once-per-edge specifically.
+
+**Whole-run verdict (for the record — not the right number to judge this
+case by, same artifact as UNI-141/B2: app1 is offline half the run, so
+the naive whole-run expected-% assumes full-time offering it never had):**
+
+| group | weight | expected % | observed % | deviation (pts) |
+|---|---|---|---|---|
+| app1 | 20 | 21.1% | 10.5% | -10.5 |
+| app2 | 10 | 10.5% | 15.3% | +4.8 |
+| end-users | 65 | 68.4% | 74.2% | +5.7 |
+
+Ledger cross-check (UNI-138/G2): **PASS**, all three groups within
+tolerance (app1 -5.7%, app2 -2.7%, end-users -0.5%) — the EPP's own
+accounting is trustworthy for this run, so the windowed/phase findings
+above reflect a real measured outcome, not broken counters.
+
+**Cluster left as found.**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce|halfLifeSeconds'
+      enforce: false
+      halfLifeSeconds: 60
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           6m18s      10m
+```
+
+`ENFORCE_LIVE=true` (UNI-174) flipped `enforce` to `true` for the
+run's duration and reverted it afterward, confirmed via the
+`llm_d_epp_maas_fairness_enforcing` metric on both EPPs at flip and at
+revert (`enforce-events.log`: `1` at 11:56:55Z, `0` at 12:04:33Z), not by
+reading the ConfigMap. Weights and `halfLifeSeconds` are unchanged from
+the live values stated on this issue; replica count untouched (this case
+sets no chaos event).
+
+Raw results: `results/20261102T115542Z-uni-144-b3-onoff-duty-cycle/` —
+`fairness-report.{md,json}`, `loadgen.log`, `epp-container.log`,
+`metrics-{before,after,timeseries}.txt`, `client-request-summary.jsonl`,
+`04-loadgen.patched.yaml`, `enforce-events.log`.
+
+**What surprised me:** how cleanly the two halves of the pass criterion
+separated once phase-averaged. Going in, the obvious hypothesis was that
+a sub-half-life duty cycle would let app1's repeated return actually
+monopolize and starve the incumbents (the B1/cold-join failure mode,
+UNI-142, repeated five times instead of once) — that's what "the other
+tenants' floors hold" was presumably written to rule out. Instead the
+clamp over-corrects the other way, every time: app1 itself is the one
+that never gets to its floor within a 30s active window, while app2 and
+end-users are, if anything, slightly over-served during app1's ramp-up.
+The actual failure this run surfaces is narrower and more mechanical than
+"does the clamp protect the floor" (it does): a duty cycle shorter than
+the system's own measured settling time (110-132s, established on
+UNI-141/142/143) guarantees the windowed data never shows a converged
+share, which is sufficient on its own to fail the "windowed shares stay
+within threshold" half of the bar regardless of which tenant is favored.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

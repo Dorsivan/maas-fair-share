@@ -3396,6 +3396,173 @@ computed pass/fail would remove that hand-derivation step and the risk
 of misreading the top-line verdict the way this report's own headline
 invites.
 
+## UNI-142: B1, `cold join` (promotes S5) — no monopolisation burst
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, simplest case in the B-series
+and the first one run (chained after UNI-140/B6 and UNI-141/B2 only because
+the board's blocker chain runs every case in series on the shared GPU pool,
+not because of any case-to-case dependency). Promotes the by-hand "S5"
+scenario (docs/poc-results.md, "Scenario matrix," above) into the scored
+harness: does a tenant returning from idle seize the pool in a burst, the
+failure mode `newcomerClamp` exists to prevent?
+
+**Setup:** `full-contention` (`app1`/`app2`/`end-users` offered 32/32/128
+workers, the same sizing as every other full-contention-shaped case), 240s
+total, live against `maas-vllm-gpu` (2 replicas, llama-3-1-8b), `enforce:
+true`, `halfLifeSeconds: 60`, `newcomerClamp: true` (all live values,
+confirmed before and after — see "Cluster left as found," below).
+`app1`/`app2` run the full 240s; `end-users` (weight 65, the dominant
+tenant) is held back cold and joins at t=120s
+(`END_USERS_START=120`, `deploy/poc/04-loadgen.yaml`'s per-tenant timeline).
+Expected split: 66.7/33.3% (app1/app2) for 0-120s, 21.1/10.5/68.4%
+(app1/app2/end-users) for 120-240s once end-users is in the mix.
+
+**Pass criteria (from the ticket):** no monopolisation burst by the
+newcomer — report its peak windowed share right after joining — and it
+reaches its target share within about one half-life (60s).
+
+**Verdict: PASS** on the question the ticket actually asks, though the
+windowed data cannot cleanly demonstrate the "within one half-life" half of
+the claim on its own — see below for why.
+
+**No burst at the join instant.** The first full window after t=120s
+(120.0-130.0s) shows end-users at **46.0%** of the app1/app2/end-users
+total — *below* its 68.4% target, not above it. A monopolisation burst
+would show end-users seizing most of the pool in this window before
+settling back down; instead it ramps up from under its target. This
+directly answers the ticket's headline question: there is no monopoly
+grab at the moment of joining.
+
+**Peak windowed share after joining: 98.4%** (180.0-190.0s window), hit
+multiple times — 97.6% (130-140s), 98.3% (150-160s), 96.1% (210-220s) —
+interleaved with equally extreme undershoots (25.2% at 140-150s, 0.8% at
+180-190s for app1/app2, i.e. end-users briefly taking nearly everything).
+Read naively, this ±30-point swing around the 68.4% target in every other
+10s window looks like repeated monopolisation rather than none. It is not
+specific to the newcomer, though: the **same** on/off pattern (several
+consecutive windows at exactly 0.0% delivered tokens for both app1 *and*
+app2 simultaneously, e.g. 20.0-70.0s, a full 50s run of zeros for a steady
+two-tenant pair with no join event anywhere near it) is already present
+*before* end-users ever joins. Both tenants were running the whole time
+(status tallies and p50/p95 latency confirm steady request flow); the
+zeros are an artifact of `contended_service_tokens_total` being a counter
+sampled at the metrics-timeseries scrape cadence, which does not line up
+with this report's 10s windows — a scrape that lands just after a 10s
+boundary books an entire multi-window burst of dispatches into one sample
+and zero into the ones before it. Since the pre-join phase shows the exact
+same magnitude of swing with no newcomer involved at all, the post-join
+swings are read the same way: scrape-cadence lumpiness, not evidence that
+end-users is actually seizing and releasing the pool every ~20s.
+
+**"Within about one half-life" is not cleanly demonstrated by the strict
+windowed check**, for the same reason. The timeline's own
+time-to-converge table reports the 120.0s phase edge as "never converged
+in this phase" — no window-to-the-end-of-phase run stays within 10 points
+continuously — but that check would also fail for app1/app2's own
+pre-join phase if it had an edge to measure from, since the scrape
+artifact above routinely exceeds 10 points in a single 10s window on its
+own regardless of fairness. A coarser read is more informative: averaged
+over pairs of windows (20s, a third of a half-life) starting right at
+t=120s, end-users reads roughly 72%, 62%, 64%, 79%, 78%, 61% across the
+six 20s blocks of the post-join phase — bracketing the 68.4% target from
+the very first post-join block, not climbing toward it over a half-life
+the way a slow convergence would, and never settling into a single
+dominant value either. The qualitative finding — the newcomer is in the
+right neighbourhood of its share almost immediately, not converging
+slowly and not monopolising — holds; a precise half-life figure does not,
+because the measurement granularity this run was taken at cannot support
+one.
+
+**Whole-run verdict (script's own number): PASS**, 7.6pt max deviation
+(app2), all three groups under the 10-point threshold:
+
+| group | weight | expected % | observed % | deviation (pts) |
+|---|---|---|---|---|
+| app1 | 20 | 21.1% | 20.2% | -0.9 |
+| app2 | 10 | 10.5% | 18.1% | +7.6 |
+| end-users | 65 | 68.4% | 61.7% | -6.7 |
+
+Same caveat as UNI-141 (B2): this top-line number applies the
+all-three-tenants expected % uniformly across the whole 240s, including
+the 120s where end-users was not offered at all, so it is not phase-aware
+the way the windowed table is. It happens to land under threshold here
+(unlike B2's -34.0pt headline), but that is this run's particular numbers
+lining up, not evidence the top-line check is the right one for a
+timeline case — see UNI-141's own entry for the fuller argument.
+
+**Ledger cross-check (UNI-138/G2): FAIL for app1 (-76.4% cost diff) and
+app2 (-78.4%), expected and not a new defect.** The raw-token check (EPP
+tokens vs. client-reported tokens, contention-independent) passes cleanly
+for every group (-0.1%, 0.0%, 0.0%) — the EPP's basic accounting is
+correct. The *cost* check fails because it is contention-gated by design:
+`15-fairness-report.py`'s own header comment states this check "is only
+meaningful for a scenario shaped like 'full contention for (almost) the
+whole run' ... which only holds when nobody is ever offered without being
+contended." app1 and app2 are offered without end-users contending
+against them for exactly half this run (0-120s), so a large share of
+their service during that phase is legitimately uncontended and
+correctly excluded from `contended_service_tokens_total`, while the
+client ledger counts every token regardless of contention. The small,
+consistent `contended_seconds_total` deltas this run produced (app1
+4.09s, app2 4.20s, end-users 4.07s over 240s — roughly half of
+`full-contention`'s usual ~9s for a tenant contended the *whole* run,
+consistent with each tenant here only facing real contention for about
+half of it) support this read rather than contradicting it. No follow-up
+filed: this is the documented scope boundary of the G2 check, not a gap
+in it.
+
+**Cluster left as found.** This case sets no chaos event and never
+patches the LLMInferenceService spec or the EPP weight config; confirmed
+after the run:
+
+```
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          9h
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-bsl76   1/1     Running   0          6h31m
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m19s      6m57s
+# live ConfigMap (maas-epp-config), unchanged by this ticket:
+groups: app1=20, app2=10, end-users=65 (prefix end-user-), defaultGroup unclassified=5
+enforce: true, halfLifeSeconds: 60, newcomerClamp: true
+```
+
+Weights, `enforce`, `halfLifeSeconds`, and `newcomerClamp` match the live
+values stated on this issue exactly. `enforce: true` live vs. the
+committed `deploy/epp-config.yaml`'s documented `enforce: false`
+shadow-mode default is the same pre-existing drift noted on UNI-139's,
+UNI-140's and UNI-141's own "Cluster left as found" sections — this
+ticket did not touch that either way.
+
+Raw results:
+`results/20261102T005325Z-b1-cold-join/` — `fairness-report.{md,json}`,
+`loadgen.log`, `epp-container.log`, `metrics-{before,after}.txt`,
+`metrics-timeseries.txt`, `client-request-summary.jsonl`,
+`04-loadgen.patched.yaml`.
+
+**What surprised me:** the magnitude of the scrape-cadence lumpiness.
+Before running this, I expected a 10s window at this request rate to be
+fine-grained enough to see a real monopolisation burst distinctly from
+noise. Instead the pre-join app1/app2 pair — two tenants with no event
+happening to them at all — shows windows swinging between 0% and ~50/50
+just as hard as anything end-users does after joining, including 50
+continuous seconds of two simultaneous all-zero windows. That made "is
+this swing real or scrape noise" the actual question this case had to
+answer, not "did a burst happen" — and the only way to tell the two apart
+turned out to be comparing the newcomer's post-join swing shape against
+the already-steady pair's own pre-join swing shape in the same run,
+since no case before this one in the chain had an idle baseline phase
+inside the same run to compare against. If a future case needs a cleaner
+half-life figure than "brackets the target within the first 20s block
+and never settles into one dominant value," the fix is coarser windows
+(e.g. `WINDOW_SECONDS=20` or `30`) or confirming and then compensating
+for the actual UWM scrape interval, not more runs at the current
+10s granularity.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

@@ -3125,6 +3125,150 @@ threshold would hold up over a larger sample than 5 reps. The
 its own threshold constant (`uncontended_threshold_seconds: 1.0`) is a
 different lever than the one this ticket was scoped to evaluate.
 
+## UNI-140: B6, soak — 1–2h at full-contention
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, promoted after the B1–B5
+timeline/open-loop harness work. Longest single run in this series so far:
+the existing `full-contention` scenario held for 90–120 minutes instead of
+the usual 240s–600s, to check for slow failure modes a short run cannot
+show — memory growth, a stuck eviction/state mechanism, or an EPP restart —
+none of which a handful of short scored runs would catch.
+
+**Setup:** `full-contention` (`app1`/`app2`/`end-users` all offered, 32/32/128
+workers), 5700s (95 min), live against `maas-vllm-gpu` (2 replicas,
+llama-3-1-8b), `enforce: true`, 5-minute windows (UNI-127 harness; HX1 — a
+windowing improvement named in the original edge-case plan — has not landed,
+so this uses the plan's documented fallback). `deploy/poc/18-soak-monitor.sh`
+(new, this ticket) ran alongside `15-fairness-benchmark.sh` to also sample
+EPP memory and restart count every 60s and capture an unfiltered `/metrics`
+scrape, neither of which the benchmark script's own grep filter keeps.
+
+**What actually happened:** both local processes stopped writing at
+~23:24:13Z, 42 minutes into the run — most likely a control-plane hiccup,
+not a cluster-side failure (see the recovery comment on this issue from
+22:47Z, which confirmed the same run was healthy shortly before this). The
+`maas-loadgen` Job itself and the EPP were unaffected by whatever killed the
+local processes, and the Job ran to its full configured duration, completing
+at 00:17:38Z. This was only caught by comparing the Job's own
+`status.completionTime` (00:17:38Z) against the local artifacts' last-written
+timestamp (23:24Z) — the local report had silently produced a complete-looking
+PASS verdict for less than half the intended window.
+
+**Recovered the missing 53 minutes from cluster-side Prometheus**, not by
+re-running: the EPP's counters and the platform's memory/restart metrics
+live in Thanos independent of whether the sandbox driver survived to read
+them. `deploy/poc/19-soak-prometheus-backfill.py` (new, this ticket) re-reads
+`llm_d_epp_maas_fairness_contended_service_tokens_total` (the same SLI
+`15-fairness-report.py` uses — not redefined here),
+`container_memory_working_set_bytes`, `process_resident_memory_bytes`,
+`kube_pod_container_status_restarts_total`, and
+`llm_d_epp_flow_control_requests_total` for the run's actual start/end
+timestamps via the live Grafana's anonymous-Viewer `/api/ds/query` proxy
+(confirmed working in UNI-130), and recomputes the same two judgements over
+the complete window.
+
+**Windowed share — PASS for the full 95 minutes.** 19 five-minute windows,
+max |deviation| 6.19 points (window 4200–4500s, `app1`), against the 10-point
+threshold. No window anywhere in the run approaches the threshold, and the
+deviation does not trend upward or downward over time — the policy's split
+is as stable at minute 90 as at minute 5:
+
+| group | expected % | observed % (whole run) | deviation (pts) |
+|---|---|---|---|
+| app1 | 21.05% | 16.85% | -4.20 |
+| app2 | 10.53% | 13.90% | +3.37 |
+| end-users | 68.42% | 69.25% | +0.83 |
+
+(Full per-window table: `results/20261101T224216Z-uni140-b6-full-contention-soak/full-run-backfill.md`.)
+
+**EPP memory — flat.** `process_resident_memory_bytes`: 322.2MB (first 10
+samples' average) → 324.7MB (last 10 samples' average) over 96 one-minute
+samples spanning the full run, range [298.4, 326.5]MB. `container_memory_working_set_bytes`
+(container=main): 313.4MB → 316.8MB, range [289.0, 318.0]MB. Both move inside
+a ~1% band start-to-end; the full range is dominated by an early dip (cold
+cache/GC right after the run started) and ordinary GC sawtooth, not a trend.
+No sustained growth over 95 minutes of full contention.
+
+**No restarts.** `kube_pod_container_status_restarts_total` reads a flat `0`
+across all 96 samples in the window, and the pod's own lifetime restart
+count (`oc get pod`, checked after the run) is `0` since its creation at
+18:28:54Z — well before this run started and still true now. The EPP never
+restarted before, during, or after the soak.
+
+**Eviction / state-table growth — no eviction activity observed, which is
+the expected result, not a miss.** `llm_d_epp_flow_control_requests_total{outcome="EvictedContextCancelled"}`
+held flat at 111 across the entire window (`Dispatched` rose by 69,070 over
+the same period, confirming real, continuous traffic). `deploy/epp-config.yaml`'s
+own `flowControl` comment is explicit about what this means: *"Watch
+`llm_d_epp_flow_control_requests_evicted_total`: if it is non-zero in a run,
+that run measured shedding, not fairness."* A flat eviction counter under
+sustained full contention is the healthy state this config was tuned for
+(`defaultRequestTTL: 300s`, set specifically so the closed-loop generator's
+deep queues get served late rather than shed). Separately, the fairness
+policy's own per-group state table has no eviction/TTL by design —
+`deploy/epp-config.yaml` notes the group set is closed and bounded at
+`len(groups)+1`, so "growth" is not structurally possible regardless of
+run length; the flat memory above is the closest available evidence that
+holds in practice, since there is no direct state-table-size metric exposed.
+If "the eviction sweep runs" in this ticket's acceptance criteria meant
+"evictions fire," this run shows they did not, under this scenario's load
+shape — not a failure of the mechanism, consistent with both the config's
+own documented intent and the unchanged, flat memory.
+
+**Cluster left as found.** This scenario sets no per-tenant override and the
+benchmark never patches the LLMInferenceService spec or the EPP weight
+config — confirmed, not assumed, via the EPP's own live config after the run:
+
+```
+$ oc get deployment maas-vllm-gpu-kserve -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}{.status.readyReplicas}{"\n"}'
+2
+2
+$ oc get pods -n maas-fairness-poc
+NAME                                                           READY   STATUS      RESTARTS   AGE
+maas-epp-4-build                                               0/1     Completed   0          12d
+maas-poc-gateway-data-science-gateway-class-58b4f8c4b4-2zvgw   1/1     Running     4 (70m ago) 14d
+maas-vllm-cpu-kserve-router-scheduler-567f8bb649-8q5v9         1/1     Running     0          10h
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                          1/1     Running     0          8h
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                          1/1     Running     0          14d
+maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-bsl76         1/1     Running     0          6h3m
+# live ConfigMap (maas-epp-config), unchanged by this ticket:
+groups: app1=20, app2=10, end-users=65 (prefix end-user-), defaultGroup unclassified=5
+enforce: true
+```
+
+`replicas: 2` matches `deploy/poc/09-vllm-gpu.yaml`. Weights match the live
+weights stated on this issue exactly. `enforce: true` live vs. the
+committed `deploy/epp-config.yaml`'s documented `enforce: false` shadow-mode
+default is pre-existing drift from earlier tickets in this series (noted on
+UNI-139's own "Cluster left as found," above) — this ticket did not touch
+that patch either way, so there was nothing of its own to restore. The
+completed `maas-loadgen` Job (left in place by the crashed driver, since it
+never reached its own cleanup step) was deleted by hand after the run
+finished, matching what `15-fairness-benchmark.sh` would have done on its
+own exit.
+
+Raw results: `results/20261101T224216Z-uni140-b6-full-contention-soak/` —
+`fairness-report.{md,json}`, `memory-timeseries.txt`, `loadgen.log`,
+`epp-container.log`, `metrics-{before,after,full-before}.txt`,
+`metrics-timeseries.txt` (all first-42-minutes-only, kept as-produced — see
+`NOTES.md` in that directory), plus `full-run-backfill.{md,json}` (the
+complete-95-minute recomputation this verdict is based on).
+
+**Not proven here:** the root cause of the local driver's mid-run stop —
+neither `15-fairness-benchmark.sh` nor `18-soak-monitor.sh` logged an error
+before going silent, and whatever killed them (if it was in fact the
+control-plane hiccup logged on this issue at 22:47Z, it was already recovered
+from once before 23:24Z, so a second, unrecovered occurrence is not ruled
+out) left no trace in-sandbox. This did not block the measurement — Thanos
+retained everything needed — but a longer soak on an environment without a
+Thanos-backed dashboard, or one that outlasts Thanos's retention window,
+would not have this fallback. Also not proven: direct evidence of the
+fairness state table's size (no such metric is exposed; "no growth" here
+rests on the closed/bounded-by-design guarantee plus flat memory, not a
+measured count), and whether a still-longer soak (beyond this ticket's
+90–120-minute scope) would eventually trigger eviction activity that this
+one did not.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

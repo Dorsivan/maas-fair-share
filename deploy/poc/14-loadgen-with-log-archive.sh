@@ -111,7 +111,7 @@ CAPTURE_OC_PIDFILE="$ARTIFACT_DIR/.capture-oc.pid"
 rm -f "$CAPTURE_OC_PIDFILE"
 capture_loop() {
   local since="$RUN_START"
-  while true; do
+  while kill -0 "$$" 2>/dev/null; do
     echo "--- [archive] (re)attaching oc logs -f at $since ---" >> "$EPP_LOG"
     $OC logs -f "$EPP_POD" -n "$NAMESPACE" -c "$EPP_CONTAINER" --since-time="$since" >> "$EPP_LOG" 2>>"$EPP_LOG.capture-stderr" &
     echo "$!" > "$CAPTURE_OC_PIDFILE"
@@ -121,6 +121,7 @@ capture_loop() {
     # than silently losing whatever comes next.
     since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "--- [archive] oc logs -f exited at $since; checking for a pod restart ---" >> "$EPP_LOG"
+    sleep 1
   done
 }
 capture_loop &

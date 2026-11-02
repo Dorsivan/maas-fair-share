@@ -787,7 +787,7 @@ CAPTURE_OC_PIDFILE="$ARTIFACT_DIR/.capture-oc.pid"
 rm -f "$CAPTURE_OC_PIDFILE"
 capture_loop() {
   local since="$RUN_START"
-  while true; do
+  while kill -0 "$$" 2>/dev/null; do
     echo "--- [benchmark] (re)attaching oc logs -f at $since ---" >> "$EPP_LOG"
     $OC logs -f "$EPP_POD" -n "$NAMESPACE" -c "$EPP_CONTAINER" --since-time="$since" >> "$EPP_LOG" 2>>"$EPP_LOG.capture-stderr" &
     echo "$!" > "$CAPTURE_OC_PIDFILE"
@@ -809,7 +809,7 @@ CAPTURE_PID=$!
 METRICS_TS="$ARTIFACT_DIR/metrics-timeseries.txt"
 { echo "# ts=$RUN_START epoch=$RUN_START_EPOCH"; cat "$METRICS_BEFORE"; } > "$METRICS_TS"
 timeseries_loop() {
-  while true; do
+  while kill -0 "$$" 2>/dev/null; do
     sleep "$WINDOW_SECONDS"
     { echo "# ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) epoch=$(date +%s)"; snapshot_metrics; } >> "$METRICS_TS"
   done
@@ -828,7 +828,7 @@ chaos_log() {
 }
 chaos_loop() {
   local delete_done=false scale_down_done=false scale_up_done=false elapsed
-  while true; do
+  while kill -0 "$$" 2>/dev/null; do
     elapsed=$(( $(date +%s) - RUN_START_EPOCH ))
     if [ -n "$CHAOS_EPP_DELETE_AT" ] && [ "$delete_done" = false ] && [ "$elapsed" -ge "$CHAOS_EPP_DELETE_AT" ]; then
       $OC delete pod "$EPP_POD" -n "$NAMESPACE" --wait=false >/dev/null 2>&1 || true

@@ -5106,6 +5106,152 @@ the ConfigMap) and reverted/confirmed `false` afterward by
   `2026-11-03T10:50:45Z` (revert confirmed). Run itself:
   `2026-11-03T10:45:03Z`–`2026-11-03T10:49:25Z`.
 
+## UNI-152: D5, missing or empty identity header — unclassified, no crash, no new queue
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, last of the D-series
+(identity variants), and the one case [UNI-129](/UNI/issues/UNI-129)'s own
+harness section already answered live on 2026-11-01 without scoring it as a
+ticket. This ticket re-runs that same probe fresh, under this ticket, as the
+formal closing evidence for D5 — same scope boundary the rest of this chain
+follows (UNI-129 builds harnesses, the numbered ticket scores the case).
+
+**Setup, as the ticket states it:** a request reaches the EPP with
+`x-maas-subscription` (the ticket's description says `x-maas-subscription-id`;
+the header actually wired, confirmed in `deploy/epp-config.yaml` and the live
+`maas-auth-maas-vllm-gpu` AuthPolicy, has no `-id` — the same naming mismatch
+[UNI-129](/UNI/issues/UNI-129) already flagged) missing or empty. **This is
+not a `04-loadgen.yaml` knob** — like D3 (UNI-129's own writeup), it is an
+auth-boundary question, not a fairness-share one, so the relevant tool is
+`deploy/poc/16-loadgen-identity-variants.sh`, a handful of single requests,
+not a closed-loop generator.
+
+**Why the setup can't be produced by just omitting a header.** `X-MaaS-Subscription`
+is set entirely by the per-model AuthPolicy
+(`(has(auth.metadata.apiKeyValidation) ? auth.metadata.apiKeyValidation.subscription : "")`)
+and unconditionally overwrites anything the client sent (the same
+`PreRequest`-overwrite mechanism D3 verified). `apiKeyValidation` only
+populates when the caller authenticates with a real `sk-oai-` key — a key
+that always resolves to a real subscription (see below) — so the only way
+the header could reach the EPP empty is for the request to authenticate some
+*other* way that Authorino accepts without setting `apiKeyValidation` at
+all, and still get forwarded to the backend.
+
+**Live run, 2026-11-03T10:57:42Z, against the actual SUT
+(`maas-vllm-gpu-kserve-route`):**
+
+| probe | expected if the gap were open | observed |
+|---|---|---|
+| real `sk-oai-` key, `/v1/chat/completions` (control) | `200` | `200` |
+| k8s ServiceAccount token, `/v1/chat/completions` | `200` (would reach EPP with empty header) | `401` — matches neither of this route's own authn rules (`api-keys` needs `sk-oai-`; `kubernetes-tokens` is scoped to `.*/v1/models$`) |
+| k8s ServiceAccount token, `/v1/models` | n/a (wrong inference path regardless) | `403` — authenticates, then fails `require-group-membership` (a ServiceAccount's OpenShift groups are never in `allowed_groups`) |
+
+Two further avenues, already closed by [UNI-129](/UNI/issues/UNI-129) and not
+re-attempted here since nothing about key-minting has changed: minting a key
+with `subscription` omitted silently assigns the caller's own first eligible
+subscription rather than leaving it blank, and naming a subscription that
+doesn't exist is rejected outright at mint time (`400 invalid_subscription`).
+Deliberately deleting an existing live subscription to orphan a key was not
+attempted — this role has no `delete` on `maassubscriptions`
+([UNI-129](/UNI/issues/UNI-129)'s board-approved grant is `create`/`get`/
+`list`/`watch` only, by design, since the five pre-existing subscriptions
+back live keys), and even if it did, breaking a live, shared-pool subscription
+on purpose is not a reasonable way to synthesize this case.
+
+**Direct EPP-side confirmation, not just the HTTP codes.** Scraped the GPU
+EPP's own metrics (`maas-vllm-gpu-epp-service` ClusterIP) immediately after
+the probe:
+
+```
+llm_d_epp_maas_fairness_dispatch_total{fairness_id="end-users"} 1
+llm_d_epp_maas_fairness_unmatched_subscriptions_total 0
+```
+
+`dispatch_total` moved by exactly `1` — the control request only. The two
+k8s-token requests left no trace in the EPP's own classification counters at
+all, confirming they never reached the EPP's dispatch logic, not merely that
+they were classified `unclassified` and dropped from view. Both vLLM pods and
+the router-scheduler (EPP) pod showed `0` restarts immediately before and
+after the probe — no crash, trivially, since the condition under test never
+reached the process.
+
+**Verdict: cannot reproduce — the setup itself does not exist on this SUT
+today.** `maas-vllm-gpu-kserve-route`'s own AuthPolicy
+(`maas-auth-maas-vllm-gpu`) atomically replaces the Gateway-level
+authentication rules for this route, so the generic "any accepted auth
+method reaches the backend with an empty subscription" path that `maas-vllm-cpu`
+(no AuthPolicy of its own) still has is closed here. Every request that
+*does* reach the backend on this route carries a real, non-empty
+subscription — so the three literal pass sub-criteria ("they go to
+unclassified," "the EPP does not crash," "no new queue is created per
+request") cannot be exercised, let alone scored PASS or FAIL, because the
+precondition that would trigger them never arrives. This is the same
+structural finding [UNI-129](/UNI/issues/UNI-129) already made on
+2026-11-01; this ticket's contribution is re-confirming it fresh, with
+EPP-side (not just HTTP-status) evidence, as the case's formal scored
+closure, and recording it as a reproducible, re-checkable fact rather than a
+one-off smoke result — any future change that re-attaches this route to a
+different (or no) AuthPolicy could reopen it silently, which is exactly why
+`16-loadgen-identity-variants.sh` exists as a standing probe rather than a
+throwaway script.
+
+**Nothing new surprised this run** — it reproduces [UNI-129](/UNI/issues/UNI-129)'s
+2026-11-01 finding exactly (same three HTTP codes), two days later, with no
+drift in the AuthPolicy's rules. The one surprise worth repeating for anyone
+reading only this ticket: the ticket description's header name,
+`x-maas-subscription-id`, is not the real header name
+(`x-maas-subscription`, no `-id`) — `design.md`'s Part 2 config block has
+carried the wrong name since early in this POC.
+
+**Cluster left as found.** This case's harness is entirely client-side
+(request headers, which credential/token is sent) and never touches the
+`LLMInferenceService` spec or the EPP's weight config — confirmed, not
+assumed:
+
+```
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          43h
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          15d
+maas-vllm-gpu-kserve-router-scheduler-575669c495-vww7h   1/1     Running   0          6m45s
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+      enforce: false
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m20s      ~1h (unchanged, UNI-151's own run)
+```
+
+Weights unchanged (20/10/65/5), `enforce` unchanged (`false`, never flipped —
+this probe is three single requests, not a scenario run), replicas unchanged
+(`2`). No Job was created or deleted by this ticket.
+
+**Not proven here, and not provable on this SUT today:** the EPP's actual
+run-time behaviour (`unclassified` routing, no crash, queue-per-request
+accounting) when it genuinely receives a request with a missing/empty
+subscription header — that would require either a code change to this
+route's AuthPolicy (out of scope, changes the live auth posture of a shared,
+real route) or reproducing the case against `maas-vllm-cpu` instead (the open
+comparison route), which is a different `LLMInferenceService` with its own
+CPU-only EPP, not the GPU SUT this ticket and the rest of the chain measure.
+
+**Evidence:**
+
+- Raw results: `results/20261103T105742Z-uni-152-d5-missing-identity-header/`
+  (probe output, EPP metrics snapshot, README cross-referencing both).
+- Harness: `deploy/poc/16-loadgen-identity-variants.sh`, built by
+  [UNI-129](/UNI/issues/UNI-129) — no harness changes needed for this ticket.
+- No commit changes code; this ticket only adds the `results/` directory and
+  this doc section (see the companion commit on `main`).
+- No Grafana time range: this case produces no fairness-share metrics (no
+  loadgen Job, `enforce` never flipped) — the dashboard has nothing to show
+  for a 3-request HTTP-status probe. The EPP metrics snapshot above is this
+  case's evidence instead.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

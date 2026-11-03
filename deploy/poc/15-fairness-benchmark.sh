@@ -391,6 +391,7 @@ CPU_EPP_METRICS_SVC="${CPU_EPP_METRICS_SVC:-maas-vllm-cpu-epp-service}"
 # inside the mutating calls themselves, not just the window after them.
 CAPTURE_PID=""
 CAPTURE_OC_PIDFILE=""
+EVENTS_PID=""
 TS_PID=""
 CHAOS_PID=""
 ORIGINAL_REPLICAS=""
@@ -726,8 +727,8 @@ restore_live_set() {
 }
 
 stop_background_loops() {
-  kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
-  wait "$CAPTURE_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+  kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" "$EVENTS_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+  wait "$CAPTURE_PID" "$EVENTS_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
 }
 
 # UNI-174: the single, unconditional owner of every piece of live cluster
@@ -1219,6 +1220,24 @@ EPP_IMAGE_DIGEST="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath="{.status
 START_RESTARTS="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
 echo "[benchmark] target pod: $EPP_POD  image: $EPP_IMAGE_DIGEST  (restarts so far: $START_RESTARTS)"
 
+# UNI-193: single source of truth for "which pod is the log-capture loop and
+# the mid-run restart detector currently watching". Both of those run as
+# their own background subshells (capture_loop) or read the variable from a
+# stale fork (the restart detector in the Job-poll loop below) -- a plain
+# `EPP_POD=...` reassignment in the main script body is invisible to a
+# subshell that already captured the old value when it was backgrounded, so
+# a pod-name change has to go through a file both sides poll/re-read.
+# CHAOS_EPP_DELETE_AT was the gap: the enforce-flip path (below) already
+# re-resolved EPP_POD, but the chaos-delete path never did, so after a chaos
+# delete capture_loop retried "oc logs -f <gone-pod-name>" every second for
+# the rest of the run (confirmed on UNI-155's E1 runs: 100%
+# "(re)attaching/exited" scaffolding, zero real EPP log content, after the
+# chaos delete in both the pass and the fail run) and the restart detector's
+# "|| echo $START_RESTARTS" fallback made a gone pod look identical to a
+# steady one.
+EPP_POD_FILE="$ARTIFACT_DIR/.epp-pod-name"
+printf '%s\n' "$EPP_POD" > "$EPP_POD_FILE"
+
 # UNI-127: capture the LLMInferenceService's current replica count before any
 # chaos runs, so a scale-down can be restored to what was actually there --
 # not a hardcoded 2 -- whether or not the chaos loop gets to do it itself.
@@ -1286,6 +1305,7 @@ if [ "$ENFORCE_LIVE" = "true" ]; then
     EPP_POD="$($OC get pods -n "$NAMESPACE" -l "$EPP_SELECTOR" -o jsonpath='{.items[0].metadata.name}')"
     EPP_IMAGE_DIGEST="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath="{.status.containerStatuses[?(@.name=='$EPP_CONTAINER')].imageID}")"
     START_RESTARTS="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+    printf '%s\n' "$EPP_POD" > "$EPP_POD_FILE"
     echo "[benchmark] enforce flip replaced the EPP pod (no live-reload): target pod is now $EPP_POD (restarts so far: $START_RESTARTS)"
   fi
 fi
@@ -1299,8 +1319,22 @@ snapshot_metrics() {
   # before/after snapshot; omitting --client-record-jsonl downstream still
   # works against a snapshot that only has the old prefix, so this is purely
   # additive.
+  #
+  # UNI-193: also capture the upstream gateway-api-inference-extension's own
+  # endpoint/flow-control metrics -- llm_d_epp_flow_control_* (including
+  # stale_endpoints, pool_saturation, capacity_utilization, dispatch-cycle
+  # duration) and llm_d_epp_ready_endpoints/per_endpoint_queue_size. UNI-155's
+  # E1 runs showed every llm_d_epp_maas_fairness_*{fairness_id="end-users"}
+  # series (dispatch_total, contended_*, normalized_service -- everything
+  # except the static configured_weight gauge) go completely MISSING from
+  # the after-snapshot in the run that starved, not merely zero, while the
+  # same labels were present and nonzero in the run that recovered -- i.e.
+  # end-users' traffic never reached the fairness plugin's own dispatch loop
+  # at all after the chaos-deleted pod's replacement came up. That is
+  # upstream of this plugin, in the picker's endpoint/queue bookkeeping, and
+  # this benchmark was never scraping that layer to see it.
   curl -sS -m 10 -H "Authorization: Bearer $METRICS_TOKEN" "http://${EPP_METRICS_SVC_IP}:9090/metrics" \
-    | grep -E '^llm_d_epp_maas_fairness_|^llm_d_epp_request_(input|output|cached)_tokens_(sum|count)\{' \
+    | grep -E '^llm_d_epp_maas_fairness_|^llm_d_epp_request_(input|output|cached)_tokens_(sum|count)\{|^llm_d_epp_flow_control_|^llm_d_epp_(ready_endpoints|per_endpoint_queue_size|average_|std_dev_)' \
     | grep -v '^#'
 }
 
@@ -1327,10 +1361,21 @@ RUN_START_EPOCH="$(date +%s)"
 CAPTURE_OC_PIDFILE="$ARTIFACT_DIR/.capture-oc.pid"
 rm -f "$CAPTURE_OC_PIDFILE"
 capture_loop() {
-  local since="$RUN_START"
+  local since="$RUN_START" pod="" last_pod=""
   while kill -0 "$$" 2>/dev/null; do
-    echo "--- [benchmark] (re)attaching oc logs -f at $since ---" >> "$EPP_LOG"
-    $OC logs -f "$EPP_POD" -n "$NAMESPACE" -c "$EPP_CONTAINER" --since-time="$since" >> "$EPP_LOG" 2>>"$EPP_LOG.capture-stderr" &
+    # UNI-193: re-read the watched pod name every iteration -- this subshell
+    # forked with its own copy of $EPP_POD and never sees a later
+    # reassignment in the main script body (chaos_loop is a *different*
+    # subshell too, so even its own reassignment wouldn't reach here). The
+    # file is the only channel both sides actually observe.
+    pod="$(cat "$EPP_POD_FILE" 2>/dev/null || echo "$EPP_POD")"
+    if [ "$pod" != "$last_pod" ]; then
+      echo "--- [benchmark] (re)attaching oc logs -f to $pod at $since ---" >> "$EPP_LOG"
+      last_pod="$pod"
+    else
+      echo "--- [benchmark] (re)attaching oc logs -f at $since ---" >> "$EPP_LOG"
+    fi
+    $OC logs -f "$pod" -n "$NAMESPACE" -c "$EPP_CONTAINER" --since-time="$since" >> "$EPP_LOG" 2>>"$EPP_LOG.capture-stderr" &
     echo "$!" > "$CAPTURE_OC_PIDFILE"
     wait "$!" || true
     since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1350,6 +1395,19 @@ CAPTURE_PID=$!
 METRICS_TS="$ARTIFACT_DIR/metrics-timeseries.txt"
 { echo "# ts=$RUN_START epoch=$RUN_START_EPOCH"; cat "$METRICS_BEFORE"; } > "$METRICS_TS"
 timeseries_loop() {
+  # UNI-193: this whole script runs under `set -euo pipefail` (line 303),
+  # which this background subshell inherits. snapshot_metrics' curl hits a
+  # Service with zero ready endpoints for a few seconds around any pod
+  # replacement (chaos delete, enforce flip, the end-of-run revert) and
+  # fails with a real nonzero exit -- under -e/pipefail, in the foreground
+  # of this subshell (not backgrounded, not `|| true`-guarded) that one
+  # transient failure terminated the *entire loop* for the rest of the run,
+  # not just that one window. Confirmed live on UNI-155's E1 runs and on a
+  # same-scenario repro for this ticket: all three showed metrics-timeseries
+  # go completely silent for ~300s starting at the first post-chaos-delete
+  # scrape, in the PASS run and the FAIL run alike -- a harness artifact,
+  # not evidence of anything the EPP did differently between them.
+  set +e
   while kill -0 "$$" 2>/dev/null; do
     sleep "$WINDOW_SECONDS"
     { echo "# ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) epoch=$(date +%s)"; snapshot_metrics; } >> "$METRICS_TS"
@@ -1357,6 +1415,49 @@ timeseries_loop() {
 }
 timeseries_loop &
 TS_PID=$!
+
+# UNI-193: periodic namespace Events snapshot. UNI-155's E1 runs showed
+# FailedPreStopHook/Unhealthy readiness-probe events on the chaos-deleted pod
+# that this harness never recorded anywhere -- that evidence only existed
+# live via `oc get events` and expires with the default ~1h Event TTL, so a
+# run investigated more than an hour later has nothing to go on. Namespace
+# Events (not just the EPP pod's own) because the chaos window also produces
+# Gateway/InferencePool/LLMInferenceService events that bear on recovery.
+# Appends a full sorted snapshot every WINDOW_SECONDS rather than following a
+# single object with --watch: a watch stream dies/reattaches exactly like
+# capture_loop's "oc logs -f" does (same NotFound-on-a-deleted-object
+# failure mode), and duplicating a cheap snapshot is simpler than rebuilding
+# that whole retry apparatus for a second object kind.
+K8S_EVENTS_LOG="$ARTIFACT_DIR/k8s-events-timeseries.log"
+snapshot_events() {
+  # UNI-193: Events have no equivalent of `--since-time` server-side, and a
+  # namespace accumulates them for its ~1h TTL regardless of this run's own
+  # start time -- an unfiltered snapshot re-dumps that whole rolling hour on
+  # every single WINDOW_SECONDS tick, so a 6-7 minute run produced a 1.3MB
+  # log that was >95% the same old lines repeated ~40 times (confirmed live
+  # on this ticket's own repro run: entries from 2+ hours before RUN_START
+  # were still present at the last tick). Filter to lastTimestamp >= this
+  # run's own start so each tick only adds what actually happened during
+  # the run -- ISO8601 Z-format timestamps compare correctly as plain
+  # strings, so a plain field compare is enough, no date parsing needed.
+  $OC get events -n "$NAMESPACE" --sort-by='.lastTimestamp' \
+    -o custom-columns='TIME:.lastTimestamp,TYPE:.type,REASON:.reason,KIND:.involvedObject.kind,NAME:.involvedObject.name,MESSAGE:.message' \
+    --no-headers 2>/dev/null | awk -v start="$RUN_START" '$1 >= start'
+}
+{ echo "# ts=$RUN_START epoch=$RUN_START_EPOCH"; snapshot_events; } > "$K8S_EVENTS_LOG"
+events_loop() {
+  # UNI-193: same `set -e` exposure as timeseries_loop above -- a transient
+  # `oc get events` failure (API server hiccup, token refresh, etc.) would
+  # otherwise kill this loop for the rest of the run instead of just
+  # skipping one window.
+  set +e
+  while kill -0 "$$" 2>/dev/null; do
+    sleep "$WINDOW_SECONDS"
+    { echo "# ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) epoch=$(date +%s)"; snapshot_events; } >> "$K8S_EVENTS_LOG"
+  done
+}
+events_loop &
+EVENTS_PID=$!
 
 # --- UNI-127 chaos loop: fires the configured hooks at their t+offset and
 # logs each one, with a timestamp, to chaos-events.log. A no-op loop (nothing
@@ -1367,6 +1468,28 @@ CHAOS_LOG="$ARTIFACT_DIR/chaos-events.log"
 chaos_log() {
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1" | tee -a "$CHAOS_LOG"
 }
+# UNI-193: poll for the Deployment's replacement pod after a chaos delete and
+# publish its name to $EPP_POD_FILE, which capture_loop and the mid-run
+# restart detector now re-read every iteration instead of trusting the
+# $EPP_POD value each of them forked with. Runs detached from chaos_loop's
+# own 1s cadence so a slow-to-schedule replacement doesn't delay the other
+# chaos hooks (CHAOS_SCALE_AT/LIVE_SET_AT) sharing that loop. Bounded at 60
+# attempts (~60s): past that, something other than a normal reschedule is
+# wrong and hammering forever is exactly the bug being fixed here.
+resolve_replacement_pod_async() {
+  local old_pod="$1" new_pod="" tries=0
+  while [ "$tries" -lt 60 ]; do
+    tries=$(( tries + 1 ))
+    new_pod="$($OC get pods -n "$NAMESPACE" -l "$EPP_SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [ -n "$new_pod" ] && [ "$new_pod" != "$old_pod" ]; then
+      printf '%s\n' "$new_pod" > "$EPP_POD_FILE"
+      chaos_log "chaos: replacement EPP pod for $old_pod is $new_pod (found after ${tries}s)"
+      return 0
+    fi
+    sleep 1
+  done
+  chaos_log "chaos: WARNING no replacement pod found for $old_pod after ${tries}s -- capture/restart-detection still watching the deleted pod"
+}
 chaos_loop() {
   local delete_done=false scale_down_done=false scale_up_done=false \
         live_set_done=false live_restore_done=false elapsed
@@ -1375,6 +1498,7 @@ chaos_loop() {
     if [ -n "$CHAOS_EPP_DELETE_AT" ] && [ "$delete_done" = false ] && [ "$elapsed" -ge "$CHAOS_EPP_DELETE_AT" ]; then
       $OC delete pod "$EPP_POD" -n "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
       chaos_log "chaos: deleted EPP scheduler pod $EPP_POD (t+${elapsed}s, target was t+${CHAOS_EPP_DELETE_AT}s)"
+      resolve_replacement_pod_async "$EPP_POD" &
       delete_done=true
     fi
     # UNI-180: re-expressed on top of live_config_set/live_config_restore --
@@ -1425,6 +1549,12 @@ RESTART_EVENTS=0
 for i in $(seq 1 240); do
   SUCCEEDED="$($OC get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)"
   FAILED="$($OC get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.failed}' 2>/dev/null || true)"
+  # UNI-193: a chaos delete updates $EPP_POD_FILE from chaos_loop's own
+  # subshell, which this (main-shell, foreground) loop never sees via the
+  # $EPP_POD variable itself -- re-read the file each iteration so a chaos
+  # delete doesn't make this detector silently watch a pod that is gone for
+  # the rest of the run.
+  EPP_POD="$(cat "$EPP_POD_FILE" 2>/dev/null || echo "$EPP_POD")"
   CUR_RESTARTS="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "$START_RESTARTS")"
   if [ "$CUR_RESTARTS" != "$START_RESTARTS" ] && [ "$RESTART_EVENTS" -eq 0 ]; then
     RESTART_EVENTS=1

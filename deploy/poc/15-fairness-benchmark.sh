@@ -976,8 +976,30 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=48 PROMPT_WORDS_MIN_END_USERS=30 PROMPT_WORDS_MAX_END_USERS=30 MAX_TOKENS_MODE_END_USERS=longgen)
     ;;
+  misclassified-prefix)
+    # UNI-153: D2, scored run of the edge-case plan's "misclassified
+    # prefix" case. UNI-129 built the `custom` pseudo-tenant mechanism and
+    # already smoke-tested this exact identity ad hoc (25s/2-worker Job,
+    # 70/70 200s, unmatched_subscriptions_total 0->70 -- see
+    # docs/runbook.md "D2, resolved"); this scenario promotes that into a
+    # proper scored benchmark run instead of a one-off Job. Background
+    # contention is full-contention's own proven sizing (app1/app2/
+    # end-users, 32/32/128) so the claim is demonstrated under real
+    # multi-tenant load, not in isolation, and so the run doubles as
+    # evidence the misclassified traffic doesn't disturb the other three
+    # groups' weighted split either. `custom` is pinned to
+    # CUSTOM_SUBSCRIPTION_NAME=enduser-foo -- no hyphen after "end," so it
+    # deliberately misses both the end-user- prefix match and the two
+    # apps' exact-name match, and free-rides the unclassified catch-all
+    # (weight 5). WORKERS_CUSTOM=8 is a light closed-loop trickle: this
+    # case is about WHERE the traffic is classified, not about saturating
+    # the custom tenant's own throughput, so it does not need
+    # full-contention's over-offering discipline.
+    TENANTS="app1 app2 end-users custom"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128 WORKERS_CUSTOM=8 CUSTOM_SUBSCRIPTION_NAME=enduser-foo)
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix)" >&2
     exit 1
     ;;
 esac

@@ -5252,6 +5252,169 @@ CPU-only EPP, not the GPU SUT this ticket and the rest of the chain measure.
   for a 3-request HTTP-status probe. The EPP metrics snapshot above is this
   case's evidence instead.
 
+## UNI-153: D2, misclassified prefix (`enduser-foo`) — lands in unclassified, classification-broken condition sustained
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, second of the D-series
+(identity variants). [UNI-129](/UNI/issues/UNI-129)'s own harness section
+already smoke-tested this exact identity ad hoc (a 25s/2-worker Job, 70/70
+`200`s, `unmatched_subscriptions_total` 0->70 — see docs/runbook.md "D2,
+resolved") but deliberately did not score it as a ticket. This ticket
+promotes that into a proper scored benchmark run and adds the one thing the
+smoke test couldn't show at 25s: whether the classification-broken
+*condition* is sustained long enough to actually latch the alert
+(`deploy/prometheusrule.yaml`'s `for: 5m`), not just momentarily true.
+
+**Setup.** `deploy/poc/15-fairness-benchmark.sh`'s new `misclassified-prefix`
+scenario: `app1`/`app2`/`end-users` at `full-contention`'s proven
+over-offering sizes (32/32/128 workers, `ENFORCE_LIVE=true`), plus the
+`custom` pseudo-tenant (UNI-129's generic arbitrary-identity mechanism)
+pinned to `CUSTOM_SUBSCRIPTION_NAME=enduser-foo` at a light 8-worker
+closed-loop trickle. `enduser-foo` has no hyphen after "end," so it
+deliberately misses both the `end-user-` prefix match and the two apps'
+exact-name match, and free-rides the `unclassified` catch-all (weight 5).
+`DURATION=420` (7 minutes, not this harness's usual 240s default) — long
+enough that the sustained-condition evidence below covers more than one
+full `for: 5m` window, not just a bare pass of it.
+
+**Expected.** Every `enduser-foo` request lands in `fairness_id="unclassified"`,
+`unmatched_subscriptions_total` rises one-for-one with it, and (if the rule
+were loaded) `MaasFairnessClassificationBroken` would go from pending to
+firing 5 minutes after the traffic starts and stay firing until 5 minutes
+after it stops. `app1`/`app2`/`end-users`' own weighted split should be
+undisturbed — `enduser-foo`'s traffic is a fourth, unrelated group as far as
+the three real tenants are concerned.
+
+**Observed — classification.** `custom` (`enduser-foo`) sent 231 requests
+(227 `200`, 4 `500`) over the 420s run. The EPP's own counters confirm where
+they landed:
+
+```
+metrics-before.txt:  llm_d_epp_maas_fairness_unmatched_subscriptions_total 0
+metrics-after.txt:   llm_d_epp_maas_fairness_unmatched_subscriptions_total 227
+metrics-after.txt:   llm_d_epp_maas_fairness_dispatch_total{fairness_id="unclassified"} 235
+```
+
+`unmatched_subscriptions_total` moved `0` -> `227`, matching `enduser-foo`'s
+227 successful (`200`) requests exactly — the same regression-detector
+design.md calls out for "a typo silently falls into `unclassified`."
+`dispatch_total{fairness_id="unclassified"}` (235) runs 8 above that and 4
+above the tenant's own 231-request total; the same class of small
+edge-count mismatch other tickets in this chain have already attributed to
+scrape-boundary/in-flight-request timing (see UNI-151's 2-request gap,
+above), not a sign of a second leak — nothing else in this run's
+`LOADGEN_GROUPS` table or config maps to `unclassified`.
+
+**Observed — sustained, not momentary.** The 10s-resolution time-series
+(`metrics-timeseries.txt`) shows `unmatched_subscriptions_total` climbing
+continuously for the entire run, not just crossing zero once:
+
+| t (s from run start) | `unmatched_subscriptions_total` |
+|---|---|
+| 0 | 0 |
+| 60 | 40 |
+| 120 | 70 |
+| 180 (~`for: 5m`'s halfway point) | ~99 (171s: 96) |
+| 300 (one `for: 5m` window closed) | 162 |
+| 421 (traffic stops) | 227 |
+| 450 (settle) | 227 (flat — confirms traffic, not the counter, stopped) |
+
+Since the counter rises continuously from `t=10s` onward with no flat
+stretch anywhere in the run, `increase(llm_d_epp_maas_fairness_unmatched_subscriptions_total[5m]) > 0`
+is true for every evaluation instant from roughly `t=10s` through the end of
+the run (`t=421s`) — a continuously-true span of ~411s, more than twice the
+alert's own `for: 5m` (300s) latch requirement. **Had the rule been loaded,
+`MaasFairnessClassificationBroken` would have transitioned pending->firing
+at approximately `t=300s` (2026-11-03T11:12:56Z) and stayed firing through
+the end of the run.**
+
+**Observed — the weighted split among the three real tenants, undisturbed.**
+app1 17.2% (-3.8pts), app2 14.2% (+3.6pts), end-users 68.6% (+0.2pts)
+against a 21.1/10.5/68.4% target (unclassified excluded, as always) — all
+three within the 10-point threshold. **Weighted-split verdict: PASS.**
+Ledger cross-check (G2): **PASS** on all three groups (-1.3%/-1.7%/-1.3%,
+all within the 10% tolerance). `enduser-foo`'s traffic rode alongside full
+three-tenant contention without moving the other three groups' shares
+outside their normal run-to-run noise band.
+
+**The alert itself could not be captured from Alertmanager or live rule
+state — same gap as [UNI-130](/UNI/issues/UNI-130), re-confirmed, not
+attempted:**
+
+```
+$ oc auth can-i create prometheusrules.monitoring.coreos.com -n maas-fairness-poc
+no
+$ oc get prometheusrule -n maas-fairness-poc
+No resources found in maas-fairness-poc namespace.
+```
+
+`deploy/prometheusrule.yaml` (which carries `MaasFairnessClassificationBroken`
+among its five alerts) has never been applied to this cluster, and this
+role cannot create `prometheusrules.monitoring.coreos.com` — the identical
+RBAC gap UNI-130 found and UNI-150's accounting-leak section re-confirmed,
+out of this role's reach per rule 5, not attempted here either. With no
+`PrometheusRule` CR loaded, Prometheus never evaluates the rule and no
+literal `ALERTS{alertname="MaasFairnessClassificationBroken"}` series can
+exist to query from Alertmanager or the rule-state API, regardless of how
+much qualifying traffic is sent. The sustained-condition evidence above —
+the rule's own expression evaluated directly against this run's scraped
+metrics, continuously true for ~411s against a 300s latch requirement — is
+the closest substitute available on this SUT today, same substitution
+UNI-150 used for `MaasFairnessAccountingLeak`.
+
+**Verdict: PASS on every part of the case this role can actually observe.**
+`enduser-foo` lands in `unclassified` (confirmed), `unmatched_subscriptions_total`
+rises (confirmed, continuously, well past the alert's own `for: 5m` window),
+and the alert's condition — evaluated directly against the rule's literal
+expression — would have fired and stayed firing for the back half of the
+run. The one sub-criterion genuinely unprovable here is capturing the literal
+`ALERTS` series itself, which needs the RBAC grant named above, not a retry
+of this case.
+
+**Cluster left as found:**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+      enforce: false
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                    1/1     Running   0          43h
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                    1/1     Running   0          15d
+maas-vllm-gpu-kserve-router-scheduler-575669c495-qmjtt   1/1     Running   0          114s
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           7m20s      10m
+```
+
+Weights unchanged (app1=20, app2=10, end-users=65, unclassified=5). `enforce`
+was flipped `true` for the run's duration (this chain's convention) and
+reverted/confirmed `false` afterward by `15-fairness-benchmark.sh`'s own
+`ENFORCE_LIVE` wrapper — matches the repo manifest
+(`deploy/poc/00-config.yaml`) exactly.
+
+**Nothing new provisioned.** `enduser-foo`'s `MaaSSubscription` and API key
+already existed from [UNI-129](/UNI/issues/UNI-129)'s board-approved grant
+(2026-11-02); this ticket only adds the `misclassified-prefix` scenario to
+`15-fairness-benchmark.sh` and runs it.
+
+**Evidence:**
+
+- Commit: see this section's companion commit on `main`.
+- Raw results: `results/20261103T110640Z-uni-153-d2-misclassified-prefix/`
+  (report, loadgen log, `client-request-summary.jsonl`, before/after/
+  time-series metric snapshots, EPP container log).
+- Harness: new `misclassified-prefix` scenario in
+  `deploy/poc/15-fairness-benchmark.sh`, built on UNI-129's existing
+  `custom`-tenant mechanism — no loadgen (`04-loadgen.yaml`) changes needed.
+- Grafana time range: `2026-11-03T11:06:43Z` (enforce flip requested) –
+  `2026-11-03T11:16:35Z` (revert confirmed). Run itself:
+  `2026-11-03T11:07:56Z`–`2026-11-03T11:15:26Z`.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

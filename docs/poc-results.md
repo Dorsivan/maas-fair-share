@@ -4748,6 +4748,144 @@ ticket if the gateway maintainers want to chase it further; not attempted here
 given the risk/cost of repeatedly triggering cluster-side connection hangs to
 gather a larger sample.
 
+## UNI-149: C5, `client-aborts` — provisional holds clear, but the no-usage code path never fired
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, first of the D/post-C-series
+cases run after the C-series closed. Setup: one tenant (`app1`) has 30% of its
+requests cancelled client-side at a random point mid-generation; pass criteria
+are "provisional tokens drop to 0 after traffic stops" and "the
+accounting-leak alert stays quiet." Unit-tested
+(`TestAbortedRequestStillBooksContendedService`) but never checked live.
+
+**Setup:** full-contention (`app1`/`app2`/`end-users`, 32/32/128 workers —
+this chain's standard sizing), live against `maas-vllm-gpu` (2 replicas,
+llama-3-1-8b), `ENFORCE_LIVE=true`, `halfLifeSeconds: 60`, 240s.
+`ABORT_FRACTION_APP1=0.3` (the [UNI-128](/UNI/issues/UNI-128) harness knob,
+cancel point uniform in the default `[ABORT_MIN_FRACTION, ABORT_MAX_FRACTION]`
+= `[0.1, 0.6]` of the response); `app2`/`end-users` unchanged. This ticket also
+adds `SETTLE_SECONDS` to `15-fairness-benchmark.sh`: an optional idle window,
+**after** the Job reports done but **before** the after-snapshot and the
+`ENFORCE_LIVE` revert, during which `capture_loop`/`timeseries_loop` keep
+running — so a "returns to zero once traffic stops" claim can be read off live
+data instead of inferred, the gap [UNI-145](/UNI/issues/UNI-145) (C2) flagged.
+Used `SETTLE_SECONDS=60` here. Default is `0`, so every scenario before this
+ticket is unaffected.
+
+**Expected split:** app1 21.1% / app2 10.5% / end-users 68.4% (weights
+20/10/65 over the three offered groups).
+
+**Observed split (by weighted tokens, the scored metric):**
+
+| group | weight | requests | statuses | expected % | observed % | deviation (pts) | dispatch_total |
+|---|---|---|---|---|---|---|---|
+| app1 | 20.0 | 544 | 200=371, ABORT=166, 500=7 | 21.1% | 17.1% | -3.9 | 533 |
+| app2 | 10.0 | 454 | 200=439, 500=15 | 10.5% | 13.9% | 3.3 | 439 |
+| end-users | 65.0 | 2213 | 200=2168, 500=45 | 68.4% | 69.0% | 0.6 | 2166 |
+
+**Verdict: the benchmark's own headline split is PASS** (max deviation
+3.9pts). Scored against this ticket's own two named criteria:
+
+1. **Provisional tokens drop to 0 after traffic stops: PASS, directly
+   observed.** `metrics-timeseries.txt`'s 10s snapshots show `app1`'s
+   `dispatch_total` reach its final value (533) at the last active-traffic
+   scrape (16:33:17Z) and then **both** `dispatch_total` and
+   `normalized_service` sit perfectly flat — zero movement — across every
+   remaining snapshot through the end of the 60s `SETTLE_SECONDS` window
+   (16:34:39Z), ~82s of true idle with no stray charge. Cross-checked a second
+   way: `llm_d_epp_maas_fairness_truing_error_tokens_count{fairness_id="app1"}`
+   (only incremented on the normal, hold-released true-up path) equals
+   `dispatch_total{app1}` exactly — 533 of 533 — and the same equality holds
+   for every other group (`app2` 439/439, `end-users` 2166/2166,
+   `unclassified` 2/2). Every single dispatched request, aborts included, had
+   its hold released via `ResponseBody`'s normal completion path.
+2. **The accounting-leak alert stays quiet: PASS, by direct evaluation of its
+   own condition.** `deploy/prometheusrule.yaml`'s `MaasFairnessAccountingLeak`
+   is still not applied to this cluster (`oc auth can-i create prometheusrules`
+   → `no`, same gap [UNI-130](/UNI/issues/UNI-130) found — out of this role's
+   reach per rule 5, not attempted), so no literal `ALERTS` series exists to
+   query. Evaluated the rule's own expression directly instead: its condition
+   is "`normalized_service` increases while `dispatch_total` records zero new
+   dispatches." The timeseries data above shows exactly zero `normalized_service`
+   movement across the entire post-traffic window while `dispatch_total` was
+   also flat — the condition never went true even once, let alone for the
+   15-minute `for:` duration the real alert would need. **Caveat:** the
+   observed idle window (~82s) is far short of that 15-minute latch, so only
+   the condition itself was exercised, not the alert's actual firing
+   threshold.
+
+**What surprised me: the no-usage/`ClientDisconnect` code path this ticket
+set out to test was never actually exercised.**
+`llm_d_epp_maas_fairness_requests_without_usage_total` — the counter that
+only increments in `ResponseBody`'s no-usage branch, the one
+`TestAbortedRequestStillBooksContendedService` covers — is **completely
+absent** from both `metrics-before.txt` and `metrics-after.txt`, for every
+group, not just `app1`. Combined with the `truing_error_tokens_count` ==
+`dispatch_total` equality above (only reachable via the *normal*, usage-present
+branch), this means: on this cluster's real gateway+vLLM stack, killing the
+loadgen's client-side connection does **not** stop the backend generation or
+suppress its usage block. vLLM still finishes computing a real usage block,
+the EPP still receives it, and `ResponseBody` trues up against that real
+(apparently often substantial) number instead of permanently booking the
+dispatch-time estimate. This is the same mechanism already documented
+elsewhere in this file under ["A killed open-loop client does not relieve the
+backend"](#a-killed-open-loop-client-does-not-relieve-the-backend) (UNI-34) —
+requests the EPP has already dispatched keep consuming GPU slots after their
+client is gone, they just also keep *generating*, and the generation's result
+still reaches the plugin. The ledger (G2) cross-check below shows the
+consequence.
+
+**Ledger cross-check (G2): FAIL for `app1`, same structural cause as
+[UNI-148](/UNI/issues/UNI-148) (C6).** `app1`'s client-recorded raw tokens
+(456330 prompt + 22745 completion) are 43.7% below the EPP's own raw total
+(688304) and cost 41.5% below the EPP's charged cost (710232 vs 501820
+expected). This is **not** a double-charge: `04-loadgen.yaml`'s client only
+parses `prompt_tokens`/`completion_tokens` out of a response body it actually
+received (`[ "$http_code" != "ABORT" ] && [ -s "$tmp" ]`), so all 166 aborted
+requests contribute **zero** to the client's own token tally — even though,
+per the finding above, the backend kept generating and the EPP legitimately
+charged what it actually saw. The client-side record structurally cannot
+capture tokens for a response it gave up on, exactly like C6's rejected-`app2`
+requests; `app2`/`end-users` (no aborts) both pass their own cross-check
+(-3.0% / -2.3%, inside the 10% tolerance).
+
+**Error rates:** `app1` 371/544 (68.2%) `200`, 166/544 (30.5%) `ABORT`
+(target 30%, confirmed), 7/544 (1.3%) `500`; `app2` 439/454 (96.7%) `200`;
+`end-users` 2168/2213 (98.0%) `200` — both comparable to this chain's usual
+background error rate.
+
+**Cluster left as found** — confirmed via `oc get` immediately after the run:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|halfLifeSeconds:'
+      enforce: false
+      halfLifeSeconds: 60
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m17s      16h
+```
+
+Weights unchanged (app1=20, app2=10, end-users=65, unclassified=5).
+
+**Raw results:** `results/20261102T162805Z-uni-149-c5-client-abort/` (report
+JSON/MD, loadgen log, `client-request-summary.jsonl`, EPP container log,
+before/after/timeseries metric snapshots).
+
+**Grafana time range:** `2026-11-02T16:28:07Z` (enforce flip requested) to
+`2026-11-02T16:35:48Z` (revert confirmed). Run itself:
+`2026-11-02T16:29:16Z` – `2026-11-02T16:34:39Z` (includes the 60s settle
+window).
+
+**Follow-up (not filed as its own ticket):** this ticket's own pass criteria
+are confirmed, but the specific no-usage/`ClientDisconnect` branch the unit
+test exercises has still never been seen live — only a harder abort (e.g.
+severing the TCP connection at the gateway/network level rather than a
+graceful client-side cancel, or killing the backend mid-stream) is likely to
+produce a response with genuinely no usage block on this stack. Tracked as
+outstanding-work item 18, below, rather than a new chain ticket, since it is
+a coverage gap in evidence, not a known defect needing a board decision.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -4782,6 +4920,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Build the timeline/chaos harness for the edge-case plan (UNI-127)~~ | **Done, development only.** Per-tenant join/leave + duty-cycle timing, EPP-pod-delete and vLLM-scale chaos hooks, windowed per-tenant share, and a time-to-converge figure -- see "UNI-127," above, for the full story including the live finding that a chaos scale-restore's actual capacity recovery (~3m39s on this backend) lags its patch by far more than a short `CHAOS_SCALE_HOLD` accounts for. `full-contention` regression confirmed the whole-run verdict is unchanged. No B1-B4/E1/E2 case was run or scored -- that is every ticket after this one in the chain | the board's edge-case cases themselves (B1-B4, E1, E2, "app3 joins at saturation"), each its own ticket |
 | — | ~~`MaaSSubscription` named `enduser-foo` for D2 (UNI-129)~~ | **Done.** Board approved and granted `create`/`get`/`list`/`watch` on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` to this role (narrowly, no write verbs). `enduser-foo` created, a key minted against it, and D2's specific case smoke-tested live: 70/70 requests `200`, `llm_d_epp_maas_fairness_unmatched_subscriptions_total` moved `0` -> `70`, confirming classification into `unclassified` | — |
 | 17 | **Decide whether terminally-unservable requests should be exempted/capped from provisional charging** | [UNI-148](/UNI/issues/UNI-148) (C6) found context-length rejections charged ~9-10x a normal request's cost, permanently (the ledger's own G2 cross-check flags it FAIL) -- by design, not a bug in the strict sense, but the design predates this evidence. The ~300s EPP/client timing gap this raised is now resolved: [UNI-190](/UNI/issues/UNI-190) live-reproduced it as a stuck gateway (Envoy/Istio) reply-path connection downstream of both vLLM and the EPP, confirmed **not** retry-amplified (one charge per request, same as finding 1 above) -- see "UNI-190," above | a policy decision |
+| 18 | **Live-exercise the no-usage/`ClientDisconnect` accounting path** | [UNI-149](/UNI/issues/UNI-149) (C5) confirmed provisional holds clear and the accounting-leak condition stays quiet, but found a graceful client-side cancel (killing the loadgen's own curl) never actually produces a no-usage response on this stack -- vLLM keeps generating and the EPP trues up against real usage instead, so `TestAbortedRequestStillBooksContendedService`'s own code path remains unverified live. Needs a harder abort (TCP-level severance, or killing the backend mid-stream) to reach it | a loadgen capability this chain's harness doesn't have yet |
 
 ## Reproducing
 

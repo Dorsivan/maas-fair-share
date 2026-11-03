@@ -288,6 +288,18 @@
 # phase-edge maths only ever reads an event's generic `at_seconds`, so this
 # needed no report-side change. See docs/runbook.md "Generic live-config
 # set/restore wrapper (UNI-180)" for the full mechanism and its known gaps.
+#
+# UNI-149 harness addition: SETTLE_SECONDS (default 0, no-op). The Job-poll
+# loop below only proves the loadgen stopped SENDING requests -- it says
+# nothing about whether the EPP has finished accounting for the ones already
+# in flight (a client abort has to propagate through the gateway before the
+# plugin's ResponseBody hook fires and releases that request's hold). Setting
+# SETTLE_SECONDS keeps capture_loop/timeseries_loop/chaos_loop running for
+# that many extra seconds after the Job completes, before the after-snapshot
+# and ENFORCE_LIVE/LIVE_SET_AT revert -- so a claim like "provisional tokens
+# return to zero once traffic stops" is read off the live epp-container.log
+# flight recorder instead of inferred from the before/after delta. 0 leaves
+# every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
 SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes}"
@@ -1370,6 +1382,23 @@ for i in $(seq 1 240); do
 done
 if [ "$PHASE" != "done" ]; then
   echo "[benchmark] WARNING: polling timed out before the Job reported completion" >&2
+fi
+
+# UNI-149 (C5): optional idle-observation window. Traffic has fully stopped
+# (the Job above reported done) but capture_loop/timeseries_loop/chaos_loop
+# are still running below this point -- that keeps the EPP container log and
+# the periodic metrics snapshot flowing for SETTLE_SECONDS before the next
+# block silences them, so a claim like "provisional tokens return to zero
+# once traffic stops" has live evidence instead of being inferred. UNI-145's
+# C2 section (docs/poc-results.md) hit exactly this gap and recommended this
+# knob. 0 (default) is a no-op -- every scenario before this ticket keeps its
+# existing immediate-stop behavior.
+SETTLE_SECONDS="${SETTLE_SECONDS:-0}"
+if [ "$SETTLE_SECONDS" -gt 0 ] 2>/dev/null; then
+  echo "[benchmark] settling: traffic stopped, waiting ${SETTLE_SECONDS}s before snapshotting/reverting (capture+timeseries stay live)"
+  chaos_log "settle: traffic stopped, waiting ${SETTLE_SECONDS}s before after-snapshot/revert"
+  sleep "$SETTLE_SECONDS"
+  chaos_log "settle: ${SETTLE_SECONDS}s window elapsed"
 fi
 
 # --- Stop capture/timeseries/chaos now (promptly, rather than leaving them

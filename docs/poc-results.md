@@ -5759,3 +5759,152 @@ never trusted on its own).
   group starved instead of cleanly recovering.
 - Grafana time range (this session's run): `2026-11-03T13:47:42Z`–
   `2026-11-03T13:54:51Z`.
+
+## UNI-193: PreStop hook fails every time, not sometimes -- the real differentiator is dispatch accounting, not the restart itself
+
+Follow-up from [UNI-155](/UNI/issues/UNI-155) E1. The ticket's premise was
+that the PreStop hook *sometimes* fails and that might explain why one
+`CHAOS_EPP_DELETE_AT` run recovered in 1s and another starved end-users
+completely for ~300s. Both halves of that premise turned out to be wrong in
+useful ways, and a third, fresh repro plus two fixed harness bugs produced
+the first real (not inferred) mechanism-level signal.
+
+**The PreStop hook does not "sometimes" fail -- it failed 100% of the time,
+every time checked.** Live `oc get events` (captured before the ~1h Event
+TTL expired) shows an identical `FailedPreStopHook` warning, with zero
+delay between `Killing` and the failure, on:
+
+- UNI-155's run 1 (PASS) -- pod `...-hzf92`
+- UNI-155's run 2 (FAIL) -- pod `...-jqczv`
+- a fresh repro run in this ticket (FAIL) -- pod `...-p5gbl` (and, from the
+  same namespace-wide events snapshot, several *other* chaos-delete events
+  from unrelated earlier sessions, also 100%)
+
+The PreStop hook itself is `/bin/sleep 15` (confirmed live from the running
+pod spec) -- about as close to unable-to-fail as a hook gets. A command
+that trivial erroring out immediately and unconditionally, with
+`terminationGracePeriodSeconds: 60` otherwise unused, reads as the cluster
+(or CRI-O) not actually attempting it rather than anything timing out. It
+is not investigated further here because **it cannot be the differentiator
+between the PASS and FAIL runs** -- it is constant across both.
+
+**The EPP log "stopping for every group" is a harness artifact, not EPP
+evidence, and it happened identically in the PASS run too.** The
+log-capture loop (`capture_loop` in `15-fairness-benchmark.sh`) and the
+mid-run restart detector were watching `$EPP_POD` by value, resolved once
+before the Job started. `CHAOS_EPP_DELETE_AT` gives the Deployment's
+replacement pod a new name mid-run; nothing re-resolved it. Checked
+directly against both UNI-155 raw result directories:
+`epp-container.log.capture-stderr` is 100% `NotFound: pods "<original
+name>" not found` from the moment of the chaos delete to the end of the
+run, in **both** the PASS run (238 failed reattach attempts against
+`hzf92`) and the FAIL run (230 against `jqczv`). The plugin's "fairness
+state" log line stopping for every group after the restart is exactly what
+that produces -- it says nothing about what the replacement pod's plugin
+was actually doing, in either run. **Fixed** (see below) -- re-confirmed
+live on the fresh repro: the replacement pod was found and reattached
+within 1 second instead of never.
+
+**`metrics-timeseries.txt` going dark for ~300s after the chaos delete is
+also a harness artifact, independent of the pod-name bug above, and also
+present identically in all three runs (PASS, FAIL, and the fresh repro).**
+The whole script runs under `set -euo pipefail`. `timeseries_loop`'s
+`curl` (and the `events_loop` added in this ticket) runs in the foreground
+of its own backgrounded subshell, unguarded. The EPP metrics Service has
+briefly zero ready endpoints around *any* pod replacement (chaos delete,
+the `ENFORCE_LIVE` flip, the end-of-run revert) -- one `curl: (7) Failed to
+connect` during that window is expected, but under `-e`/`pipefail` it
+silently killed the *entire loop* for the rest of the run instead of just
+skipping one 10s sample. Confirmed live on the fresh repro: exactly one
+curl failure logged, immediately followed by zero further
+`metrics-timeseries.txt` entries until the script's own end-of-run
+snapshot ~280s later -- matching the gap already visible in both of
+UNI-155's committed runs (run 1: last periodic sample at t+121s, next at
+t+430s; run 2: t+130s to t+429s). **Fixed** (see below).
+
+**Harness fixes landed in this ticket** (`deploy/poc/15-fairness-benchmark.sh`):
+
+1. `$EPP_POD` is now published to a file (`$EPP_POD_FILE`) that
+   `capture_loop` re-reads every iteration and the mid-run restart detector
+   re-reads every poll, instead of each holding a stale copy from whichever
+   subshell they forked from. A new `resolve_replacement_pod_async` helper
+   polls (bounded, 60 attempts) for the chaos-deleted pod's replacement and
+   publishes its name the moment it appears -- 1 second on the fresh repro.
+2. `timeseries_loop` and the new `events_loop` now run with `set +e`
+   locally, so a transient scrape/API failure skips one sample instead of
+   permanently killing the loop.
+3. A new periodic namespace-wide `oc get events` snapshot
+   (`k8s-events-timeseries.log`, same `WINDOW_SECONDS` cadence) closes the
+   gap this ticket's own text named: `FailedPreStopHook`/`Unhealthy`
+   evidence previously only existed live and expired with the ~1h Event
+   TTL.
+4. `snapshot_metrics()` now also captures the upstream
+   `sigs.k8s.io/gateway-api-inference-extension` (`v1.5.0`) flow-control
+   and endpoint-health metric families
+   (`llm_d_epp_flow_control_*`, `llm_d_epp_ready_endpoints`,
+   `llm_d_epp_per_endpoint_queue_size`, `llm_d_epp_average_*`/`std_dev_*`)
+   that the EPP was already exposing but this benchmark never scraped.
+
+**The fresh repro (`results/20261103T142146Z-uni-193-e1-repro/`), run with
+the fixed harness, reproduced the FAIL mode a second time** (end-users
+-62.8pts) and, for the first time, gives a real, quantified, triangulated
+signal instead of an inferred one:
+
+| signal | app1 | app2 | end-users |
+|---|---|---|---|
+| client 200s | 2702 | 2868 | 1305 |
+| EPP `dispatch_total` | 2111 | 2305 | **261** |
+| dispatch / client-200 ratio | 78% | 80% | **20%** |
+| ledger raw-token diff (EPP vs client) | -21.9% | -19.6% | **-80.0%** |
+| client p95 latency | 15.7s | 13.8s | **300.0s** |
+
+Three independent measurements agree: app1/app2 lose the same ~20% of
+their traffic to EPP-side accounting that every run in this chain loses to
+ordinary before/after-snapshot boundary effects, but end-users loses
+**~80%** of it -- four times worse, and specific to end-users, not a
+general artifact of the chaos event. Those ~80% of end-users' requests
+completed successfully at the backend (client saw `200`) but never
+registered in the fairness plugin's own `dispatch_total`, token-ledger, or
+`contended_*` metrics at all -- consistent with (not just similar to) what
+UNI-155's run 2 showed in its raw `metrics-after.txt`, where those same
+`fairness_id="end-users"` series were **completely absent**, not merely
+small, while present and populated for app1/app2 in that same snapshot and
+for all four groups in run 1's. The client p95 latency on end-users'
+failed (`000`) requests was `300.0`–`300.01`s in **all three** FAIL/PASS
+observations checked -- exactly `flowControl.defaultRequestTTL` from
+`deploy/poc/00-config.yaml`, not a round number a client-side timeout
+would produce on its own (`REQUEST_TIMEOUT_SECONDS` is not set to 300
+anywhere in this scenario).
+
+**What this triangulates to, still short of a proven code-level cause:**
+after the chaos-deleted pod's replacement comes up, a large fraction of
+end-users' ~128 concurrently-reconnecting client connections complete
+successfully at the backend while bypassing the EPP's per-group
+flow-control/fairness accounting entirely, and separately, whichever
+fraction do get admitted and then fail are held for almost exactly the
+configured flow-control TTL before failing -- both outcomes scaling with
+the one documented difference between end-users and app1/app2 (128 workers
+vs. 32). That is a real, now-quantified mechanism candidate, not the
+original "maybe many persistent connections" guess -- but confirming *why*
+reconnection volume causes some requests to bypass flow-control
+registration specifically needs the upstream
+`sigs.k8s.io/gateway-api-inference-extension` source (not vendored in this
+module; `go.mod` pins `v1.5.0`), which is out of scope for this ticket.
+Filed as [UNI-194](/UNI/issues/UNI-194).
+
+**Evidence:**
+
+- Commits: see this section's companion commit on `main`.
+- Harness fixes: `deploy/poc/15-fairness-benchmark.sh` (pod-name file
+  channel + async resolver, `set +e` in the two periodic loops, new
+  `events_loop`, broadened `snapshot_metrics`).
+- Fresh repro raw results: `results/20261103T142146Z-uni-193-e1-repro/`
+  (report, loadgen log, `client-request-summary.jsonl`,
+  before/after/time-series metric snapshots including the new flow-control
+  metric families, EPP container log, new `k8s-events-timeseries.log`).
+- Re-examined UNI-155 raw results (no changes): both
+  `results/20261103T133100Z-...` and `results/20261103T134626Z-...`.
+- Follow-up: [UNI-194](/UNI/issues/UNI-194) -- trace the upstream
+  flow-control/endpoint-registration path for why a 128-connection
+  reconnect burst bypasses per-group dispatch accounting while a
+  32-connection one does not.

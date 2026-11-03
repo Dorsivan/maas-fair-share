@@ -5415,6 +5415,110 @@ already existed from [UNI-129](/UNI/issues/UNI-129)'s board-approved grant
   `2026-11-03T11:16:35Z` (revert confirmed). Run itself:
   `2026-11-03T11:07:56Z`–`2026-11-03T11:15:26Z`.
 
+## UNI-154: D1, many end-user keys share one queue — collective ≈ 65%
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, last of the D-series run on
+this ticket chain. Where UNI-153 tested a key that *fails* to match
+`end-users`, this case tests the opposite edge: a large number of keys that
+all legitimately match, and whether the `prefix: [end-user-]` match
+collapses them into one fairness queue instead of fragmenting the group
+per-credential.
+
+**Setup.** `full-contention` (the proven 32/32/128-worker over-offering
+shape, `DURATION=240`, `ENFORCE_LIVE=true`), with `END_USERS_KEYS` widened
+from the scenario's own two-key default (`end-user-alpha end-user-beta`) to
+22 distinct `sk-oai-` credentials: the same two real `end-user-alpha`/
+`end-user-beta` `MaaSSubscription`s plus `end-user-gen01`..`end-user-gen20`
+— per `deploy/poc/04-loadgen.yaml`'s own comment, 20 more credentials minted
+against those same two subscriptions specifically for this key-rotation
+case. All 22 credential files already existed in the `maas-loadgen-keys`
+Secret before this run (UNI-129's board-approved provisioning); nothing new
+was minted or applied here, matching rule 5 — the run only passed
+`END_USERS_KEYS` to the existing harness, no code or cluster changes.
+`end-users`' 128 workers round-robin across all 22 credentials instead of
+just the usual 2.
+
+**Expected.** 20+ distinct credentials, each independently authenticated by
+Authorino and each injecting its own `X-MaaS-Subscription` value
+(`end-user-alpha`, `end-user-beta`, or `end-user-gen01..20`), but every one
+of those values starts with `end-user-`, so the EPP's `prefix` match should
+fold all of them into a single `fairness_id="end-users"` series — no
+per-credential or per-subscription fragmentation in `dispatch_total` or any
+other fairness metric — and the group's collective share should land at its
+normal 68.4% target, undiluted by how many distinct identities fed it.
+
+**Observed — the grouping claim.** Every fairness metric in the run's
+after-snapshot carries exactly one `end-users`-related label, the same as
+every two-key run before it:
+
+```
+llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"}         727468
+llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"}         574740
+llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"}    2824554
+llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="unclassified"} 25650
+```
+
+No `end-user-gen01`, `end-user-alpha`, etc. label ever appears anywhere in
+`metrics-after.txt` (checked across all `llm_d_epp_maas_fairness_*` series,
+84 label-combinations total — the same cardinality a 2-key run produces).
+`unmatched_subscriptions_total` stayed `0` before and after: all 22
+credentials validated and matched on the first try, none fell through to
+`unclassified`. 2233 end-users requests (2158 `200`, 75 `500`) all landed in
+the one queue.
+
+**Observed — the share claim.** end-users: 68.4% observed against a 68.4%
+expected target — **0.0pt deviation**, the tightest result of any case in
+this chain. app1 17.6% (-3.4pts), app2 13.9% (+3.4pts), both within the
+10-point threshold. **Verdict: PASS.** Ledger cross-check (G2): **PASS** on
+all three groups (-3.2%/-4.3%/-3.2% cost-diff, all within the 10%
+tolerance).
+
+**Surprise.** None expected, and none found — which is itself the point of
+this case. 10x'ing the credential count (2 → 22) changed neither the
+metric's cardinality nor the measured split by a meaningful amount; the
+prefix match is genuinely identity-count-agnostic, the way `docs/design.md`
+describes it. The per-10s timeline swings just as hard here (single
+windows see end-users anywhere from 0% to 100%) as every other
+closed-loop full-contention run in this chain — that's the already-documented
+window-noise artifact of `newcomerClamp`/`halfLifeSeconds=60` against a
+closed-loop generator (see UNI-144's and UNI-153's own timelines), not
+anything specific to the key count, and the window-level noise fully washes
+out in the whole-run share the verdict is actually scored on.
+
+**Cluster left as found:**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+      enforce: false
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m19s      115m
+```
+
+Weights unchanged (app1=20, app2=10, end-users=65, unclassified=5). `enforce`
+was flipped `true` for the run's duration and reverted/confirmed `false`
+afterward by `15-fairness-benchmark.sh`'s `ENFORCE_LIVE` wrapper, matching
+`deploy/poc/00-config.yaml` exactly. **Nothing new provisioned** — all 22
+end-user credentials and both backing `MaaSSubscription`s predate this
+ticket.
+
+**Evidence:**
+
+- Commit: see this section's companion commit on `main`.
+- Raw results: `results/20261103T112454Z-uni-154-d1-many-end-user-keys/`
+  (report, loadgen log, `client-request-summary.jsonl`, before/after/
+  time-series metric snapshots, EPP container log).
+- Harness: no code changes — existing `full-contention` scenario, invoked
+  with `END_USERS_KEYS` widened to 22 credentials. Reproduce with:
+  `END_USERS_KEYS="end-user-alpha end-user-beta end-user-gen01 end-user-gen02 end-user-gen03 end-user-gen04 end-user-gen05 end-user-gen06 end-user-gen07 end-user-gen08 end-user-gen09 end-user-gen10 end-user-gen11 end-user-gen12 end-user-gen13 end-user-gen14 end-user-gen15 end-user-gen16 end-user-gen17 end-user-gen18 end-user-gen19 end-user-gen20" DURATION=240 ./deploy/poc/15-fairness-benchmark.sh full-contention uni-154-d1-many-end-user-keys`.
+- Grafana time range: `2026-11-03T11:24:56Z` (enforce flip requested) –
+  `2026-11-03T11:31:41Z` (revert confirmed). Run itself:
+  `2026-11-03T11:26:08Z`–`2026-11-03T11:30:30Z`.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

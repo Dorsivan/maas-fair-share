@@ -5616,3 +5616,146 @@ Requests the EPP has already dispatched keep running on the backend after the
 client that sent them is gone — confirm recovery with a trivial single probe
 request before reusing the rig (see "a killed open-loop client does not
 relieve the backend" above).
+
+## UNI-155: E1, EPP restart mid-run — one run converges in 1s, the next never does
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, first of the E-series
+("state and membership edge cases") run on this chain. Setup: delete the
+GPU scheduler pod at t+120s during a `full-contention` run and see whether
+the system re-converges from the resulting cold start (fairness state is
+held only in the EPP's memory, so a pod replacement means every tenant's
+`attainedService` resets to zero).
+
+**Setup.** `full-contention` (32/32/128 workers), `DURATION=360`,
+`CHAOS_EPP_DELETE_AT=120` (UNI-127's existing chaos hook), `ENFORCE_LIVE=true`.
+360s gives ~240s of post-restart observation — 4x the system's
+`halfLifeSeconds=60` — specifically so a slow-but-real convergence has room
+to show up as converging, not just starting to.
+
+**Two runs exist for this exact case, and they disagree sharply.**
+
+The first run (`results/20261103T133100Z-uni-155-e1-epp-restart-mid-run/`)
+was started by an earlier agent session that was killed by a Paperclip
+adapter defect (the kill-grace-period was 2 minutes, shorter than this
+benchmark) before it could commit anything — the run itself completed
+normally on the cluster and in the local workspace, it just never reached
+`git push`. That data was recovered intact from the workspace in this
+session and is committed as-is for the record.
+
+- **Verdict: PASS.** end-users 67.0% observed vs 68.4% expected (-1.4pt).
+  app1 -0.2pt, app2 +1.6pt. Ledger cross-check: PASS, all groups within
+  10%.
+- **Time-to-converge:** the 120s phase edge (the restart) converged at
+  **121.0s — 1 second**, by a comfortable margin the fastest recovery in
+  this whole chain.
+- Windowed timeline: end-users drops to 0% in the single 10s window
+  spanning the restart (111–121s), then is back to a normal, noisy-but-
+  converged share for the remaining 121–430s window (67.0% against the
+  68.4% target).
+
+The second run (`results/20261103T134626Z-uni-155-e1-epp-restart-mid-run/`)
+is a fresh, independent run of the **identical** scenario and config, done
+in this session (foreground, blocking, no detached wrapper — see this
+ticket's comment thread for why that mattered this time).
+
+- **Verdict: FAIL.** end-users deviated **-68.4 points** — it went from a
+  converged ~68% share before the restart to **exactly 0% for the entire
+  remaining ~300 seconds of the run**. app1 and app2 did not just survive
+  the restart, they absorbed end-users' entire share: app1 52.2%
+  (+31.2pt), app2 47.8% (+37.3pt).
+- **Time-to-converge:** "n/a (never converged in this phase)" for the
+  120s-to-end phase. N is not a small number of half-lives here — it is
+  "did not happen inside 5 half-lives."
+- Ledger cross-check: FAIL on all three groups. end-users' raw/cost
+  columns are `n/a` outright — the EPP's own `contended_service_tokens_total`
+  for `fairness_id="end-users"` is **absent** from the after-snapshot, not
+  just small.
+- The EPP's own `maas-fairness` plugin logs a per-group "fairness state"
+  line every 5s (`stateLogIntervalSeconds: 5`) while it is enforcing. In
+  this run those lines exist for `app1`/`app2`/`end-users`/`unclassified`
+  identically up to the last tick before the restart (13:49:33Z, 9s before
+  the chaos delete), and then **stop entirely for every group** — the log
+  capture reattached to the replacement pod within ~41s, so the absence
+  of `end-users` ticks afterward is not a capture gap, it's that the
+  replacement pod's own log stream has no "fairness state" lines for any
+  group, which itself is suspicious and not fully explained (see below).
+- `oc get events` on the deleted pod
+  (`maas-vllm-gpu-kserve-router-scheduler-676fd97cd-jqczv`) shows a
+  **`FailedPreStopHook`** warning at termination, immediately followed by
+  two `Unhealthy` readiness-probe failures (`responded with "NOT_SERVING"`,
+  then `context deadline exceeded`) in the minute after the delete was
+  issued — i.e. the pod chaos deleted did not terminate cleanly, and
+  stayed registered and being probed for longer than a clean delete should
+  take. 128 of end-users' 1196 client requests came back as connection-level
+  failures (`000`) and 49 as `500`; p95 latency was `300.01s`, essentially
+  exactly `flowControl.defaultRequestTTL`. app1/app2 saw only a handful of
+  `000`/`500` each (11–13), out of far more total requests.
+- No crash loop in the strict sense the ticket asks to rule out: container
+  `restartCount` stayed `0` throughout (confirmed both via the benchmark's
+  own tracking and a direct `oc get pods` check afterward), and the final
+  replacement pod has been `Running` and stable since. But a failed
+  PreStop hook plus an extended unhealthy-but-not-yet-replaced window is
+  its own kind of chaos-restart failure mode, distinct from a clean
+  delete-and-recreate, and it coincides exactly with the run that failed.
+
+**Surprise — this is the whole finding.** The ticket expected "does it
+re-converge, and how many half-lives does that take." What actually showed
+up is that the *same* chaos action against the *same* config produced two
+qualitatively different outcomes 15 minutes apart: a clean 1-second
+recovery once, and a complete, sustained (not slowly-decaying) starvation
+of the single highest-weight, highest-concurrency group the next time,
+with no corresponding crash-loop to explain it. end-users is also the only
+group with 128 workers against app1/app2's 32 each — whether that
+concurrency difference is why it was the one group that failed to recover
+(e.g. many persistent connections pinned to the pod mid-termination, vs.
+few) is a plausible mechanism but not confirmed here; confirming it would
+need gateway/endpoint-level evidence this ticket did not collect.
+
+**This did not get root-caused further in this ticket** — doing so needs
+endpoint/readiness-controller and gateway-level evidence, which is a
+different, open-ended investigation, not "run case E1." Filed as
+[UNI-193](/UNI/issues/UNI-193) with cause-not-yet-known, so a FAIL can
+close here per the delivery standard's "no ticket closes on a red result"
+rule.
+
+**Harness correctness (the ticket's other two asks).** Both runs confirm
+the harness does what UNI-127 built it to do: the restart is flagged in
+both reports' "Chaos events" and "Time-to-converge" sections without any
+manual intervention, and "no crashloop" is checkable directly from the
+report plus a live `oc get pods` (both runs: stable, 0 restarts, by the
+time the report ran).
+
+**Cluster left as found** (captured after this session's run, the live
+state at time of writing):
+
+```
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}'
+2
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+      enforce: false
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+$ oc get pods -n maas-fairness-poc | grep vllm-gpu
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk                          1/1   Running  0   46h
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                          1/1   Running  0   16d
+maas-vllm-gpu-kserve-router-scheduler-575669c495-vhg65         1/1   Running  0   5m51s
+```
+`enforcing` metric confirmed `0` on both EPPs after the run (same mechanism
+every other ticket in this chain uses — the ConfigMap, not mounted live, is
+never trusted on its own).
+
+**Evidence:**
+
+- Commits: see this section's companion commits on `main`.
+- Raw results (both runs): `results/20261103T133100Z-uni-155-e1-epp-restart-mid-run/`
+  and `results/20261103T134626Z-uni-155-e1-epp-restart-mid-run/` (report,
+  loadgen log, `client-request-summary.jsonl`, before/after/time-series
+  metric snapshots, EPP container log, each run's own chaos/enforce event
+  logs).
+- Follow-up: [UNI-193](/UNI/issues/UNI-193) — root-cause why the chaos-deleted
+  pod sometimes fails its PreStop hook and leaves the highest-concurrency
+  group starved instead of cleanly recovering.
+- Grafana time range (this session's run): `2026-11-03T13:47:42Z`–
+  `2026-11-03T13:54:51Z`.

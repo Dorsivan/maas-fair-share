@@ -5908,3 +5908,141 @@ Filed as [UNI-194](/UNI/issues/UNI-194).
   flow-control/endpoint-registration path for why a 128-connection
   reconnect burst bypasses per-group dispatch accounting while a
   32-connection one does not.
+
+## UNI-156: E2, lose one vLLM replica mid-run — ratio holds (tighter than before), the floor doesn't drop
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, second of the E-series. Setup:
+`full-contention` (32/32/128 workers), scale `maas-vllm-gpu` from 2 replicas to
+1 at t+120s, restore to 2 at the run's end (t+360s), `ENFORCE_LIVE=true`.
+`DURATION=360` for the same reason [UNI-155](/UNI/issues/UNI-155) picked it —
+120s of clean baseline plus 240s (4x `halfLifeSeconds=60`) of post-chaos
+observation. The ticket's own stated pass condition: "the ratio holds and
+absolute throughput drops by about half."
+
+**The ratio held — more tightly than the pre-chaos baseline did.** Whole-run
+verdict: **PASS**. app1 18.7% (-2.3pt), app2 12.0% (+1.4pt), end-users 69.3%
+(+0.9pt) against the 21.1/10.5/68.4% target; ledger cross-check PASS on all
+three groups (raw-token diff 0.0/0.0/-0.3%). The windowed timeline resolves
+this further: the 120s phase edge (the scale-down) converged in **20
+seconds** (120s → 140s), and averaging each 10s window's deviation across its
+whole phase —
+
+| phase | app1 avg dev | app2 avg dev | end-users avg dev |
+|---|---|---|---|
+| baseline, 2 replicas (0–120s) | -4.9pt | +4.2pt | +0.7pt |
+| single-replica, converged (150–360s) | **-0.06pt** | **+0.08pt** | **-0.02pt** |
+
+— the single-replica phase tracked its target to within a tenth of a point on
+average, noticeably *tighter* than the two-replica baseline managed before
+the chaos event. Losing half the pool's capacity did not loosen the weighted
+split; if anything the remaining single replica's queue stayed more
+consistently backlogged (no idle gaps for the scheduler to make a biased
+pick in), which is a plausible mechanism, not a confirmed one — this
+benchmark does not instrument per-replica queue depth.
+
+**The floor did not drop by half.** This is the surprise, and it contradicts
+the ticket's own stated expectation. Average delivered-token throughput
+(summed across the three contending groups) over clean windows in each
+phase:
+
+| phase | windows | avg tokens/10s-window | tok/s |
+|---|---|---|---|
+| baseline, 2 replicas (20–120s) | 10 | 164,355 | 16,435 |
+| single-replica, converged (150–360s) | 20 | 151,200 | 15,120 |
+
+That is an **8% drop, not ~50%**. The transition window itself (120–140s,
+while the scale-down patch was landing and the single replica was absorbing
+the full offered load) briefly spiked *above* baseline (24,070–24,501
+tokens/10s) before settling to the steady value above — consistent with a
+queue draining faster than it filled for a few seconds, not with any
+data-loss artifact. Status tallies stayed overwhelmingly `200` throughout
+(app1 846/870, app2 545/567, end-users 3126/3204; a handful of `500`s in each
+group, no concentration visible in the aggregate client record this
+benchmark collects). EPP pick latency stayed sub-millisecond
+(`flow_control_dispatch_cycle` p50 0.05ms, p99 0.1ms) and nothing was shed
+(0 `429`/`503` client-side, 0 EPP-side) — the system never hit an admission
+limit at any point in the run, full capacity or half.
+
+**Not confirmed here, by design:** *why* one A100 running `llama-3-1-8b`
+under this benchmark's offered concurrency (192 workers total, all three
+groups combined) delivers nearly the same aggregate token throughput as two
+A100s did is not established by this ticket's evidence. The benchmark
+scrapes the EPP's own fairness/flow-control metrics, not vLLM's internal
+batch size, KV-cache occupancy, or GPU utilization — any of which could
+explain a throughput ceiling that was already below what two replicas could
+jointly produce (i.e., the pool may not have been GPU-compute-bound at this
+worker count even before the chaos event). Filed as a backlog idea (not a
+blocking follow-up — the benchmark's own PASS/FAIL gates are clean; this is
+an informational gap, not a red result) for someone to profile vLLM-side if
+the question becomes load-bearing for a future ticket.
+
+**A second, unrelated observation, pre-dating the chaos event:** the 80–110s
+windows (still on 2 replicas, 10–50s before the scale-down) swung far wider
+than typical — one window gave end-users 100% of delivered tokens and app1/
+app2 0% each, the next almost fully reversed it. [UNI-127](/UNI/issues/UNI-127)
+already documented ±15–20pt noise on 10s full-contention windows as expected
+and not a regression; this run's swings (up to -27.8/+31.6pt) are larger than
+that prior observation but land in the same category — pre-chaos, whole-run
+verdict unaffected, not investigated further here since it predates and is
+independent of this ticket's own intervention.
+
+**One operational note for anyone sizing a future chaos-scale case on this
+backend:** the restored replica's real Ready state took **about 7 minutes**
+this time (patch landed 14:54:06Z, pod `maas-vllm-gpu-kserve-74d8dd69bd-vcrhp`
+confirmed `1/1 Running` at 15:01), longer than [UNI-127](/UNI/issues/UNI-127)'s
+smoke-test measurement of ~3m39s. `DURATION`/`CHAOS_SCALE_HOLD` should be
+sized with real GPU-restart variance in mind, not a single prior sample — a
+case that needs to *observe* recovery, unlike this one, should budget more
+than 4 minutes of post-restore runway.
+
+**A turn-boundary note, for the record.** This run's background shell hit
+this harness's 10-minute background-task limit a few seconds after the
+script's own `enforce` revert and chaos-scale restore both completed and
+confirmed — before it reached report generation. All raw evidence
+(before/after/timeseries metric snapshots, loadgen log, client record, chaos
+events, k8s events) was captured intact; only the derived
+`fairness-report.json`/`.md` were missing. They were regenerated
+out-of-band by invoking `15-fairness-report.py` directly against the same
+captured inputs the script would have used (same scenario/label, same
+`ENFORCE`/`EPP_POD`/image digest/run-start-end/cost-model weights, all read
+from the run's own artifacts or the live ConfigMap) — the report script is a
+pure function of these inputs with its own independent unit coverage
+(`15-fairness-report-test.py`), so this is a reconstruction of the same
+computation the script would have run, not a new one.
+
+**Cluster left as found**, confirmed after the restored replica reached
+`Ready` (not just after the patch landed, given the note above) and the
+`enforcing` metric read back `0` on both EPPs directly (not the ConfigMap —
+see [UNI-155](/UNI/issues/UNI-155) for why that distinction matters here):
+
+```
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+$ oc get pods -n maas-fairness-poc | grep vllm-gpu
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                          1/1     Running     0             16d
+maas-vllm-gpu-kserve-74d8dd69bd-vcrhp                          1/1     Running     0             9m4s
+maas-vllm-gpu-kserve-router-scheduler-575669c495-cpbzc         1/1     Running     0             5m39s
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           8m43s      15m
+```
+`llm_d_epp_maas_fairness_enforcing` confirmed `0` on both the GPU and CPU EPP
+(they share this ConfigMap — see [UNI-174](/UNI/issues/UNI-174)) by direct
+scrape, not inferred from the ConfigMap alone.
+
+**Evidence:**
+
+- Commits: see this section's companion commit on `main`.
+- Raw results: `results/20261103T144653Z-uni-156-e2-lose-replica-mid-run/`
+  (report, loadgen log, `client-request-summary.jsonl`, before/after/
+  time-series metric snapshots, EPP container log, `k8s-events-timeseries.log`,
+  chaos/enforce/live-config event logs).
+- Grafana time range: `2026-11-03T14:48:05Z`–`2026-11-03T14:56:59Z` (the
+  scored run itself; the cluster did not finish settling back to its
+  pre-run state until ~15:01Z — see the operational note above).

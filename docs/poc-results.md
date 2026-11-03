@@ -5002,6 +5002,110 @@ Weights unchanged (app1=20, app2=10, end-users=65, unclassified=5).
   `2026-11-03T10:33:18Z` (revert confirmed). Run itself:
   `2026-11-03T10:20:18Z`–`2026-11-03T10:32:09Z`.
 
+## UNI-151: D3, spoofed fairness-id header — charged to the real group
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, third of the D-series
+(identity variants). This is the scored case the [UNI-129](/UNI/issues/UNI-129)
+harness built but deliberately did not score — that ticket's own "D3" section
+already showed the mechanism working on a 68/34-request ad hoc smoke Job; this
+ticket re-runs it as a proper scored benchmark, through
+`deploy/poc/15-fairness-benchmark.sh`, under the full three-tenant weighted
+contention the case's "under contention" setup actually calls for.
+
+**Setup.** `full-contention` (app1/app2/end-users, 32/32/128 workers,
+`ENFORCE_LIVE=true` per this chain's convention), with
+`FORGE_FAIRNESS_ID_FRACTION_END_USERS=1` — **every** end-users request, on
+top of its real `end-user-*` key, also carries a forged
+`x-llm-d-inference-fairness-id: app1` header (`FORGE_FAIRNESS_ID_VALUE`'s
+default). This is the harder version of the ad hoc smoke test: instead of a
+50% forge fraction against an idle app1, 100% of a fully-loaded end-users
+tenant's traffic forges app1's identity while app1 is simultaneously sending
+its own real, unforged load — the clearest possible test of whether forged
+traffic can inflate app1's own share.
+
+**Expected split (unaffected by the forgery, if the defense holds):**
+app1 21.1%, app2 10.5%, end-users 68.4% of offered weight (unclassified
+excluded, not offered) — the same weighted-token target as every
+`full-contention` run, because [design.md](design.md)'s unconditional
+`PreRequest` overwrite means the forged header should never be read.
+
+**Observed split:** app1 17.9% (-3.1pts), app2 13.9% (+3.4pts), end-users
+68.1% (-0.3pts) — all three within the 10-point threshold.
+**Weighted-split verdict: PASS.** Ledger cross-check (G2): **PASS** on all
+three groups (-1.1%/-3.2%/-1.5%, all within the 10% tolerance).
+
+**The actual D3 question — direct counter evidence, not just the aggregate
+split.** The aggregate PASS above is consistent with the defense holding,
+but it doesn't by itself rule out some crossover hiding inside normal
+run-to-run noise. The sharper evidence is in `client-request-summary.jsonl`
+and the EPP's own fresh-pod counters (the `ENFORCE_LIVE` flip recreates the
+scheduler pod, so `metrics-after.txt`'s absolute values ARE this run's
+delta):
+
+| | client-recorded | EPP `llm_d_epp_maas_fairness_dispatch_total` |
+|---|---|---|
+| app1 (real traffic, 0 forged) | 568 sent, 558×`200` | `fairness_id="app1"` = **558** |
+| end-users (real traffic, **all 2162 forged** to `app1`) | 2162 sent, 2162×`forged_fairness_id`, 2128×`200` | `fairness_id="end-users"` = **2126** |
+
+`fairness_id="app1"`'s counter (558) is **exactly** app1's own real
+`200`-status request count — not one of the 2162 forged-to-`app1` end-users
+requests moved it. If the forged header had been honored even partially,
+app1's dispatch count would sit somewhere above 558 and below
+558+2126=2684; it does not. (The 2126 vs. end-users' own 2128 `200`s is a
+2-request gap consistent with scrape-timing noise at the run boundary — the
+same kind of ±1-2 request edge effect other tickets in this chain have
+already documented, not a sign that 2 forged requests slipped through: a
+genuine leak would show up on the `app1` side, where it stayed at exactly
+558.) This is the same "defense holds" result [UNI-129](/UNI/issues/UNI-129)
+found at 36/68 forged under light, single-tenant-comparison load — now
+confirmed at 2162/2162 (100%) forged under full three-tenant GPU-pool
+contention, which is the harder and more representative condition.
+
+**Nothing surprising this time** — unlike most of this chain's cases, D3's
+behavioral claim (the plugin's unconditional `PreRequest` overwrite from the
+authenticated `x-maas-subscription`, not the client-settable
+`x-llm-d-inference-fairness-id`) held exactly as designed, at the hardest
+fraction (100%) this harness can express, with no edge case or regression
+uncovered.
+
+**Cluster left as found:**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+      enforce: false
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/name=maas-vllm-gpu
+NAME                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-74d8dd69bd-69gqk    1/1     Running   0          43h
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4    1/1     Running   0          15d
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m20s      7m10s
+```
+
+Weights unchanged (app1=20, app2=10, end-users=65, unclassified=5). `enforce`
+was flipped `true` for the run's duration (this chain's convention,
+confirmed via `llm_d_epp_maas_fairness_enforcing` on both EPPs, not read off
+the ConfigMap) and reverted/confirmed `false` afterward by
+`15-fairness-benchmark.sh`'s own `ENFORCE_LIVE` wrapper.
+
+**Evidence:**
+
+- Commit: see this section's companion commit on `main`.
+- Raw results: `results/20261103T104350Z-uni-151-d3-forged-fairness-id/`
+  (report, loadgen log, `client-request-summary.jsonl`, before/after metric
+  snapshots, EPP container log).
+- Harness: `FORGE_FAIRNESS_ID_FRACTION`/`FORGE_FAIRNESS_ID_VALUE`, built by
+  [UNI-129](/UNI/issues/UNI-129) — no harness changes needed for this ticket.
+- Grafana time range: `2026-11-03T10:43:52Z` (enforce flip requested) –
+  `2026-11-03T10:50:45Z` (revert confirmed). Run itself:
+  `2026-11-03T10:45:03Z`–`2026-11-03T10:49:25Z`.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.

@@ -1,0 +1,1 @@
+field:llmisvc:maas-vllm-gpu:spec.replicas

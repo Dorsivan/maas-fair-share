@@ -4886,6 +4886,122 @@ produce a response with genuinely no usage block on this stack. Tracked as
 outstanding-work item 18, below, rather than a new chain ticket, since it is
 a coverage gap in evidence, not a known defect needing a board decision.
 
+See also outstanding-work item 19, below, for a harness-level connection-race
+finding from [UNI-150](/UNI/issues/UNI-150) (C4) that produced a batch of
+false-looking HTTP 500s immediately after an `ENFORCE_LIVE` flip.
+
+## UNI-150: C4, `near-timeout-long-generations` — no premature 504s, up to the 600s edge
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, fourth of the C-series. This
+is the case outstanding-work item 15 (below) asked for: closes the gap it
+flagged by driving genuinely long (minutes, not seconds) generations through
+the Route under real multi-tenant contention, not a single request.
+
+**Setup, and two discarded calibration attempts.** The runbook's own note on
+this case ("Long generations, concretely") predicted `LONG_GEN_MAX_TOKENS`
+would need empirical sizing against the real backend, and it took two
+discarded attempts to find it (neither in `results/`):
+
+1. Reused `asymmetric-request-shapes`' proven app1/end-users 32/104 sizing
+   with `LONG_GEN_MAX_TOKENS` scaled from its calibrated 1500 (UNI-146,
+   ~170-200s) up to 4000 by simple linear extrapolation, targeting ~7.5min.
+   104 concurrent ~4000-token completions instead blew through this GPU's
+   KV-cache capacity: a 32%/19% HTTP 500 rate on app1/end-users respectively
+   (resource exhaustion, not a timeout artifact), and p95 latency pinned
+   exactly at the 650s `REQUEST_TIMEOUT_SECONDS` client cutoff rather than a
+   real completion time — the linear extrapolation itself was wrong.
+2. Cut end-users down to 8 concurrent long-gen workers (new scenario,
+   `near-timeout-long-generations`) at the same `LONG_GEN_MAX_TOKENS=4000`:
+   clean (zero errors) but completed in **51s** median. The lesson: this
+   backend's per-sequence decode throughput is governed far more by how many
+   *concurrent long-gen sequences* dilute the shared decode budget than by
+   token count — 104 concurrent sequences measured 5.6x slower per sequence
+   than 8 concurrent ones at the identical 4000-token target (280s vs 51s),
+   but token count alone can't reach 5-9 minutes at 8-worker throughput
+   without exceeding the backend's 8192-token context window
+   (8150 max completion tokens / ~80 tok/s ≈ 102s, still short of 5 minutes).
+
+**Scored run.** `near-timeout-long-generations`: app1/app2 at
+`full-contention`'s proven 32/32 short-request sizing (continuous
+background contention for the whole run), end-users at 48 concurrent
+long-gen workers (30-word fixed prompt, `LONG_GEN_MAX_TOKENS=8100`, vLLM's
+`min_tokens`/`ignore_eos` extensions forcing the full length every time),
+`REQUEST_TIMEOUT_SECONDS=900` (clear of the Route's 600s so a real
+completion is never confused with a client-side cutoff), `ENFORCE_LIVE=true`
+(this chain's convention), live against `maas-vllm-gpu` (2 replicas,
+llama-3-1-8b).
+
+**Verdict: UNCONTENDED** (benchmark's own weighted-split check, same
+mechanism UNI-146 documented for every duration-asymmetric case: long-held
+GPU slots make "pick" events — the moments the fairness plugin actually
+chooses between groups — too sparse in time for the 10-point deviation
+check to mean anything; not scored). Ledger cross-check: **FAIL**
+(end-users -35.7%, same structural truing-estimate-vs-actual-cost pattern as
+every other large-completion case in this chain, e.g. [UNI-148](/UNI/issues/UNI-148)).
+
+**This ticket's own pass criterion — PASS.** end-users' 48 concurrent
+generations measured **p50 297.9s / p95 402.8s** (5.0 / 6.7 minutes),
+squarely inside the ticket's 5-9 minute target, each one forced to its full
+8100-token length. app1/app2's own short (64-token) requests, competing for
+GPU slots against those 48 long-held sequences, saw their own tail latency
+balloon to **p95 594.3s / 593.6s** — right at the edge of the Route's 600s
+timeout, driven by admission queueing rather than generation time. Across
+all 264 requests in the scored run (and 311 more across both discarded
+attempts), **zero HTTP 504s occurred, at any latency, including the ones
+landing within 6 seconds of the Route's 600s cutoff.** The `timeout: 600s` /
+`buffer-response: "false"` Route annotations behave exactly as documented
+under sustained multi-tenant contention, not just for the single requests
+[UNI-27](/UNI/issues/UNI-27) originally proved them with.
+
+**The real surprise: the HTTP 500s, and where they actually came from.**
+The scored run's own statuses (`app1 200=65 500=25`, `app2 200=59 500=22`,
+`end-users 200=84 500=9`) look like a timeout-adjacent failure at first
+glance, but the gateway's own access log (not captured in prior tickets'
+evidence, pulled live for this one) resolves it completely: **all 56 HTTP
+500s across the entire ~12-minute run landed inside a single 339ms window**
+(`10:20:21.304Z`–`10:20:21.643Z`), seconds after `ENFORCE_LIVE`'s
+config-edit recreated the EPP pod and the benchmark applied the loadgen Job.
+vLLM's own access log shows exactly `264 - 56 = 208` requests ever reached a
+backend replica — the 500s never got that far; they are a one-time
+connection-establishment race between the new EPP pod/route mapping coming
+up and the Job's workers all dispatching their first request simultaneously,
+not a timeout, not KV-cache pressure, and not specific to long generations
+(the same signature, at a different scale, likely explains the first
+discarded attempt's much higher failure rate too — that one started 136
+workers at once instead of 112). Zero 500s occurred after that initial
+window, including on every request that ran 300-600s later. Filed as
+outstanding-work item 19, below: `15-fairness-benchmark.sh` should confirm
+the new EPP pod is actually serving (not just that the fairness-enforcing
+metric reads back correctly) before applying the Job.
+
+**Cluster left as found:**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|halfLifeSeconds:'
+      enforce: false
+      halfLifeSeconds: 60
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           11m        14m
+$ oc get route maas-gateway -n maas-fairness-poc -o jsonpath='{.metadata.annotations.haproxy\.router\.openshift\.io/timeout} {.metadata.annotations.haproxy\.router\.openshift\.io/buffer-response}{"\n"}'
+600s false
+```
+
+Weights unchanged (app1=20, app2=10, end-users=65, unclassified=5).
+
+**Evidence:**
+
+- Commit: see this section's companion commit on `main`.
+- Raw results (scored run only; the two discarded calibration attempts are
+  not pushed): `results/20261103T101904Z-uni-150-c4-near-timeout-v3/`.
+- Harness addition: `near-timeout-long-generations` scenario in
+  `deploy/poc/15-fairness-benchmark.sh`.
+- Grafana time range: `2026-11-03T10:19:06Z` (enforce flip requested) –
+  `2026-11-03T10:33:18Z` (revert confirmed). Run itself:
+  `2026-11-03T10:20:18Z`–`2026-11-03T10:32:09Z`.
+
 ## Outstanding work
 
 Ordered by how much they would change a conclusion.
@@ -4906,7 +5022,7 @@ Ordered by how much they would change a conclusion.
 | 12 | **Red Hat support boundary** | a custom EPP image takes that component outside RHOAI support. The plan calls this the biggest non-technical risk and it has never been raised with the account team. Nothing technical unblocks it | a conversation |
 | 13 | **Version-pin maintenance** | flow-control interfaces sit on a module that only reached v1.0.0 on 2026-10-15; we are pinned to v0.11.0. Process, pinned versions and the named interface inventory are now in [version-pinning.md](version-pinning.md). Monthly check, manual — there is no CI runner | process |
 | 14 | **Disconnected / mirrored clusters** | the image must be mirrored with a matching IDMS/ICSP entry. Untested, and the Quay reference assumes egress | an air-gapped target |
-| 15 | **600s timeout and `buffer-response: false` under sustained/long-running load** | these annotations govern long-running and streaming responses; still only proven by single requests. UNI-27's closed-loop run used short prompts (`max_tokens: 64`, ~6-11s p95 responses), which never approaches the timeout or exercises buffering behaviour | a load generator issuing long-running/streaming requests |
+| — | ~~600s timeout and `buffer-response: false` under sustained/long-running load~~ | **Done for non-streamed long generations ([UNI-150](/UNI/issues/UNI-150), C4).** A load generator now drives genuinely long (5-9 minute, up to 8100-token) completions through the Route under real multi-tenant contention: zero HTTP 504s across 575 requests spanning three live attempts, including ones completing within 6 seconds of the Route's 600s cutoff. The `timeout: 600s` / `buffer-response: "false"` annotations behave exactly as documented. **Not yet covered: the streaming (`stream: true`) half of this item** — [UNI-145](/UNI/issues/UNI-145)'s `STREAM_FRACTION` knob exists but has never been paired with a long generation, so whether buffering behaves identically for an SSE response near the timeout boundary is still unproven | a loadgen run pairing `STREAM_FRACTION` with `LONG_GEN_MAX_TOKENS` |
 | — | ~~Gateway header stripping (MaaS path, UNI-33)~~ | **Fixed and verified live.** The EPP's own header-alias resolution prefers client-settable `x-llm-d-inference-objective` over the gateway-authored `x-gateway-inference-objective`, so a client forging the former won outright regardless of what Authorino set for the latter -- proven live 2026-10-19 (a forged header passed through the gateway untouched, HTTP 200). The one-line patch to `maas-poc-gateway-authn` was applied live on 2026-10-19 once `patch` on `authpolicies.kuadrant.io` in `maas-fairness-poc` was granted, and the conformance check (`cmd/gateway-header-check`) now reports `OK` against the live cluster. Still dormant: zero `InferenceObjective` resources exist, so no behavioural queue-jump has been demonstrated, only the structural fix. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
 | — | ~~Gateway header stripping (direct rig, UNI-43)~~ | **Fixed and verified live.** The direct rig (`02-epp.yaml`/`03-gateway.yaml`) has no Authorino layer, so UNI-33's overwrite mechanism doesn't apply -- fixed instead by removing the header outright, via an Istio `EnvoyFilter` (`envoy.filters.http.header_mutation`, `INSERT_BEFORE` `envoy.filters.http.ext_proc`) scoped to `maas-poc-route` alone so it can't also strip the value UNI-33 set for the authenticated MaaS routes sharing the same Gateway. Applied and verified live 2026-10-19 once `create`/`update` on `envoyfilters.networking.istio.io` and `pods/exec` in `maas-fairness-poc` were granted: the live config dump confirmed `header_mutation` sits immediately before `ext_proc` in the chain, and the per-route override lands on exactly one route (`maas-fairness-poc.maas-poc-route.0`), not on the MaaS routes. `gateway-header-check` still reports this route as uncovered -- a known, documented limitation (it only recognises AuthPolicy-based coverage), not a sign the fix didn't take. Not verified: an end-to-end request proving a forged header doesn't reach the EPP/simulator, since both remain scaled to 0/0. See [gateway-header-stripping.md](gateway-header-stripping.md) | N/A -- closed |
 | — | ~~Reproduce the headline split on real vLLM, both modes (UNI-29)~~ | **Done.** Re-run 2026-10-22 against the live GPU deployment (now serving `llama-3-1-8b`, EPP image digest `sha256:5ef5df27...`): shadow 33.0/33.6/33.4%, enforce (sized workers) 16.2/13.7/70.1% against a 20/10/65 target. See "A4 (UNI-29): reproduced again, against the current EPP build, both modes," above, for the full data including a negative-control run and the sizing hypothesis for the ~5-point residual gap. `enforce` was restored to `true` (the live default) afterward | follow-up: tune worker sizing further to close the ~5-point gap (same section) |
@@ -4921,6 +5037,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~`MaaSSubscription` named `enduser-foo` for D2 (UNI-129)~~ | **Done.** Board approved and granted `create`/`get`/`list`/`watch` on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` to this role (narrowly, no write verbs). `enduser-foo` created, a key minted against it, and D2's specific case smoke-tested live: 70/70 requests `200`, `llm_d_epp_maas_fairness_unmatched_subscriptions_total` moved `0` -> `70`, confirming classification into `unclassified` | — |
 | 17 | **Decide whether terminally-unservable requests should be exempted/capped from provisional charging** | [UNI-148](/UNI/issues/UNI-148) (C6) found context-length rejections charged ~9-10x a normal request's cost, permanently (the ledger's own G2 cross-check flags it FAIL) -- by design, not a bug in the strict sense, but the design predates this evidence. The ~300s EPP/client timing gap this raised is now resolved: [UNI-190](/UNI/issues/UNI-190) live-reproduced it as a stuck gateway (Envoy/Istio) reply-path connection downstream of both vLLM and the EPP, confirmed **not** retry-amplified (one charge per request, same as finding 1 above) -- see "UNI-190," above | a policy decision |
 | 18 | **Live-exercise the no-usage/`ClientDisconnect` accounting path** | [UNI-149](/UNI/issues/UNI-149) (C5) confirmed provisional holds clear and the accounting-leak condition stays quiet, but found a graceful client-side cancel (killing the loadgen's own curl) never actually produces a no-usage response on this stack -- vLLM keeps generating and the EPP trues up against real usage instead, so `TestAbortedRequestStillBooksContendedService`'s own code path remains unverified live. Needs a harder abort (TCP-level severance, or killing the backend mid-stream) to reach it | a loadgen capability this chain's harness doesn't have yet |
+| 19 | **`ENFORCE_LIVE`'s pod-recreate races the Job's first request wave** | [UNI-150](/UNI/issues/UNI-150) (C4) traced a batch of HTTP 500s (56 of them, 20-30% of app1/app2's requests) to a single 339ms window immediately after an `ENFORCE_LIVE` config flip recreates the EPP pod -- confirmed via the gateway access log: those requests never reached a vLLM backend at all, timestamped seconds after the benchmark applied the loadgen Job. `15-fairness-benchmark.sh` currently only waits for `llm_d_epp_maas_fairness_enforcing=1` to read back on both EPPs' metrics before applying the Job; it does not confirm the new pod/route mapping is actually accepting traffic. Harmless to every `ENFORCE_LIVE` run's actual fairness/ledger numbers so far (the failures land in a fixed one-time window, not spread through the run), but inflates the "overwhelmingly 200" status-tally check `run.sh` itself prints, and would confound a ticket that specifically needed a clean status tally | a short readiness probe (e.g. one throwaway request) after the enforce-flip confirms, before the Job is applied |
 
 ## Reproducing
 

@@ -302,7 +302,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -941,8 +941,43 @@ case "$SCENARIO" in
     TENANTS="app1 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_END_USERS=104 PROMPT_WORDS_MIN_END_USERS=30 PROMPT_WORDS_MAX_END_USERS=30 MAX_TOKENS_MODE_END_USERS=longgen LONG_GEN_MAX_TOKENS=1500)
     ;;
+  near-timeout-long-generations)
+    # UNI-150: C4, "long-running requests near the 600s timeout" -- the case
+    # this chain's own runbook note (docs/runbook.md, "Long generations,
+    # concretely") flagged as where LONG_GEN_MAX_TOKENS/REQUEST_TIMEOUT_SECONDS
+    # sizing against the real backend finally gets pinned down. A first
+    # attempt reused asymmetric-request-shapes' full 104-worker end-users
+    # sizing with LONG_GEN_MAX_TOKENS scaled up to 4000 (discarded, not in
+    # results/): 104 concurrent ~4000-token completions blew through this
+    # backend's KV-cache capacity, producing a ~32%/~19% HTTP 500 rate on
+    # app1/end-users respectively (resource exhaustion, not a timeout
+    # artifact) and pinning p95 latency at the REQUEST_TIMEOUT_SECONDS=650
+    # client-side cutoff rather than a real completion time.
+    #
+    # This case keeps full-contention's proven app1/app2 sizing (32/32, real
+    # short-request background contention for the whole run). A second
+    # attempt at WORKERS_END_USERS=8 (also discarded, not in results/) swung
+    # the other way: with only 8 concurrent long-gen sequences, this
+    # backend's decode throughput per sequence is fast enough (~80
+    # tokens/sec) that even LONG_GEN_MAX_TOKENS=4000 finished in ~51s median
+    # -- nowhere near 5-9 minutes, and the model's 8192-token context window
+    # rules out reaching that target by raising the token count alone at
+    # this concurrency (8150 max completion tokens / 80 tok/s =~ 102s).
+    # Generation wall-clock time on this backend is governed by how many
+    # concurrent long-gen sequences dilute the shared decode budget, not by
+    # token count in isolation: 104 workers measured 5.6x slower per
+    # sequence than 8 workers at the same token target (280s vs 51s for
+    # 4000 tokens) but also pushed KV-cache usage into the regime that
+    # produced the first attempt's HTTP 500s. WORKERS_END_USERS=48 is the
+    # empirical middle point this ticket settled on: enough concurrent
+    # long-gen sequences to meaningfully dilute decode throughput toward the
+    # 5-9 minute band, while staying under half of the 104-worker count that
+    # produced resource-exhaustion errors.
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=48 PROMPT_WORDS_MIN_END_USERS=30 PROMPT_WORDS_MAX_END_USERS=30 MAX_TOKENS_MODE_END_USERS=longgen)
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations)" >&2
     exit 1
     ;;
 esac

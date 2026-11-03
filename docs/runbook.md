@@ -760,6 +760,22 @@ is exactly where that sizing gets pinned down against the real backend; this
 ticket only has to prove the knob moves generation length in the right
 direction, not calibrate it.
 
+**UNI-150's pinned-down numbers, for the next person sizing this knob.**
+Per-sequence decode throughput on this backend is governed far more by how
+many *concurrent* long-gen sequences share the decode budget than by token
+count in isolation: 8 concurrent long-gen workers cleared `max_tokens: 4000`
+in ~51s median (too fast for 5-9 minutes within the 8192-token context
+window at that concurrency -- 8150 max completion tokens / ~80 tok/s ≈
+102s), while 104 concurrent ones took ~280s at the same token target but
+pushed KV-cache usage into a regime that produced a 20-30% HTTP 500 rate
+(resource exhaustion, not a timeout artifact). The `near-timeout-long-generations`
+scenario added by this ticket lands in between: 48 concurrent long-gen
+workers at `LONG_GEN_MAX_TOKENS=8100` (near this backend's real context
+ceiling) measured **p50 297.9s / p95 402.8s** -- squarely inside the 5-9
+minute band -- with `REQUEST_TIMEOUT_SECONDS=900` giving enough headroom to
+observe real completions rather than client-side cutoffs. Treat these as
+specific to this backend/model/replica-count, not a portable constant.
+
 **Usage, streamed or not, from one grep path.** `deploy/poc/09-vllm-gpu.yaml`
 already sets `--enable-force-include-usage`, which makes vLLM put the usage
 block in the final chunk of a streamed response the same as it would in a

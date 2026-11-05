@@ -1,0 +1,214 @@
+{
+  "schema": "uni54.fairness_benchmark_report.v1",
+  "run": {
+    "scenario": "e3-queue-ttl-shedding",
+    "label": "uni-157-e3-queue-ttl-shedding",
+    "control": false,
+    "generator": "open-loop",
+    "namespace": "maas-fairness-poc",
+    "enforce": true,
+    "duration_seconds": 1176,
+    "backend": "vllm-gpu (real)",
+    "epp_image_digest": "quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135",
+    "epp_pod": "maas-vllm-gpu-kserve-router-scheduler-676fd97cd-52kpg",
+    "run_start": "2026-11-03T15:28:33Z",
+    "run_end": "2026-11-03T15:47:40Z"
+  },
+  "groups": [
+    {
+      "group": "app1",
+      "configured_weight": 20.0,
+      "offered": true,
+      "offered_workers": 12.0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": 5163893.0,
+      "expected_share_pct": 21.05263157894737,
+      "observed_share_pct": 24.597588405131056,
+      "deviation_pts": 3.544956826183686,
+      "request_share_pct": 0.0,
+      "request_share_deviation_pts": -21.05263157894737,
+      "contended_seconds": 97.99862934500003,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 3935.0
+    },
+    {
+      "group": "app2",
+      "configured_weight": 10.0,
+      "offered": true,
+      "offered_workers": 12.0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": 2785433.0,
+      "expected_share_pct": 10.526315789473685,
+      "observed_share_pct": 13.268077875368334,
+      "deviation_pts": 2.741762085894649,
+      "request_share_pct": 0.0,
+      "request_share_deviation_pts": -10.526315789473685,
+      "contended_seconds": 98.03323255900003,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 2143.0
+    },
+    {
+      "group": "end-users",
+      "configured_weight": 65.0,
+      "offered": true,
+      "offered_workers": 12.0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": 13044167.0,
+      "expected_share_pct": 68.42105263157895,
+      "observed_share_pct": 62.13433371950061,
+      "deviation_pts": -6.286718912078335,
+      "request_share_pct": 0.0,
+      "request_share_deviation_pts": -68.42105263157895,
+      "contended_seconds": 94.37975144600006,
+      "prompt_tokens_cached_ratio": 0.9885176003312072,
+      "dispatch_total": 9588.0
+    },
+    {
+      "group": "unclassified",
+      "configured_weight": 5.0,
+      "offered": false,
+      "offered_workers": 0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": null,
+      "expected_share_pct": null,
+      "observed_share_pct": null,
+      "deviation_pts": null,
+      "request_share_pct": null,
+      "request_share_deviation_pts": null,
+      "contended_seconds": null,
+      "prompt_tokens_cached_ratio": null,
+      "dispatch_total": null
+    }
+  ],
+  "verdict": {
+    "result": "PASS",
+    "threshold_points": 10.0,
+    "max_abs_deviation_points": 6.286718912078335,
+    "reasons": [],
+    "epp_restarted_mid_run": false,
+    "solo_group": null,
+    "capped_groups": [],
+    "uncontended_threshold_seconds": 1.0
+  },
+  "sources": {
+    "delivered_tokens_and_observed_share": "llm_d_epp_maas_fairness_contended_service_tokens_total, scraped directly from the EPP's /metrics immediately before and after the run (same mechanism as deploy/poc/13-loadgen-poisson.sh). This is the EPP's own accounting -- the generator cannot see token usage. Reused unmodified from the SLI deploy/grafana-dashboard.yaml (UNI-50) already defines; this report does not invent a second definition of delivered share.",
+    "offered_and_delivered_requests": "deploy/poc/13-loadgen-poisson.py's own stdout (UNI-137/B5): the 'load: open-loop Poisson arrivals rate ...' line for each offered group's Poisson arrival rate in req/s -- NOT a worker count, this generator is open-loop -- and each group's own 'sent=... completion_tokens=... p50=...s p95=...s p99=...s codes=[...]' summary line for delivered requests, status tally, and latency.",
+    "expected_share": "each offered group's configured_weight divided by the sum of configured_weight over OFFERED groups only (excludes the never-offered 'unclassified' catch-all and any group this scenario left idle), so a work-conserving policy absorbing an idle group's share is not scored as a deviation. Also excludes any 'capped_groups' entry (UNI-134's app2-trickle): a group offered but structurally unable to reach a weight-proportional share at its own worker count is scored on a dedicated 'did it get served' check instead, not folded into the other groups' expected-share denominator.",
+    "request_share_pct": "UNI-146 (C1): the SAME expected_share target above, scored against requests_total (plain request count, from the loadgen log) instead of delivered weighted tokens -- informational only, never part of the verdict. Equal to observed_share_pct when every offered group's requests are uniform cost (every scenario before this ticket); expected to diverge when request cost is asymmetric across groups."
+  },
+  "timeline": null,
+  "ledger": null,
+  "shed": {
+    "shed_statuses": [
+      "429",
+      "503"
+    ],
+    "total_shed": 0,
+    "rows": [
+      {
+        "group": "app1",
+        "state": "not_recorded",
+        "requests_total": null,
+        "status_429": null,
+        "status_503": null,
+        "shed": null,
+        "shed_rate_pct": null,
+        "weight_share_pct": 21.05263157894737,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      },
+      {
+        "group": "app2",
+        "state": "not_recorded",
+        "requests_total": null,
+        "status_429": null,
+        "status_503": null,
+        "shed": null,
+        "shed_rate_pct": null,
+        "weight_share_pct": 10.526315789473685,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      },
+      {
+        "group": "end-users",
+        "state": "not_recorded",
+        "requests_total": null,
+        "status_429": null,
+        "status_503": null,
+        "shed": null,
+        "shed_rate_pct": null,
+        "weight_share_pct": 68.42105263157895,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      }
+    ],
+    "epp_pool_wide": {
+      "state": "ok",
+      "outcome_deltas": {
+        "Dispatched": 15666.0,
+        "EvictedContextCancelled": 14203.0,
+        "EvictedTTL": 242.0,
+        "RejectedCapacity": 4565.0
+      },
+      "epp_shed_total": 4807.0,
+      "epp_429_upper_bound": 4807.0,
+      "client_429_total": 0,
+      "non_epp_429_lower_bound": 0.0,
+      "epp_restarted": false
+    }
+  },
+  "pick_latency": {
+    "histograms": {
+      "scheduler_e2e": {
+        "metric": "llm_d_epp_scheduler_e2e_duration_seconds",
+        "state": "not_recorded",
+        "observations": null,
+        "p50_seconds": null,
+        "p99_seconds": null,
+        "p50_bucket": null,
+        "p99_bucket": null,
+        "p99_at_histogram_ceiling": null,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      },
+      "flow_control_dispatch_cycle": {
+        "metric": "llm_d_epp_flow_control_dispatch_cycle_duration_seconds",
+        "state": "ok",
+        "observations": 1272684.0,
+        "p50_seconds": 5.000719056409386e-05,
+        "p99_seconds": 9.901423731690584e-05,
+        "p50_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_at_histogram_ceiling": false,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      }
+    },
+    "epp_restarted": false,
+    "baseline_report": null,
+    "baseline_has_pick_latency": null
+  },
+  "alerts": null
+}

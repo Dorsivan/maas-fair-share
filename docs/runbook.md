@@ -2032,6 +2032,21 @@ See "UNI-137: B5, open-loop (Poisson) below / at / above saturation" in
 UNI-34's measured pool ceiling) and the UNCONTENDED-verdict fix this ticket
 needed (see also the "Correction (UNI-137)" note above).
 
+**`CLIENT_TIMEOUT` (UNI-157, default 90, matches the pre-existing hardcoded
+value)** overrides `13-loadgen-poisson.py`'s `urlopen` timeout. Needed for any
+scenario testing `flowControl.defaultRequestTTL` specifically (currently
+300s live): left at the 90s default, the client gives up before the TTL
+does, and the EPP records `EvictedContextCancelled` instead of `EvictedTTL`,
+silently never exercising the mechanism under test. Set it above the TTL and
+below the Route's `haproxy.router.openshift.io/timeout` (600s). Pass `DRAIN_TIMEOUT`
+comfortably above whatever `CLIENT_TIMEOUT` you pick, for the same reason.
+`13-loadgen-poisson.sh`'s `snapshot_metrics()` also now greps
+`^llm_d_epp_flow_control_` in addition to `^llm_d_epp_maas_fairness_`, so a
+shedding run's before/after snapshots carry real eviction-outcome deltas —
+see "UNI-157: E3, queue TTL shedding" in `docs/poc-results.md` for a worked
+run and a load-bearing caveat about this rig's Gateway connection capacity
+under the concurrency a real TTL test requires.
+
 ---
 
 ## Turn on the V(4) per-request tier

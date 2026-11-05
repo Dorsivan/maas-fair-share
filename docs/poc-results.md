@@ -6046,3 +6046,255 @@ scrape, not inferred from the ConfigMap alone.
 - Grafana time range: `2026-11-03T14:48:05Z`–`2026-11-03T14:56:59Z` (the
   scored run itself; the cluster did not finish settling back to its
   pre-run state until ~15:01Z — see the operational note above).
+
+## UNI-157: E3, queue TTL shedding — the Gateway crash-loops before the TTL ever gets the chance
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, "E" group: push an open-loop
+overload well past the live `flowControl.defaultRequestTTL` (300s,
+`deploy/poc/epp-config.yaml` as mirrored into the live `maas-epp-config`
+ConfigMap), report shed rate per tenant against weight, and say whether
+shedding overrides the weights and whether
+`MaasFairnessSheddingIsRealAllocator` fires and clears.
+
+**Setup.** Full-contention mix, equal offered rate per tenant (so any split
+away from equal thirds is the policy's doing, not the traffic's — this
+series' own established methodology), `enforce: true` flipped live for the
+duration of the run (no `ENFORCE_LIVE` flag exists on the open-loop path, so
+this was done by hand, mirroring `15-fairness-benchmark.sh`'s
+`patch_configmap_epp`/`wait_for_enforcing` technique and confirmed on both
+EPPs before and after):
+
+```
+RATE_APP1=12 RATE_APP2=12 RATE_END_USERS=12 DURATION=1200 SEED=1 \
+  CLIENT_TIMEOUT=340 DRAIN_TIMEOUT=380 MAX_WORKERS=9000 THRESHOLD_POINTS=10 \
+  ./deploy/poc/17-fairness-benchmark-openloop.sh e3-queue-ttl-shedding uni-157-e3-queue-ttl-shedding
+```
+
+Two generator changes went with this run, both in `deploy/poc/13-loadgen-
+poisson.{py,sh}`:
+
+- **`--client-timeout`/`CLIENT_TIMEOUT`** (default unchanged at 90s). Left at
+  the stock 90s `urlopen` timeout, the *client* would give up and disconnect
+  long before the 300s TTL, and the EPP would record that as
+  `EvictedContextCancelled`, never `EvictedTTL` — the test would silently
+  never exercise the TTL mechanism it is supposed to measure. 340s (comfortably
+  above the 300s TTL, comfortably under the Route's 600s `haproxy.router.
+  openshift.io/timeout`, deliberately set longer than the TTL per
+  `deploy/poc/08-route.yaml`'s own comment) lets the EPP's TTL, not the
+  client's patience, decide a queued request's fate.
+- **Widened `snapshot_metrics()`'s grep** from `^llm_d_epp_maas_fairness_`
+  alone to also pull `^llm_d_epp_flow_control_`. `docs/runbook.md`'s UNI-181
+  section flagged this as a known, deliberately-deferred gap: without it, a
+  shedding run's before/after snapshots carry no eviction evidence at all,
+  and the report's `shed` section can only ever fall back to the client's
+  own 429/503 tally. All 59 `15-fairness-report-test.py` cases still pass —
+  every prior committed run's snapshot simply has no `flow_control_*` lines
+  to match, since nothing was ever queued/evicted on those runs.
+
+**What actually happened: the Gateway's `istio-proxy` crash-looped under the
+connection load, and that — not the TTL — did almost all of the shedding.**
+Within the first few minutes, `oc get events` showed
+`maas-poc-gateway-data-science-gateway-class-*`'s `istio-proxy` container in
+`BackOff restarting failed container`, repeatedly, for the rest of the run —
+8 restarts total by the time the run was stopped at 1176s (vs. 0 restarts in
+the 19 days before this run started). Each restart tears down every gRPC
+`ext_proc` stream the dying Envoy process was holding open to the EPP, which
+the EPP reports as `outcome="EvictedContextCancelled"` with
+`error: "... client disconnected: request evicted from queue: request
+context cancelled: context canceled"` — *from the EPP's side this is
+indistinguishable from a real client hanging up*, but cross-referencing
+individual `x-request-id`s in the EPP container log shows requests received
+anywhere from 15 to 115 seconds apart all getting cancelled within the same
+~10ms window, repeatedly, which only a shared upstream connection dying
+explains. Concurrency at the time: ~1,700–1,800 requests in flight
+(well under the `MAX_WORKERS=9000` budget — the thread pool was never the
+constraint). This was not previously documented anywhere in this repo; nothing
+in this series' prior cases held anywhere near this many concurrent
+long-lived connections through the Gateway. **Filed as a backlog idea, not a
+blocking follow-up for this ticket** (fixing Gateway/Envoy connection
+capacity is sizing work outside what this ticket is about, and outside what
+this role provisions — see "Ideas that fall outside the ticket" in the
+company's POC delivery standard): the live Gateway Deployment's `istio-proxy`
+sidecar cannot sustain the concurrent long-held connections a 300s-TTL
+overload test structurally requires, on its current resource allocation.
+
+**The run was stopped early (1176s of the planned 1200s) once this was
+confirmed**, rather than running the full window chasing a cleaner TTL
+signal that this Gateway instability was always going to pre-empt. Real,
+if rare, TTL eviction *did* still occur — see below — so this is not a null
+result, and rule 4 of this series makes a result like this a valid `done`,
+not a `blocked`.
+
+**Observed, pool-wide (`llm_d_epp_flow_control_requests_total`, before→after
+deltas over the run):**
+
+| outcome | delta |
+|---|---|
+| Dispatched | 15,666 |
+| EvictedContextCancelled | 14,203 |
+| EvictedTTL | **242** |
+| RejectedCapacity | 4,565 |
+
+**Per tenant, the outcomes that the alert's own `outcome=~"Evicted.*"` expr
+counts** (`EvictedContextCancelled` + `EvictedTTL`, from
+`llm_d_epp_flow_control_request_queue_duration_seconds_count{fairness_id,
+outcome}` before→after deltas):
+
+| tenant | weight | weight share | shed (Evicted.\*) | shed share | shed share ÷ weight share |
+|---|---|---|---|---|---|
+| app1 | 20 | 21.05% | 5,896 | 40.82% | **1.94** |
+| app2 | 10 | 10.53% | 6,986 | 48.36% | **4.59** |
+| end-users | 65 | 68.42% | 1,563 | 10.82% | **0.16** |
+
+Including `RejectedCapacity` (pool-wide admission rejection at the
+`maxRequests: "5000"` cap — does **not** match the alert's `Evicted.*`
+regex, and is not weight-aware by construction, so it lands close to evenly
+across tenants in proportion to *offered* load, not weight) moves the
+numbers a little but not the direction: app1 38.91%/ratio 1.85, app2
+44.90%/ratio 4.27, end-users 16.19%/ratio 0.24.
+
+**The 242 `EvictedTTL` events were 100% app2, 0% app1, 0% end-users** — the
+`llm_d_epp_flow_control_request_queue_duration_seconds_count{outcome=
+"EvictedTTL"}` series never even registered for app1 or end-users (lazy
+registration, so "never appeared" means "never happened," not "happened zero
+times," same logic [UNI-137](/UNI/issues/UNI-137) established). With all
+three tenants offering identical load, a uniform (weight-blind) mechanism
+would have split TTL evictions roughly a third each; instead the entire
+measurable TTL-eviction population landed on the single lowest-weight
+tenant.
+
+**Dispatched (served) share, for context — the weighted policy's own
+headline number, same as every other case in this series:**
+
+| tenant | weight share | dispatched share |
+|---|---|---|
+| app1 | 21.05% | 25.12% |
+| app2 | 10.53% | 13.68% |
+| end-users | 68.42% | 61.20% |
+
+**Does shedding override the weights? No — the opposite.** Every shedding
+view above (Evicted-only, Evicted+RejectedCapacity, and the TTL-only slice)
+puts the *lowest*-weight tenant (app2) at the top of the shed-share-vs-
+weight-share ratio and the *highest*-weight tenant (end-users) at the
+bottom, by a wide margin — consistent with, not contradicting, the
+configured weights: the fairness policy's dispatch ordering keeps end-users'
+queue draining fastest, so end-users' requests are the ones least likely to
+still be sitting in the queue — and therefore least exposed — whenever a
+connection-tearing event (a real TTL deadline, or this run's Gateway
+crashes) hits. `RejectedCapacity`'s near-even split (app1 1,501 / app2 1,549
+/ end-users 1,515 — within 3% of each other despite wildly different
+weights) is the control case that makes this reading solid: a genuinely
+weight-blind shedding mechanism on this same run's own traffic produces an
+even split, and that is visibly *not* what `EvictedContextCancelled`/
+`EvictedTTL` did.
+
+**Does `MaasFairnessSheddingIsRealAllocator` fire, and then clear?
+Confirmed fires; clearing not confirmed — and here is exactly why.**
+`maas-fairness-alerts` is still not applied to this cluster (`oc get
+prometheusrule -n maas-fairness-poc` → no resources; re-confirmed again for
+this ticket, same gap [UNI-130](/UNI/issues/UNI-130) and
+[UNI-181](/UNI/issues/UNI-181) already documented, and this role does not
+have `create` on `prometheusrules` in this namespace — `oc auth can-i
+create prometheusrules -n maas-fairness-poc` → `no`). So there is no real
+`ALERTS{alertname=~"MaasFairness.*"}` series to read (confirmed: querying it
+for this run's window returns an empty matrix, and a direct check of
+`prometheus_rule_group_rules{rule_group=~".*maas-fairness-poc.*"}` also
+returns nothing — the rule genuinely isn't loaded, this is not a quiet
+alert, there is no alert to be quiet). In its place, the alert's own `expr`
+(`sum(rate(llm_d_epp_flow_control_requests_total{job="maas-vllm-gpu-epp-
+service", outcome=~"Evicted.*"}[5m])) > 0`, `for: 10m`) was evaluated
+directly against the live metric via `thanos-querier` (a real, if
+non-standard, read path this role does have — see
+`reference_grafana_anonymous_viewer_validates_queries`-style verification
+used elsewhere in this series):
+
+- The expression read continuously **above zero from 15:33:02Z to at least
+  15:56:02Z** — over 23 minutes, more than twice the `for: 10m` bar — so it
+  would have transitioned `pending` → `firing` had the rule been loaded.
+- Whether and when it **cleared** is genuinely unconfirmed, for a mundane
+  but worth-recording reason: the monitoring window drawn for this run ended
+  at 15:57:40Z (10 minutes after the load was stopped, intended to cover the
+  5-minute `rate()` window's full decay) while the expression was still
+  reading positive — residual queued requests from right before the load
+  stopped were still individually reaching their own TTL deadlines, exactly
+  as expected. By the time this write-up resumed (after two intervening
+  session interruptions — see the note below), re-querying the same metric
+  over the same window returned **no data at all**: this cluster's
+  `openshift-user-workload-monitoring` Prometheus retention is short enough
+  that the raw samples had already aged out. The only honest answer here is
+  "fired, confirmed; cleared, not measured" — not a fabricated timestamp.
+
+**A session-continuity note, for the record.** This ticket's run was
+interrupted twice by the harness's own adapter failing mid-turn (unrelated
+to the cluster or this repo). Both times, the actual background processes
+(the benchmark script, then a watcher script waiting on it) kept running
+unattended and uninterrupted on the host, independent of the orchestrating
+session — so the real measurement is intact and was not re-run or
+duplicated. What was lost was only the *narrow* window to extend the
+Prometheus monitoring range before the cluster's own retention aged the
+raw samples out, which is the reason the "clears" timestamp above is an
+honest gap rather than a fabricated one.
+
+**What surprised us.** Two things, both documented above rather than
+smoothed over: (1) the Gateway's own connection-handling capacity, not the
+EPP's configured TTL, turned out to be the binding constraint on how far
+"well past the queue TTL" this rig can actually be pushed — a genuinely new
+finding for this series, filed as a backlog idea rather than expanded into
+this ticket's scope; (2) despite that, the EPP's weighted dispatch ordering
+visibly protected the high-weight tenant from both the real TTL evictions
+and the Gateway-crash-triggered cancellations, while a weight-blind
+admission-capacity mechanism on the exact same traffic split almost evenly —
+a clean, same-run A/B that makes the "shedding does not override the
+weights, here" conclusion solid rather than circumstantial.
+
+**Cluster left as found**, confirmed after the revert (same "verify the
+metric, not the ConfigMap" discipline [UNI-155](/UNI/issues/UNI-155)
+established, on **both** EPPs since they share this ConfigMap —
+[UNI-174](/UNI/issues/UNI-174)):
+
+```
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+$ oc get pods -n maas-fairness-poc | grep -E 'vllm-gpu|gateway'
+maas-poc-gateway-data-science-gateway-class-58b4f8c4b4-2zvgw   1/1     Running     8 (2d7h ago)   18d
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                          1/1     Running     0              18d
+maas-vllm-gpu-kserve-74d8dd69bd-vcrhp                          1/1     Running     0              2d8h
+maas-vllm-gpu-kserve-router-scheduler-575669c495-8sznm         1/1     Running     0              2d7h
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           8m43s      2d8h
+```
+
+`llm_d_epp_maas_fairness_enforcing` confirmed `0` on both the GPU and CPU EPP
+by direct scrape: `gpu: llm_d_epp_maas_fairness_enforcing 0`,
+`cpu: llm_d_epp_maas_fairness_enforcing 0`. The Gateway pod's 8 restarts are
+all from during the run itself (last one well before the revert) — no
+further restarts since, i.e. it is not still unstable at rest, only under
+this test's connection load.
+
+**Evidence:**
+
+- Commits: see this section's companion commits on `main`.
+- Raw results: `results/20261103T152802Z-uni-157-e3-queue-ttl-shedding/`
+  (EPP container log, loadgen log, before/after metric snapshots, the
+  reconstructed `fairness-report.json`/`.md`, and three Prometheus
+  `query_range`/`query` captures: `flow-control-eviction-rate.json`,
+  `shed-per-tenant-timeseries.json`, `alerts-query-range.json` and
+  `rule-group-loaded-check.json` — the latter two are the real, truthfully
+  empty exports that back the "rule not loaded" finding above, not
+  fabricated placeholders). No per-tenant client-side status-code tally is
+  included: the generator was stopped before it reached the code path that
+  writes those logs, so that table's `shed` section correctly reads
+  `not_recorded` rather than a fabricated zero — the pool-wide and
+  per-`fairness_id` EPP metrics above are this run's real shed-rate
+  evidence instead.
+- Grafana/Prometheus time range: `2026-11-03T15:27:02Z`–`2026-11-03T15:57:40Z`
+  (run start minus one minute of margin, through the end of the extended
+  post-run monitoring window used for the fire/clear check above; the
+  scored load itself ran `15:28:02Z`–`15:47:40Z`).

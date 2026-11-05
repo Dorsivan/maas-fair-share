@@ -52,7 +52,7 @@ def read_key(path):
         return f.read().strip()
 
 
-def send_request(gw, modelpath, token, group, arrival_t, results, lock):
+def send_request(gw, modelpath, token, group, arrival_t, results, lock, client_timeout=90):
     body = json.dumps(
         {
             "model": "llama-3-1-8b",
@@ -73,7 +73,7 @@ def send_request(gw, modelpath, token, group, arrival_t, results, lock):
     code = 0
     completion_tokens = -1
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with urllib.request.urlopen(req, timeout=client_timeout) as resp:
             code = resp.status
             payload = json.loads(resp.read())
             completion_tokens = payload.get("usage", {}).get("completion_tokens", -1)
@@ -146,6 +146,13 @@ def main():
     ap.add_argument("--out", required=True, help="directory for per-request logs")
     ap.add_argument("--max-workers", type=int, default=1000)
     ap.add_argument("--drain-timeout", type=float, default=100.0, help="seconds to wait for in-flight requests after the arrival window closes")
+    ap.add_argument(
+        "--client-timeout", type=float, default=90.0,
+        help="UNI-157: urlopen timeout, seconds. Must exceed flowControl.defaultRequestTTL "
+             "(300s live) for a run to exercise the EPP's own TTL eviction -- left at the "
+             "90s default, the client abandons the connection first and the EPP records "
+             "EvictedContextCancelled instead of EvictedTTL.",
+    )
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
@@ -163,7 +170,7 @@ def main():
     futures_lock = threading.Lock()
 
     def bound_send(gw, modelpath, token, group, arrival_t):
-        send_request(gw, modelpath, token, group, arrival_t, results[group], locks[group])
+        send_request(gw, modelpath, token, group, arrival_t, results[group], locks[group], args.client_timeout)
 
     def make_worker(rate, group, token_cycle, end_time):
         def run():

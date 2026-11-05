@@ -43,6 +43,7 @@ SEED="${SEED:-1}"
 OUT="${OUT:-/tmp/poisson-codes-$(date +%s)}"
 MAX_WORKERS="${MAX_WORKERS:-1000}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-100}"
+CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-90}"
 EPP_METRICS_SVC_IP="${EPP_METRICS_SVC_IP:-}"
 CAPTURE_EPP_LOG="${CAPTURE_EPP_LOG:-1}"
 EPP_POD_LABEL_SELECTOR="${EPP_POD_LABEL_SELECTOR:-app.kubernetes.io/name=maas-vllm-gpu,app.kubernetes.io/component=llminferenceservice-router-scheduler}"
@@ -86,9 +87,18 @@ if [ -z "$EPP_METRICS_SVC_IP" ]; then
   EPP_METRICS_SVC_IP="$($OC get svc maas-vllm-gpu-epp-service -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
 fi
 
+# UNI-157: widened from the original llm_d_epp_maas_fairness_-only grep to also pull the
+# flow-control queueing metrics (llm_d_epp_flow_control_requests_total,
+# llm_d_epp_flow_control_request_queue_duration_seconds_{count,sum,bucket}). docs/runbook.md's
+# UNI-181 section flagged this as a known, deliberately-deferred gap: without it, a TTL-shedding
+# run's before/after snapshots carry no evidence of evictions at all, and 15-fairness-report.py's
+# `shed` section can only ever fall back to the client's own 429/503 tally. Checked against
+# 15-fairness-report-test.py's 31 existing cases: all still pass, since every prior committed
+# run's snapshot simply has no flow_control_* lines to match (nothing was ever queued/evicted on
+# those runs) and the report's parser already treats an absent line as "not recorded".
 snapshot_metrics() {
   curl -sS -m 10 -H "Authorization: Bearer $METRICS_TOKEN" "http://${EPP_METRICS_SVC_IP}:9090/metrics" \
-    | grep '^llm_d_epp_maas_fairness_' | grep -v '^#'
+    | grep -E '^(llm_d_epp_maas_fairness_|llm_d_epp_flow_control_)' | grep -v '^#'
 }
 
 EPP_LOG_FILE="$OUT/epp-container.log"
@@ -195,7 +205,8 @@ python3 "$SCRIPT_DIR/13-loadgen-poisson.py" \
   --rate-app1 "$RATE_APP1" --rate-app2 "$RATE_APP2" --rate-end-users "$RATE_END_USERS" \
   --key-app1 "$KEYS/app1-production" --key-app2 "$KEYS/app2-batch" \
   --key-end-alpha "$KEYS/end-user-alpha" --key-end-beta "$KEYS/end-user-beta" \
-  --out "$OUT" --seed "$SEED" --max-workers "$MAX_WORKERS" --drain-timeout "$DRAIN_TIMEOUT"
+  --out "$OUT" --seed "$SEED" --max-workers "$MAX_WORKERS" --drain-timeout "$DRAIN_TIMEOUT" \
+  --client-timeout "$CLIENT_TIMEOUT"
 GEN_STATUS=$?
 set -e
 

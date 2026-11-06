@@ -170,6 +170,30 @@
 #                          nothing is left to enforce the weighted split.
 #                          Scored INFO, like every other named negative
 #                          control, not PASS/FAIL.
+#   app1-flood             TENANTS="app1 app2 end-users", per-tenant workers
+#                          256/32/64 (app1/app2/end-users) -- UNI-161: board
+#                          case, end-users standing in for "app3" at a
+#                          reweighted 30/10/60 (the operator patches
+#                          maas-epp-config's three group weights to 30/10/60
+#                          before invoking this scenario and restores
+#                          20/10/65 after; this script does not own that
+#                          weight patch itself, same division of
+#                          responsibility UNI-160/F3 used for its own
+#                          alternative weight sets). app1 deliberately
+#                          over-offers far harder than its own entitlement
+#                          needs (8x full-contention's usual 32, against a
+#                          weight that only doubled from 20 to 30) --
+#                          UNI-104 found that heavy over-offering by the
+#                          dominant tenant can push its measured share past
+#                          its configured weight (82% vs 67%); this sizing
+#                          is deliberately chosen to re-expose that same
+#                          failure mode at a different ratio, not to avoid
+#                          it. app2/end-users keep roughly full-contention's
+#                          own over-offering discipline (32, and 64 -- half
+#                          of full-contention's 128, since 60 is roughly
+#                          full-contention's 65 scaled by this scenario's
+#                          own total offered weight) so neither is the
+#                          reason for any deviation seen in app1.
 #
 # Per-tenant worker sizing (see docs/runbook.md "Per-tenant worker sizing
 # and the saturation check" for the full method): every ACTIVE tenant in a
@@ -339,7 +363,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -1072,8 +1096,35 @@ case "$SCENARIO" in
     IS_CONTROL="true"
     SHADOW_MODE="true"
     ;;
+  app1-flood)
+    # UNI-161: board case, 30/10/60 (end-users standing in for "app3"), app1
+    # flooding far harder than the other two -- see the header comment above
+    # for the full sizing rationale. This scenario does NOT touch
+    # maas-epp-config's weights itself (unlike shadow-mode-control's `enforce`
+    # self-ownership) -- the operator patches the three group weights to
+    # 30/10/60 before invoking this scenario, the same division of labor
+    # UNI-160/F3 used for its own alternative weight sets, so this case block
+    # only owns the per-tenant worker sizing.
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=256 WORKERS_APP2=32 WORKERS_END_USERS=64)
+    ;;
+  app1-flood-moderate)
+    # UNI-161: "watch for" follow-up -- if app1-flood's 256 workers overshoot
+    # its 30% weight (the UNI-104 pattern), this halves app1's worker count to
+    # locate where the overshoot starts easing, holding app2/end-users and the
+    # 30/10/60 weights fixed so app1's own sizing is the only variable.
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=128 WORKERS_APP2=32 WORKERS_END_USERS=64)
+    ;;
+  app1-flood-light)
+    # UNI-161: second "watch for" follow-up -- app1 worker count brought down
+    # to full-contention's own usual 32 (still over-offering its 30% weight,
+    # just not by 8x), the other end of the bracket from app1-flood's 256.
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=64)
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light)" >&2
     exit 1
     ;;
 esac

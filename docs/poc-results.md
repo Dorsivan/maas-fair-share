@@ -6747,3 +6747,136 @@ weight-patch before/after proof) are in `results/20261106T162815Z-uni-160-f3-40-
   (first weight patch through the final post-restore confirmation across all
   three cases). Per-case scored load: 40/20/40 `16:29:27Z`–`16:33:49Z`,
   98/1/1 `16:39:04Z`–`16:43:27Z`, 33/33/33 `16:48:47Z`–`16:53:09Z`.
+
+## UNI-161: board case, 30/10/60 with app1 flooding — FAIL, and it is NOT the UNI-160 worker-sizing confound
+
+**Setup.** Weights app1=30, app2=10, end-users=60 (defaultGroup `unclassified`
+stays 5). **Chose: reuse the existing `end-users` group as "app3"** rather than
+provision a real one — [UNI-179](/UNI/issues/UNI-179)'s per-group loadgen
+support never got a matching EPP group/MaaSSubscription for `app3` (see
+[[project_ngroup_support_stops_at_the_loadgen]]), and this agent's token
+cannot even `list maassubscriptions` to check ([[cluster_forbidden_names_the_group_you_asked_about]]),
+so creating a real one would have meant provisioning a new MaaSSubscription
+and minting a new API key — outside what rule 5 allows without a board
+decision. Three new named scenarios were added to
+`deploy/poc/15-fairness-benchmark.sh` (`app1-flood`, `app1-flood-moderate`,
+`app1-flood-light`) because `full-contention`'s own fixed 32/32/128 worker
+sizing is tuned for 20/10/65 and — per UNI-160/F3 — tracks its own worker
+ratio rather than the configured weight for any other weight set; this case
+needed real, independently-chosen worker counts per the ticket's own example
+(app1 256, app2 32, end-users 64), not the named `full-contention` scenario.
+As with F3, this case block does not own the weight patch itself — the
+operator (this agent) patched `maas-epp-config`'s three group weights to
+30/10/60 before each run and restored 20/10/65 after the last one, same
+division of labor UNI-160 used.
+
+**Pass bar:** delivered split 30/10/60 within 10 points, despite app1's flood.
+
+### Three worker levels for app1, app2/end-users held fixed at 32/64
+
+| run | app1 workers | app1 observed (dev) | app2 observed (dev) | end-users observed (dev) | ledger | verdict |
+|---|---|---|---|---|---|---|
+| `app1-flood` | 256 | 61.6% (**+31.6**) | 10.8% (+0.8) | 27.6% (**-32.4**) | PASS | **FAIL** |
+| `app1-flood-moderate` | 128 | 58.2% (**+28.2**) | 12.0% (+2.0) | 29.8% (**-30.2**) | PASS | **FAIL** |
+| `app1-flood-light` | 32 | 25.8% (-4.2) | 22.6% (**+12.6**) | 51.6% (-8.4) | PASS | **FAIL** |
+
+Ledger cross-check PASSED on all three groups in all three runs — the
+accounting is clean, every FAIL here is a genuine distribution mismatch, not
+a leak.
+
+**This reproduces UNI-104, not UNI-160.** The ticket's own "watch for"
+flagged [UNI-104](/UNI/issues/UNI-104), where heavy over-offering by the
+dominant tenant pushed its measured share past its configured weight (82%
+vs. 67% expected). That is exactly what happened here: at 256 and 128
+workers app1 overshot its 30% weight by roughly the same ~30 points either
+way — **halving app1's own worker count (256→128) barely moved the
+overshoot** (31.6pt → 28.2pt), which rules out UNI-160/F3's "fixed
+worker-ratio confound" as the explanation here. In F3, three *different*
+weight sets all landed on the *same* split (the fixed 32:32:128 ratio),
+because nothing about the per-tenant sizing changed between runs. Here, the
+weight set is held constant and app1's own sizing is deliberately varied by
+8x, and the overshoot barely responds — the dominant tenant's absolute
+worker count, not its ratio to the others, is what drives the overshoot,
+consistent with the UNI-104 mechanism (more concurrent requests from one
+tenant keep its queue topped up, so the weighted-fair dispatcher sees it as
+"needing" service more often) rather than a sizing-ratio artifact.
+
+**`app1-flood-light` (32/32/64) is not a clean third data point — it fell
+out of saturation.** `contended_seconds` (the per-group backlogged-time
+metric) was 16.8-18.1s per group in the two flood runs, but collapsed to
+2.3-2.7s at this lightest sizing — the pool was effectively **uncontended**
+most of the run, the same regime [UNI-135](/UNI/issues/UNI-135)'s
+`below-capacity` scenario names explicitly as not a fairness result. Rule 5's
+"all three clearly backlogged" setup requirement was met for the two flood
+runs but not cleanly for this one: dropping app1 to parity with app2 (32
+workers each) was not enough offered concurrency to keep a 30%-weighted
+tenant backlogged against a 2-replica pool once `end-users` (60% weight) is
+also only offering 64. The failure mode flips accordingly: app2, not app1,
+is the one that overshoots (+12.6pt) — plausibly because app1's queue
+drained more often than app2's at this sizing (lower weight needs less
+concurrency to stay topped up), so app2 ends up looking "needier" by the
+same queue-topping mechanism, now working in app2's favor. This is a useful
+boundary finding in its own right (it brackets where this test design stops
+being valid, the same kind of result UNI-135 produced for `below-capacity`),
+but it does not "show where [the app1 overshoot] breaks" the way 128 workers
+was meant to — per rule 4, it is recorded as a third FAIL with this caveat,
+not discarded.
+
+**What this does and does not prove.** It demonstrates the weighted split
+does NOT hold at a reweighted 30/10/60 under a heavy, sustained flood from
+the dominant tenant — the same characteristic UNI-104 already documented at
+20/10 for a different pair, now confirmed to generalize to a three-way split
+at a different ratio, and confirmed (via the 256→128 comparison) to be about
+app1's absolute offered concurrency rather than a `full-contention`-style
+fixed-ratio artifact. It does not identify a worker level at which app1's
+overshoot disappears while the pool stays genuinely saturated — the three
+levels tried span from clearly-overshooting-and-saturated (256, 128) to
+clearly-undersaturated (32), with no scored point in between. A future case
+could narrow that gap (e.g. 48-96 workers) if the board wants the exact
+breakpoint; this ticket's "try one or two levels" is satisfied by the two
+points taken.
+
+**Cluster left as found.** Weights restored to 20/10/65, `enforce` reverted
+to `false` (each run's own `ENFORCE_LIVE` wrapper reverts it; the final
+restore of the *weights* was a manual patch, same as F3), 2 GPU replicas
+unchanged, no loadgen Job/pod left running. Confirmed after the last case:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler,app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-router-scheduler-575669c495-b9jhv   1/1     Running   0          9m36s
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m13s      17m
+```
+
+Matches `deploy/epp-config.yaml`'s committed defaults (20/10/65/5,
+`enforce: false`) and the 2-replica GPU count this ticket found at checkout.
+
+**Done when:** raw results (report, loadgen log, metric deltas) are in
+`results/20261106T171509Z-uni-161-app1-flood-256-32-64/`,
+`results/20261106T172439Z-uni-161-app1-flood-128-32-64/` and
+`results/20261106T190215Z-uni-161-app1-flood-32-32-64/`.
+
+**Evidence:**
+
+- Commits: see this section's companion commit on `main`.
+- Raw results: `results/20261106T171509Z-uni-161-app1-flood-256-32-64/`,
+  `results/20261106T172439Z-uni-161-app1-flood-128-32-64/`,
+  `results/20261106T190215Z-uni-161-app1-flood-32-32-64/` (each with
+  `fairness-report.json`/`.md`, `epp-container.log`, `loadgen.log`,
+  `client-request-summary.jsonl`, before/after metric snapshots, and
+  `live-config/` enforce-live before/applied/post-restore proof).
+- Grafana/Prometheus time range: `2026-11-06T17:15:09Z`–`2026-11-06T19:08:58Z`
+  (first weight patch through the final enforce-reverted confirmation across
+  all three cases; the long gap between the second and third case is a
+  session interruption between agent runs, not cluster activity — no
+  loadgen Job ran in that window). Per-case scored load: 256 workers
+  `17:16:21Z`–`17:21:05Z`, 128 workers `17:25:50Z`–`17:30:23Z`, 32 workers
+  `19:03:26Z`–`19:07:49Z`.

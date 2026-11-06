@@ -1,0 +1,131 @@
+apiVersion: v1
+data:
+  epp: |-
+    apiVersion: llm-d.ai/v1alpha1
+    kind: EndpointPickerConfig
+    featureGates: [flowControl]
+    plugins:
+      - type: maas-weighted-fairness
+        name: maas-fairness
+        parameters:
+          # x-maas-subscription, NOT x-maas-subscription-id.
+          #
+          # This was wrong for most of the POC and the failure is silent: with
+          # the id suffix the header simply never matches, every request falls
+          # to defaultGroup, and unmatched_subscriptions_total stays at ZERO --
+          # because nothing was mis-matched, the header was absent. The only
+          # symptom is all traffic quietly sharing the `unclassified` weight.
+          #
+          # Verified against the AuthPolicy MaaS generates per model
+          # (maas-auth-<model> in the model namespace), whose success response
+          # injects exactly:
+          #     X-MaaS-Subscription: auth.metadata.apiKeyValidation.subscription
+          # i.e. the MaaSSubscription NAME from the validated sk-oai API key.
+          # It also blanks Authorization before forwarding upstream.
+          #
+          # CONSEQUENCE FOR `groups` BELOW: the match values must be
+          # MaaSSubscription names, not invented tenant strings. Confirm with
+          #     oc get maassubscriptions -A
+          # before trusting any weight in this file.
+          identityHeader: x-maas-subscription
+          groups:
+            - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+            - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+            - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+          defaultGroup: { name: unclassified, weight: 5 }
+
+          enforce: false
+          stateLogIntervalSeconds: 5
+
+          halfLifeSeconds: 60
+          observedHalfLivesSeconds: [20, 120]
+
+          costModel: tokens
+          inputTokenWeight: 1.0
+          outputTokenWeight: 2.0       # PLACEHOLDER until calibrated
+          cachedInputTokenWeight: 1.0
+
+          # Left at the production default, but see docs/poc-results.md: in this
+          # POC, turning the clamp ON measurably moved the split AWAY from the
+          # configured weights (end-users 62.8% -> 45.1%), and it did so while
+          # firing only 19 times in 862 dispatches. The highest-weight group is
+          # hit hardest, because it is served fastest, so its queue is the one
+          # that momentarily drains -- and the clamp writes A = floor * w, so
+          # the largest weight loses the most credit per clamp.
+          #
+          # Unresolved: whether the empty -> non-empty edge is simply a poor
+          # proxy for "returning from idle" when a tenant is being served so
+          # well that its queue keeps draining. Do not change the default on
+          # this evidence alone; the closed-loop generator may drain queues in
+          # ways real traffic does not.
+          newcomerClamp: true
+          provisionalCharge: true
+          defaultEstimatedOutputTokens: 512
+          estimatedBytesPerToken: 4
+          agingTokensPerSecond: 0
+
+          # x-request-id, x-maas-fairness-group, x-maas-fairness-queue-ms on the
+          # response -- see docs/design.md "Per-request attribution" (UNI-53).
+          # Defaults to true; set false to suppress if this is considered
+          # internal detail leakage.
+          emitAttributionHeaders: true
+
+          # V(4) per-request tier -- see docs/design.md "V(4) is off Pick's hot
+          # path" (UNI-47). Off by default; also requires -v=4 on the EPP
+          # process. Neither this file nor -v reload without a redeploy.
+          # Enabling needs BOTH this and a second edit to deploy/poc/02-epp.yaml,
+          # or emission stays silently off -- see docs/runbook.md "Turn on the
+          # V(4) per-request tier" for the exact steps and how to undo them.
+          # requestTierV4SampleEvery: 100
+          # requestTierV4TimeBoxSeconds: 900
+
+      - type: single-profile-handler
+      - type: queue-scorer
+      - type: kv-cache-utilization-scorer
+      - type: prefix-cache-scorer
+      - type: max-score-picker
+
+    flowControl:
+      # 300s here, against 60s in deploy/epp-config.yaml, and this is the one
+      # POC deviation that is NOT a simplification.
+      #
+      # The load generator deliberately over-offers ~12x the pool's capacity so
+      # the queues are deep enough for the weights to be expressible. The flip
+      # side is that the throttled group waits a long time by design: at a 10%
+      # share with 32 closed-loop workers, app2's queue wait approaches a
+      # minute. With TTL at 60s those requests would be EVICTED rather than
+      # served late -- and then the shed rate, not the fairness policy, is what
+      # allocates the pool. The measurement would show app2 "receiving" its
+      # share while most of its traffic was quietly dropped.
+      #
+      # Production keeps TTL within ~2x of halfLifeSeconds precisely so that
+      # shedding stays a backstop. Do not copy 300s into a real deployment; it
+      # is compensating for a synthetic over-offer that real traffic will not
+      # reproduce. Watch llm_d_epp_flow_control_requests_evicted_total: if it
+      # is non-zero in a run, that run measured shedding, not fairness.
+      defaultRequestTTL: 300s
+      defaultPriorityBand:
+        fairnessPolicyRef: maas-fairness
+        orderingPolicyRef: fcfs-ordering-policy
+      priorityBands:
+        - priority: 0
+          fairnessPolicyRef: maas-fairness
+          maxRequests: "5000"
+
+    schedulingProfiles:
+      - name: default
+        plugins:
+          - { pluginRef: queue-scorer, weight: 2.0 }
+          - { pluginRef: kv-cache-utilization-scorer, weight: 2.0 }
+          - { pluginRef: prefix-cache-scorer, weight: 3.0 }
+          - { pluginRef: max-score-picker }
+kind: ConfigMap
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","data":{"epp":"apiVersion: llm-d.ai/v1alpha1\nkind: EndpointPickerConfig\nfeatureGates: [flowControl]\nplugins:\n  - type: maas-weighted-fairness\n    name: maas-fairness\n    parameters:\n      # x-maas-subscription, NOT x-maas-subscription-id.\n      #\n      # This was wrong for most of the POC and the failure is silent: with\n      # the id suffix the header simply never matches, every request falls\n      # to defaultGroup, and unmatched_subscriptions_total stays at ZERO --\n      # because nothing was mis-matched, the header was absent. The only\n      # symptom is all traffic quietly sharing the `unclassified` weight.\n      #\n      # Verified against the AuthPolicy MaaS generates per model\n      # (maas-auth-\u003cmodel\u003e in the model namespace), whose success response\n      # injects exactly:\n      #     X-MaaS-Subscription: auth.metadata.apiKeyValidation.subscription\n      # i.e. the MaaSSubscription NAME from the validated sk-oai API key.\n      # It also blanks Authorization before forwarding upstream.\n      #\n      # CONSEQUENCE FOR `groups` BELOW: the match values must be\n      # MaaSSubscription names, not invented tenant strings. Confirm with\n      #     oc get maassubscriptions -A\n      # before trusting any weight in this file.\n      identityHeader: x-maas-subscription\n      groups:\n        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }\n        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }\n        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }\n      defaultGroup: { name: unclassified, weight: 5 }\n\n      enforce: false\n      stateLogIntervalSeconds: 5\n\n      halfLifeSeconds: 60\n      observedHalfLivesSeconds: [20, 120]\n\n      costModel: tokens\n      inputTokenWeight: 1.0\n      outputTokenWeight: 2.0       # PLACEHOLDER until calibrated\n      cachedInputTokenWeight: 1.0\n\n      # Left at the production default, but see docs/poc-results.md: in this\n      # POC, turning the clamp ON measurably moved the split AWAY from the\n      # configured weights (end-users 62.8% -\u003e 45.1%), and it did so while\n      # firing only 19 times in 862 dispatches. The highest-weight group is\n      # hit hardest, because it is served fastest, so its queue is the one\n      # that momentarily drains -- and the clamp writes A = floor * w, so\n      # the largest weight loses the most credit per clamp.\n      #\n      # Unresolved: whether the empty -\u003e non-empty edge is simply a poor\n      # proxy for \"returning from idle\" when a tenant is being served so\n      # well that its queue keeps draining. Do not change the default on\n      # this evidence alone; the closed-loop generator may drain queues in\n      # ways real traffic does not.\n      newcomerClamp: true\n      provisionalCharge: true\n      defaultEstimatedOutputTokens: 512\n      estimatedBytesPerToken: 4\n      agingTokensPerSecond: 0\n\n      # x-request-id, x-maas-fairness-group, x-maas-fairness-queue-ms on the\n      # response -- see docs/design.md \"Per-request attribution\" (UNI-53).\n      # Defaults to true; set false to suppress if this is considered\n      # internal detail leakage.\n      emitAttributionHeaders: true\n\n      # V(4) per-request tier -- see docs/design.md \"V(4) is off Pick's hot\n      # path\" (UNI-47). Off by default; also requires -v=4 on the EPP\n      # process. Neither this file nor -v reload without a redeploy.\n      # Enabling needs BOTH this and a second edit to deploy/poc/02-epp.yaml,\n      # or emission stays silently off -- see docs/runbook.md \"Turn on the\n      # V(4) per-request tier\" for the exact steps and how to undo them.\n      # requestTierV4SampleEvery: 100\n      # requestTierV4TimeBoxSeconds: 900\n\n  - type: single-profile-handler\n  - type: queue-scorer\n  - type: kv-cache-utilization-scorer\n  - type: prefix-cache-scorer\n  - type: max-score-picker\n\nflowControl:\n  # 300s here, against 60s in deploy/epp-config.yaml, and this is the one\n  # POC deviation that is NOT a simplification.\n  #\n  # The load generator deliberately over-offers ~12x the pool's capacity so\n  # the queues are deep enough for the weights to be expressible. The flip\n  # side is that the throttled group waits a long time by design: at a 10%\n  # share with 32 closed-loop workers, app2's queue wait approaches a\n  # minute. With TTL at 60s those requests would be EVICTED rather than\n  # served late -- and then the shed rate, not the fairness policy, is what\n  # allocates the pool. The measurement would show app2 \"receiving\" its\n  # share while most of its traffic was quietly dropped.\n  #\n  # Production keeps TTL within ~2x of halfLifeSeconds precisely so that\n  # shedding stays a backstop. Do not copy 300s into a real deployment; it\n  # is compensating for a synthetic over-offer that real traffic will not\n  # reproduce. Watch llm_d_epp_flow_control_requests_evicted_total: if it\n  # is non-zero in a run, that run measured shedding, not fairness.\n  defaultRequestTTL: 300s\n  defaultPriorityBand:\n    fairnessPolicyRef: maas-fairness\n    orderingPolicyRef: fcfs-ordering-policy\n  priorityBands:\n    - priority: 0\n      fairnessPolicyRef: maas-fairness\n      maxRequests: \"5000\"\n\nschedulingProfiles:\n  - name: default\n    plugins:\n      - { pluginRef: queue-scorer, weight: 2.0 }\n      - { pluginRef: kv-cache-utilization-scorer, weight: 2.0 }\n      - { pluginRef: prefix-cache-scorer, weight: 3.0 }\n      - { pluginRef: max-score-picker }\n"},"kind":"ConfigMap","metadata":{"annotations":{},"name":"maas-epp-config","namespace":"maas-fairness-poc"}}
+  creationTimestamp: "2026-10-04T14:29:33Z"
+  name: maas-epp-config
+  namespace: maas-fairness-poc
+  resourceVersion: "267819628"
+  uid: 99bb2b3b-cc83-48af-8e1e-88432ecb58cc

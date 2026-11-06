@@ -6582,3 +6582,168 @@ id, plus a copy of the final manually-restored ConfigMap state) are in
 - Grafana/Prometheus time range: `2026-11-06T16:05:33Z`–`2026-11-06T16:15:00Z`
   (script start through this ticket's own final manual-restore confirmation;
   the scored load itself ran `16:06:45Z`–`16:11:07Z`).
+
+## UNI-160: F3, alternative weight sets (40/20/40, 98/1/1, 33/33/33) — all three FAIL, and not for the reason the ticket expected
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, "F" group, third case: patch
+`maas-epp-config`'s three group weights to each of three alternative sets in
+turn, run the headline `full-contention` load under each with real
+enforcement on, and confirm the observed split tracks whichever weight set is
+live — not just the one (20/10/65) every other case in this series uses.
+98/1/1 was called out in advance as likely to fail (it stresses the
+small-weight floor) and the ticket's own rule 4 says to report that FAIL, not
+chase a PASS.
+
+**Setup.** `maas-epp-config`'s `groups[].weight` for app1/app2/end-users has
+no existing single-shot multi-value editor — [UNI-180](/UNI/issues/UNI-180)'s
+`LIVE_SET_TARGET=epp-weight:<group>` wrapper only ever changes ONE group per
+invocation, and this ticket needs all three changed together before the Job
+starts (not mid-run). A one-off script (not committed; scratch orchestration
+only) read the live ConfigMap, rewrote all three `weight:` entries with the
+same regex `15-fairness-benchmark.sh`'s own `patch_epp_text_weight` uses,
+`oc patch --type=merge`'d it back, and waited for both the GPU and CPU
+`router-scheduler` pods (they share this one ConfigMap) to roll to a new pod
+name and report Ready — the same ConfigMap-triggers-a-new-pod mechanism
+[UNI-174](/UNI/issues/UNI-174) measured for `enforce`, just applied to
+`groups[].weight` instead. Each weight set then ran the stock, UNRETOUCHED
+`full-contention` scenario (`TENANTS="app1 app2 end-users"`,
+`WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128` — `full-contention`'s
+own fixed sizing from [UNI-103](/UNI/issues/UNI-103)/[UNI-104](/UNI/issues/UNI-104),
+unchanged), `ENFORCE_LIVE=true`, `DURATION=240`:
+
+```
+OPENSHIFT_TOKEN=... ENFORCE_LIVE=true DURATION=240 \
+  ./deploy/poc/15-fairness-benchmark.sh full-contention uni-160-f3-40-20-40
+# (weights restored to 20/10/65, pods rolled back, before the next case)
+OPENSHIFT_TOKEN=... ENFORCE_LIVE=true DURATION=240 \
+  ./deploy/poc/15-fairness-benchmark.sh full-contention uni-160-f3-98-1-1
+OPENSHIFT_TOKEN=... ENFORCE_LIVE=true DURATION=240 \
+  ./deploy/poc/15-fairness-benchmark.sh full-contention uni-160-f3-33-33-33
+```
+
+One case ran at a time (rule 1); the namespace had no loadgen Job/pod running
+before this ticket started (the prior run, [UNI-159](/UNI/issues/UNI-159),
+had completed 12 minutes earlier).
+
+**Expected (per the ticket):** each split matches its own configured weight
+within the 10-point threshold; 98/1/1 may legitimately fail.
+
+**Observed: all three FAIL, and the observed split barely moves between
+them.**
+
+| weight set (app1/app2/end-users) | app1 observed (expected, deviation) | app2 observed (expected, deviation) | end-users observed (expected, deviation) | verdict |
+|---|---|---|---|---|
+| 40/20/40 | 18.4% (40.0%, **-21.6**) | 15.4% (20.0%, -4.6) | 66.2% (40.0%, **+26.2**) | **FAIL** |
+| 98/1/1 | 19.1% (98.0%, **-78.9**) | 15.0% (1.0%, +14.0) | 65.9% (1.0%, +64.9) | **FAIL** |
+| 33/33/33 | 16.1% (33.3%, -17.2) | 16.2% (33.3%, -17.1) | 67.6% (33.3%, **+34.3**) | **FAIL** |
+| *(reference only)* `full-contention`'s own offered-worker ratio, 32:32:128 | 16.7% | 16.7% | 66.7% | — |
+
+Ledger cross-check ([UNI-138](/UNI/issues/UNI-138)/G2) **PASSED on every
+group in all three runs** (≤3.7% cost-diff, well inside the 10% tolerance),
+so none of this is an accounting leak — the EPP's own token counting matches
+the client's independent record throughout. This is a genuine distribution
+mismatch, not a bookkeeping bug.
+
+**Root cause: the fixed worker sizing, not the policy.** Line the three
+observed splits up — 18.4/15.4/66.2, 19.1/15.0/65.9, 16.1/16.2/67.6 — and they
+are all close to IDENTICAL despite three very different configured weights,
+and all three sit almost exactly on `full-contention`'s own offered-worker
+ratio (32:32:128 = 16.7%/16.7%/66.7%, last row above). This is the
+[UNI-100](/UNI/issues/UNI-100)/UNI-103/UNI-104 "per-tenant worker sizing"
+lesson (`docs/runbook.md`, "Per-tenant worker sizing and the saturation
+check") showing up on a new axis: `32/32/128` was derived specifically FOR
+20/10/65 (end-users given 4x the workers so it stays backlogged at 65%
+weight instead of draining its queue and falling out of contention). This
+ticket's Setup says to patch the config and run `full-contention` — the one
+fixed, named scenario — not a per-weight-set resized variant, so that sizing
+was never re-derived for 40/20/40, 98/1/1 or 33/33/33. The result: in 98/1/1,
+app1 (now the 98%-weight tenant) gets the SAME 32 workers that were "enough
+to stay backlogged" at a mere 20% share — 32 outstanding requests cannot keep
+app1's queue full once it is being served almost exclusively, so its queue
+repeatedly empties and the scheduler's non-fairness scorers (queue-scorer,
+kv-cache-utilization-scorer, prefix-cache-scorer) give its idle capacity away
+— the same work-conservation mechanism UNI-100 first documented, just
+triggered from the opposite direction. In 40/20/40 and 33/33/33 the mirror
+problem hits end-users: its 128 workers vastly over-offer relative to its
+new (no-longer-dominant) weight, so its queue never drains no matter what the
+policy does, and it ends up with by far the largest share regardless of its
+configured number.
+
+**98/1/1 specifically — "stress the small-weight floor" ended up testing
+something else.** The ticket expected 98/1/1 to probe whether a 1%-weight
+floor meaningfully throttles a tenant down near zero. It does not get to:
+app2 and end-users (both weight 1) are already massively over-offered
+relative to 1% by the same fixed 32/128 workers, so their queues can never
+drain regardless of where the floor sits — they look exactly as well-served
+at weight 1 as they did at weight 10/65, because the floor was never actually
+approached from above. The dominant, visible effect in this run is app1's
+-78.9pt collapse from worker undersizing, not a small-weight-floor
+measurement. A real floor probe would need app1 resized to several hundred
+workers (to stay backlogged at 98%) with app2/end-users trimmed back toward
+1-2 workers each (to actually approach their 1% entitlement) — out of this
+ticket's scope (Setup says run `full-contention` as named), but worth a
+follow-up ticket if the board wants that question actually answered.
+
+**What surprised me.** I expected weight changes alone, under the standard
+`full-contention` load, to move the split in the right direction even if
+imperfectly — the pre-harness Qwen2.5-7B GPU-suite result quoted above
+("4. 40/20/40 also lands": 41.3/20.7/38.0% against a 40/20/40 target) did
+exactly that, by hand, on a different backend/model. On `llama-3-1-8b` with
+this harness's current fixed sizing, the split barely moved at all across
+three very different configured weights — which means `full-contention`'s
+own built-in worker counts are currently a BIGGER determinant of the
+measured split than the configured weight itself, for any weight set other
+than the one (20/10/65) they were tuned for. That is a methodology gap worth
+a board decision, not a POC confound to quietly paper over: either
+`full-contention` needs parametric per-weight-set worker sizing (a real
+script change, out of this ticket's "patch the config, run full-contention"
+scope) or alternative-weight-set testing needs its own scenario(s) with their
+own sizing, the same way `app2-idle`/`app1-idle` got theirs in the A-series.
+Until one of those exists, this series cannot show the weighted-split result
+"isn't tuned to one weight set" — ironically the opposite of what this
+ticket set out to demonstrate — because the harness's own load shape IS tuned
+to one weight set.
+
+**Cluster left as found.** All three weight patches were restored to
+20/10/65 (with a full pod-roll-and-Ready wait after each), `enforce`
+reverted to `false` by each run's own `ENFORCE_LIVE` wrapper, and no loadgen
+Job/pod left behind. Confirmed after all three cases:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+$ oc get deployment maas-vllm-gpu-kserve maas-vllm-gpu-kserve-router-scheduler -n maas-fairness-poc -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
+NAME                                    DESIRED   READY
+maas-vllm-gpu-kserve                    2         2
+maas-vllm-gpu-kserve-router-scheduler   1         1
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m19s      15m
+```
+
+Matches `deploy/epp-config.yaml`'s committed defaults
+(20/10/65/5, `enforce: false`) and the replica count this ticket found at
+checkout.
+
+**Done when:** raw results (report, loadgen log, metric deltas, and the
+weight-patch before/after proof) are in `results/20261106T162815Z-uni-160-f3-40-20-40/`,
+`results/20261106T163753Z-uni-160-f3-98-1-1/` and
+`results/20261106T164729Z-uni-160-f3-33-33-33/`.
+
+**Evidence:**
+
+- Commits: see this section's companion commit on `main`.
+- Raw results: `results/20261106T162815Z-uni-160-f3-40-20-40/`,
+  `results/20261106T163753Z-uni-160-f3-98-1-1/`,
+  `results/20261106T164729Z-uni-160-f3-33-33-33/` (each with
+  `fairness-report.json`/`.md`, `epp-container.log`, `loadgen.log`,
+  `client-request-summary.jsonl`, before/after metric snapshots, and
+  `live-config/` enforce-live before/applied/post-restore proof).
+- Grafana/Prometheus time range: `2026-11-06T16:26:52Z`–`2026-11-06T16:55:45Z`
+  (first weight patch through the final post-restore confirmation across all
+  three cases). Per-case scored load: 40/20/40 `16:29:27Z`–`16:33:49Z`,
+  98/1/1 `16:39:04Z`–`16:43:27Z`, 33/33/33 `16:48:47Z`–`16:53:09Z`.

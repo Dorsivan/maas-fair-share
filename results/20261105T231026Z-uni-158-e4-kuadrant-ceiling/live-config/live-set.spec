@@ -1,0 +1,1 @@
+field:tokenratelimitpolicies.kuadrant.io:maas-trlp-maas-vllm-gpu:spec.limits.models-as-a-service-app1-production-maas-vllm-gpu-tokens.rates

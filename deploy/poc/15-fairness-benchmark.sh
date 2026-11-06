@@ -330,6 +330,13 @@
 # phase-edge maths only ever reads an event's generic `at_seconds`, so this
 # needed no report-side change. See docs/runbook.md "Generic live-config
 # set/restore wrapper (UNI-180)" for the full mechanism and its known gaps.
+# UNI-163 fix: firing LIVE_SET_AT mid-run against an epp-key/epp-weight target,
+# or a field: target that happens to be this same ConfigMap's epp key, was a
+# gap UNI-180 shared with CHAOS_EPP_DELETE_AT before UNI-193 fixed it there --
+# chaos_loop now calls the same resolve_replacement_pod_async after applying
+# such a target, so capture_loop and the mid-run restart detector follow the
+# EPP pod's replacement instead of silently watching the one just recreated.
+# See live_set_target_recreates_pod below.
 #
 # UNI-159 harness addition: SHADOW_MODE (default false), the mirror image of
 # ENFORCE_LIVE for the opposite direction. ENFORCE_LIVE only ever confirms and
@@ -755,6 +762,29 @@ live_config_proof() {
 live_set_restore_at_hold() {
   case "$LIVE_SET_TARGET" in
     field:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# UNI-163: does applying $1 (a LIVE_SET_TARGET spec) edit $CONFIGMAP_NAME's
+# data.epp? That ConfigMap has no live-reload path (same hazard documented on
+# revert_enforce_live below), so the controller recreates the EPP pod under a
+# new name every time -- epp-key:/epp-weight: always, and a field: target only
+# if it happens to point at this same ConfigMap's epp key (e.g. a blob
+# replacement used to change more than one epp-weight atomically in a single
+# patch). Every prior LIVE_SET_AT case (C2, C5 -- see
+# [[project_llmisvc_patch_path_works_and_edge_case_series]]) used an
+# epp-key/epp-weight target applied before traffic started or restored only
+# after it stopped, so chaos_loop firing this mid-run with capture_loop still
+# attached was never actually exercised until UNI-163 (F6) first did. Used by
+# chaos_loop below to decide whether to kick off resolve_replacement_pod_async
+# the same way CHAOS_EPP_DELETE_AT already does -- without it, capture_loop and
+# the mid-run restart detector silently keep watching the pod that is about to
+# be gone, exactly the bug UNI-193 fixed for the chaos-delete path.
+live_set_target_recreates_pod() {
+  case "$1" in
+    epp-key:*|epp-weight:*) return 0 ;;
+    "field:configmap:$CONFIGMAP_NAME:"*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -1681,8 +1711,16 @@ chaos_loop() {
     # for restore_live_set after the run) only happens for a `field:` target
     # with LIVE_SET_HOLD set -- see live_set_restore_at_hold.
     if [ -n "$LIVE_SET_AT" ] && [ "$live_set_done" = false ] && [ "$elapsed" -ge "$LIVE_SET_AT" ]; then
+      # UNI-163: read the pre-patch pod name from the same file CHAOS_EPP_DELETE_AT
+      # keeps current, not the $EPP_POD this subshell forked with -- see the
+      # UNI-193 comment above resolve_replacement_pod_async for why.
+      local pre_set_pod
+      pre_set_pod="$(cat "$EPP_POD_FILE" 2>/dev/null || echo "$EPP_POD")"
       live_config_set live-set "$LIVE_SET_TARGET" "$LIVE_SET_VALUE"
       chaos_log "live-config: set $LIVE_SET_TARGET -> $LIVE_SET_VALUE (t+${elapsed}s, target was t+${LIVE_SET_AT}s)"
+      if live_set_target_recreates_pod "$LIVE_SET_TARGET"; then
+        resolve_replacement_pod_async "$pre_set_pod" &
+      fi
       live_set_done=true
     fi
     if [ "$live_set_done" = true ] && [ "$live_restore_done" = false ] && [ -n "$LIVE_SET_HOLD" ] \
@@ -1775,18 +1813,18 @@ snapshot_metrics > "$METRICS_AFTER"
 RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 { echo "# ts=$RUN_END epoch=$(date +%s)"; cat "$METRICS_AFTER"; } >> "$METRICS_TS"
 
-# UNI-143 (B4 investigation): revert_enforce_live is called here -- AFTER the
-# after-snapshot, not before. This plugin's config has no live-reload path
-# (pkg/fairness/weightedlas/plugin.go's v4Logger comment: "Factory decodes it
-# once, at construction"), so every maas-epp-config edit this script makes,
-# including the revert, is actually applied by the LLMInferenceService
-# controller DELETING AND RECREATING the EPP pod -- same Deployment/
-# ReplicaSet, new pod, fresh Prometheus registry. The pod's container
-# restartCount is unaffected (it is a new pod, not a restarted container),
-# so the mid-run-restart check above cannot see this. Reverting before this
-# snapshot silently zeroes every llm_d_epp_maas_fairness_contended_* and
-# dispatch_total series the report depends on -- the run still completes and
-# a report still gets written, but every group's contended_seconds comes
+# UNI-143 (B4 investigation): these three reverts are called here -- AFTER
+# the after-snapshot, not before. This plugin's config has no live-reload
+# path (pkg/fairness/weightedlas/plugin.go's v4Logger comment: "Factory
+# decodes it once, at construction"), so every maas-epp-config edit this
+# script makes, including a revert, is actually applied by the
+# LLMInferenceService controller DELETING AND RECREATING the EPP pod -- same
+# Deployment/ReplicaSet, new pod, fresh Prometheus registry. The pod's
+# container restartCount is unaffected (it is a new pod, not a restarted
+# container), so the mid-run-restart check above cannot see this. Reverting
+# before this snapshot silently zeroes every llm_d_epp_maas_fairness_contended_*
+# and dispatch_total series the report depends on -- the run still completes
+# and a report still gets written, but every group's contended_seconds comes
 # back null and the verdict reads UNCONTENDED regardless of what actually
 # happened. Caught on uni-143-b4-long-idle-return's first attempt: the
 # timeseries capture showed real, growing contended_seconds_total through
@@ -1794,18 +1832,31 @@ RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # 6 static lines the instant enforce flipped. Confirmed via `oc get pods`:
 # the pod on record for that run no longer existed afterward; a new pod
 # under the same ReplicaSet hash had replaced it, age-zero at revert time.
+#
+# UNI-163 fix: restore_live_set MUST run before revert_enforce_live/
+# revert_shadow_mode, not after -- this call site had them in the opposite
+# order from on_exit's (correct) sequence above, and that divergence was
+# latent until UNI-163 (F6) first combined ENFORCE_LIVE=true with a LIVE_SET_AT
+# target that edits this same ConfigMap's data.epp. live_config_restore's
+# idempotency check compares the CURRENT live value against what THIS id
+# applied; running revert_enforce_live first flips `enforce` back on top of
+# the live-set id's still-applied text (not the pre-run text), so when
+# restore_live_set runs next, the live value no longer matches what live-set
+# applied (enforce now differs) and it logs "nothing to do" -- silently
+# leaving the live-set change (here, three re-weighted groups) live after the
+# run, in violation of this series' own "leave the cluster as you found it"
+# rule. Confirmed live on UNI-163's first run: maas-epp-config was left at
+# app1/app2/end-users weight 40/20/40 (enforce correctly back to false) until
+# caught by the post-run `oc get` check and corrected by hand. Restoring
+# live-set first means its own idempotency check runs against the untouched
+# post-run live value, exactly like on_exit already does it.
+restore_live_set
 revert_enforce_live
 # UNI-159: revert_shadow_mode shares the exact same hazard (and the exact
 # same reason it must run AFTER the after-snapshot, not before) as
 # revert_enforce_live just above -- it is the same pod-recreate-on-ConfigMap-
 # edit mechanism, just restoring the opposite flip direction.
 revert_shadow_mode
-# UNI-180: restore_live_set shares the exact same hazard and is called here
-# for the exact same reason -- an epp-key/epp-weight LIVE_SET_AT target
-# recreates the EPP pod on restore too. A held field: target has usually
-# already self-restored from the chaos loop by now; this is that case's
-# idempotent backstop, not its primary restore path.
-restore_live_set
 
 # UNI-138 (G2): the ledger cross-check's cost formula needs the EPP's live
 # cost-model weights to translate the client's raw token counts into the

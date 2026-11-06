@@ -7082,3 +7082,201 @@ convention as every prior case.
 `results/20261106T193828Z-uni-162-f2-clamp-off-cold-join/` (part 2: same
 shape plus `timeline-config.json`, `client-request-summary.jsonl`,
 `04-loadgen.patched.yaml`).
+
+## UNI-163: F6, live config change mid-run — does NOT apply without a restart, costs ~70s of real downtime, and resets accumulated per-group state
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, F-series. The ticket asks
+three direct questions about patching `maas-epp-config`'s weights mid-run
+(not before it, like [UNI-160](/UNI/issues/UNI-160)/F3, or after it stops):
+does the change apply without an EPP restart, how long does it take to show
+in windowed shares, and is accumulated per-group state kept or reset across
+it?
+
+**Setup.** `full-contention` (`app1`/`app2`/`end-users` offered 32/32/128
+workers, the series' standard sizing), 240s, live against `maas-vllm-gpu` (2
+replicas, llama-3-1-8b), `enforce: true` (flipped live for the run via
+[UNI-180](/UNI/issues/UNI-180)'s `ENFORCE_LIVE=true`). At t=120s (the
+midpoint), [UNI-180](/UNI/issues/UNI-180)'s generic mid-run hook
+(`LIVE_SET_AT=120`) atomically replaced `maas-epp-config`'s entire `data.epp`
+blob (`LIVE_SET_TARGET=field:configmap:maas-epp-config:data.epp`) with one
+that re-weights app1/app2/end-users from 20/10/65 to **40/20/40** — a single
+combined patch, not three separate `epp-weight:` flips, so the pod only
+recreates once, not three times, and the "does it apply" question gets one
+clean before/after instant rather than three staggered ones. Restored to
+20/10/65 after the run's final metrics snapshot, per rule 3. Full command:
+
+```
+LIVE_SET_VALUE="$(cat new-weights.yaml)" ENFORCE_LIVE=true DURATION=240 \
+  LIVE_SET_AT=120 LIVE_SET_TARGET="field:configmap:maas-epp-config:data.epp" \
+  ./deploy/poc/15-fairness-benchmark.sh full-contention uni-163-f6-live-config-change
+```
+
+(`new-weights.yaml` was built by taking the live `data.epp` and applying the
+exact same `enforce: false -> true` and `weight:` regex substitutions
+`15-fairness-benchmark.sh`'s own `patch_epp_text_key`/`patch_epp_text_weight`
+use, so the patch would recreate the pod exactly once at t=120s with both
+the enforce flip -- already applied at run start -- and the new weights
+present together, not flip enforce back off as a side effect.)
+
+**Two real harness bugs found and fixed while running this case** (neither
+is specific to this ticket's weights-at-t=120s setup -- both are latent gaps
+in the generic mid-run/live-config machinery that this is simply the first
+case to exercise in this combination):
+
+1. **The EPP pod's replacement was never tracked for a mid-run `LIVE_SET_AT`
+   patch, so `capture_loop` and the restart detector would have kept
+   watching the terminated pod.** [UNI-193](/UNI/issues/UNI-193) fixed this
+   exact problem for `CHAOS_EPP_DELETE_AT` (`resolve_replacement_pod_async`),
+   but [UNI-180](/UNI/issues/UNI-180)'s `LIVE_SET_AT` hook -- added after
+   UNI-193 -- never got the same wiring, and no earlier case fired it against
+   a target that recreates the pod while traffic was still flowing (C2/C5
+   used `epp-key`/`epp-weight` only before traffic started or after it
+   stopped). Fixed in `15-fairness-benchmark.sh`: a new
+   `live_set_target_recreates_pod()` helper, and `chaos_loop` now calls
+   `resolve_replacement_pod_async` after a `LIVE_SET_AT` patch exactly like
+   it already does after a chaos delete. Confirmed working on this run's own
+   `chaos-events.log`: `chaos: replacement EPP pod for
+   ...-676fd97cd-g9klf is ...-656748bc54-n6kvf (found after 33s)`, and
+   `epp-container.log` has real content through `20:04:36Z`, 11s before run
+   end, instead of going silent at the swap.
+2. **The post-run cleanup called `revert_enforce_live` BEFORE
+   `restore_live_set` -- the opposite order from the (correct) `on_exit`
+   trap's own sequence -- which silently left this run's weight change live
+   after the script exited.** Both reverts rewrite the same ConfigMap text;
+   running the `enforce` revert first patches it against the *already-set*
+   live-set text (not the pre-run text), so when `restore_live_set` runs
+   next, the live value no longer matches what *it* applied and it logs
+   "nothing to do" instead of restoring. Caught live by this series' own
+   rule-3 `oc get` verification: `maas-epp-config` was found at
+   `app1/app2/end-users` weight **40/20/40** (not the two were reverted
+   independently and correctly in series) with `enforce` correctly back at
+   `false` -- the enforce revert itself worked, it just made the
+   weight-revert that followed it a no-op. Corrected by hand immediately
+   (same regex-based patch used to apply the change in the first place,
+   verified via `oc get`), then fixed at the source: reordered the explicit
+   post-run call site to match `on_exit`'s sequence
+   (`restore_live_set`, then `revert_enforce_live`, then
+   `revert_shadow_mode`). See "Cluster left as found" below for the final,
+   now-correct state.
+
+**Report-script blind spot found and fixed.** The run's own verdict came
+back `UNCONTENDED` -- on its face absurd for a 240s `full-contention` run
+that, per its own raw mid-run metrics, had `end-users` at 1.29M contended
+tokens by t=120s (an order of magnitude more than the ~9s/run's worth of
+`contended_seconds` the UNCONTENDED threshold is calibrated against). Root
+cause: `15-fairness-report.py`'s top-level `epp_restarted` check only
+compares the run's single before/after snapshot pair, and a pod recreate
+strictly between a near-zero `before` and a still-higher-but-far-lower-than-
+actual `after` reads as ordinary monotonic growth -- the two endpoints never
+cross each other backwards, even though they bracket a real reset.
+`compute_windows`'s own, separate restart detector (comparing *consecutive*
+scrapes, which do cross the reset) correctly flagged
+`epp_restarted_during_windows`, but per [UNI-127](/UNI/issues/UNI-127)'s own
+design note that signal was "purely additive" and never reached the verdict.
+Fixed in `15-fairness-report.py`: a new, additive
+`verdict.epp_restarted_in_windows_but_not_snapshot_pair` field (and a
+markdown caveat) surfaces exactly this mismatch, without overriding
+`verdict.result`/`reasons` -- a scenario that intentionally recreates the EPP
+mid-run (e.g. a future `CHAOS_EPP_DELETE_AT` resilience case) may already
+score that correctly through its own path, and forcing `FAIL` here on every
+mid-run restart could silently change scoring conventions this report has no
+visibility into. Two new tests added (`15-fairness-report-test.py`, now
+61/61 passing, was 59/59): one proving the gap existed (a synthetic
+before/after pair that reads monotonic while the windowed series shows a
+real reset), one guarding that the new field stays `False` on an ordinary
+run with no mismatch.
+
+**Answering the ticket's three questions, with the regenerated (fixed-script)
+report:**
+
+1. **Does the change apply without an EPP restart? No.** `oc get pods`
+   during the run shows the GPU router-scheduler pod replaced
+   (`...-676fd97cd-g9klf` -> `...-656748bc54-n6kvf`) within 33s of the patch
+   landing -- the same "any `maas-epp-config` edit recreates the pod, it has
+   no live-reload path" mechanism already documented for the `enforce` flip
+   ([UNI-143](/UNI/issues/UNI-143)/[UNI-174](/UNI/issues/UNI-174)), now
+   directly confirmed for a weight edit too, including one combining
+   multiple weights in a single patch.
+2. **How long to show in windowed shares? None of the three groups delivered
+   a single token for 70 straight seconds (seven consecutive 10s windows,
+   t=120s-190s), not a slow fade-in.** `/metrics` was unreachable
+   (`curl: (7) Failed to connect`) from `19:59:48Z` to `20:00:48Z` while the
+   Deployment rolled to the new pod and the route/Gateway reconnected;
+   traffic only resumes in the 190-200s window. This is not "the policy is
+   slow to re-converge on the new weights" -- it is the EPP tier being
+   briefly absent entirely. (Once traffic does resume, the post-patch
+   windows track the *worker-sizing* confound [UNI-160](/UNI/issues/UNI-160)
+   already documented -- `full-contention`'s fixed 32/32/128 sizing was never
+   re-derived for 40/20/40, so app1 stays suppressed near 7% instead of
+   climbing toward 40% -- not a separate finding here, just the same one
+   showing up again on the back half of this run.)
+3. **Is accumulated per-group state kept or reset? Reset.** Direct
+   Prometheus evidence from this run's own `metrics-timeseries.txt`:
+   `contended_service_tokens_total` read app1=323,010 / app2=271,908 /
+   end-users=1,286,094 at the last scrape before the patch (`19:59:38Z`,
+   t≈120s -- real, substantial contention had been accruing for two full
+   minutes), then app1=4,018 / app2=24,342 / end-users=45,936 at the first
+   scrape after the new pod resumed serving (`20:00:58Z`, t≈200s) -- an
+   order of magnitude lower, consistent with a brand-new process's fresh
+   Prometheus registry starting from zero, not a continuation of the old
+   pod's counters. This is the same "new pod, new registry" mechanism
+   [[project_epp_configmap_edit_recreates_pod_and_zeroes_counters]]
+   documents for the `enforce` flip, now directly measured for a weight
+   change.
+
+**What surprised us.** Not that the pod recreates (expected, consistent with
+every prior ConfigMap-edit case) -- it's how completely invisible the
+resulting measurement corruption was before this ticket's report-script fix.
+The run's own ledger cross-check (UNI-138/G2) did independently catch
+something was badly wrong (app1/app2/end-users raw-token deltas were
+76-88% below what the client actually sent, because the EPP-side delta only
+covers the post-reset ~40s of real traffic against the client's full 240s),
+but the *headline* verdict read as a clean, unremarkable `UNCONTENDED` with
+no indication anything unusual had happened -- exactly the kind of result
+that would get skimmed past rather than investigated, on a run that in fact
+measured substantial real contention for its first half.
+
+**Verdict: answered, not scored.** This ticket's "done when" is the three
+questions above, not a weighted-split PASS/FAIL -- the run's own `verdict`
+field reads `UNCONTENDED` (now correctly flagged as unreliable by the new
+caveat) because the post-reset snapshot pair genuinely did see less than a
+second of fresh `contended_seconds` accrual in the ~40s it had left to
+run, and the ledger `FAIL` is a known, explained consequence of the same
+reset, not a new accounting bug (rule 4: a FAIL is a valid, reportable
+result once the cause is established, which it is here).
+
+**Cluster left as found.** Confirmed via `oc get`/the live metrics endpoint,
+not assumed -- including the manual correction for bug #2 above:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E '^\s*(enforce|newcomerClamp|halfLifeSeconds):'
+      enforce: false
+      halfLifeSeconds: 60
+      newcomerClamp: true
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'weight:'
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler -o jsonpath='{range .items[*]}{.metadata.name}{" ready="}{.status.containerStatuses[0].ready}{" restarts="}{.status.containerStatuses[0].restartCount}{"\n"}{end}'
+maas-vllm-cpu-kserve-router-scheduler-d8b6f4944-whrmh ready=true restarts=0
+maas-vllm-gpu-kserve-router-scheduler-575669c495-p66zd ready=true restarts=0
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ curl .../metrics (via the metrics-reader token):
+llm_d_epp_maas_fairness_enforcing 0
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           7m7s       32m
+```
+
+Matches `deploy/epp-config.yaml`'s committed defaults (`enforce: false`,
+`newcomerClamp: true`, `halfLifeSeconds: 60`, weights 20/10/65/5) and the
+checked-out 2-replica GPU count exactly. `maas-loadgen` is this run's own
+completed Job, left in place per the series' standing convention.
+
+**Raw results:** `results/20261106T195628Z-uni-163-f6-live-config-change/`
+(`fairness-report.{json,md}` regenerated with the fixed report script,
+`loadgen.log`, `epp-container.log`, `metrics-{before,after,timeseries}.txt`,
+`live-config-events.log`, `enforce-events.log`, `chaos-events.log`,
+`client-request-summary.jsonl`, `timeline-config.json`).

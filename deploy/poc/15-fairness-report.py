@@ -1474,6 +1474,29 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "max_abs_deviation_points": max_abs_dev,
             "reasons": reasons,
             "epp_restarted_mid_run": epp_restarted,
+            # UNI-163: the before/after snapshot pair this report is built from only
+            # sees two points on the line -- it flags epp_restarted_mid_run above only
+            # when a GROUP'S OWN after-value is lower than its before-value. A restart
+            # strictly between a near-zero before and a lower (but still positive)
+            # after reads as a normal monotonic rise and is invisible to it, even
+            # though the windowed series (compute_windows, scraped every
+            # WINDOW_SECONDS through the run) crosses the reset directly and catches
+            # it. This field surfaces that gap rather than silently trusting whichever
+            # check happened to fire: True means the windowed series saw a restart
+            # this snapshot pair did not, so every before/after delta above --
+            # including the verdict and the ledger cross-check below -- undercounts
+            # real traffic and should be read with that in mind. Deliberately does
+            # NOT change `result`/`reasons` itself: a scenario that intentionally
+            # recreates the EPP mid-run (e.g. a CHAOS_EPP_DELETE_AT resilience case)
+            # may already score that correctly through its own path, and retroactively
+            # forcing FAIL here could silently change past scoring conventions this
+            # report doesn't have visibility into. See UNI-163's writeup in
+            # docs/poc-results.md for the run this was found on.
+            "epp_restarted_in_windows_but_not_snapshot_pair": bool(
+                timeline_section
+                and timeline_section.get("epp_restarted_during_windows")
+                and not epp_restarted
+            ),
             "solo_group": solo,
             "capped_groups": sorted(capped_groups),
             "uncontended_threshold_seconds": UNCONTENDED_SECONDS_THRESHOLD,
@@ -1685,6 +1708,19 @@ def render_markdown(report):
         lines.append("")
         for reason in v["reasons"]:
             lines.append(f"- {reason}")
+    if v.get("epp_restarted_in_windows_but_not_snapshot_pair"):
+        lines.append("")
+        lines.append(
+            "**Caveat (UNI-163): the EPP restarted mid-run in a way this verdict did not "
+            "catch.** The windowed series below shows a counter going backwards between "
+            "two in-run scrapes, but the single before/after snapshot pair this verdict is "
+            "built from happened to read monotonically end-to-end (a near-zero start and a "
+            "lower-but-still-higher-than-zero end look the same as no restart at all). "
+            "Every before/after delta above -- the verdict and the ledger cross-check below "
+            "-- is computed from the post-restart pod's fresh counters alone and undercounts "
+            "real traffic; read them as a measurement of the time since the restart, not the "
+            "whole run."
+        )
     lines.append("")
     lines.append("## Run metadata")
     lines.append("")

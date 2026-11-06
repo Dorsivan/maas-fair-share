@@ -1021,6 +1021,85 @@ def test_build_report_timeline_section_populated_with_timeseries_and_config():
         assert cli_report["timeline"] is not None
 
 
+def test_mid_run_restart_invisible_to_snapshot_pair_is_flagged_from_windows():
+    # UNI-163 (F6): found live on a run that patched maas-epp-config mid-run
+    # (any edit recreates the EPP pod -- no live-reload path -- so its
+    # counters reset to zero). before=~0 and after=the post-reset pod's own
+    # modest cumulative total is STILL a monotonic rise end to end, so the
+    # before/after-only epp_restarted check (test_epp_restart_mid_run_fails,
+    # above) never fires -- only the windowed series, which scrapes through
+    # the actual reset, sees the backwards step. Before this ticket that
+    # signal was "purely additive" (UNI-127's own description of the timeline
+    # section) and never reached the verdict: a run that reset mid-flight and
+    # undercounted every delta as a result rendered as a clean, unremarkable
+    # verdict with no indication anything was wrong.
+    with tempfile.TemporaryDirectory() as tmp:
+        before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON +
+                       'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n')
+        # Lower than the mid-run peak (9000) but still higher than `before` --
+        # reads as ordinary, modest growth unless you have the windowed data.
+        after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON +
+                      'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 50\n')
+        log = write(tmp, "loadgen.log", loadgen_log("app1", 32, 0, 0, 30, [
+            ("app1", 500, "1.20", "2.40", "200=500"),
+        ]))
+        ts = write_timeseries(tmp, "ts.txt", [
+            (0, {"app1": 0.0}),
+            (10, {"app1": 9000.0}),
+            (20, {"app1": 20.0}),   # the reset the before/after pair never sees
+            (30, {"app1": 50.0}),
+        ])
+        cfg = write_timeline_config(tmp, "timeline.json")
+        report = fairness_report.build_report(
+            scenario="test-scenario", enforce=True, duration_seconds=30, backend="vllm-gpu",
+            epp_image_digest="sha256:deadbeef", namespace="maas-fairness-poc",
+            epp_pod="test-pod", run_start="2026-11-01T00:00:00Z", run_end="2026-11-01T00:00:30Z",
+            threshold_points=10.0, metrics_before_path=before, metrics_after_path=after,
+            loadgen_log_path=log, metrics_timeseries_path=ts, timeline_config_path=cfg,
+            window_seconds=10.0,
+        )
+        v = report["verdict"]
+        # The before/after-only check still reads this as monotonic growth --
+        # confirming the gap exists, not asserting that's correct.
+        assert v["epp_restarted_mid_run"] is False, v
+        assert v["epp_restarted_in_windows_but_not_snapshot_pair"] is True, v
+        md = fairness_report.render_markdown(report)
+        assert "Caveat (UNI-163)" in md
+
+
+def test_epp_restarted_in_windows_but_not_snapshot_pair_is_false_when_consistent():
+    # Regression guard: an ordinary run (no mid-run reset at all, or one the
+    # before/after pair already caught on its own) must not get the new
+    # caveat -- it is additive signal for exactly the gap above, not a
+    # second, redundant restart flag.
+    with tempfile.TemporaryDirectory() as tmp:
+        before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON +
+                       'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n')
+        after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON +
+                      'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2000\n')
+        log = write(tmp, "loadgen.log", loadgen_log("app1", 32, 0, 0, 20, [
+            ("app1", 500, "1.20", "2.40", "200=500"),
+        ]))
+        ts = write_timeseries(tmp, "ts.txt", [
+            (0, {"app1": 0.0}),
+            (10, {"app1": 1000.0}),
+            (20, {"app1": 2000.0}),
+        ])
+        cfg = write_timeline_config(tmp, "timeline.json")
+        report = fairness_report.build_report(
+            scenario="test-scenario", enforce=True, duration_seconds=20, backend="vllm-gpu",
+            epp_image_digest="sha256:deadbeef", namespace="maas-fairness-poc",
+            epp_pod="test-pod", run_start="2026-11-01T00:00:00Z", run_end="2026-11-01T00:00:20Z",
+            threshold_points=10.0, metrics_before_path=before, metrics_after_path=after,
+            loadgen_log_path=log, metrics_timeseries_path=ts, timeline_config_path=cfg,
+            window_seconds=10.0,
+        )
+        v = report["verdict"]
+        assert v["epp_restarted_mid_run"] is False, v
+        assert v["epp_restarted_in_windows_but_not_snapshot_pair"] is False, v
+        assert "Caveat (UNI-163)" not in fairness_report.render_markdown(report)
+
+
 # UNI-137 (B5): open-loop (Poisson) generator support in parse_loadgen_log.
 def test_parse_loadgen_log_detects_open_loop_generator():
     with tempfile.TemporaryDirectory() as tmp:

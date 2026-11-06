@@ -741,6 +741,35 @@ def write_timeseries(tmp, name, snapshots):
     return write(tmp, name, "\n".join(lines) + "\n")
 
 
+def write_timeseries_raw(tmp, name, snapshots):
+    """snapshots: list of (epoch, raw_prometheus_text_block) -- for fixtures
+    that need labels write_timeseries' plain {group: value} shape can't carry
+    (UNI-164: a histogram's le/outcome labels alongside fairness_id)."""
+    lines = []
+    for epoch, block in snapshots:
+        lines.append(f"# ts=2026-11-01T00:00:{epoch:02d}Z epoch={epoch}")
+        lines.append(block.rstrip("\n"))
+    return write(tmp, name, "\n".join(lines) + "\n")
+
+
+def queue_wait_bucket_lines(fairness_id, outcome, cumulative):
+    """Prometheus text for llm_d_epp_flow_control_request_queue_duration_seconds,
+    labelled the way llm-d-router v0.11.0 actually emits it (fairness_id,
+    priority, outcome, inference_pool, model_name, target_model_name --
+    only fairness_id/outcome vary across these fixtures, the rest are fixed
+    so _histogram_buckets' "sum across any other label" path is exercised
+    the same way a real multi-pool scrape would). `cumulative` is
+    [(le, count)], with le="+Inf" last."""
+    name = "llm_d_epp_flow_control_request_queue_duration_seconds"
+    lines = "".join(
+        f'{name}_bucket{{fairness_id="{fairness_id}",priority="0",outcome="{outcome}",'
+        f'inference_pool="maas-vllm-gpu-inference-pool",model_name="llama-3-1-8b",'
+        f'target_model_name="llama-3-1-8b",le="{le}"}} {c}\n'
+        for le, c in cumulative
+    )
+    return lines + f'{name}_count{{fairness_id="{fairness_id}",priority="0",outcome="{outcome}"}} {cumulative[-1][1]}\n'
+
+
 def write_timeline_config(tmp, name, tenants=None, chaos_events=None):
     return write(tmp, name, json.dumps({"tenants": tenants or {}, "chaos_events": chaos_events or []}))
 
@@ -1098,6 +1127,128 @@ def test_epp_restarted_in_windows_but_not_snapshot_pair_is_false_when_consistent
         assert v["epp_restarted_mid_run"] is False, v
         assert v["epp_restarted_in_windows_but_not_snapshot_pair"] is False, v
         assert "Caveat (UNI-163)" not in fairness_report.render_markdown(report)
+
+
+# UNI-164: per-group, per-window flow-control queue-wait distribution, from
+# the upstream llm-d-router v0.11.0 Flow Control layer's own fairness_id-
+# labelled histogram (already scraped by 15-fairness-benchmark.sh's
+# snapshot_metrics since UNI-193 -- no EPP or benchmark-script change here,
+# report-side only).
+
+def test_compute_queue_wait_windows_computes_quantiles_per_window():
+    schedule = {"app1": fairness_report.default_schedule_entry(20)}
+    block0 = queue_wait_bucket_lines("app1", "Dispatched", [("0.01", 0), ("0.1", 0), ("1", 0), ("+Inf", 0)])
+    block1 = queue_wait_bucket_lines("app1", "Dispatched", [("0.01", 50), ("0.1", 90), ("1", 100), ("+Inf", 100)])
+    ts = [
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+    ]
+    windows, restarted = fairness_report.compute_queue_wait_windows(ts, schedule)
+    assert restarted is False
+    assert len(windows) == 1
+    g = windows[0]["groups"][0]
+    assert g["group"] == "app1" and g["state"] == "ok" and g["observations"] == 100
+    assert abs(g["p50_seconds"] - 0.01) < 1e-9
+    # Cross-check against the same Prometheus-quantile semantics the pick
+    # latency section already tests, rather than a hand-derived constant.
+    expected_p99, _ = fairness_report.histogram_quantile(
+        0.99, {0.01: 50.0, 0.1: 90.0, 1.0: 100.0, float("inf"): 100.0})
+    assert abs(g["p99_seconds"] - expected_p99) < 1e-9
+
+
+def test_compute_queue_wait_windows_filters_outcome_dispatched_only():
+    # A request evicted after a long TTL wait is not "served late" the way a
+    # dispatched one is (see the Shed section for eviction accounting) -- its
+    # queue time must not leak into the Dispatched quantiles for the same
+    # fairness_id.
+    schedule = {"app1": fairness_report.default_schedule_entry(20)}
+    block0 = (queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 0), ("+Inf", 0)]) +
+              queue_wait_bucket_lines("app1", "EvictedTTL", [("0.1", 0), ("+Inf", 0)]))
+    block1 = (queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 10), ("+Inf", 10)]) +
+              queue_wait_bucket_lines("app1", "EvictedTTL", [("0.1", 0), ("+Inf", 500)]))
+    ts = [
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+    ]
+    windows, _ = fairness_report.compute_queue_wait_windows(ts, schedule)
+    g = windows[0]["groups"][0]
+    assert g["observations"] == 10
+
+
+def test_compute_queue_wait_windows_distinguishes_not_recorded_from_no_observations():
+    schedule = {"app1": fairness_report.default_schedule_entry(20), "app2": fairness_report.default_schedule_entry(20)}
+    block0 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 20), ("+Inf", 20)])
+    block1 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 20), ("+Inf", 20)])  # unchanged
+    ts = [
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+    ]
+    windows, _ = fairness_report.compute_queue_wait_windows(ts, schedule)
+    by_group = {g["group"]: g for g in windows[0]["groups"]}
+    assert by_group["app1"]["state"] == "no_observations"
+    assert by_group["app2"]["state"] == "not_recorded"
+
+
+def test_compute_queue_wait_windows_flags_epp_restart_and_uses_post_restart_snapshot():
+    schedule = {"app1": fairness_report.default_schedule_entry(20)}
+    block0 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 5000), ("+Inf", 5000)])
+    block1 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 8), ("+Inf", 10)])
+    ts = [
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+    ]
+    windows, restarted = fairness_report.compute_queue_wait_windows(ts, schedule)
+    assert restarted is True
+    assert windows[0]["groups"][0]["observations"] == 10
+
+
+def test_compute_queue_wait_windows_excludes_groups_without_schedule_entry():
+    schedule = {"app1": fairness_report.default_schedule_entry(20)}
+    block0 = (queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 0), ("+Inf", 0)]) +
+              queue_wait_bucket_lines("app2", "Dispatched", [("0.1", 0), ("+Inf", 0)]))
+    block1 = (queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 5), ("+Inf", 5)]) +
+              queue_wait_bucket_lines("app2", "Dispatched", [("0.1", 50), ("+Inf", 50)]))
+    ts = [
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+    ]
+    windows, _ = fairness_report.compute_queue_wait_windows(ts, schedule)
+    assert [g["group"] for g in windows[0]["groups"]] == ["app1"]
+
+
+def test_queue_wait_integrates_into_timeline_section_and_markdown():
+    with tempfile.TemporaryDirectory() as tmp:
+        before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON +
+                       'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n')
+        after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON +
+                      'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2000\n')
+        log = write(tmp, "loadgen.log", loadgen_log("app1", 32, 0, 0, 10, [
+            ("app1", 500, "1.20", "2.40", "200=500"),
+        ]))
+        qw0 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 0), ("+Inf", 0)])
+        qw1 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 40), ("+Inf", 50)])
+        ts = write_timeseries_raw(tmp, "ts.txt", [
+            (0, metrics_block({"app1": 0.0}) + qw0),
+            (10, metrics_block({"app1": 2000.0}) + qw1),
+        ])
+        cfg = write_timeline_config(tmp, "timeline.json")
+        report = fairness_report.build_report(
+            scenario="test-scenario", enforce=True, duration_seconds=10, backend="vllm-gpu",
+            epp_image_digest="sha256:deadbeef", namespace="maas-fairness-poc",
+            epp_pod="test-pod", run_start="2026-11-01T00:00:00Z", run_end="2026-11-01T00:00:10Z",
+            threshold_points=10.0, metrics_before_path=before, metrics_after_path=after,
+            loadgen_log_path=log, metrics_timeseries_path=ts, timeline_config_path=cfg,
+            window_seconds=10.0,
+        )
+        tl = report["timeline"]
+        assert tl is not None
+        qww = tl["queue_wait_windows"]
+        assert len(qww) == 1
+        g = qww[0]["groups"][0]
+        assert g["group"] == "app1" and g["state"] == "ok" and g["observations"] == 50
+        md = fairness_report.render_markdown(report)
+        assert "Flow-control queue wait" in md
+        json.dumps(report, allow_nan=False)
 
 
 # UNI-137 (B5): open-loop (Poisson) generator support in parse_loadgen_log.

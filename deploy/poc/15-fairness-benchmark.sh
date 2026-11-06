@@ -370,7 +370,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -1153,8 +1153,30 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=64)
     ;;
+  app3-joins-at-saturation)
+    # UNI-164: board case, 30/10/60 (end-users standing in for "app3", same
+    # substitution UNI-161 used -- see that ticket's writeup and
+    # [[project_ngroup_support_stops_at_the_loadgen]] for why a real app3
+    # group/MaaSSubscription is out of reach under rule 5). Unlike
+    # app1-flood*, app1 and app2 are NOT flooding here -- the ticket wants a
+    # clean, trackable two-tenant 75/25 (30:10 = 3:1) split BEFORE end-users
+    # joins, so worker counts are sized to that 3:1 ratio (mirroring how
+    # end-users-idle's 64:32 tracks its own 2:1 weight ratio) rather than
+    # reused from any app1-flood* run, which deliberately over-offers app1
+    # far past its weight.  WORKERS_END_USERS=128 reuses full-contention's
+    # own dominant-tenant sizing, since weight 60 here is close to
+    # full-contention's 65. This scenario does NOT touch maas-epp-config's
+    # weights or own the join timing itself -- same division of labor as
+    # app1-flood: the operator patches weights to 30/10/60 before the run and
+    # restores 20/10/65 after, and invokes this scenario with
+    # END_USERS_START=<join offset> (a TIMELINE_VARS knob, see the header
+    # comment above) so end-users is silent until the join instant while
+    # app1/app2 run for the whole DURATION.
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=96 WORKERS_APP2=32 WORKERS_END_USERS=128)
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation)" >&2
     exit 1
     ;;
 esac

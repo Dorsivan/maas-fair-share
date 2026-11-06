@@ -229,14 +229,13 @@ def parse_metrics(path):
 TIMESERIES_HEADER = re.compile(r'^#\s*ts=(?P<ts>\S+)\s+epoch=(?P<epoch>\d+)\s*$')
 
 
-def parse_timeseries(path):
-    """A sequence of (epoch_seconds: float, iso_ts: str, series: dict) from
+def _split_timeseries_blocks(text):
+    """A sequence of (epoch_seconds: float, iso_ts: str, block_text: str) from
     deploy/poc/15-fairness-benchmark.sh's metrics-timeseries.txt: blocks of
     Prometheus text, each preceded by a '# ts=<iso> epoch=<unix seconds>'
     header. Returns entries sorted by epoch (they are written in order, but a
     clock that is not monotonic -- NTP step, not a backend restart -- would
     otherwise silently produce a negative-duration window)."""
-    text = open(path).read()
     entries = []
     epoch = None
     ts = None
@@ -244,7 +243,7 @@ def parse_timeseries(path):
 
     def flush():
         if epoch is not None:
-            entries.append((epoch, ts, parse_metrics_text('\n'.join(block_lines))))
+            entries.append((epoch, ts, '\n'.join(block_lines)))
 
     for line in text.splitlines():
         m = TIMESERIES_HEADER.match(line)
@@ -256,6 +255,24 @@ def parse_timeseries(path):
     flush()
     entries.sort(key=lambda e: e[0])
     return entries
+
+
+def parse_timeseries(path):
+    """A sequence of (epoch_seconds, iso_ts, series) -- series as
+    parse_metrics_text returns it (one value per fairness_id, other labels
+    dropped). See _split_timeseries_blocks for the block format."""
+    text = open(path).read()
+    return [(epoch, ts, parse_metrics_text(block)) for epoch, ts, block in _split_timeseries_blocks(text)]
+
+
+def parse_timeseries_labeled(path):
+    """Same blocks as parse_timeseries, but series as parse_metrics_labeled_text
+    returns it (every label kept) -- needed for a histogram metric like
+    llm_d_epp_flow_control_request_queue_duration_seconds, where collapsing
+    to a single fairness_id key per metric would silently overwrite one `le`
+    bucket with another."""
+    text = open(path).read()
+    return [(epoch, ts, parse_metrics_labeled_text(block)) for epoch, ts, block in _split_timeseries_blocks(text)]
 
 
 def parse_loadgen_log(path):
@@ -376,23 +393,27 @@ def _counter_deltas(before_map, after_map, group_ids):
 # These three sections need the other labels, so they use their own parser
 # rather than changing the one every pre-existing section is built on.
 
-def parse_metrics_labeled(path):
+def parse_metrics_labeled_text(text):
     """{metric_name: [(labels: dict, value: float)]} -- every label kept."""
     series = {}
-    with open(path) as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith('#'):
-                continue
-            m = METRIC_LINE.match(line)
-            if not m:
-                continue
-            try:
-                value = float(m.group(3))
-            except ValueError:
-                continue
-            series.setdefault(m.group(1), []).append((dict(LABEL.findall(m.group(2) or '')), value))
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        m = METRIC_LINE.match(line)
+        if not m:
+            continue
+        try:
+            value = float(m.group(3))
+        except ValueError:
+            continue
+        series.setdefault(m.group(1), []).append((dict(LABEL.findall(m.group(2) or '')), value))
     return series
+
+
+def parse_metrics_labeled(path):
+    with open(path) as f:
+        return parse_metrics_labeled_text(f.read())
 
 
 # The EPP's own scheduling cost, separate from inference cost. Both are
@@ -422,14 +443,20 @@ EPP_429_OUTCOMES = ("RejectedCapacity", "EvictedTTL")
 SHED_STATUSES = ("429", "503")
 
 
-def _histogram_buckets(labeled, name):
+def _histogram_buckets(labeled, name, filters=None):
     """{le: cumulative_count} for `name`, summed across any non-`le` labels,
-    or None if the histogram has no _bucket line at all in this snapshot."""
+    or None if the histogram has no _bucket line at all in this snapshot.
+    `filters`, when given, restricts to lines whose labels match every
+    key/value in it (e.g. {"fairness_id": "app1", "outcome": "Dispatched"})
+    before summing -- the rest of this function's "sum across any other
+    label" behaviour is unchanged for whatever labels are left unfiltered."""
     lines = labeled.get(name + "_bucket")
     if not lines:
         return None
     buckets = {}
     for labels, value in lines:
+        if filters and any(labels.get(k) != v for k, v in filters.items()):
+            continue
         le = labels.get("le")
         if le is None:
             continue
@@ -858,6 +885,76 @@ def compute_windows(timeseries, schedule, weights):
                 "observed_share_pct": observed_pct,
                 "deviation_pts": deviation,
             })
+        windows.append({"start_s": start_s, "end_s": end_s, "groups": groups})
+    return windows, any_restart
+
+
+# UNI-164: per-group, per-window queue-wait distribution from the upstream
+# llm-d-router Flow Control layer's own histogram (fairness_id-labelled since
+# v0.11.0, llm-d-router docs/metrics.md "Flow control") -- already scraped by
+# 15-fairness-benchmark.sh's snapshot_metrics (the `^llm_d_epp_flow_control_`
+# grep predates this ticket, UNI-193), so this is a report-side-only change:
+# no EPP code, no new scrape, no new benchmark-script flag. Restricted to
+# outcome="Dispatched" -- a request that was rejected or evicted never
+# produced a real "time until served" wait the same way a dispatched one did,
+# and mixing the two would conflate shedding (already covered by the Shed
+# section) with queueing.
+QUEUE_WAIT_HISTOGRAM = "llm_d_epp_flow_control_request_queue_duration_seconds"
+
+
+def compute_queue_wait_windows(timeseries_labeled, schedule):
+    """One row per consecutive pair of labeled time-series snapshots, per
+    scheduled group: p50/p90/p99 queue wait (seconds) for requests that
+    reached outcome=Dispatched in that window, bucket-diffed the same way
+    compute_pick_latency diffs its histograms. A bucket going backwards means
+    the EPP restarted between the two scrapes; the post-restart snapshot
+    alone is used for that window, same fallback compute_pick_latency uses,
+    and any_restart is flagged rather than silently clamped away. A group
+    with no schedule entry (never offered this run) is absent, not zeroed --
+    the same "never happened" vs. "not recorded" distinction every other
+    histogram-backed section in this report makes."""
+    if len(timeseries_labeled) < 2:
+        return [], False
+    t0 = timeseries_labeled[0][0]
+    windows = []
+    any_restart = False
+    for (e0, _, s0), (e1, _, s1) in zip(timeseries_labeled, timeseries_labeled[1:]):
+        start_s, end_s = e0 - t0, e1 - t0
+        groups = []
+        for gid in schedule:
+            filters = {"fairness_id": gid, "outcome": "Dispatched"}
+            b = _histogram_buckets(s0, QUEUE_WAIT_HISTOGRAM, filters)
+            a = _histogram_buckets(s1, QUEUE_WAIT_HISTOGRAM, filters)
+            entry = {"group": gid, "state": None, "observations": None,
+                     "p50_seconds": None, "p90_seconds": None, "p99_seconds": None}
+            if a is None and b is None:
+                entry["state"] = "not_recorded"
+                groups.append(entry)
+                continue
+            a = a or {}
+            b = b or {}
+            delta = {}
+            went_backwards = False
+            for bound in set(a) | set(b):
+                d = a.get(bound, 0.0) - b.get(bound, 0.0)
+                if d < 0:
+                    went_backwards = True
+                    d = 0.0
+                delta[bound] = d
+            if went_backwards:
+                any_restart = True
+                delta = dict(a)
+            count = delta.get(float("inf"), 0.0)
+            entry["observations"] = count
+            if count <= 0:
+                entry["state"] = "no_observations"
+                groups.append(entry)
+                continue
+            p50, _ = histogram_quantile(0.50, delta)
+            p90, _ = histogram_quantile(0.90, delta)
+            p99, _ = histogram_quantile(0.99, delta)
+            entry.update({"state": "ok", "p50_seconds": p50, "p90_seconds": p90, "p99_seconds": p99})
+            groups.append(entry)
         windows.append({"start_s": start_s, "end_s": end_s, "groups": groups})
     return windows, any_restart
 
@@ -1310,6 +1407,12 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         windows, windows_epp_restarted = compute_windows(timeseries, schedule, weights)
         phase_edges = compute_phase_edges(schedule, chaos_events, run_duration)
         convergence = compute_convergence(windows, phase_edges, threshold_points)
+        # UNI-164: same metrics-timeseries.txt file, parsed a second time with
+        # every label kept (see parse_timeseries_labeled) -- needed because
+        # the queue-wait histogram has a `le` label per bucket, which
+        # parse_timeseries' single-fairness_id-key dict would collapse.
+        timeseries_labeled = parse_timeseries_labeled(metrics_timeseries_path)
+        queue_wait_windows, queue_wait_epp_restarted = compute_queue_wait_windows(timeseries_labeled, schedule)
         timeline_section = {
             "window_seconds": window_seconds,
             "schedule": schedule,
@@ -1318,6 +1421,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "windows": windows,
             "convergence": convergence,
             "epp_restarted_during_windows": windows_epp_restarted,
+            "queue_wait_windows": queue_wait_windows,
+            "queue_wait_epp_restarted": queue_wait_epp_restarted,
         }
 
     # UNI-138 (G2): purely additive, like the timeline section above -- never
@@ -1819,6 +1924,32 @@ def render_markdown(report):
                     f"| {w['start_s']:.1f} | {w['end_s']:.1f} | {g['group']} | {g['active']} | "
                     f"{wfmt(g['delivered_tokens'])} | {wfmt(g['expected_share_pct'], '%')} | "
                     f"{wfmt(g['observed_share_pct'], '%')} | {wfmt(g['deviation_pts'])} |"
+                )
+        lines.append("")
+        lines.append(
+            "**Flow-control queue wait, dispatched requests only** "
+            f"(`{QUEUE_WAIT_HISTOGRAM}`, `outcome=\"Dispatched\"`" +
+            (", EPP restart detected mid-window at least once" if t.get("queue_wait_epp_restarted") else "") +
+            "):"
+        )
+        lines.append("")
+        lines.append("| start (s) | end (s) | group | state | observations | p50 wait | p90 wait | p99 wait |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        qw_state_label = {
+            "not_recorded": "not recorded (absent from both snapshots)",
+            "no_observations": "no dispatches in this window",
+        }
+
+        def qwfmt(v):
+            return "n/a" if v is None else f"{v * 1000:.0f}ms"
+
+        for w in t.get("queue_wait_windows", []):
+            for g in w["groups"]:
+                state = qw_state_label.get(g["state"], "ok")
+                obs = "n/a" if g["observations"] is None else f"{g['observations']:.0f}"
+                lines.append(
+                    f"| {w['start_s']:.1f} | {w['end_s']:.1f} | {g['group']} | {state} | {obs} | "
+                    f"{qwfmt(g['p50_seconds'])} | {qwfmt(g['p90_seconds'])} | {qwfmt(g['p99_seconds'])} |"
                 )
     lines.append("")
     lines.append("## Ledger cross-check (UNI-138/G2)")

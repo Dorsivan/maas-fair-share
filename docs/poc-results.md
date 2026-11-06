@@ -7280,3 +7280,158 @@ completed Job, left in place per the series' standing convention.
 `loadgen.log`, `epp-container.log`, `metrics-{before,after,timeseries}.txt`,
 `live-config-events.log`, `enforce-events.log`, `chaos-events.log`,
 `client-request-summary.jsonl`, `timeline-config.json`).
+
+## UNI-164: board case, app3 joins at saturation (30/10/60) — a real wait, but a measurable head start first, and a report gap worth knowing about
+
+**Setup.** Same 30/10/60 substitution [UNI-161](/UNI/issues/UNI-161) used
+(`end-users` standing in for "app3" -- a real app3
+group/MaaSSubscription is still out of reach under rule 5, see
+[[project_ngroup_support_stops_at_the_loadgen]]). A new scenario,
+`app3-joins-at-saturation`, added to `deploy/poc/15-fairness-benchmark.sh`:
+app1/app2 run the whole 240s (`WORKERS_APP1=96`, `WORKERS_APP2=32` -- sized to
+the 30:10 = 3:1 weight ratio, mirroring how `end-users-idle`'s 64:32 tracks
+its own 2:1 ratio, rather than reused from any of UNI-161's `app1-flood*`
+sizings, which deliberately over-offer app1 past its weight). `end-users`
+("app3") joins at t=120s via UNI-179's `END_USERS_START=120` timeline knob
+with `WORKERS_END_USERS=128`, then runs to the end. `ENFORCE_LIVE=true` for
+the whole run; the operator (this agent) patched weights to 30/10/60 before
+the run and restored 20/10/65 after, same division of labor UNI-160/161 used.
+
+**Pass bar.** app3 ~60%, app1 ~30%, app2 ~10% (10-point threshold), with
+app1/app2 queueing once app3 joins.
+
+**Pre-join phase (0-120s, app1+app2 only) converges cleanly:** app1
+72.9-75.8% (target 75%), app2 24.2-27.1% (target 25%), both within 2.1 points
+throughout and fully converged by t=90s. The 3:1 worker-sizing choice tracked
+the 30:10 weight ratio well -- a cleaner result than any of UNI-160/F3's or
+UNI-161's non-default-weight attempts, because this sizing was chosen to
+match the ratio rather than reused from `full-contention`'s fixed one.
+
+**Post-join phase (120-240s) -- two numbers, two different questions:**
+
+| measure | app1 (target 30%) | app2 (target 10%) | end-users/"app3" (target 60%) |
+|---|---|---|---|
+| Whole-run ratio (`contended_service_tokens_total` delta over the full 240s) | 55.2% (**+25.2**) | 17.1% (+7.1) | 27.7% (**-32.3**) |
+| Post-join-phase average (mean of the 12 windowed deviations, t=120-240s only) | 37.6% (+7.6) | 12.8% (+2.8) | 49.7% (**-10.3**) |
+
+**Verdict: FAIL** either way, but the gap between the two numbers is itself a
+finding. The whole-run ratio divides end-users' post-join-only tokens by a
+denominator that includes 120s of app1/app2-only traffic from before
+end-users sent a single byte -- that mechanically depresses its apparent
+share far below what it actually achieved once it was in the race. This is
+not the same case this report's "expected share over OFFERED groups only"
+logic already handles (`end-users-idle`'s absorbed-not-reserved case): that
+logic excludes a group from the denominator only when it sends *zero* load
+for the *whole* run, not when it is offered for only part of it. **The
+whole-run ratio is the wrong number for a staggered-join case; the
+phase-averaged -10.3pt figure is the one that actually answers "does app3
+reach about 60%"** -- and even by that fairer number this case still FAILs,
+just by much less than the headline -32.3pt makes it look. Filed the general
+gap as [UNI-201](/UNI/issues/UNI-201) (backlog, Ideas project) since fixing
+`15-fairness-report.py`'s share math for every caller is out of scope for a
+single measurement ticket.
+
+**Does app3 wait in queue at all? Yes -- but only after a near-zero-wait free
+pass.** `llm_d_epp_flow_control_request_queue_duration_seconds{outcome="Dispatched"}`
+(fairness_id-labelled since llm-d-router v0.11.0; already enabled by this
+cluster's `featureGates: [flowControl]` and already scraped by
+`snapshot_metrics` since [UNI-193](/UNI/issues/UNI-193) -- see "New
+instrumentation" below) gives the per-request, per-group, per-window
+distribution directly:
+
+| window from join | app1 p50/p99 | app2 p50/p99 | end-users p50/p99 | end-users observations |
+|---|---|---|---|---|
+| +0-10s | 3.6s / 9.8s | 7.5s / 10.0s | **44ms / 235ms** | 10 |
+| +10-21s | 4.9s / 9.9s | 0.7s / 2.4s | **6.9s / 9.9s** | 126 |
+| +21s onward (9 windows) | 15-20s / ~30s | 1-20s / ~30s | 7-14s / ~30s | 75-126/window |
+
+end-users' very first 10 dispatched requests after joining wait essentially
+nothing; by the very next window it queues like everyone else, and from
+t≈150s on all three groups show broadly similar (and large, several-second
+to ~30s) queue-wait distributions that oscillate window to window in roughly
+the same ~20-30s period the share table above shows
+([[process_windowed_report_lumpiness_at_10s_resolution]] -- closed-loop p95
+latencies of 20-27s mean one big batch of completions can dominate a 10s
+window and starve the next).
+
+**Why: newcomer-clamp-bounded weighted-least-attained-service, not
+flow-control eviction or plain FCFS.** `newcomer_clamps_total{fairness_id="end-users"}`
+rose by 8 during the run -- end-users' attained-service tab was clamped to
+the current band minimum on arrival rather than left at its true,
+never-contended value of zero. A raw zero tab under weighted-LAS would make a
+joiner look infinitely "needy" and let it monopolize every dispatch slot the
+instant it appears; the clamp bounds that burst to roughly the
+currently-most-starved incumbent's level -- still enough of an edge that
+end-users' first batch clears essentially instantly, but not an unlimited
+one. Once its tab catches up past that clamped floor, it is throttled back
+into the same weighted rotation as app1/app2, queueing for the same scarce
+resource they do: two GPU replicas' worth of in-flight vLLM batch slots, with
+zero spare capacity (`llm_d_epp_flow_control_requests_total{outcome="Dispatched"}`
+= 3278 and no `Rejected*`/`Evicted*` outcome anywhere in the after-snapshot --
+nothing was shed or TTL-evicted this run, so every wait eventually ends in a
+real dispatch, never a timeout). That rules out the ticket's other two
+example mechanisms: not TTL/flow-control eviction (0 evictions, and the
+observed max wait of ~30s is an order of magnitude under the 300s TTL this
+suite uses), and not pure FCFS ordering (`fcfs-ordering-policy` governs
+ordering *within* a group's own queue; the visible free pass and subsequent
+throttle is the fairness policy choosing *which group's* queue to drain next,
+which is exactly what weighted-LAS plus `newcomerClamp` is for).
+
+**New instrumentation: none needed.** `llm_d_epp_flow_control_request_queue_duration_seconds`
+and `_queue_size` are upstream llm-d-router v0.11.0 metrics, already
+fairness_id-labelled, already enabled on this cluster, and already captured
+by `15-fairness-benchmark.sh`'s `snapshot_metrics` (`^llm_d_epp_flow_control_`
+grep, added for UNI-193) in every before/after/timeseries scrape.
+`docs/runbook.md`'s panel table already named this exact metric for "the
+30/10/60 join case" before this ticket ever ran. The only change made is
+report-side: `15-fairness-report.py` gained `compute_queue_wait_windows` (a
+windowed, per-group, `outcome="Dispatched"`-filtered quantile calculation
+over the histogram, reusing the bucket-diff/restart-detection machinery
+`compute_pick_latency` already had, plus a new `parse_timeseries_labeled` to
+read the full label set a histogram needs instead of `parse_timeseries`'
+single-fairness_id-key collapse) and a markdown table, with 6 new tests in
+`15-fairness-report-test.py` (67/67 pass). No dashboard change was needed --
+`docs/runbook.md` already planned around this metric.
+
+**What surprised:** the size of the whole-run-vs-phase-average gap (-32.3 vs
+-10.3 points, same group, same run) -- a staggered join is exactly the case
+this report's single "offered groups" denominator was never built for,
+worth a real report fix ([UNI-201](/UNI/issues/UNI-201)), not just a
+footnote here. Also surprising: the literal ticket wording ("why does it
+wait") presupposes queueing starts the moment app3 joins; the newcomer clamp
+instead gives it a brief, measurable head start before the long wait sets
+in -- the complete answer has to name both phases, not just the long-term
+one.
+
+**Cluster left as found** (confirmed via `oc get`, not assumed):
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:|newcomerClamp|halfLifeSeconds'
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+      halfLifeSeconds: 60
+      newcomerClamp: true
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler,app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                      READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-router-scheduler-575669c495-9lgxt    1/1     Running   0          34s
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m24s      10m
+```
+
+Matches `deploy/epp-config.yaml`'s committed defaults (`enforce: false`,
+`newcomerClamp: true`, `halfLifeSeconds: 60`, weights 20/10/65/5) and the
+checked-out 2-replica GPU count exactly. `maas-loadgen` is this run's own
+completed Job, left in place per the series' standing convention.
+
+**Raw results:** `results/20261106T204857Z-uni-164-app3-joins-at-saturation/`
+(`fairness-report.{json,md}`, `loadgen.log`, `epp-container.log`,
+`metrics-{before,after,timeseries}.txt`, `enforce-events.log`,
+`live-config-events.log`, `k8s-events-timeseries.log`,
+`client-request-summary.jsonl`, `timeline-config.json`,
+`04-loadgen.patched.yaml`).

@@ -6298,3 +6298,143 @@ this test's connection load.
   (run start minus one minute of margin, through the end of the extended
   post-run monitoring window used for the fire/clear check above; the
   scored load itself ran `15:28:02Z`–`15:47:40Z`).
+
+## UNI-158: E4, Kuadrant ceiling + contention — the TRLP can't be capped by hand; `maas-controller` reconciles it back in under a second
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, "E" group, fourth case:
+temporarily lower one tenant's `TokenRateLimitPolicy` so it hits 429s while
+contended, confirm the other tenants absorb its share, and confirm rejected
+requests leave no accounting leak in the EPP's own counters.
+
+**Setup.** `full-contention` (32/32/128 workers), `ENFORCE_LIVE=true`,
+`DURATION=360`. app1's limit entry in `maas-trlp-maas-vllm-gpu`
+(`models-as-a-service-app1-production-maas-vllm-gpu-tokens`, the subscription
+the loadgen's `app1` group authenticates as) was targeted with the generic
+`LIVE_SET_AT`/`LIVE_SET_TARGET`/`LIVE_SET_VALUE` wrapper (UNI-180) built for
+exactly this kind of case:
+
+```
+OPENSHIFT_TOKEN=... ENFORCE_LIVE=true DURATION=360 LIVE_SET_AT=120 \
+  LIVE_SET_TARGET="field:tokenratelimitpolicies.kuadrant.io:maas-trlp-maas-vllm-gpu:spec.limits.models-as-a-service-app1-production-maas-vllm-gpu-tokens.rates" \
+  LIVE_SET_VALUE='[{"limit":20000,"window":"1m"}]' \
+  ./deploy/poc/15-fairness-benchmark.sh full-contention uni-158-e4-kuadrant-ceiling
+```
+
+120s of clean baseline, then the cap engages at t+120s (app1's natural rate
+in this scenario is ~180k tokens/min — a 20k/min cap is roughly 9x below
+that, chosen to force visible throttling, not a marginal nudge), held
+through the remaining 240s, auto-restored at run end by the same wrapper
+(`field:` targets restore after the final metrics snapshot with no
+EPP-pod-recreating side effect, unlike an `epp-key`/`epp-weight` target —
+see UNI-180's header comment in `15-fairness-benchmark.sh`).
+`get`/`patch`/`update` on `tokenratelimitpolicies.kuadrant.io` were already
+confirmed `yes` for this role in [UNI-183](/UNI/issues/UNI-183); this ticket
+needed no RBAC follow-up to attempt its own setup step.
+
+**Expected:** app1 gets throttled to 429s once it crosses 20k tokens in a
+given 1-minute window; app2/end-users (whose own limits are untouched)
+absorb app1's unused weight share under the live fairness weights; the
+EPP's own `contended_service_tokens_total`/dispatch counters show no leak
+for the rejected requests (they never reach the EPP to begin with, since
+Kuadrant's gateway-layer check runs ahead of EPP dispatch).
+
+**Observed: the cap never took effect. Verdict: FAIL (the capped-tenant
+behavior was not exercised) — not blocked, not a RBAC gap on this ticket's
+own ask.** The full-contention baseline math still scored its own usual
+PASS (app1 17.0%/-4.1pt, app2 13.3%/+2.8pt, end-users 69.7%/+1.3pt against
+21.1/10.5/68.4% expected, all within the 10-point threshold; ledger
+cross-check PASS on all three groups) — but that PASS is for the *ordinary*
+full-contention split, unaffected by this ticket's intervention, not
+evidence the edge case passed. The actual measurement this ticket exists to
+take came back negative:
+
+- **Zero 429s, on any group, for the whole run.** `app1`: 790 requests,
+  `200`=780, `500`=10, 0 `429`, 0 `503` — identical in kind to app2/end-users'
+  own incidental `500`s (not concentrated post-t+120s; this is the same
+  background noise rate every full-contention run in this series shows, not
+  shedding). The report's own shed-rate table (UNI-181) reads 0.00% shed
+  for every group, "nothing shed."
+- **No dip in app1's windowed share after t+120s either.** The 10s-window
+  table shows app1 swinging between roughly 0% and 33% of delivered tokens
+  throughout the *entire* run, pre- and post-cap alike — the same
+  ±15–30pt noise [UNI-127](/UNI/issues/UNI-127) already documented as normal
+  for full-contention's 10s windows (see UNI-156's write-up for the same
+  observation on a different case). There is no visible step change at the
+  t+120s mark.
+- **The live object was already back at its original value before the
+  script's own restore ran.** `live-config-events.log`:
+  `23:13:42Z set live-set ... -> [{"limit":20000,...}]`, then at
+  `23:19:20Z restore live-set ...: already at [{"limit":100000000,...}],
+  nothing to do` — the wrapper's restore found nothing to revert because
+  the object had already reverted on its own, well before the run even
+  finished.
+
+**Root cause, confirmed by a direct diagnostic** (run immediately after,
+isolated, no loadgen active — see
+`results/20261105T231026Z-uni-158-e4-kuadrant-ceiling/reconcile-timing-diagnostic.md`
+for the full transcript): a fresh `oc patch --type=merge` on the same
+`spec.limits.<key>.rates` field was reverted by `maas-controller` in **under
+one second** — the very first 1-second poll after the patch already showed
+the original `100000000` value and a bumped `metadata.generation`. There is
+no window, however short, in which a direct edit to
+`maas-trlp-maas-vllm-gpu`'s `spec.limits` survives long enough for Kuadrant's
+own enforcement layer (Limitador, behind the TokenRateLimitPolicy
+controller) to plausibly even notice it, let alone act on it before a real
+request arrives. This is the exact hazard [UNI-182](/UNI/issues/UNI-182) and
+[UNI-183](/UNI/issues/UNI-183) flagged in advance ("permission to patch is
+not the same as the patch surviving") — now empirically measured rather than
+just anticipated, and the reconcile loop is far faster than either comment's
+author guessed when writing "re-read the limit at the end of the run."
+
+**The real lever is out of reach for this role.** `maas-trlp-maas-vllm-gpu`
+is owned by `maas-controller`
+(`app.kubernetes.io/managed-by: maas-controller`, `ownerReference` to
+HTTPRoute `maas-vllm-gpu-kserve-route`); `spec.limits` is derived,
+reconciled state, not a settable field. The plausible source object —
+`maassubscriptions.maas.opendatahub.io`, which the controller's own
+`maas.opendatahub.io/subscriptions` annotation on the TRLP names as the
+one it tracks — is **Forbidden to this role on every verb**:
+
+```
+$ for v in get list patch update; do
+    oc auth can-i $v maassubscriptions.maas.opendatahub.io -n maas-fairness-poc
+  done
+get     no
+list    no
+patch   no
+update  no
+```
+
+This is a *different* RBAC gap than the one this ticket's own "Permissions"
+clause asked about (editing the TRLP itself, which this role can do freely —
+that was never the problem). Producing a genuinely sustained Kuadrant
+ceiling for a future case would mean either editing the `MaaSSubscription`
+quota directly (currently Forbidden) or some other sanctioned path this
+ticket did not find. Not pursued further here per rule 5 — this is new
+access, not something within this role's existing capability, and is called
+out for the board rather than self-granted.
+
+**No accounting leak either way.** Since nothing was ever actually shed,
+"no leak on rejected requests" cannot be confirmed as a pass — there was
+nothing rejected to check. The ledger cross-check (UNI-138/G2) on the
+requests that *did* flow is clean regardless (app1/app2/end-users all within
+the 10% tolerance on raw-token and cost-model diffs), which at least confirms
+this run's baseline accounting integrity was not disturbed by the live-set
+attempt itself.
+
+**Done when:** Raw results, including the reconcile-timing diagnostic, are
+in `results/20261105T231026Z-uni-158-e4-kuadrant-ceiling/`.
+
+**Evidence:**
+
+- Commits: see this section's companion commit on `main`.
+- Raw results: `results/20261105T231026Z-uni-158-e4-kuadrant-ceiling/`
+  (`fairness-report.json`/`.md`, `epp-container.log`, `loadgen.log`,
+  `client-request-summary.jsonl`, before/after metric snapshots,
+  `live-config/` before/applied/post-restore proof for both the
+  `enforce-live` and `live-set` wrapper ids, and
+  `reconcile-timing-diagnostic.md` for the standalone sub-second-reconcile
+  probe).
+- Grafana/Prometheus time range: `2026-11-05T23:10:26Z`–`2026-11-05T23:19:21Z`
+  (script start through final live-config restore confirmation; the scored
+  load itself ran `23:11:40Z`–`23:18:07Z`).

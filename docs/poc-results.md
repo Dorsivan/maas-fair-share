@@ -5534,7 +5534,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Re-run S1 longer~~ | **Done, negative result.** Re-ran at 600s (10 half-lives, vs the original 150s): the split moved to 50.3/49.7%, *further* from 2:1 than the original 1.57:1, which refutes the duration hypothesis — see "A3 (UNI-28): S1 re-run at 600s," above. Root cause is the same worker-sizing-vs-backend-latency mechanism UNI-29's Run 2 identified on this same current (llama-3-1-8b) deployment, not warm-up time. The resize itself is now done — [UNI-103](/UNI/issues/UNI-103), below — and the app1:app2 over-offer ratio is retuned and passing — [UNI-104](/UNI/issues/UNI-104), below | — |
 | 8 | **`maas-default-gateway` inference path** | returns 500: `maas-api-route` targets a TLS service port with no `BackendTLSPolicy`, and that CRD is not installed. **Correction (UNI-129, 2026-11-01): minting keys does not actually require port-forwarding** in this environment -- the agent sandbox has direct pod-network reachability to the `maas-api` Service's ClusterIP, which answers the same `POST .../v1/api-keys` call with no tunnel. Port-forwarding is still the documented, more portable fallback for an environment without that reachability | upstream/MaaS |
 | — | ~~Sustained load through the LLMInferenceService path and the Route (UNI-27)~~ | **Done for status tally and fairness.** 240s closed-loop runs (32 workers/tenant, `app1`/`app2`/`end-users`) against both the in-cluster gateway Service and the public Route landed 94.7% and 97.9% HTTP 200 respectively. `normalized_service` converged to within ~7% across the three backlogged groups on both paths, confirmed at multiple flight-recorder ticks through each run. On the non-200s: the Route path's are directly traced via the gateway access log to a ~2s connection/endpoint-pool warm-up burst at request-storm start (zero thereafter), not a sustained-load or fairness defect. The LLMInferenceService path's (5.3% error rate) are **inferred to be the same mechanism by analogy, not log-verified** — this cluster has no log aggregation and the gateway's own access-log buffer had already rotated past the run window by the time it was checked. Script: `deploy/poc/12-loadgen-route.sh` (Route path); `deploy/poc/04-loadgen.yaml` unchanged (LLMInferenceService path). Does **not** cover the 600s timeout / `buffer-response: false` annotations — see item 15 | N/A -- closed for status tally + fairness scope |
-| — | ~~Open-loop load generation (UNI-34)~~ | **Done, and the clamp finding flips.** `deploy/poc/13-loadgen-poisson.{py,sh}` adds open-loop Poisson arrivals. Below saturation the clamp fires on ~65% of dispatches (vs 0.2–2.2% closed-loop) but is harmless (pool uncontended). Above saturation (24 req/s aggregate vs a measured ~20-22 req/s pool ceiling) it measurably **inverts** the 20/10/65 split: end-users (w=65) delivered 25.5%, app1 (w=20) delivered 40.4%. This **contradicts** the GPU closed-loop "clamp is inert" finding (`## 3`) and confirms the SUPERSEDED section's concern more strongly than originally observed. See "Open-loop (Poisson) load generation (UNI-34)" above for the full data, including what was not tested (no clamp on/off A/B — see that section for why). **Promoted to a scored benchmark by [UNI-137](/UNI/issues/UNI-137) (B5)**: reproduces the inversion direction at 120% of ceiling (FAIL, end-users -18.8pts) but at roughly half UNI-34's original magnitude, and found 100% of the documented ceiling still reads as UNCONTENDED despite already-large per-group deviations — see "UNI-137," above | **newcomerClamp default should be revisited** — a policy decision, same owner as item 2 |
+| — | ~~Open-loop load generation (UNI-34)~~ | **Done, and the clamp finding flips.** `deploy/poc/13-loadgen-poisson.{py,sh}` adds open-loop Poisson arrivals. Below saturation the clamp fires on ~65% of dispatches (vs 0.2–2.2% closed-loop) but is harmless (pool uncontended). Above saturation (24 req/s aggregate vs a measured ~20-22 req/s pool ceiling) it measurably **inverts** the 20/10/65 split: end-users (w=65) delivered 25.5%, app1 (w=20) delivered 40.4%. This **contradicts** the GPU closed-loop "clamp is inert" finding (`## 3`) and confirms the SUPERSEDED section's concern more strongly than originally observed. See "Open-loop (Poisson) load generation (UNI-34)" above for the full data, including what was not tested (no clamp on/off A/B — see that section for why). **Promoted to a scored benchmark by [UNI-137](/UNI/issues/UNI-137) (B5)**: reproduces the inversion direction at 120% of ceiling (FAIL, end-users -18.8pts) but at roughly half UNI-34's original magnitude, and found 100% of the documented ceiling still reads as UNCONTENDED despite already-large per-group deviations — see "UNI-137," above. **[UNI-162](/UNI/issues/UNI-162) (F2) ran the clamp on/off A/B this item once called for a gap**: with the clamp off, B5's own above-saturation level FAILs smaller (-13.1pts vs -18.8pts) but still FAILs — the clamp is a partial contributor, not the cause — while the same clamp-off config costs a B1-style cold-join scenario a PASS→FAIL flip and a >60% incumbent-throughput collapse. See "UNI-162," above | **Resolved: keep `newcomerClamp: true`.** Its removal does not clear B5's FAIL bar and is expensive elsewhere; no further policy decision pending on this item |
 | — | ~~Verify metrics reach Prometheus~~ | **Done (UNI-50).** The D3 dashboard (`deploy/grafana-dashboard.yaml`) confirmed this end to end against live Grafana/Thanos: the headline expected-vs-observed panel and five supporting panels all rendered real, current GPU-EPP data from a load run, with the exact PromQL and output pasted on that ticket. Datasource confirmed as the standalone `grafana` namespace's Prometheus-only datasource, pointed at the same UWM Thanos Querier every other observability asset in this repo already reads | N/A -- closed |
 | 12 | **Red Hat support boundary** | a custom EPP image takes that component outside RHOAI support. The plan calls this the biggest non-technical risk and it has never been raised with the account team. Nothing technical unblocks it | a conversation |
 | 13 | **Version-pin maintenance** | flow-control interfaces sit on a module that only reached v1.0.0 on 2026-10-15; we are pinned to v0.11.0. Process, pinned versions and the named interface inventory are now in [version-pinning.md](version-pinning.md). Monthly check, manual — there is no CI runner | process |
@@ -6880,3 +6880,205 @@ Matches `deploy/epp-config.yaml`'s committed defaults (20/10/65/5,
   loadgen Job ran in that window). Per-case scored load: 256 workers
   `17:16:21Z`–`17:21:05Z`, 128 workers `17:25:50Z`–`17:30:23Z`, 32 workers
   `19:03:26Z`–`19:07:49Z`.
+
+## UNI-162: F2, `newcomerClamp` off, open-loop — the B5 inversion shrinks but does not go away, and the incumbent cost in a B1-style burst is severe
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, F-series, promoting a named
+gap from UNI-34/UNI-137 (B5): B5 found that pushing the open-loop generator
+past the pool's saturation point inverts the 20/10/65 split (end-users,
+the dominant weight, under-delivers; app1/app2 over-deliver) and FAILs. That
+run had `newcomerClamp: true` live throughout — same as every other case in
+this series — so B5 never separated "is this the clamp's doing" from "is
+this saturation itself." This ticket does: repeat B5's own above-saturation
+level with the clamp off, then separately repeat UNI-142's (B1) cold-join
+scenario with the clamp off too, to price what the clamp's absence costs the
+one case it exists to protect.
+
+**Setup, part 1 (repeats B5 exactly, clamp off).** Open-loop, full-contention
+mix (`app1`/`app2`/`end-users`, Poisson arrivals) via
+`deploy/poc/17-fairness-benchmark-openloop.sh`, live against `maas-vllm-gpu`
+(2 replicas, llama-3-1-8b), 8.4 req/s per tenant (25.2 req/s aggregate — B5's
+own "120% of ceiling" level, the one that FAILed), 240s, `THRESHOLD_POINTS=10`.
+`enforce: true` and `newcomerClamp: false` were set live *before* the run (one
+combined ConfigMap patch, one EPP pod roll, confirmed via
+`llm_d_epp_maas_fairness_enforcing=1` on the new pod before starting) —
+`17-fairness-benchmark-openloop.sh` itself has no `ENFORCE_LIVE`/clamp
+mechanism of its own (unlike `15-fairness-benchmark.sh`), so both flips are
+manual here, the same way B5's own `enforce: true` was manual.
+
+**Setup, part 2 (repeats UNI-142/B1 exactly, clamp still off).**
+Closed-loop `full-contention` (32/32/128 workers) via
+`deploy/poc/15-fairness-benchmark.sh full-contention`, same cluster, `
+ENFORCE_LIVE=true` (a no-op here — part 1 already left `enforce: true` live,
+and the script's own idempotency check correctly declines to re-flip or
+later revert a state it didn't cause), `END_USERS_START=120` (end-users
+joins cold at the halfway point, identical timeline to B1), 240s,
+`newcomerClamp` left `false` from part 1 throughout. Run back-to-back with
+part 1, no intervening config change, so both measurements share one
+clamp-off window.
+
+**Clamp confirmed off, not just requested, for both runs**: the first-fire
+counter `llm_d_epp_maas_fairness_newcomer_clamps_total` — present and
+nonzero in both B5's and B1's own raw metrics (B5: 1649/1375/1751 clamps by
+the "before" snapshot alone) — is **absent from both runs' `metrics-after.txt`
+entirely**, the same "never incremented, not merely flat" signal UNI-137
+already established for a lazily-registered Prometheus counter.
+
+**Part 1 result — the inversion shrinks, it does not disappear.**
+
+| metric | B5 (clamp ON) | F2 part 1 (clamp OFF) |
+|---|---|---|
+| verdict | FAIL | **FAIL** |
+| app1 obs% (dev) | 32.4% (+11.3) | 29.5% (+8.4) |
+| app2 obs% (dev) | 18.0% (+7.5) | 15.2% (+4.7) |
+| end-users obs% (dev) | 49.6% (**-18.8**) | 55.3% (**-13.1**) |
+| app1/app2/end-users success rate | 35.9% / 20.4% / 53.0% | **17.4% / 8.4% / 100%** |
+| contended_seconds (app1/app2/eu) | 23.9 / 24.0 / 21.5s | 22.6 / 22.6 / 18.1s |
+
+The deviation shrinks by roughly a third for every group (end-users -18.8 →
+-13.1, app1 +11.3 → +8.4, app2 +7.5 → +4.7) but the direction is identical
+and end-users still clears the 10-point FAIL bar by a comfortable margin.
+**Answering the ticket's own question directly: no, the inversion does not
+go away with the clamp off — it is a smaller version of the same failure**,
+which says the clamp is a contributor to B5's saturation inversion but not
+its primary cause; something else about the open-loop over-saturation regime
+(queue depth, `halfLifeSeconds` decay, or the flow-control TTL/shed dynamics
+documented in `17-fairness-benchmark-openloop.sh`'s own header) accounts for
+the larger share of it.
+
+**What surprised us in part 1: the clamp's absence redistributes *where* the
+pain lands, even though the token-weighted score barely notices.** With the
+clamp on (B5), all three groups shared the 50s client-timeout pain roughly
+symmetrically (35.9/20.4/53.0% success). With it off, **end-users' success
+rate jumps to a clean 100% (zero timeouts across 2006 requests) while app1's
+collapses to 17.4% and app2's to 8.4%** — both *worse* than their own B5
+numbers. The weighted-token deviation score (which only measures delivered
+tokens among the fraction that completed) reads this as a *smaller* FAIL
+because end-users' uncontested, fully-successful traffic still only amounts
+to 55.3% of a token pool it is entitled to 68.4% of — but by raw completed-request
+count, disabling the clamp made the experience distinctly worse for app1 and
+app2 and distinctly better for end-users than B5 showed. A reader who only
+checks the deviation column would miss that the clamp's removal did not make
+things "better for everyone, just less so" — it shifted the cost onto the two
+smaller tenants.
+
+**Part 2 result — the B1-style cost is severe, and shows up even before the
+newcomer joins.**
+
+| metric | B1/UNI-142 (clamp ON) | F2 part 2 (clamp OFF) |
+|---|---|---|
+| whole-run verdict | PASS (7.6pt max dev) | **FAIL (end-users -33.8pt)** |
+| app1 requests (200/500) | 1607 (1584/23) | **404 (394/10)** |
+| app2 requests (200/500) | 1560 (1550/10) | **69 (58/11)** |
+| end-users requests (200/500) | 1185 (1185/0) | 1160 (1095/65) |
+| total completed requests | 4352 | **1633 (-62.5%)** |
+| app1 p50/p95 | 1.60s / 25.18s | **14.45s / 74.11s** |
+| app2 p50/p95 | 1.60s / 25.29s | **29.37s / 248.98s** |
+| end-users p50/p95 | 10.68s / 18.79s | 13.77s / 18.60s |
+
+The same caveat B1's own write-up gives for its whole-run number applies
+here too (it is not phase-aware, and over-weights the 120s end-users is not
+offered at all), so the windowed timeline is the more honest read — and it
+makes the cost look worse, not better:
+
+- **Pre-join (0-120s), before end-users ever enters the mix: app1/app2 hold
+  a clean 66.7/33.3 split through t=70s, same as B1's own steady pre-join
+  phase, then the split collapses.** From t=80s to t=120s — a full 40s,
+  four consecutive 10s windows, entirely before the newcomer joins — app2
+  takes roughly 75% of the pool against app1's 25%, including one window
+  (100-110s) where app1 delivered **zero** tokens and app2 took 100%. B1's
+  own pre-join phase showed no equivalent: its only pre-join anomaly was
+  brief, *simultaneous* co-zero windows for both tenants at once (a
+  scrape-cadence artifact, per UNI-142's own write-up), not a sustained,
+  one-sided 40-second shift like this one. This is a two-tenant instability
+  with no newcomer involved at all — the clamp's absence destabilizes
+  ordinary contention between two already-steady tenants, not just the
+  join event the case is nominally about.
+- **Post-join (120-240s) is more volatile than B1's, not less.** end-users'
+  windowed share swings from 19.8% to 95.7% (B1: 46.0%-98.4%, a similar
+  range but B1's post-join phase never saw app1 or app2 pinned near 0%;
+  this run does, repeatedly — app2 at 0.0% for two separate windows
+  (140-150s, 200-210s), app1 down to 1.6-2.5% in three others).
+- **Ledger cross-check (UNI-138/G2) FAILs in the opposite direction from
+  B1's, and far more severely**: app1's EPP-accounted raw tokens exceed the
+  client's own count by **+157.1%**, app2's by **+1690.2%** (B1: -76.4%/
+  -78.4%, the expected under-count from the documented contention-gated
+  scope boundary). The sign flip is itself informative: `provisionalCharge:
+  true` charges an estimated token cost at dispatch time and trues it up on
+  completion, but a request that is evicted or errors out before completing
+  (this run's own report shows 309 pool-wide EPP-side TTL evictions, plus
+  the 500s in the status table) never reaches that true-up — its optimistic
+  provisional charge stays on the books permanently. app2, the group whose
+  completed-request count collapsed hardest (69 of what was likely several
+  hundred dispatch attempts), is also the group whose ledger inflated
+  hardest, consistent with a large population of its dispatches ending in an
+  uncompleted, never-trued-up provisional charge rather than a real delivery.
+  **This means the -33.8pt end-users deviation above is itself probably
+  somewhat inflated** by app1/app2's stale provisional charges padding their
+  side of the ledger, not purely by end-users being that much more starved —
+  but the clean, provisional-charge-independent client-side signal (app2
+  collapsing from 1560 completed requests to 69, a 95.6% drop, with p95
+  latency up 10x) does not depend on that question at all and is not in
+  doubt. **Not root-caused further here** — fixing or bounding the
+  stale-provisional-charge behavior under heavy eviction is a distinct
+  question from this ticket's clamp on/off comparison; flagging it as a
+  finding, not filing a follow-up, since it did not block scoring either run
+  (the client-side numbers above stand on their own).
+
+**Recommendation for the default: keep `newcomerClamp: true`.** The clamp is
+not sufficient on its own to fix the open-loop saturation inversion UNI-34/
+B5 found — turning it off only shrinks that FAIL by about a third, it does
+not clear the 10-point bar — so it should not be defended on that basis. But
+turning it off is not free either: in the scenario it exists to protect
+(a tenant returning to a contended pool), its absence reproduces a FAIL where
+the clamp-on run PASSed, collapses the incumbents' completed-request
+throughput by more than 60% in aggregate (app2 alone by 95.6%), inflates p95
+latency by up to 10x, and destabilizes ordinary two-tenant contention even
+*before* any join event occurs. The clamp's cost (B1-style) is large and
+certain; its benefit (B5-style) is real but partial. Keep it on, and treat
+the open-loop saturation inversion as a separate, still-open problem — not
+one `newcomerClamp` was ever going to fully solve.
+
+**Cluster left as found.** `enforce` and `newcomerClamp` were set together in
+one combined ConfigMap patch before part 1 (one EPP pod roll instead of two),
+left unchanged across both parts, then both reverted together in a second
+combined patch after part 2 — confirmed via the live metrics endpoint and
+`oc get configmap`, not assumed:
+
+```
+$ # before (checkout baseline, confirmed first):
+enforce: false
+newcomerClamp: true
+$ # after the combined pre-run patch (enforce=true, newcomerClamp=false),
+$ # confirmed on the new EPP pod before either benchmark started:
+llm_d_epp_maas_fairness_enforcing 1
+$ # after the combined post-run restore patch:
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E '^\s*(enforce|newcomerClamp|halfLifeSeconds):'
+      enforce: false
+      halfLifeSeconds: 60
+      newcomerClamp: true
+$ oc get pod maas-vllm-gpu-kserve-router-scheduler-575669c495-zmp72 -n maas-fairness-poc -o jsonpath='ready={.status.containerStatuses[0].ready} restarts={.status.containerStatuses[0].restartCount}{"\n"}'
+ready=true restarts=0
+$ curl .../metrics (via the metrics-reader token):
+llm_d_epp_maas_fairness_enforcing 0
+$ oc get jobs,pods -n maas-fairness-poc | grep loadgen
+job.batch/maas-loadgen   Complete   1/1   4m20s   6m53s
+pod/maas-loadgen-hztfl   0/1   Completed   0   6m53s
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+```
+
+Matches `deploy/epp-config.yaml`'s committed defaults (`enforce: false`,
+`newcomerClamp: true`, `halfLifeSeconds: 60`, weights 20/10/65/5) and the
+checked-out 2-replica GPU count exactly. The `maas-loadgen` Job left in place
+is part 2's own completed Job (part 1 uses no Job, per
+`17-fairness-benchmark-openloop.sh`'s design), same leave-it-in-place
+convention as every prior case.
+
+**Raw results:**
+`results/20261106T193258Z-uni-162-f2-clamp-off-above-saturation/` (part 1:
+`fairness-report.{json,md}`, `loadgen.log`, `epp-container.log`,
+`metrics-{before,after}.txt`, per-tenant client logs) and
+`results/20261106T193828Z-uni-162-f2-clamp-off-cold-join/` (part 2: same
+shape plus `timeline-config.json`, `client-request-summary.jsonl`,
+`04-loadgen.patched.yaml`).

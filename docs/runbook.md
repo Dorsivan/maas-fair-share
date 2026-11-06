@@ -1689,6 +1689,76 @@ a target/value, and a target/value without `LIVE_SET_AT`) actually fire.
 
 ---
 
+### Shadow-mode control, F1 (UNI-159)
+
+The edge-case plan's second named negative control (the first is
+`equal-workers-control`, UNI-103): run `full-contention`'s own proven sizing
+(`TENANTS="app1 app2 end-users"`, `WORKERS_APP1=32 WORKERS_APP2=32
+WORKERS_END_USERS=128`) with `maas-epp-config`'s `enforce` key flipped to
+`false` for the whole run instead of its live `true`. In shadow mode the
+plugin still observes and accounts every request (the
+`llm_d_epp_maas_fairness_*` counters still move) but never reorders the
+queue by weight, so a correct implementation should show the same
+work-conservation compression toward equal thirds that `equal-workers-control`
+shows for a different reason (under-offered load there; no enforcement here).
+
+```sh
+OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh shadow-mode-control
+```
+
+No extra env vars are needed or should be passed — the scenario's own
+case-statement branch sets `SHADOW_MODE="true"` (and `IS_CONTROL="true"`)
+itself, exactly as the ticket asks ("add it to the benchmark as a scenario
+that sets and restores the mode itself").
+
+**`SHADOW_MODE`, the mirror of `ENFORCE_LIVE`.** UNI-174's `ENFORCE_LIVE` only
+ever confirms and flips TOWARD `enforce=true` (`wait_for_enforcing("1")`) —
+it has no notion of flipping the other way, and generalizing its boolean to
+mean "whatever direction the live value isn't" would have made every existing
+`ENFORCE_LIVE=true` invocation (UNI-151/156/157/158, this chain's own prior
+tickets) silently context-dependent on whatever `enforce` happened to be live
+at the time, instead of the explicit "make it true" it is documented and
+relied on to mean. `SHADOW_MODE="${SHADOW_MODE:-false}"` is a separate,
+explicit boolean instead, built on the same UNI-180 `live_config_set`/
+`live_config_restore` wrapper ENFORCE_LIVE itself now sits on:
+
+- Already `false`: logs `enforce already false in maas-epp-config -- nothing
+  to flip; this run will NOT revert it on exit` and leaves `SHADOW_FLIPPED`
+  unset — same "did this run actually cause the state" guard `ENFORCE_LIVE`
+  uses, so a run that happens to start during someone else's shadow-mode
+  window doesn't clobber it on exit.
+- Otherwise: `live_config_set shadow-mode "epp-key:enforce" "false"`, confirms
+  `llm_d_epp_maas_fairness_enforcing=0` on both EPPs (GPU and CPU share the
+  one ConfigMap — see the UNI-174 section above) via the same
+  `wait_for_enforcing` helper, FATALs before the Job ever starts if that
+  timed out, and re-resolves `$EPP_POD`/`$EPP_IMAGE_DIGEST`/`$START_RESTARTS`
+  afterward — same no-live-reload, pod-gets-recreated mechanism UNI-174's own
+  flip has, so the log-capture loop and the mid-run restart detector don't
+  silently end up watching a pod that is already gone.
+- Reverts at the exact same point `revert_enforce_live` does — AFTER the
+  after-snapshot, not before, for the identical reason (a ConfigMap edit
+  recreates the EPP pod and zeroes its Prometheus registry; reverting earlier
+  would silently zero every `contended_*`/`dispatch_total` series this run's
+  own report depends on). `on_exit`'s trap calls it unconditionally as a
+  backstop, same shape as `revert_enforce_live`/`restore_live_set`.
+
+**`ENFORCE_LIVE=true` and `SHADOW_MODE=true` together are a hard FATAL**,
+checked right after the scenario's case statement runs (so a scenario that
+sets one of them itself, like `shadow-mode-control`, is still caught if an
+operator also passes the other by hand): both target the one `enforce` key in
+opposite directions, and there is no combined outcome to converge on.
+
+**Verified (2026-11-06), via the same offline technique UNI-180 used**: both
+`origin/main`'s pre-UNI-159 `15-fairness-benchmark.sh` and this branch's
+version, each truncated right before their first `$OC` call, produced
+byte-identical patched manifests and `timeline-config.json` for every
+existing scenario with no extra env vars — `shadow-mode-control` is additive,
+not a behaviour change to anything before it. The FATAL branch for
+`ENFORCE_LIVE=true SHADOW_MODE=true` together was exercised the same way and
+confirmed to fire before any `$OC` call.
+
+---
+
 ## Load the fairness dashboard into the live Grafana
 
 `deploy/grafana-dashboard.yaml` ships the dashboard JSON as a ConfigMap

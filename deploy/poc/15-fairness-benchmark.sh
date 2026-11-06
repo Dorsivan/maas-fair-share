@@ -152,6 +152,24 @@
 #                          count/cache ratio, not a PASS/FAIL), so it runs
 #                          with --control to report the numbers without
 #                          scoring them against the weighted-split threshold.
+#   shadow-mode-control    TENANTS="app1 app2 end-users", same 32/32/128
+#                          sizing as full-contention -- UNI-159: F1, the
+#                          second negative control in this series (the first
+#                          is equal-workers-control above, UNI-103). This
+#                          scenario owns its own live-config flip: it sets
+#                          maas-epp-config's `enforce` key to false (shadow
+#                          mode -- the plugin observes and scores dispatch
+#                          but never reorders the queue) before the run and
+#                          restores whatever `enforce` was before at the same
+#                          restore point/hazard ENFORCE_LIVE uses (see
+#                          SHADOW_MODE below); an operator does not pass
+#                          SHADOW_MODE=true by hand for this scenario, it is
+#                          hardcoded in the case block. Expected: close to
+#                          equal thirds, the same work-conservation
+#                          compression equal-workers-control shows, because
+#                          nothing is left to enforce the weighted split.
+#                          Scored INFO, like every other named negative
+#                          control, not PASS/FAIL.
 #
 # Per-tenant worker sizing (see docs/runbook.md "Per-tenant worker sizing
 # and the saturation check" for the full method): every ACTIVE tenant in a
@@ -289,6 +307,25 @@
 # needed no report-side change. See docs/runbook.md "Generic live-config
 # set/restore wrapper (UNI-180)" for the full mechanism and its known gaps.
 #
+# UNI-159 harness addition: SHADOW_MODE (default false), the mirror image of
+# ENFORCE_LIVE for the opposite direction. ENFORCE_LIVE only ever confirms and
+# flips TOWARD enforce=true (UNI-174's own wait_for_enforcing("1")); F1 (the
+# shadow-mode-control scenario, see above) needs the opposite -- flip the live
+# `enforce` key to false, run full-contention sizing, and restore whatever it
+# was before. SHADOW_MODE=true does exactly that: flips maas-epp-config's
+# enforce to false before the run (no-op, and not reverted on exit, if it was
+# already false -- same "did this run actually cause the state" guard
+# ENFORCE_LIVE uses), confirms llm_d_epp_maas_fairness_enforcing=0 on both
+# EPPs via the same wait_for_enforcing helper, and reverts at the same
+# post-after-snapshot point revert_enforce_live uses (same pod-recreate/
+# zeroed-counters hazard -- see the UNI-143 note on revert_enforce_live
+# below). ENFORCE_LIVE=true and SHADOW_MODE=true together are rejected: they
+# name opposite target values for the same key, so there is no "both" to
+# converge on. This scenario sets SHADOW_MODE itself in its case-statement
+# branch -- an operator does not need to (and should not) pass it by hand for
+# any other scenario. Unset (every scenario before this ticket, and every
+# scenario except shadow-mode-control after it) leaves this knob's entire
+# code path untouched.
 # UNI-149 harness addition: SETTLE_SECONDS (default 0, no-op). The Job-poll
 # loop below only proves the loadgen stopped SENDING requests -- it says
 # nothing about whether the EPP has finished accounting for the ones already
@@ -302,7 +339,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -377,6 +414,11 @@ fi
 # evidence. Not tunable down safely without re-measuring this cluster's
 # rollout latency.
 ENFORCE_LIVE="${ENFORCE_LIVE:-false}"
+# UNI-159: mirror of ENFORCE_LIVE for the opposite flip direction -- see the
+# header comment above. Read here (before shadow-mode-control's case-block
+# branch can set it) so an operator-supplied SHADOW_MODE=true on a DIFFERENT
+# scenario is still honored instead of silently ignored.
+SHADOW_MODE="${SHADOW_MODE:-false}"
 ENFORCE_WAIT_TIMEOUT_SECONDS="${ENFORCE_WAIT_TIMEOUT_SECONDS:-180}"
 CONFIGMAP_NAME="maas-epp-config"
 CPU_EPP_METRICS_SVC="${CPU_EPP_METRICS_SVC:-maas-vllm-cpu-epp-service}"
@@ -396,6 +438,7 @@ TS_PID=""
 CHAOS_PID=""
 ORIGINAL_REPLICAS=""
 ENFORCE_FLIPPED="false"
+SHADOW_FLIPPED="false"
 METRICS_TOKEN=""
 EPP_METRICS_SVC_IP=""
 CPU_EPP_METRICS_SVC_IP=""
@@ -708,6 +751,16 @@ revert_enforce_live() {
   ENFORCE_FLIPPED="false"
 }
 
+revert_shadow_mode() {
+  # UNI-159: mirror of revert_enforce_live, opposite direction. Same
+  # SHADOW_FLIPPED/live_config_restore idempotency split as that function --
+  # see its comment above.
+  [ "$SHADOW_FLIPPED" = "true" ] || return 0
+  live_config_restore shadow-mode
+  wait_for_enforcing "1" || true
+  SHADOW_FLIPPED="false"
+}
+
 restore_chaos_scale() {
   [ -n "$CHAOS_SCALE_AT" ] || return 0
   live_config_restore chaos-scale
@@ -738,18 +791,20 @@ stop_background_loops() {
 # collection, and report generation alike, so none of that ~100-line
 # post-processing tail runs without a safety net. Each piece it restores
 # (stop_background_loops, restore_chaos_scale, restore_live_set,
-# revert_enforce_live) is idempotent and checks live cluster state before
-# acting, so calling this again at actual process exit after the explicit
-# mid-script call below (see "Stop capture/timeseries/chaos" further down) is
-# always a safe no-op, not a double-revert. SIGKILL (-9) cannot be trapped by
-# this or any process, so a `kill -9` or an OOM-kill still leaves the cluster
-# enforcing (or whatever LIVE_SET_AT last touched) with no automatic recovery
-# -- that gap is real and is not closed by anything below.
+# revert_enforce_live, revert_shadow_mode -- UNI-159) is idempotent and
+# checks live cluster state before acting, so calling this again at actual
+# process exit after the explicit mid-script call below (see "Stop capture/
+# timeseries/chaos" further down) is always a safe no-op, not a
+# double-revert. SIGKILL (-9) cannot be trapped by this or any process, so a
+# `kill -9` or an OOM-kill still leaves the cluster enforcing (or whatever
+# LIVE_SET_AT/SHADOW_MODE last touched) with no automatic recovery -- that
+# gap is real and is not closed by anything below.
 on_exit() {
   stop_background_loops
   restore_chaos_scale
   restore_live_set
   revert_enforce_live
+  revert_shadow_mode
 }
 trap on_exit EXIT
 # A trap registered on INT/TERM/HUP alone only RUNS its command when the
@@ -999,11 +1054,38 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users custom"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128 WORKERS_CUSTOM=8 CUSTOM_SUBSCRIPTION_NAME=enduser-foo)
     ;;
+  shadow-mode-control)
+    # UNI-159: F1, the second named negative control in this series (the
+    # first is equal-workers-control, UNI-103). Same TENANTS/PER_TENANT_OVERRIDES
+    # as full-contention -- the per-tenant over-offering discipline is kept
+    # exactly as-is, because the thing being tested here is NOT whether the
+    # offered load saturates the pool (it already does, full-contention
+    # proved that), it's whether the weighted split still shows up once
+    # nothing is left to enforce it. SHADOW_MODE="true" makes this scenario
+    # own its own live-config flip end to end (set up, confirm, restore) --
+    # see the UNI-159 header comment and SHADOW_MODE's declaration above for
+    # the mechanism. IS_CONTROL="true" for the same reason
+    # equal-workers-control sets it: a large deviation from the configured
+    # weights is the expected, correct result here, not a policy failure.
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128)
+    IS_CONTROL="true"
+    SHADOW_MODE="true"
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control)" >&2
     exit 1
     ;;
 esac
+
+if [ "$ENFORCE_LIVE" = "true" ] && [ "$SHADOW_MODE" = "true" ]; then
+  # UNI-159: both flip the same maas-epp-config `enforce` key, to opposite
+  # target values -- there is no combined outcome to converge on, and
+  # whichever one's live_config_set ran second would just clobber the
+  # other's .before/.applied bookkeeping for the same ConfigMap key.
+  echo "[benchmark] FATAL: ENFORCE_LIVE=true and SHADOW_MODE=true both target maas-epp-config's enforce key in opposite directions -- set at most one" >&2
+  exit 1
+fi
 
 echo "[benchmark] scenario: $SCENARIO  artifact dir: $ARTIFACT_DIR"
 
@@ -1307,6 +1389,36 @@ if [ "$ENFORCE_LIVE" = "true" ]; then
     START_RESTARTS="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
     printf '%s\n' "$EPP_POD" > "$EPP_POD_FILE"
     echo "[benchmark] enforce flip replaced the EPP pod (no live-reload): target pod is now $EPP_POD (restarts so far: $START_RESTARTS)"
+  fi
+fi
+
+if [ "$SHADOW_MODE" = "true" ]; then
+  # UNI-159: mirror of the ENFORCE_LIVE block above, flipping the opposite
+  # direction (true -> false) -- see that block's comments for why both EPPs
+  # are resolved/confirmed and why the pod is re-resolved after the flip.
+  # Mutually exclusive with ENFORCE_LIVE (checked before the scenario even
+  # starts, see above), so this never runs in the same invocation as that
+  # block.
+  CPU_EPP_METRICS_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+  CUR_EPP_YAML="$($OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}')"
+  if printf '%s' "$CUR_EPP_YAML" | grep -qE '^[[:space:]]*enforce:[[:space:]]*false'; then
+    enforce_log "enforce already false in $CONFIGMAP_NAME -- nothing to flip; this run will NOT revert it on exit (it did not cause the shadow state)"
+  else
+    live_config_set shadow-mode "epp-key:enforce" "false"
+    enforce_log "flipping $CONFIGMAP_NAME enforce true -> false (shadow mode)"
+    # Same ordering reason as ENFORCE_FLIPPED above: set before waiting, so a
+    # death on the next line still leaves on_exit knowing to revert it.
+    SHADOW_FLIPPED="true"
+    if ! wait_for_enforcing "0"; then
+      echo "[benchmark] FATAL: shadow-mode flip did not take effect on both EPPs within ${ENFORCE_WAIT_TIMEOUT_SECONDS}s -- aborting before an enforcing measurement gets mislabeled as shadow mode (the exit trap will still revert the ConfigMap edit)" >&2
+      exit 1
+    fi
+    # Same no-live-reload pod-recreate hazard as the ENFORCE_LIVE flip above.
+    EPP_POD="$($OC get pods -n "$NAMESPACE" -l "$EPP_SELECTOR" -o jsonpath='{.items[0].metadata.name}')"
+    EPP_IMAGE_DIGEST="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath="{.status.containerStatuses[?(@.name=='$EPP_CONTAINER')].imageID}")"
+    START_RESTARTS="$($OC get pod "$EPP_POD" -n "$NAMESPACE" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+    printf '%s\n' "$EPP_POD" > "$EPP_POD_FILE"
+    echo "[benchmark] shadow-mode flip replaced the EPP pod (no live-reload): target pod is now $EPP_POD (restarts so far: $START_RESTARTS)"
   fi
 fi
 
@@ -1632,6 +1744,11 @@ RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # the pod on record for that run no longer existed afterward; a new pod
 # under the same ReplicaSet hash had replaced it, age-zero at revert time.
 revert_enforce_live
+# UNI-159: revert_shadow_mode shares the exact same hazard (and the exact
+# same reason it must run AFTER the after-snapshot, not before) as
+# revert_enforce_live just above -- it is the same pod-recreate-on-ConfigMap-
+# edit mechanism, just restoring the opposite flip direction.
+revert_shadow_mode
 # UNI-180: restore_live_set shares the exact same hazard and is called here
 # for the exact same reason -- an epp-key/epp-weight LIVE_SET_AT target
 # recreates the EPP pod on restore too. A held field: target has usually

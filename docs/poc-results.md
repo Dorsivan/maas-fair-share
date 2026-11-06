@@ -6438,3 +6438,147 @@ in `results/20261105T231026Z-uni-158-e4-kuadrant-ceiling/`.
 - Grafana/Prometheus time range: `2026-11-05T23:10:26Z`–`2026-11-05T23:19:21Z`
   (script start through final live-config restore confirmation; the scored
   load itself ran `23:11:40Z`–`23:18:07Z`).
+
+## UNI-159: F1, shadow-mode control — the second negative control, and a weaker one than it looks
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, "F" group, first case: flip
+`maas-epp-config`'s `enforce` key to `false` (shadow mode — the plugin still
+accounts every dispatch, it just never reorders the queue by weight) and run
+the headline `full-contention` load under it, as a second named negative
+control alongside `equal-workers-control` ([UNI-103](/UNI/issues/UNI-103)).
+
+**Setup.** A new permanent scenario, `shadow-mode-control`, added to
+`deploy/poc/15-fairness-benchmark.sh` rather than a one-off env-var
+invocation — the ticket asked for a scenario that "sets and restores the mode
+itself," not an operator-supplied flag. It reuses `full-contention`'s own
+proven sizing (`TENANTS="app1 app2 end-users"`,
+`WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128`) and sets a new
+`SHADOW_MODE="true"` in its own case-statement branch — the mirror image of
+[UNI-174](/UNI/issues/UNI-174)'s `ENFORCE_LIVE` (which only ever flips
+TOWARD `enforce=true`) built on the same [UNI-180](/UNI/issues/UNI-180)
+`live_config_set`/`live_config_restore` wrapper. `ENFORCE_LIVE=true` and
+`SHADOW_MODE=true` together are rejected with a FATAL before the Job ever
+starts (both target the one `enforce` key in opposite directions). See
+`docs/runbook.md`'s "Shadow-mode control, F1 (UNI-159)" for the full
+mechanism and its offline regression verification (every pre-existing
+scenario's patched manifest came out byte-identical, truncated-script
+technique, same as UNI-180 used).
+
+```
+OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh shadow-mode-control uni-159-f1-shadow-mode-control
+```
+
+The live cluster's `enforce` was already `false` at rest (matching
+`deploy/epp-config.yaml`'s own committed default — `ENFORCE_LIVE=true` is
+what other scored cases in this chain use to turn enforcement ON
+*temporarily*; shadow mode is this POC's actual steady state). To exercise
+the new flip-and-restore code path for real, rather than only its
+already-covered "nothing to flip" no-op branch, `enforce` was set to `true`
+by hand immediately before this run (confirmed `llm_d_epp_maas_fairness_enforcing=1`
+on both EPPs) so `shadow-mode-control` would perform a genuine
+true→false→true cycle, then restored back to `false` by hand afterward to
+match both the repo manifest and the state this ticket found at the start of
+its own checkout — see "Cluster state" below for the full before/after
+`oc get` proof.
+
+**Expected (per the ticket):** close to equal thirds, matching
+`equal-workers-control`.
+
+**Observed: 16.9/16.7/66.4% (app1/app2/end-users) against the 21.1/10.5/68.4%
+weighted target — max deviation 6.1 points. Verdict: INFO (correctly
+unscored, per rule 4 of this series a negative control never reaches
+PASS/FAIL).** The live flip-and-restore mechanism worked exactly as
+designed:
+
+- `enforce` flipped `true`→`false` at `16:05:35Z`, confirmed
+  `llm_d_epp_maas_fairness_enforcing=0` on both EPPs at `16:06:44Z` (69s —
+  well inside the 180s timeout; same order of magnitude as UNI-174's own
+  measured ~50–90s single-EPP rollout), EPP pod recreated
+  (`...-575669c495-gr7bq`) before the metrics-before snapshot or the Job
+  started, so no real-traffic second of the run was mislabeled.
+- 240s full-contention load ran clean: 535/530/2115 requests
+  (app1/app2/end-users), only the series' usual incidental ~2% `500`
+  background rate, zero `429`/`503` (0.00% shed, per the UNI-181 shed-rate
+  table), ledger cross-check (UNI-138/G2) PASS on all three groups (≤1.5%
+  cost-diff, well inside the 10% tolerance).
+- `enforce` restored `false`→`true` (this run's own "before" value — see
+  "Cluster state" below for why that is not the POC's steady state) at
+  `16:11:08Z`, confirmed `enforcing=1` on both EPPs at `16:12:15Z` (67s).
+
+**What surprised me: this is a materially weaker negative control than
+`equal-workers-control`, because of a sizing choice the ticket's own
+"Expected" line didn't anticipate.** `equal-workers-control` offers every
+tenant the SAME worker count, so its observed split (30.7/30.7/38.7%,
+29.7-point max deviation from the weighted target — see the UNI-103 section
+above) genuinely looks like "equal thirds," distinct from both the raw
+worker ratio (1:1:1, which IS equal thirds here) and the weighted target.
+`shadow-mode-control` instead reuses `full-contention`'s deliberately
+*asymmetric* worker sizing (32/32/128 — chosen specifically to approximate
+the 20/10/65 weight ratio under real contention, see "Per-tenant worker
+sizing" in `docs/runbook.md`). With `enforce=false`, nothing is left to
+express the configured weights, so the scheduler's own non-fairness plugins
+(queue-scorer, kv-cache-utilization-scorer, prefix-cache-scorer) drive the
+split toward something close to the OFFERED-worker ratio instead:
+32:32:128 = 16.7/16.7/66.7%, and the observed 16.9/16.7/66.4% lands almost
+exactly there — not on "equal thirds" at all. Because `full-contention`'s
+worker sizing was itself picked to *resemble* the weight ratio, the
+unenforced result ends up only 6.1 points from the weighted target, under
+the 10-point PASS/FAIL threshold that would apply to a scored scenario. If
+`shadow-mode-control` were (mis)read as a PASS/FAIL check instead of the
+INFO it correctly is, it would look like fairness "basically still works"
+with enforcement OFF — which is an artifact of this scenario's own worker
+sizing happening to approximate the target ratio, not evidence the plugin
+does anything in shadow mode. `equal-workers-control` remains the stronger,
+cleaner negative control of the two; this one's main value is showing that
+the near-pass is sizing-driven, not policy-driven, which is itself worth
+having on record so nobody mistakes a future shadow-mode near-pass for
+"enforcement isn't needed."
+
+**Cluster state.** The repo's `deploy/epp-config.yaml` ships `enforce: false`
+as its committed default, and the live `maas-epp-config` ConfigMap was
+already at `false` — matching the manifest — before this ticket touched
+anything. That is a different baseline than most of this chain's other
+tickets assume: `ENFORCE_LIVE=true` is the mechanism several scored cases
+(UNI-151/156/157/158) use to turn enforcement ON for their own run, always
+restoring back to `false` afterward, which is this POC's actual steady
+state. This ticket's own `shadow-mode-control` run needed `enforce` to
+start at `true` to exercise its flip-to-false path for real (see "Setup"
+above), so `enforce` was set to `true` by hand before the run and back to
+`false` by hand afterward — confirmed via the enforcing metric both times,
+not just the ConfigMap literal (`maas-epp-config` is not mounted into the
+EPP process; the metric is the only thing that reflects what is actually
+live — see UNI-174's own note on this). Final state, confirmed after this
+ticket's work:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+      - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+      - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+      - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+  defaultGroup: { name: unclassified, weight: 5 }
+  enforce: false
+```
+
+`llm_d_epp_maas_fairness_enforcing=0` confirmed on both the GPU and CPU EPP
+within ~75s of the `16:13:45Z` patch (`metadata.managedFields` timestamp on
+`maas-epp-config`). `llmisvc/maas-vllm-gpu` replica count unchanged at 2
+throughout; no loadgen Job or pod left running (`maas-loadgen` `Complete`,
+not reapplied after this ticket's own run).
+
+**Done when:** raw results (report, loadgen log, metric deltas, and the
+live-config before/applied/post-restore proof for the `shadow-mode` wrapper
+id, plus a copy of the final manually-restored ConfigMap state) are in
+`results/20261106T160533Z-uni-159-f1-shadow-mode-control/`.
+
+**Evidence:**
+
+- Commits: see this section's companion commit on `main`.
+- Raw results: `results/20261106T160533Z-uni-159-f1-shadow-mode-control/`
+  (`fairness-report.json`/`.md`, `epp-container.log`, `loadgen.log`,
+  `client-request-summary.jsonl`, before/after metric snapshots,
+  `live-config/shadow-mode.{before,applied,spec,post-restore.yaml}`, and
+  `live-config/final-cluster-state.post-restore.yaml` for this ticket's own
+  manual final restore to `false`).
+- Grafana/Prometheus time range: `2026-11-06T16:05:33Z`–`2026-11-06T16:15:00Z`
+  (script start through this ticket's own final manual-restore confirmation;
+  the scored load itself ran `16:06:45Z`–`16:11:07Z`).

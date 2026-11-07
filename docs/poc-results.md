@@ -7435,3 +7435,120 @@ completed Job, left in place per the series' standing convention.
 `live-config-events.log`, `k8s-events-timeseries.log`,
 `client-request-summary.jsonl`, `timeline-config.json`,
 `04-loadgen.patched.yaml`).
+
+## UNI-165: board case, six real groups (app1-app6) under five weight sets — 4/5 PASS, pow2's >50% entitlement breaks the linear worker-sizing fit
+
+**Setup.** Unlike UNI-161/164 (which stood `end-users` in for a third
+group), app3-app6 are real `MaaSSubscription`s as of
+[UNI-187](/UNI/issues/UNI-187)/[UNI-189](/UNI/issues/UNI-189) -- no
+substitution needed. Added a `six-group-board-case` scenario to
+`deploy/poc/15-fairness-benchmark.sh`: `TENANTS="app1 app2 app3 app4 app5
+app6"`, and every `WORKERS_APPn` is required from the caller rather than
+fixed in the script, because one flat count that over-offers one weight set
+under-offers another (the app1-flood "watch for" from
+[UNI-161](/UNI/issues/UNI-161)). The operator (this agent) patched
+`maas-epp-config`'s `groups` weights before each run and restored the
+repo's 20/10/65/5 default after the last one -- same division of labor
+UNI-160/161/164 used. `ENFORCE_LIVE=true` and all groups over-offer for all
+five runs.
+
+Per-run worker counts were sized from a 2-point linear fit between
+UNI-160/161's two proven full-contention calibration points (20% weight ->
+32 workers, 65% weight -> 128 workers), floored at 32 workers below 20%
+weight (closed-loop workers can't go negative, and 32 was the smallest
+calibration point that stayed saturating).
+
+| case | weights (app1..app6) | verdict | worst deviation |
+|---|---|---|---|
+| `equal` | 16.7 each | **PASS** | app2, -4.3pts |
+| `graded` | 40/20/15/10/10/5 | **PASS** | app6 (smallest weight), +7.1pts |
+| `dominant` | 90/2/2/2/2/2 | **PASS**, but close | app1 (90% share), -9.5pts -- inside the 10pt threshold but by under a point |
+| `pow2` | 32/16/8/4/2/1 | **FAIL** | app1 (50.8% renormalized share), -19.3pts |
+| `subset-3-idle` | `equal` table, app4/5/6 at `WORKERS_APP{4,5,6}=0` | **PASS** | app2, +0.0pts |
+
+**`equal`, `graded`, `dominant` all PASS, and the same smallest-weight
+overshoot pattern repeats across all three.** In both `equal` and `graded`
+the smallest-weight groups floored at 32 workers land 0.7-7.1pts *above*
+target (app6 at 5% weight in `graded` is the extreme: 12.1% observed, +7.1).
+`dominant`'s five 2%-weight groups, all floored at 32 workers, land
+3.8-4.0% observed against a 2% target (+1.8 to +2.0pts) -- small in absolute
+points only because 2% leaves little room to overshoot, not because the
+mechanism went away. The floor keeps a small group fast enough to win more
+than its configured share whenever the dominant group's own worker count
+isn't large enough to fully compensate -- a closed-loop queueing-model
+artifact of the *benchmark's* worker sizing, not the fairness policy itself.
+
+**`pow2` FAILs, and it's the fit degrading above the two calibration
+points, not a new mechanism.** app1 at 32% weight should get 50.8% of the
+offered total (`32/(32+16+8+4+2+1)`), but the linear fit only assigns it 58
+workers for a majority entitlement -- extrapolating past the fit's two
+proven points (20%->32, 65%->128) rather than interpolating between them.
+The result: app1 under-offers and lands at 31.5% observed, -19.3pts. app2
+(25.4% target, between the fit's two points) is also short at -8.1pts. The
+same floored-smallest-weight overshoot as `equal`/`graded` shows again for
+app4/5/6 (+6.6 to +10.0pts). This is the same failure mode
+[UNI-160](/UNI/issues/UNI-160) already flagged for a board decision --
+"worker sizing pinned the split, not the policy" -- now showing specifically
+as the 2-point fit's accuracy degrading for an entitlement past its upper
+calibration point. Per rule 4 this is recorded as-is, not re-tuned and
+re-run to chase a PASS: the fix is a benchmark-methodology decision (a
+better-calibrated sizing curve, or accepting worker-sizing as an explicit
+confound above ~65% share), not something this run can correct by retrying.
+
+**`subset-3-idle` confirms shares renormalize over active groups only.**
+app1/app2/app3 run the `equal` weight table (16.7 each) with app4/5/6 idled
+via `WORKERS_APP{4,5,6}=0` rather than removed from `TENANTS` (so they stay
+on the client-side ledger as offered-zero groups instead of silently
+dropping out of the report -- same "expected share over OFFERED groups
+only" denominator this report has used since `end-users-idle`). All three
+active groups converge to within 0.2pts of an even 33.3% split (expected:
+`16.7/(16.7*3)` = 33.3% each, since the three idle groups' configured
+weight is excluded from the denominator entirely, not redistributed as a
+discount). Time-to-converge was 230s of this run's 240s -- slower than most
+prior cases, consistent with the per-window table swinging several points
+either way window-to-window before settling
+([[process_windowed_report_lumpiness_at_10s_resolution]]).
+
+**What surprised:** the floored-minimum-worker overshoot for small weights
+is consistent and reproducible across three independent weight sets
+(`equal`, `graded`, `pow2`) -- not run-to-run noise, a real artifact of a
+32-worker floor applied regardless of how small the target share is. Also
+notable: `dominant`'s 90% group came within a point of the 10pt FAIL
+threshold even though its own worker count (181) was itself a linear-fit
+extrapolation past the 65% calibration point -- the same mechanism that
+broke `pow2` almost broke `dominant` too, just not quite far enough past
+the fit's valid range to cross the line.
+
+**Cluster left as found** (confirmed via `oc get`, not assumed):
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:|newcomerClamp|halfLifeSeconds'
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+      halfLifeSeconds: 60
+      newcomerClamp: true
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler,app.kubernetes.io/name=maas-vllm-gpu
+NAME                                                      READY   STATUS    RESTARTS   AGE
+maas-vllm-gpu-kserve-router-scheduler-575669c495-krh6b    1/1     Running   0          17h
+```
+
+Matches `deploy/epp-config.yaml`'s committed defaults (`enforce: false`,
+`newcomerClamp: true`, `halfLifeSeconds: 60`, weights 20/10/65/5) and the
+checked-out 2-replica GPU count exactly.
+
+**Raw results:**
+`results/20261106T211729Z-uni-165-equal/`,
+`results/20261106T212442Z-uni-165-graded/`,
+`results/20261106T213542Z-uni-165-dominant/`,
+`results/20261106T214302Z-uni-165-pow2/`,
+`results/20261106T221202Z-uni-165-subset-3-idle/`
+(each with `fairness-report.{json,md}`, `loadgen.log`, `epp-container.log`,
+`metrics-{before,after,timeseries}.txt`, `enforce-events.log`,
+`live-config-events.log`, `k8s-events-timeseries.log`,
+`client-request-summary.jsonl`, `timeline-config.json`,
+`04-loadgen.patched.yaml`).

@@ -370,7 +370,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -1175,8 +1175,31 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=96 WORKERS_APP2=32 WORKERS_END_USERS=128)
     ;;
+  six-group-board-case)
+    # UNI-165: board case, app1..app6. Unlike UNI-161/164, these are real
+    # MaaSSubscriptions as of UNI-187 (ConfigMap/loadgen tables)/UNI-189
+    # (subscriptions+keys applied) -- no end-users substitution needed.
+    #
+    # This single scenario runs against FOUR different weight sets (equal,
+    # graded 40/20/15/10/10/5, dominant 90/2/2/2/2/2, pow2 32/16/8/4/2/1) plus
+    # a subset run, in one ticket. A flat worker count that over-offers one
+    # weight set would under-offer another -- the app1-flood "watch for"
+    # lesson (UNI-161) -- so this block owns NO fixed sizing at all. Every
+    # per-group count is the caller's WORKERS_APPn env var, chosen to track
+    # whichever weight set maas-epp-config currently holds (same
+    # operator-owns-the-ConfigMap division of labor as app1-flood/
+    # app3-joins-at-saturation -- this block never touches the ConfigMap).
+    # Idling a group for the subset run is WORKERS_APPn=0, not removing it
+    # from TENANTS, so it stays on the client-side ledger as an offered-zero
+    # group rather than silently dropping out of the report.
+    TENANTS="app1 app2 app3 app4 app5 app6"
+    PER_TENANT_OVERRIDES=(
+      WORKERS_APP1="${WORKERS_APP1:?six-group-board-case requires WORKERS_APP1..APP6}"
+      WORKERS_APP2="${WORKERS_APP2:?six-group-board-case requires WORKERS_APP1..APP6}"
+    )
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case)" >&2
     exit 1
     ;;
 esac

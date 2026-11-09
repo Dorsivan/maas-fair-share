@@ -875,12 +875,18 @@ spec:
             # enough: the simulator's latency is sleeps rather than compute, so
             # a CPU-starved generator slows all three tenants equally and the
             # RATIO -- the thing under test -- is unaffected.
+            #
+            # UNI-167: the memory LIMIT (not the request, which stays tiny and
+            # doesn't affect scheduling) needs headroom for high-group-count
+            # scale scenarios -- each tenant's worker loop forks a curl per
+            # request, and at ~1000 concurrent workers that blew through 2Gi
+            # with "fork: Cannot allocate memory" after ~55s.
             requests:
               cpu: 100m
               memory: 256Mi
             limits:
               cpu: "2"
-              memory: 2Gi
+              memory: 6Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

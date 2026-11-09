@@ -7779,3 +7779,72 @@ transitions watcher log covering the whole drill),
 `results/20261109T093212Z-uni-166-g1-not-converging-attempt3/`,
 `results/20261109T095138Z-uni-166-g1-accounting-leak/`,
 `results/20261109T100349Z-uni-166-g1-band-split-not-exercised/`.
+
+## UNI-167: H3, scale — 20 groups, ~1000 workers — split holds tighter than the 3-group baseline, but the loadgen itself was the bottleneck, not the EPP
+
+**Setup:** extended `twenty-group-scale` (added in UNI-167, reusing UNI-165's/UNI-179's multi-group tooling) — 20 equal-weight groups (app1..app20, 5% each), 50 workers per group, 1000 workers total, against the live GPU EPP (`maas-vllm-gpu`, 2 replicas). A 3-group `full-contention` baseline (app1=20/app2=10/end-users=65, 32/32/128 workers) was run first for comparison.
+
+### First attempt: the loadgen OOM'd, not the EPP
+
+The first 20-group run (`results/20261109T105234Z-uni-167-h3-20group/`, superseded) died at ~55s into a configured 240s run with `/script/run.sh: fork: Cannot allocate memory`. `04-loadgen.yaml`'s container had a 2Gi memory **limit** sized for the smallest scenarios (3-32 tenants); at 1000 concurrently-forked bash workers (each worker forks a `curl` per request) that ceiling was too small. The pod exited before the client-side request log (`client-request-summary.jsonl`) ever got written, so the ledger cross-check failed completely (0 client records for all 20 groups) even though the EPP-side token counters looked superficially plausible for the partial window — this result is **not usable evidence** of anything at the 1000-worker scale and is kept only as a record of the finding.
+
+**Fix:** raised `deploy/poc/04-loadgen.yaml`'s container memory **limit** from 2Gi to 6Gi (request left at 256Mi — unchanged scheduling impact, see the manifest's own CPU-scheduling-headroom comment). This is a resources.limits change to an already-existing Deployment manifest, not new provisioning.
+
+### Second finding: the interrupted prior session left the cluster mid-experiment
+
+Before re-running, `maas-epp-config` was found still holding the 20-group weight table from the crashed run — the crash happened before the scenario's restore-to-`00-config.yaml` step (the groups table is the operator's own responsibility per the scenario's header comment; the benchmark script only ever manages the `enforce` flag). Restored to the repo's 3-group default immediately, confirmed with `oc get`, before doing anything else.
+
+### Re-run 1 (shadow mode, informational only)
+
+`results/20261109T131723Z-uni-167-h3-20group-retry/`: ran clean end-to-end with the memory fix (no forks failed, Job succeeded, full 240s). But this run did not set `ENFORCE_LIVE=true`, so it ran with the cluster's default `enforce: false` (shadow mode) — not a real test of the weighted-fairness mechanism, since 20 identical-weight groups with identical worker counts converge to roughly equal shares from work-conservation alone, enforced or not. Kept as supplementary evidence (clean full-duration pick-latency/throughput numbers at scale), not as the scored result.
+
+### Re-run 2 (enforced — the scored result)
+
+`results/20261109T132337Z-uni-167-h3-20group-enforced/`: same scenario, `ENFORCE_LIVE=true` (harness flips `enforce: false -> true`, confirms `llm_d_epp_maas_fairness_enforcing=1` on both EPPs, reverts automatically after the snapshot). Full 240s, Job succeeded, ledger cross-check PASS.
+
+**Verdict: PASS**
+
+| metric | 3-group baseline (`full-contention`) | 20-group scale (`twenty-group-scale`, enforced) |
+|---|---|---|
+| groups | 3 (weights 20/10/65) | 20 (weight 5 each) |
+| total offered workers | 192 | 1000 |
+| worst deviation (pts) | -4.0 (app1) at the per-run level; individual 10s windows swing far more (up to ±37 pts) | ±0.1 across all 20 groups |
+| ledger cross-check | PASS (within 10%) | PASS (within 10%) |
+| scheduler_e2e pick latency p50 / p99 | 0.050ms / 0.100ms (3115 obs) | 0.050ms / 0.099ms (3868 obs) |
+| flow_control_dispatch_cycle p50 / p99 | 0.050ms / 0.099ms | 0.050ms / 0.099ms |
+| shed (429/503) | 0 | 0 |
+
+**EPP CPU and memory during the enforced run** (`maas-vllm-gpu-kserve-router-scheduler-66847d4868-4qss2`, requests 1 CPU/2Gi, limits 6 CPU/16Gi — queried directly from UWM Thanos for the run window, saved as `epp-cpu-timeseries.json`/`epp-memory-timeseries.json` in the results dir since the benchmark script does not capture this itself):
+
+- CPU: steady ~0.07-0.15 cores (7-15% of the 1 CPU request, <3% of the 6 CPU limit).
+- Memory (working set): ramped from ~34MB to a steady ~173-176MB (~8.5% of the 2Gi request, ~1% of the 16Gi limit).
+
+Both comfortably inside request, nowhere near limit — "reasonable" by any reading.
+
+### What surprised us
+
+1. **The thing that didn't scale was the test harness, not the system under test.** The EPP held pick latency flat (same histogram bucket) and the split *tighter* at 20 groups/1000 workers than at 3 groups/192 workers — the loadgen's own `fork()`-per-request shell design was the actual ceiling, at a resource limit nobody had reason to revisit before a 1000-worker scenario existed.
+2. **The split holding tighter at 20 groups is not a surprise once you see why**: equal weights across equal worker counts is a much easier case for the policy than the 3-group baseline's skewed 20/10/65 with mismatched worker sizing (32/32/128) — this comparison is informative about scale, not a stronger fairness claim than the baseline already supports.
+3. **A shadow-mode run of this scenario would have looked identical to a PASS almost regardless of whether the policy worked** — 20 symmetric groups give work-conservation nothing to disagree with the weights about. `ENFORCE_LIVE=true` was necessary to make this a real test, not just a rerun of the 3-group baseline's historical `ENFORCE_LIVE` convention.
+4. **The interrupted-session cluster drift (stale 20-group groups table, correct `enforce` state)** is a reminder that only the `enforce` key has automatic revert built into the harness; the groups table swap `render.py` documents is unprotected against a mid-run crash, same as the config-drift in UNI-166 was for a different key.
+
+**Cluster left as found**, confirmed after the run:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+      enforce: false
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get jobs,pods -n maas-fairness-poc -l job-name=maas-loadgen
+No resources found in maas-fairness-poc namespace.
+```
+
+**Raw results:**
+`results/20261109T104353Z-uni-167-h3-baseline-3group/` (3-group comparison baseline),
+`results/20261109T105234Z-uni-167-h3-20group/` (superseded — loadgen OOM'd, kept only as evidence of the tooling gap this ticket's fix addresses),
+`results/20261109T131723Z-uni-167-h3-20group-retry/` (clean full-duration run, shadow mode — supplementary, not scored),
+`results/20261109T132337Z-uni-167-h3-20group-enforced/` (the scored result, `ENFORCE_LIVE=true`, includes `epp-cpu-timeseries.json`/`epp-memory-timeseries.json`).

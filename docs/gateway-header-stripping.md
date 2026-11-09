@@ -310,21 +310,22 @@ them would have noticed**, because the "standing check" this document and
 to run before trusting a result, not something either script actually ran.
 `grep -rln gateway-header-check deploy/poc/*.sh` returned nothing before this
 incident: the conformance tool UNI-33 built was never wired into anything
-that runs automatically. That gap — not the specific revert — is what
-[[process_restore_does_not_fix_the_automation]] means by fixing the
-automation, not just the object.
+that runs automatically. Restoring the object without wiring that check in
+would have fixed nothing durable: the same unmonitored reconcile risk would
+still have been there for the next chaos-scale run to re-trigger.
 
 **Restored and reverified live, 2026-11-09**, by re-running the exact
-command in `deploy/maas/09-objective-header-stripping.patch.yaml`:
-`x-llm-d-inference-objective` is back in `maas-poc-gateway-authn`'s
-`spec.rules.response.success.headers` (confirmed by direct manifest
-inspection — the Go toolchain was not available in this session to rebuild
-`bin/gateway-header-check`, so the check was done by hand against the same
-criteria `conformance/gatewayheaders.Check` applies: both
-`maas-vllm-cpu-kserve-route` and `maas-vllm-gpu-kserve-route` parent
-`Gateway/maas-poc-gateway`, route to an `InferencePool` backend, and
-`maas-poc-gateway-authn` — targeting that Gateway — now overwrites the
-header). The before/after forged-header `curl` against the GPU route still
+command in `deploy/maas/09-objective-header-stripping.patch.yaml`, then
+rebuilding and running the real conformance check against a live snapshot:
+
+```sh
+(cd cmd/gateway-header-check && GOPROXY=off go build -o ../../bin/gateway-header-check .)
+oc get httproute,gateway,authpolicy -n maas-fairness-poc -o yaml | bin/gateway-header-check -
+# gateway-header-check: OK -- every InferencePool-backed HTTPRoute overwrites x-llm-d-inference-objective
+```
+
+Same as UNI-33's original closure, this is a genuine live re-verification
+through the same tool, not a local simulation. The before/after forged-header `curl` against the GPU route still
 returns `HTTP 200` either way, for the same reason UNI-33's original proof
 did: zero `InferenceObjective` resources exist on this cluster, so there is
 still no behavioral queue-jump to show either way — the fix is proven at the

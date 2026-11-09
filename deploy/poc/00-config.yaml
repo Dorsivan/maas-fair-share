@@ -69,12 +69,16 @@ data:
           # that momentarily drains -- and the clamp writes A = floor * w, so
           # the largest weight loses the most credit per clamp.
           #
-          # Unresolved: whether the empty -> non-empty edge is simply a poor
-          # proxy for "returning from idle" when a tenant is being served so
-          # well that its queue keeps draining. Do not change the default on
-          # this evidence alone; the closed-loop generator may drain queues in
-          # ways real traffic does not.
+          # RESOLVED by UNI-212: the empty -> non-empty edge WAS exactly that
+          # poor proxy -- it was keyed to the shared Pick-call sequence, which
+          # advances on a ~1ms ticker and on every other group's enqueue, so a
+          # momentary drain from efficient service (milliseconds) was
+          # indistinguishable from a genuine return from idle (tens of
+          # seconds). newcomerClampIdleSeconds below adds a wall-clock gate so
+          # only the latter clamps. See docs/design.md "UNI-212: the backlog
+          # edge was Pick-cadence-blind".
           newcomerClamp: true
+          newcomerClampIdleSeconds: 2
           provisionalCharge: true
           defaultEstimatedOutputTokens: 512
           estimatedBytesPerToken: 4

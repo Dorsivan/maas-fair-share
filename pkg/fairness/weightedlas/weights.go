@@ -96,6 +96,20 @@ type Config struct {
 	// be run both ways; turning it off re-couples fairness to idleness.
 	NewcomerClamp bool `json:"newcomerClamp"`
 
+	// NewcomerClampIdleSeconds is the minimum wall-clock time a group must have
+	// been absent from Pick candidacy before its return counts as an "edge" for
+	// the newcomer clamp above. UNI-212: without this gate, the edge was keyed
+	// to the shared Pick-call sequence alone, which advances on every Pick call
+	// (a ~1ms ticker, plus every enqueue from any group) rather than once per
+	// this group's own request -- so a group efficiently served enough to drain
+	// its own queue between bursts registered as "away" on a millisecond
+	// timescale, and got its earned tab overwritten with the current floor every
+	// time. 2s is comfortably above that kind of dispatch-driven churn and
+	// comfortably below the tens-of-seconds absence the clamp exists to catch
+	// (one halfLifeSeconds is 60s by default). <= 0 reproduces the previous
+	// (buggy) seq-only behavior exactly.
+	NewcomerClampIdleSeconds float64 `json:"newcomerClampIdleSeconds,omitempty"`
+
 	// ProvisionalCharge charges an estimate at dispatch and trues it up against
 	// the response's usage block. Without it the policy is blind for the whole
 	// duration of a generation.
@@ -152,6 +166,7 @@ func DefaultConfig() Config {
 		OutputTokenWeight:            2.0,
 		CachedInputTokenWeight:       1.0,
 		NewcomerClamp:                true,
+		NewcomerClampIdleSeconds:     2.0,
 		ProvisionalCharge:            true,
 		DefaultEstimatedOutputTokens: 512,
 		EstimatedBytesPerToken:       4,

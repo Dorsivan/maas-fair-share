@@ -270,6 +270,14 @@ type bandState struct {
 	// detected without scanning every group on every call.
 	seq      int64
 	lastSeen map[string]int64
+	// lastSeenAt records the wall-clock time at which each group was last a
+	// candidate, parallel to lastSeen. seq alone cannot tell a group that
+	// returned after a genuine multi-second absence from one that returned on
+	// the very next Pick call a millisecond later -- seq advances on every
+	// Pick call, which the processor invokes on a ~1ms ticker and on every
+	// enqueue from any group, not once per this group's own request (see
+	// UNI-212, docs/design.md "UNI-212: the backlog edge was Pick-cadence-blind").
+	lastSeenAt map[string]time.Time
 
 	// lastContendedAt anchors the contended-seconds accounting: the SLI's
 	// denominator is only the time a group actually had competition.
@@ -277,7 +285,7 @@ type bandState struct {
 }
 
 func newBandState() *bandState {
-	return &bandState{lastSeen: make(map[string]int64)}
+	return &bandState{lastSeen: make(map[string]int64), lastSeenAt: make(map[string]time.Time)}
 }
 
 // beginPick advances the sequence and returns it.
@@ -286,13 +294,37 @@ func (bs *bandState) beginPick() int64 {
 	return bs.seq
 }
 
-// isBacklogEdge reports whether this group was absent from the previous Pick,
-// and records it as present at seq. The clamp fires only on this edge, so a
-// group trickling traffic continuously is never clamped.
-func (bs *bandState) isBacklogEdge(id string, seq int64) bool {
-	prev, ok := bs.lastSeen[id]
+// isBacklogEdge reports whether this group's return counts as coming back
+// from idle, for the newcomer clamp, and records it as present at (seq, now).
+//
+// A group present on the literal immediately-preceding Pick call is never an
+// edge, regardless of timing -- this is the continuously-backlogged case, and
+// it costs nothing to check first. Otherwise this is an edge only if at least
+// idleThreshold of real wall-clock time has elapsed since the group was last
+// a candidate, not merely "at least one Pick call": seq advances on every
+// Pick call, which fires on a ~1ms ticker and on every enqueue from *any*
+// group, so a gap of a few Pick calls can be a few milliseconds of real time,
+// far short of a genuine return from idle. UNI-212 found the pure seq-based
+// version firing on exactly that -- a well-served, higher-weight group
+// draining its own queue to empty between bursts -- discarding the credit its
+// weight had just earned it every time. idleThreshold <= 0 reproduces that
+// previous behavior exactly (any seq gap at all is an edge), kept as an
+// escape hatch rather than removed.
+func (bs *bandState) isBacklogEdge(id string, seq int64, now time.Time, idleThreshold time.Duration) bool {
+	prevSeq, seenBefore := bs.lastSeen[id]
+	prevAt, hadTime := bs.lastSeenAt[id]
 	bs.lastSeen[id] = seq
-	return !ok || prev != seq-1
+	bs.lastSeenAt[id] = now
+	if !seenBefore {
+		return true
+	}
+	if prevSeq == seq-1 {
+		return false
+	}
+	if !hadTime {
+		return true
+	}
+	return now.Sub(prevAt) >= idleThreshold
 }
 
 // pruneLastSeen drops groups that have been absent for a while. The map is
@@ -305,6 +337,7 @@ func (bs *bandState) pruneLastSeen(seq int64, candidates int) {
 	for id, s := range bs.lastSeen {
 		if s < seq-1 {
 			delete(bs.lastSeen, id)
+			delete(bs.lastSeenAt, id)
 		}
 	}
 }

@@ -468,7 +468,104 @@ Both terms are needed: `virtualTime` is the textbook `V(t)` and handles a cold s
 where everyone legitimately begins at 0; `min over backlogged` handles a band that went
 fully empty leaving `virtualTime` stale.
 
-### Provisional charge at dispatch
+### UNI-212: the backlog edge was Pick-cadence-blind, not time-blind
+
+[UNI-161](/UNI/issues/UNI-161), [UNI-160](/UNI/issues/UNI-160) and
+[UNI-104](/UNI/issues/UNI-104) found the delivered split tracking offered
+worker count / concurrency, not the configured weight, under closed-loop
+over-offer: varying the weight set at a fixed 32:32:128 worker ratio always
+converged on 32:32:128 (UNI-160), and varying app1's own worker count at a
+fixed 30/10/60 weight set changed the overshoot almost in proportion to that
+worker count, not the weight (UNI-161).
+
+**Diagnosis**, backed by live evidence already in this repo plus a fresh read
+of UNI-161's raw metrics:
+
+- This file's own `00-config.yaml` carries a prior calibration finding:
+  turning `newcomerClamp` on moved end-users from 62.8% to 45.1% while firing
+  only 19 times in 862 dispatches, and "the highest-weight group is hit
+  hardest, because it is served fastest, so its queue is the one that
+  momentarily drains." That comment flagged the mechanism and left it
+  unresolved; UNI-212 resolves it.
+- `results/20261106T171509Z-uni-161-app1-flood-256-32-64/metrics-after.txt`
+  shows `flow_control_request_queue_duration_seconds` with genuine,
+  multi-second mean FlowController queueing for every group (app1 23.3s over
+  n=2031, app2 13.7s over n=353, end-users 9.1s over n=903) — the
+  FlowController really does hold a deep backlog, so `Pick` is genuinely the
+  arbiter of most of each request's latency. This rules out "FlowControl
+  never backs up" as the mechanism.
+- `flow_control_queue_size`'s time series in the same run shows app2 and
+  end-users (the two non-flooding groups) repeatedly cycling all the way down
+  to **0** and back up to their full worker count throughout the 240s run
+  (end-users: ...,64,0,2,36,11,64,19,32,...), while app1's climbs
+  monotonically and never returns to 0. Every one of those drops to 0 is an
+  `isBacklogEdge` the instant the group's next request arrives.
+- `isBacklogEdge` (`pkg/fairness/weightedlas/state.go`) keyed "was this group
+  a Pick candidate last time" to `seq`, a counter shared across the *whole
+  band* and incremented on every `Pick` call. `Pick` is invoked from
+  `dispatchCycle` (`llm-d-router`
+  `pkg/epp/flowcontrol/controller/internal/processor.go`), which the
+  processor's `Run` loop calls on a ~1ms ticker **and** synchronously on every
+  enqueue from *any* group — not once per this specific group's own request.
+  So a group's own inter-arrival gap only had to exceed roughly one Pick
+  cycle — a millisecond, or however long it took some *other* group to
+  enqueue something — to register as "away." That is far below the gap a
+  return-from-genuine-idle clamp should fire on; one half-life is 60s.
+- The effect is exactly the self-undermining asymmetry the config-comment's
+  "largest weight loses the most credit" observation describes: a
+  higher-weight group is *correctly* favored by `Pick` when it competes,
+  which drains its own queue to empty faster, which produces more backlog
+  edges for itself, each of which overwrites its earned (favorably low)
+  `normalizedService` with the current floor — discarding exactly the credit
+  its weight just bought it. A continuously-flooding group never empties its
+  queue, so it is never edge-clamped at all, and accumulates (and is
+  correctly penalized for) its tab normally. Net effect: any group that
+  cannot sustain a literally-always-nonempty queue gets repeatedly reset to
+  parity with the flooder instead of carrying forward the deficit its weight
+  entitles it to — so the realized split tracks each group's own ability to
+  keep a queue backlogged (worker count / offered concurrency), not the
+  configured weight.
+
+**Fix:** `isBacklogEdge` gains a wall-clock gate. A group present on the
+*literal* immediately-preceding `Pick` call is still never an edge
+(unchanged — the continuously-backlogged case costs nothing extra to check).
+Otherwise, it is an edge only if **at least `newcomerClampIdleSeconds` of real
+wall-clock time** elapsed since the group was last a candidate — not merely
+"at least one Pick call since." New config field `newcomerClampIdleSeconds`
+(default 2s): comfortably above normal dispatch-churn gaps (milliseconds),
+comfortably below the tens-of-seconds absence the clamp exists to catch (see
+`TestReturningIdleTenant`'s 10s Phase 1). `<= 0` reproduces the previous
+(buggy) behavior exactly, kept as an explicit escape hatch rather than
+removed outright.
+
+**Expected effect:** a group that cannot sustain a continuously non-empty
+queue stops losing its earned deficit every time its queue transiently
+drains from being served promptly, so weighted sharing should hold closer to
+the configured weights under UNI-161/UNI-160's own worker sizings. This does
+not touch `TestWorkConservation` (an idle group still gets nothing — it has
+no deficit to lose) or `TestReturningIdleTenant`'s genuine-absence case (10s
+of simulated idle is 5x the 2s default gate), and it keeps `newcomerClamp:
+true` as [UNI-162](/UNI/issues/UNI-162) already recommended — this is a
+timing-precision fix to the existing mechanism, not a reversal of that
+decision. New tests: `TestNewcomerClampIdleGate` (direct, deterministic
+coverage of the gate itself) and `TestNewcomerClampGateImprovesBurstyShare`
+(shows the fix measurably moves a bursty group's share up from the legacy
+baseline and eliminates spurious clamps on a 20ms inter-burst gap, without
+asserting a specific equilibrium number — a group's own duty cycle still caps
+how much of the pool it can claim, independent of this fix).
+
+**Not expected to fully close the UNI-161/UNI-160 gap on its own:**
+[UNI-211](/UNI/issues/UNI-211) separately found an independent
+scheduling-profile bug (prefix-cache-scorer endpoint lock-in,
+[UNI-214](/UNI/issues/UNI-214), still open, pending a board decision on the
+scorer-weight redesign). This plugin's own `contended_seconds_total`
+accounting (`bandState.contendedDelta`) also resets its single, band-shared
+timer to zero on *any* Pick call with only one candidate, which looks like a
+second, separate undercount of true contention — worth a follow-up, but it
+affects the SLI denominator, not dispatch order, so it is out of scope here.
+UNI-161 and UNI-160 are re-run after this fix (below, with workers **not**
+sized to the weights) to measure how much of the gap it actually closes, not
+assumed to close it outright.
 
 **Never invoke the tokenizer.** Use `Body.TokenizedRequest.TokenCount()` *only* if the
 token-producer already ran for another plugin's benefit — opportunistic reuse, never a

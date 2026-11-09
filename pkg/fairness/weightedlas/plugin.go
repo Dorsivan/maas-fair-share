@@ -436,10 +436,11 @@ func (p *Plugin) Pick(
 	// handles the cold start where every group legitimately begins at zero;
 	// the minimum over current candidates handles a band that went fully empty
 	// and left virtualTime stale.
+	idleThreshold := time.Duration(p.cfg.NewcomerClampIdleSeconds * float64(time.Second))
 	if p.cfg.NewcomerClamp {
 		floor := math.Max(bs.virtualTime, minNormalized)
 		for i := range candidates {
-			edge := bs.isBacklogEdge(candidates[i].id, seq)
+			edge := bs.isBacklogEdge(candidates[i].id, seq, now, idleThreshold)
 			if edge && candidates[i].normalized < floor {
 				candidates[i].state.setNormalizedService(now, floor)
 				candidates[i].normalized = floor
@@ -448,7 +449,7 @@ func (p *Plugin) Pick(
 		}
 	} else {
 		for i := range candidates {
-			bs.isBacklogEdge(candidates[i].id, seq)
+			bs.isBacklogEdge(candidates[i].id, seq, now, idleThreshold)
 		}
 	}
 	bs.pruneLastSeen(seq, len(candidates))

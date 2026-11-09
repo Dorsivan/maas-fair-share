@@ -169,6 +169,110 @@ func TestReturningIdleTenant(t *testing.T) {
 		"without the clamp the incumbent should be starved through the transition")
 }
 
+// 4b. UNI-212: isBacklogEdge must distinguish a group that drained its own
+// queue to empty for a few milliseconds (served efficiently, not absent) from
+// one that was genuinely away for seconds. The old version keyed the edge to
+// the shared Pick-call sequence alone, which advances on every Pick call --
+// any group's enqueue, or the ~1ms dispatch ticker -- not once per this
+// group's own request, so both gaps looked identical to it.
+func TestNewcomerClampIdleGate(t *testing.T) {
+	t.Parallel()
+	bs := newBandState()
+	t0 := testBasis
+
+	// Cold start: always an edge, regardless of threshold.
+	require.True(t, bs.isBacklogEdge("g", 1, t0, 2*time.Second))
+
+	// Present on the literal immediately-preceding Pick call (seq 1 -> 2):
+	// never an edge, however the clock moved -- the continuously-backlogged
+	// case must stay free of the time check entirely.
+	require.False(t, bs.isBacklogEdge("g", 2, t0.Add(500*time.Millisecond), 2*time.Second))
+
+	// A seq gap (candidate absent at seq 3) opens, then returns at seq 4 after
+	// only 20ms of real time: far short of the 2s gate, so not an edge.
+	short := t0.Add(500*time.Millisecond + 20*time.Millisecond)
+	require.False(t, bs.isBacklogEdge("g", 4, short, 2*time.Second),
+		"a millisecond-scale drain must not count as a returning-idle newcomer")
+
+	// Another seq gap, this time with 3s of real elapsed time: at or past the
+	// gate, so this is a genuine return from idle.
+	long := short.Add(3 * time.Second)
+	require.True(t, bs.isBacklogEdge("g", 6, long, 2*time.Second),
+		"a multi-second absence must still count as a returning-idle newcomer")
+
+	// idleThreshold <= 0 reproduces the previous (buggy) behavior exactly: any
+	// seq gap at all is an edge, however little real time elapsed.
+	bs2 := newBandState()
+	require.True(t, bs2.isBacklogEdge("g", 1, t0, 0))
+	require.False(t, bs2.isBacklogEdge("g", 2, t0.Add(time.Millisecond), 0),
+		"consecutive seq is never an edge, even with idleThreshold disabled")
+	require.True(t, bs2.isBacklogEdge("g", 4, t0.Add(2*time.Millisecond), 0),
+		"idleThreshold <= 0 means any seq gap counts, even a 1ms one")
+}
+
+// 4c. The same distinction, exercised through Pick(): a higher-weight group
+// that is served well enough to fully drain its queue between bursts of its
+// own traffic must not have its earned (favorably low) tab overwritten by the
+// clamp every time, which is what let a continuously-flooding, lower-weight
+// rival dominate despite the weight disadvantage (UNI-160/UNI-161's
+// worker-ratio overshoot). This does not assert a specific equilibrium share
+// -- the bursty group's duty cycle genuinely caps how much of the pool it can
+// claim, independent of the clamp -- only that fixing the edge gate measurably
+// moves its share toward its weight and away from the legacy floor, and fires
+// far fewer clamps doing it.
+func TestNewcomerClampGateImprovesBurstyShare(t *testing.T) {
+	t.Parallel()
+
+	run := func(t *testing.T, idleSeconds float64) (share float64, clamps float64) {
+		t.Helper()
+		cfg := twoGroupConfig(1, 3)
+		cfg.Enforce = true
+		cfg.ProvisionalCharge = false
+		cfg.NewcomerClamp = true
+		cfg.NewcomerClampIdleSeconds = idleSeconds
+		cfg.HalfLifeSeconds = 60
+		p, clock := newTestPlugin(t, cfg)
+
+		flooder := &simFlow{id: "a-group", depth: 100000, promptIn: 500, output: 100}
+		bursty := &simFlow{id: "b-group", depth: 0, promptIn: 500, output: 100}
+		band := newSimBand(p, flooder, bursty)
+
+		before := testutil.ToFloat64(newcomerClamps.WithLabelValues(boundID("b-group")))
+		step := time.Millisecond
+		totals := map[string]float64{}
+		for burst := 0; burst < 200; burst++ {
+			bursty.depth = 5
+			bursty.headAt = clock.now()
+			r := band.run(t, p, 5, step, clock)
+			for id, v := range r.tokens {
+				totals[id] += v
+			}
+			// A 20ms gap: far shorter than any meaningful fraction of the 60s
+			// half-life, modeling a group drained by being served promptly,
+			// not one that went away.
+			bursty.depth = 0
+			r = band.run(t, p, 20, step, clock)
+			for id, v := range r.tokens {
+				totals[id] += v
+			}
+		}
+		after := testutil.ToFloat64(newcomerClamps.WithLabelValues(boundID("b-group")))
+		return totals["b-group"] / (totals["a-group"] + totals["b-group"]), after - before
+	}
+
+	legacyShare, legacyClamps := run(t, 0)
+	fixedShare, fixedClamps := run(t, 2.0)
+
+	assert.Greater(t, fixedShare, legacyShare,
+		"gating the edge on real elapsed time should move bursty's share up from the legacy seq-only baseline")
+	assert.Less(t, fixedClamps, legacyClamps,
+		"a 20ms inter-burst gap should clamp far less often once it must also clear the 2s idle gate")
+	assert.Zero(t, fixedClamps,
+		"a 20ms gap should never clear a 2s idle gate")
+	assert.Greater(t, legacyClamps, float64(0),
+		"the legacy path must actually exercise the clamp on every burst return, or this test proves nothing")
+}
+
 // 5. Decay. The tab measures recent usage, not all-time: one half-life after a
 // charge, half of it must be gone.
 func TestDecay(t *testing.T) {

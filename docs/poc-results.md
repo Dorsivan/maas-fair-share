@@ -7848,3 +7848,54 @@ No resources found in maas-fairness-poc namespace.
 `results/20261109T105234Z-uni-167-h3-20group/` (superseded — loadgen OOM'd, kept only as evidence of the tooling gap this ticket's fix addresses),
 `results/20261109T131723Z-uni-167-h3-20group-retry/` (clean full-duration run, shadow mode — supplementary, not scored),
 `results/20261109T132337Z-uni-167-h3-20group-enforced/` (the scored result, `ENFORCE_LIVE=true`, includes `epp-cpu-timeseries.json`/`epp-memory-timeseries.json`).
+
+## UNI-168: H2, overhead vs stock EPP — FAIL, and the gap is enforcement queueing, not EPP processing cost
+
+**Setup:** serial A/B on the same `maas-vllm-gpu` LLMISVC, same `full-contention` scenario (app1=32/app2=32/end-users=128 workers, 240s), same two GPU-backed vLLM replicas, nothing else touched between runs.
+
+- **Ours:** `results/20261109T134057Z-uni-168-ours/` — our pinned image (`quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9...e135`), live `maas-epp-config` (`type: maas-weighted-fairness`, weights 20/10/65), `ENFORCE_LIVE=true` so the weighted split is actually applied (shadow mode would make this a no-op comparison, same reasoning as UNI-167).
+- **Stock:** `results/20261109T135007Z-uni-168-stock/` — upstream `v0.11.0` digest (`ghcr.io/llm-d/llm-d-router-endpoint-picker@sha256:39257d2...c610cf`, pulled anonymously from `ocp-gpu-worker-1`, cleared in UNI-182/183), a second ConfigMap `maas-epp-config-stock` with an upstream-only `EndpointPickerConfig` (`single-profile-handler` / `queue-scorer` / `kv-cache-utilization-scorer` / `prefix-cache-scorer` / `max-score-picker` — no fairness plugin, since stock v0.11.0 rejects `type: maas-weighted-fairness` outright), `spec.router.scheduler.config.ref` flipped to it in the same patch as the image. Both the image patch and the ConfigMap were removed after the run.
+
+**Expected:** p95 latency and throughput delta under 5% between the two.
+
+**Observed:**
+
+| group | p95 ours | p95 stock | p95 delta | throughput ours (reqs/240s) | throughput stock | throughput delta |
+|---|---|---|---|---|---|---|
+| app1 (w=20) | 24.22s | 8.69s | **+178.7%** | 547 | 944 | **+72.6%** |
+| app2 (w=10) | 27.73s | 8.68s | **+219.5%** | 455 | 941 | **+106.8%** |
+| end-users (w=65) | 19.28s | 8.68s | **+122.1%** | 2239 | 3766 | **+68.2%** |
+| **total** | — | — | — | 3241 | 5651 | **+74.4%** |
+
+**Verdict: FAIL.** Every group blows through the 5% threshold by more than an order of magnitude, in both directions the ticket asked about (ours is slower end-to-end, and delivers fewer completed requests in the same wall-clock window).
+
+### What surprised us
+
+The EPP's own per-request processing cost is **not** where the gap comes from. `llm_d_epp_scheduler_e2e_duration_seconds` — the picker's own pick-latency histogram — is statistically identical between the two runs: p50 50.3µs / p99 99.6µs (ours) vs p50 50.2µs / p99 99.4µs (stock), same histogram bucket, comparable observation counts (3147 vs similar order). The 2-3x end-to-end latency gap and ~70-100% throughput gap is the weighted-fairness flow-control layer deliberately queueing and pacing the higher-volume/lower-weight groups to hold the 20/10/65 split (confirmed PASS on the split itself: max deviation 3.9 points, well inside the 10-point bar) — stock has no such admission control and lets every worker's requests through as fast as the backend will take them, first-come-first-served. That is the intended behaviour of a weighted-fairness policy under 12x over-offer, not a bug, but it means "overhead vs stock" is not a fair apples-to-apples number here: the two EPPs are not doing the same job. A <5%-overhead bar only makes sense when the comparison holds the admission-control behaviour constant (e.g. shadow mode on both sides), which the ticket's own A/B design (ours enforcing, stock with no fairness plugin at all) does not do.
+
+The stock run's own `fairness-report.json` verdict shows `FAIL` for an unrelated reason: `offered groups delivered zero contended service tokens`, because stock does not expose `llm_d_epp_maas_fairness_contended_service_tokens_total` at all (no fairness plugin loaded) — generated with `--control` to suppress split-deviation scoring, but the zero-tokens structural check still fires. That FAIL is a report-tooling artifact of asking our fairness-aware report script to score a run from an EPP with no fairness metrics, not a finding about this ticket's actual pass/fail criterion.
+
+**Cluster left as found**, confirmed after the run:
+
+```
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o json | jq '.spec.router.scheduler'
+{
+  "config": { "ref": { "key": "epp", "name": "maas-epp-config" } },
+  "replicas": 1,
+  "template": { "containers": [ { "image": "quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135", "imagePullPolicy": "Always", "name": "main", "resources": {} } ] }
+}
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+      enforce: false
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+$ oc get configmap maas-epp-config-stock -n maas-fairness-poc
+Error from server (NotFound): configmaps "maas-epp-config-stock" not found
+$ oc get jobs,pods -n maas-fairness-poc -l job-name=maas-loadgen
+No resources found in maas-fairness-poc namespace.
+```
+
+**Raw results:**
+`results/20261109T134057Z-uni-168-ours/` (our image, enforcing, scored PASS on the split itself),
+`results/20261109T135007Z-uni-168-stock/` (stock v0.11.0 image + upstream-only config, report generated with `--control`).

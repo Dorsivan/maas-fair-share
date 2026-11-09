@@ -8259,3 +8259,118 @@ ticket's "Done when" literally asks -- blocked on [UNI-214](/UNI/issues/UNI-214)
 profile fix, not on anything in this ticket's own change. The refund mechanism's correctness
 is proven directly at the metric level instead (table above), which is strictly more precise
 than a derived ledger PASS would have been.
+
+## UNI-212: re-running UNI-161/UNI-160 after the newcomer-clamp fix -- the core finding is unchanged, one data point got worse
+
+[UNI-212](/UNI/issues/UNI-212) is the direct follow-up to UNI-160/UNI-161/UNI-104: diagnose why
+the delivered split tracks offered concurrency instead of configured weight, fix it if
+feasible, and re-run both tickets' cases. The diagnosis and fix (gating the newcomer clamp's
+backlog edge on wall-clock idleness instead of Pick-call adjacency) were posted and merged as
+commit `05d705d` before this comment; this section covers the re-runs plus two things
+discovered while running them.
+
+**Finding 1 (expected): the fix is real but does not close the gap.** `app1-flood` at 256
+workers (the only one of UNI-161's three levels still genuinely contended post-UNI-211, see
+Finding 2) now deviates **+41.7 points**, worse than the pre-fix **+31.6 points**
+([UNI-161](/UNI/issues/UNI-161)). This is consistent with the fix's own mechanism, not a
+regression: the pre-fix clamp fired spuriously on almost every Pick cycle and hit the
+*highest*-weight group hardest (it drains its own queue fastest, so it re-enters "empty" most
+often), so it was accidentally suppressing some of app1's overshoot as a side effect of a bug.
+Removing that bug removes the accidental suppression too. Ledger cross-check also moved from
+PASS (≤3.7% in the original run) to a genuine FAIL here (-10.1% to -15.6% across all three
+groups) -- flagged in the original diagnosis comment as a separate, already-known
+`contended_seconds_total`/`contended_service_tokens_total` undercounting issue, not something
+this ticket fixes.
+
+**Finding 2 (new, structural): UNI-211's saturation-threshold fix neutered this ticket's
+old worker sizing.** UNI-211 (merged the same day, before these re-runs) raised
+`maas-saturation`'s `queueDepthThreshold` from 5 to 150 to match this backend's genuine
+steady-state vLLM-side queue depth. Re-running `app1-flood-moderate` (128 workers) and
+`app1-flood-light` (32 workers) at the UNI-161 sizing, and `full-contention` (32/32/128) at
+each UNI-160 weight set, all came back **UNCONTENDED**: `llm_d_epp_flow_control_request_queue_
+duration_seconds` was **0ms at every percentile in every 10s window** of all four runs, despite
+real backend latency (p50 9.9-16.8s) and genuine HTTP 500s -- confirmed from each run's
+`metrics-before.txt`/`metrics-after.txt`, where `contended_seconds_total`/
+`contended_service_tokens_total` are simply absent (never incremented), not merely zero. With
+the threshold raised to 150, these worker counts (192-224 total) no longer back up the EPP's
+own FlowControl queue at all; the bottleneck moved entirely inside vLLM's own internal request
+queue, which this plugin cannot see or influence. Only `app1-flood`'s 352 total workers still
+clears the new threshold. This is not a bug in this ticket's fix -- UNI-211's threshold change
+is independently justified (deploy/poc/00-config.yaml's own comment) -- but it does mean
+UNI-160/UNI-161's original worker sizing can no longer exercise the weighted-fairness policy at
+all, and any future re-run of those tickets' scenarios needs re-sizing, not just a literal
+re-run.
+
+**Response: added `full-contention-2x`** (`deploy/poc/15-fairness-benchmark.sh`) -- the same
+1:1:4 ratio as `full-contention`, offered workers doubled to 64/64/256 (384 total, close to
+`app1-flood`'s already-confirmed-working 352) -- and re-ran all three of UNI-160/F3's weight
+sets against it instead.
+
+| weight set (app1/app2/end-users) | app1 observed (dev) | app2 observed (dev) | end-users observed (dev) | ledger | verdict |
+|---|---|---|---|---|---|
+| 40/20/40 | 16.7% (-23.3) | 16.3% (-3.7) | 67.0% (**+27.0**) | FAIL (app2 -11.5%, end-users -11.8%) | **FAIL** |
+| 98/1/1 | 17.8% (**-80.2**) | 16.9% (+15.9) | 65.3% (**+64.3**) | PASS (all within 10%) | **FAIL** |
+| 33/33/33 | 16.9% (-16.5) | 16.5% (-16.8) | 66.6% (**+33.3**) | FAIL (app1 -10.7%, app2 -11.3%) | **FAIL** |
+| *(reference)* offered-worker ratio, 64:64:256 | 16.7% | 16.7% | 66.7% | -- | -- |
+
+**Same root cause as the original F3, reproduced at 2x scale, unaffected by the fix:** every
+weight set lands within ~1 point of the 64:64:256 offered-worker ratio (16.7/16.7/66.7%), not
+its own configured weight -- an even tighter clustering than the original 1x F3 run. The
+newcomer-clamp fix changes *how* a group's backlog-empty edge is detected; it does not change
+*what the dispatcher does with a persistent backlog*, which is what F3/UNI-161/UNI-104 all
+actually measure. This confirms the honest caveat in the original diagnosis comment: the fix
+was never expected to close this gap alone, and it hasn't.
+
+**Cluster side-effect found and fixed while re-running: the shared ConfigMap broke the CPU
+route.** `maas-epp-config` is read by both `maas-vllm-gpu` and `maas-vllm-cpu`'s
+`router-scheduler` ([[project_cpu_and_gpu_epp_share_maas-epp-config]]), but only the GPU
+route's live image had been bumped to the `05d705d` build before this ticket's first benchmark
+run. `maas-vllm-cpu`'s scheduler was still running an older pinned image
+(`sha256:5ddee9a7...`) that pre-dates the `newcomerClampIdleSeconds` field this ticket adds to
+the config schema; it rejected the config at startup (`json: unknown field
+"newcomerClampIdleSeconds"`) and CrashLoopBackOff'd, which in turn made every
+`ENFORCE_LIVE=true` run in this ticket fail outright (`15-fairness-benchmark.sh`'s own
+`wait_for_enforcing` by design confirms the flip on *both* EPPs, since both resolve the same
+ConfigMap -- UNI-174). Fixed by re-pinning `maas-vllm-cpu`'s live image to the same `05d705d`
+build as GPU, then updating the repo's own manifest pins (all six files that reference the old
+`sha256:b0bc21af...` digest: `deploy/llmisvc.yaml`, `deploy/poc/02-epp.yaml`,
+`deploy/poc/05-llmisvc-sim.yaml`, `deploy/poc/06-rhoai34-shape.yaml`,
+`deploy/poc/07-vllm-cpu.yaml`, `deploy/poc/09-vllm-gpu.yaml`) to match -- same convention
+UNI-213 used for its own image-pin bump, not reverted.
+
+**Cluster left as found.** Weights restored to 20/10/65, `enforce` reverted to `false` (each
+run's own `ENFORCE_LIVE` wrapper, plus a final manual weight restore, same division of labor
+F3/UNI-161 used), no loadgen Job/pod left running, both router-scheduler pods healthy on the
+re-pinned image:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler
+NAME                                                      READY   STATUS    RESTARTS   AGE
+maas-vllm-cpu-kserve-router-scheduler-74d6f9478-nht8n     1/1     Running   0          39s
+maas-vllm-gpu-kserve-router-scheduler-66957bf467-pq5h7    1/1     Running   0          42s
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           8m15s      12m
+```
+
+**Raw results:** `results/20261109T201954Z-uni-212-reverify-app1-flood-256/` (the one genuinely
+contended UNI-161 re-run), `results/20261109T202745Z-uni-212-reverify-app1-flood-128/` and
+`results/20261109T203641Z-uni-212-reverify-app1-flood-32/` (UNCONTENDED, Finding 2),
+`results/20261109T204611Z-uni-212-reverify-f3-40-20-40/` (UNCONTENDED at the original 1x
+sizing, Finding 2), `results/20261109T205702Z-uni-212-reverify-f3-40-20-40-2x/`,
+`results/20261109T211020Z-uni-212-reverify-f3-98-1-1-2x/`, and
+`results/20261109T212330Z-uni-212-reverify-f3-33-33-33-2x/` (the three scored F3 re-runs).
+
+**Not proven:** a worker sizing at which the weighted split holds under sustained flood on this
+backend. Every genuinely-contended run across this ticket and UNI-160/UNI-161 -- 1x and 2x,
+three different ratios, two different flood levels -- lands on the offered-worker ratio, not
+the configured weight. This is this POC's single clearest open gap; closing it would need a
+change beyond the newcomer-clamp timing this ticket fixed (see UNI-211's prefix-cache
+endpoint-lock-in, [UNI-214](/UNI/issues/UNI-214), still open pending board sign-off, as the
+most likely next lever).

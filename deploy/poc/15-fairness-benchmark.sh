@@ -370,7 +370,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-2x end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -949,8 +949,32 @@ case "$SCENARIO" in
     # Sized from A4 Run 3 (docs/poc-results.md, UNI-29), the first config on
     # this backend/model (llama-3-1-8b) that put every tenant above its
     # entitlement and reproduced the weight ordering end-users > app1 > app2.
+    #
+    # UNI-212: since UNI-211 raised maas-saturation's queueDepthThreshold
+    # from 5 to 150 (calibrated against this backend's genuine steady-state
+    # vLLM-side queue depth), this sizing's 192 total offered workers no
+    # longer backs up llm_d_epp_flow_control_request_queue_duration_seconds
+    # at all -- every request is admitted immediately (confirmed live,
+    # 2026-11-09: p50/p99 queue wait 0ms in every 10s window of a 240s run,
+    # despite 16.8s end-to-end latency, and contended_seconds_total/
+    # contended_service_tokens_total never incremented -- UNCONTENDED, not a
+    # metrics bug: see docs/poc-results.md "UNI-212"). The bottleneck moved
+    # entirely inside vLLM's own request queue, which this EPP's
+    # weighted-fairness policy cannot see or influence, so this sizing can no
+    # longer exercise that policy. Use full-contention-2x below for any
+    # re-run that needs genuine EPP-level contention post-UNI-211.
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128)
+    ;;
+  full-contention-2x)
+    # UNI-212: full-contention's own 1:1:4 ratio, offered workers doubled
+    # (64/64/256, 384 total) to clear UNI-211's new queueDepthThreshold=150
+    # and reproduce genuine EPP-level FlowControl backlog again -- see the
+    # full-contention case above for why the un-scaled sizing stopped
+    # working. 384 total is close to app1-flood's already-confirmed-working
+    # 352 (256+32+64).
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=64 WORKERS_APP2=64 WORKERS_END_USERS=256)
     ;;
   end-users-idle)
     # app1 is the higher-share tenant once end-users is excluded (66.7% vs

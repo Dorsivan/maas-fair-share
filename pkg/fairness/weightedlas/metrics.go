@@ -129,6 +129,18 @@ var (
 			Help:      help("Completed requests whose response carried no usage block, so no true-up was possible."),
 		}, []string{"fairness_id"})
 
+	// UNI-190: context-length rejections (HTTP 400, no usage block) are exempt
+	// from provisional charging by board decision -- see responseStatusKey and
+	// contextLengthStatusCode. This counts the reversed holds so the exemption
+	// is visible in metrics rather than only inferable from a ledger that stops
+	// leaking.
+	provisionalChargesExempted = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "provisional_charges_exempted_total",
+			Help:      help("Provisional charges reversed because the backend terminally rejected the request (context-length 400) before generating anything."),
+		}, []string{"fairness_id"})
+
 	// The headline shadow-mode reading: it decides whether
 	// cachedInputTokenWeight is a real lever and in whose favour. A flat zero
 	// across all groups means --enable-prompt-tokens-details is missing, not
@@ -160,6 +172,7 @@ func collectors() []prometheus.Collector {
 		unmatchedSubscriptions,
 		truingError,
 		requestsWithoutUsage,
+		provisionalChargesExempted,
 		cachedRatio,
 		enforcingGauge,
 	}

@@ -73,6 +73,25 @@ const maxLoggedUnmatched = 16
 // because attribute lifetime tracks the request so an abandoned one cannot leak.
 var provisionalChargeKey = fwkplugin.NewDataKey("provisional-cost", PluginType)
 
+// responseStatusKey holds the backend's HTTP status header, captured at
+// ResponseHeader so ResponseBody's no-usage branch (which runs on the body
+// phase, where Response.Headers is nil) can tell a terminally-unservable
+// rejection from a stream that was simply torn down. See UNI-190: a
+// context-length rejection (HTTP 400) sends no usage block, by design, so
+// without this the no-usage branch cannot distinguish "backend said no" from
+// "we never found out."
+var responseStatusKey = fwkplugin.NewDataKey("response-status", PluginType)
+
+// contextLengthStatusCode is vLLM's status for a context-length rejection.
+// This plugin never sees the response body, only the status header, so a
+// backend 400 that reaches ResponseBody's no-usage branch is treated as a
+// context-length rejection by proxy. In practice no other 400 cause reaches
+// that branch: malformed requests and auth failures are rejected before
+// PreRequest ever dispatches them (see UNI-148 C6, where only the oversized,
+// dispatched requests landed here). See UNI-190 for the board's scope
+// decision: exempt context-length 400s only, not 4xx/5xx broadly.
+const contextLengthStatusCode = "400"
+
 type provisionalCharge struct {
 	cost float64
 	at   time.Time
@@ -575,15 +594,31 @@ func (p *Plugin) ResponseBody(
 
 	if !ok {
 		// No usage block. Either a model server is missing
-		// --enable-force-include-usage, or the stream was torn down before the
-		// final chunk. Either way the provisional charge stays: refunding would
-		// make abort-spam free, and the charge decays away on its own over a few
-		// half-lives if the request genuinely never ran.
+		// --enable-force-include-usage, the stream was torn down before the final
+		// chunk, or the backend rejected the request outright (context-length
+		// 400) before it ever generated anything. The first two cases keep the
+		// provisional charge: refunding on abort would make abort-spam free, and
+		// the charge decays away on its own over a few half-lives if the request
+		// genuinely never ran. The third case is handled below.
 		requestsWithoutUsage.WithLabelValues(boundID(id)).Inc()
 		if response.TerminationCause == fwkrc.TerminationCauseNatural {
 			fields := append([]any{"plugin", p.name, "group", id,
 				"band", request.Objectives.Priority, "enforcing", p.cfg.Enforce}, corr.logFields()...)
 			log.FromContext(ctx).V(1).Info("response completed with no usage block; check --enable-force-include-usage", fields...)
+		}
+		// UNI-190: the board decided a context-length rejection (HTTP 400) is
+		// terminally unservable through no fault of the tenant's traffic pattern
+		// -- the oversized prompt was rejected before a token was generated, so
+		// it should never have reached the ledger at ~9-10x a served request's
+		// cost. Reverse the hold with the same decayed true-up chargeInflight
+		// uses for a measured actual of zero, rather than booking it, so the
+		// tab ends up exactly as if PreRequest had never charged it.
+		if status, haveStatus := fwksched.ReadRequestAttribute[string](request, responseStatusKey); haveStatus && status == contextLengthStatusCode {
+			if charged {
+				gs.chargeInflight(now, -charge.cost, now.Sub(charge.at).Seconds())
+			}
+			provisionalChargesExempted.WithLabelValues(boundID(id)).Inc()
+			return
 		}
 		// No true-up will ever follow this charge, so the estimate IS the cost
 		// actually charged -- book it now, under the contention decided at
@@ -650,13 +685,24 @@ func (p *Plugin) ResponseBody(
 // Suppressible via cfg.EmitAttributionHeaders: this is a tenant's own
 // classification, but it is also internal detail some deployments may not
 // want on the wire.
+//
+// Also records the backend status (see responseStatusKey) regardless of
+// EmitAttributionHeaders -- that flag only governs what goes back to the
+// caller, and this is internal bookkeeping ResponseBody needs for the
+// provisional-charge exemption, not an attribution header.
 func (p *Plugin) ResponseHeader(
 	_ context.Context,
 	request *fwksched.InferenceRequest,
 	response *fwkrc.Response,
 	_ *datalayer.EndpointMetadata,
 ) {
-	if !p.cfg.EmitAttributionHeaders || request == nil || response == nil {
+	if request == nil || response == nil {
+		return
+	}
+	if status, ok := response.Headers["status"]; ok {
+		request.PutAttribute(responseStatusKey, status)
+	}
+	if !p.cfg.EmitAttributionHeaders {
 		return
 	}
 	corr, ok := fwksched.ReadRequestAttribute[correlation](request, correlationKey)

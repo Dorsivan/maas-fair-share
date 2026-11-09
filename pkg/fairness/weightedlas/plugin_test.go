@@ -305,6 +305,68 @@ func TestProvisionalTrueUp(t *testing.T) {
 	assert.Zero(t, gs.provisionalTotal)
 }
 
+// 8a2. UNI-190: a context-length rejection (HTTP 400, no usage block) must be
+// fully reversed, not booked -- the board's decision was to exempt it
+// entirely, not cap it. Before this fix, ResponseBody's no-usage branch
+// treated every no-usage completion the same way and permanently booked the
+// oversized prompt's own dispatch-time estimate.
+func TestContextLengthRejectionIsExemptFromProvisionalCharge(t *testing.T) {
+	t.Parallel()
+	// A dedicated, unused group name: contendedServiceTokens and
+	// provisionalChargesExempted are package-global CounterVecs shared across
+	// every parallel test in this package, so reusing "a-group"/"b-group" here
+	// would make the ledger assertion below flaky against unrelated tests'
+	// charges. See TestContendedServiceTokensEqualChargedCost for the same
+	// convention.
+	const group = "ctx-length-exempt-group"
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupConfig{
+		{Name: group, Weight: 1, Match: GroupMatch{Exact: []string{group}}},
+	}
+	cfg.DefaultGroup = DefaultGroupConfig{Name: "ctx-length-exempt-fallback", Weight: 1}
+	cfg.ProvisionalCharge = true
+	cfg.HalfLifeSeconds = 60
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+	gs := p.states[group]
+
+	// Contended at dispatch, same as UNI-148's C6 run -- otherwise this test
+	// cannot distinguish the fix from "never contended, so never booked anyway."
+	p.lastContendedUnixNano.Store(clock.now().UnixNano())
+
+	maxTokens := int64(1000)
+	req := &fwksched.InferenceRequest{
+		FairnessID:       group,
+		RequestSizeBytes: 80000, // a deliberately oversized prompt, like UNI-148's C6
+		Body:             &fwkrh.InferenceRequestBody{MaxOutputTokens: &maxTokens},
+	}
+	require.NoError(t, p.PreRequest(ctx, req, nil))
+	assert.Positive(t, gs.normalizedService(clock.now()), "the hold must land on the tab at dispatch")
+	assert.Equal(t, int64(1), gs.inFlight)
+
+	clock.advance(30 * time.Second)
+
+	// The backend rejects the request before generating anything: status 400,
+	// no usage block. ResponseHeader runs first, same as in production.
+	p.ResponseHeader(ctx, req, &fwkrc.Response{Headers: map[string]string{"status": "400"}}, nil)
+	resp := &fwkrc.Response{
+		EndOfStream:      true,
+		TerminationCause: fwkrc.TerminationCauseNatural,
+	}
+	p.ResponseBody(ctx, req, resp, nil)
+
+	assert.InDelta(t, 0, gs.normalizedService(clock.now()), 1e-9,
+		"the hold must be fully reversed, leaving the tab exactly as if it had never been charged")
+	assert.Zero(t, gs.inFlight)
+	assert.Zero(t, gs.provisionalTotal)
+
+	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues(group))
+	assert.Zero(t, got, "an exempted request must never reach the SLI ledger")
+
+	exempted := testutil.ToFloat64(provisionalChargesExempted.WithLabelValues(group))
+	assert.Equal(t, float64(1), exempted)
+}
+
 // 8b. Estimator independence -- the decisive test for the DECAYED correction.
 //
 // The provisional charge decays for the whole generation. Adding the raw

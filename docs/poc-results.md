@@ -4748,6 +4748,59 @@ ticket if the gateway maintainers want to chase it further; not attempted here
 given the risk/cost of repeatedly triggering cluster-side connection hangs to
 gather a larger sample.
 
+### Policy decision and implementation: context-length rejections are exempt from provisional charging
+
+The board resolved the finding-1 policy question: **exempt entirely**, scoped
+to **context-length 400s only** (not the broader 4xx/5xx classes also offered
+as an option). Implemented in `pkg/fairness/weightedlas/plugin.go`:
+
+- `ResponseHeader` now records the backend's HTTP status (the `status` entry
+  of `response.Headers`) onto the request as a new attribute
+  (`responseStatusKey`), unconditionally — this is internal bookkeeping for
+  `ResponseBody`, not one of the attribution headers `cfg.EmitAttributionHeaders`
+  gates. `ResponseBody`'s own `response.Headers` is nil during body processing
+  (confirmed against this extension point, same as the existing
+  `ResponseHeader` doc comment), so the status has to be captured one hook
+  earlier and threaded through.
+- `ResponseBody`'s no-usage branch checks that attribute: a `400` means the
+  backend rejected the request before generating anything. Instead of booking
+  the dispatch-time estimate permanently (the prior, by-design behavior that
+  produced finding 1's ~9-10x leak), it now reverses the hold with the same
+  decayed `chargeInflight` true-up a normal completion uses for an actual cost
+  of zero — so the tab ends up exactly as if `PreRequest` had never charged it,
+  not merely "not worse." A new counter,
+  `maas_fairness_provisional_charges_exempted_total{fairness_id}`, counts the
+  reversals so the exemption is visible in metrics instead of only inferable
+  from a ledger that stops leaking.
+- **Scope caveat, by construction, not by choice:** this plugin never sees the
+  response body, only the status header — `fwkrc.Response` carries no raw body
+  field a request-control plugin can inspect. So the exemption is implemented
+  as "backend 400 with no usage block," a status-code proxy for "context-length
+  rejection," not a literal match on the error type. In this system that proxy
+  is exact in practice: the C6 evidence above (UNI-148) shows other 400 causes
+  (bad auth, malformed request) are rejected before `PreRequest` ever dispatches
+  them, so they never reach the no-usage branch at all — only the dispatched,
+  then-rejected, oversized-prompt case does. A future error class that reaches
+  dispatch and also returns 400 for a different reason would be swept into this
+  exemption too; narrowing further would require either a body-parsing hook
+  this framework version does not expose to request-control plugins, or the
+  backend tagging its own rejection reason into a response header.
+- Covered by a new unit test,
+  `TestContextLengthRejectionIsExemptFromProvisionalCharge`
+  (`pkg/fairness/weightedlas/plugin_test.go`), which drives `PreRequest` with
+  an oversized-prompt-shaped request, confirms the hold lands on the tab at
+  dispatch (reproducing finding 1's precondition), then drives `ResponseHeader`
+  with `status: 400` and a no-usage `ResponseBody`, and asserts the tab returns
+  to exactly zero, in-flight accounting clears, the SLI ledger
+  (`contendedServiceTokens`) never sees the charge, and the new exemption
+  counter increments. `go build ./...` and `go test ./pkg/fairness/weightedlas/...`
+  both pass.
+- Not re-run live against the cluster: UNI-148's and this ticket's own live
+  repros already captured the exact request shape and charging behavior this
+  fix targets, and `enforce` is `false` cluster-wide (shadow mode) so a live
+  re-run would not change cluster-visible behavior, only increment metrics a
+  unit test already covers precisely.
+
 ## UNI-149: C5, `client-aborts` — provisional holds clear, but the no-usage code path never fired
 
 [UNI-117](/UNI/issues/UNI-117)'s edge-case plan, first of the D/post-C-series
@@ -5552,7 +5605,7 @@ Ordered by how much they would change a conclusion.
 | — | ~~Retune `end-users-idle`'s app1:app2 worker ratio to match its 2:1 target, re-run (UNI-104)~~ | **Done, PASS.** `WORKERS_APP1` moved from 128 to 64 (keeping `WORKERS_APP2=32`), matching the offered-worker ratio to the pair's actual 2:1 target share ratio instead of reusing `full-contention`'s 4:1 dominant-tenant figure. Live re-run 2026-10-29: 68.4/31.6% against a 66.7/33.3% target (1.8pt max deviation) -- **PASS**. `contended_seconds_total` deltas (app1 1.46s, app2 1.50s) confirm both tenants were genuinely contending. Why the 4:1 ratio overshot so much more than 2:1 undershoots remains unexplained, same as UNI-103 left it -- see "UNI-104," below | root cause of the ratio's exact sensitivity: pending [UNI-100](/UNI/issues/UNI-100)'s scope decision |
 | — | ~~Build the timeline/chaos harness for the edge-case plan (UNI-127)~~ | **Done, development only.** Per-tenant join/leave + duty-cycle timing, EPP-pod-delete and vLLM-scale chaos hooks, windowed per-tenant share, and a time-to-converge figure -- see "UNI-127," above, for the full story including the live finding that a chaos scale-restore's actual capacity recovery (~3m39s on this backend) lags its patch by far more than a short `CHAOS_SCALE_HOLD` accounts for. `full-contention` regression confirmed the whole-run verdict is unchanged. No B1-B4/E1/E2 case was run or scored -- that is every ticket after this one in the chain | the board's edge-case cases themselves (B1-B4, E1, E2, "app3 joins at saturation"), each its own ticket |
 | — | ~~`MaaSSubscription` named `enduser-foo` for D2 (UNI-129)~~ | **Done.** Board approved and granted `create`/`get`/`list`/`watch` on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` to this role (narrowly, no write verbs). `enduser-foo` created, a key minted against it, and D2's specific case smoke-tested live: 70/70 requests `200`, `llm_d_epp_maas_fairness_unmatched_subscriptions_total` moved `0` -> `70`, confirming classification into `unclassified` | — |
-| 17 | **Decide whether terminally-unservable requests should be exempted/capped from provisional charging** | [UNI-148](/UNI/issues/UNI-148) (C6) found context-length rejections charged ~9-10x a normal request's cost, permanently (the ledger's own G2 cross-check flags it FAIL) -- by design, not a bug in the strict sense, but the design predates this evidence. The ~300s EPP/client timing gap this raised is now resolved: [UNI-190](/UNI/issues/UNI-190) live-reproduced it as a stuck gateway (Envoy/Istio) reply-path connection downstream of both vLLM and the EPP, confirmed **not** retry-amplified (one charge per request, same as finding 1 above) -- see "UNI-190," above | a policy decision |
+| — | ~~Decide whether terminally-unservable requests should be exempted/capped from provisional charging (UNI-148/UNI-190)~~ | **Done.** [UNI-148](/UNI/issues/UNI-148) (C6) found context-length rejections charged ~9-10x a normal request's cost, permanently (the ledger's own G2 cross-check flags it FAIL). [UNI-190](/UNI/issues/UNI-190) resolved the ~300s EPP/client timing gap this raised (a stuck gateway reply-path connection, confirmed not retry-amplified) and the board then decided the policy question: **exempt entirely, context-length 400s only**. Implemented in `pkg/fairness/weightedlas/plugin.go` -- the no-usage branch now reverses the dispatch-time hold via the same decayed true-up a normal completion uses, instead of booking it, when the backend's status (captured at `ResponseHeader`, since `ResponseBody`'s own headers are nil) is 400. Covered by `TestContextLengthRejectionIsExemptFromProvisionalCharge`; `go build ./...` and the package's tests pass. See "Policy decision and implementation," above, under UNI-190 | N/A -- closed |
 | 18 | **Live-exercise the no-usage/`ClientDisconnect` accounting path** | [UNI-149](/UNI/issues/UNI-149) (C5) confirmed provisional holds clear and the accounting-leak condition stays quiet, but found a graceful client-side cancel (killing the loadgen's own curl) never actually produces a no-usage response on this stack -- vLLM keeps generating and the EPP trues up against real usage instead, so `TestAbortedRequestStillBooksContendedService`'s own code path remains unverified live. Needs a harder abort (TCP-level severance, or killing the backend mid-stream) to reach it | a loadgen capability this chain's harness doesn't have yet |
 | 19 | **`ENFORCE_LIVE`'s pod-recreate races the Job's first request wave** | [UNI-150](/UNI/issues/UNI-150) (C4) traced a batch of HTTP 500s (56 of them, 20-30% of app1/app2's requests) to a single 339ms window immediately after an `ENFORCE_LIVE` config flip recreates the EPP pod -- confirmed via the gateway access log: those requests never reached a vLLM backend at all, timestamped seconds after the benchmark applied the loadgen Job. `15-fairness-benchmark.sh` currently only waits for `llm_d_epp_maas_fairness_enforcing=1` to read back on both EPPs' metrics before applying the Job; it does not confirm the new pod/route mapping is actually accepting traffic. Harmless to every `ENFORCE_LIVE` run's actual fairness/ledger numbers so far (the failures land in a fixed one-time window, not spread through the run), but inflates the "overwhelmingly 200" status-tally check `run.sh` itself prints, and would confound a ticket that specifically needed a clean status tally | a short readiness probe (e.g. one throwaway request) after the enforce-flip confirms, before the Job is applied |
 

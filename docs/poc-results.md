@@ -5605,8 +5605,8 @@ Ordered by how much they would change a conclusion.
 | — | ~~Retune `end-users-idle`'s app1:app2 worker ratio to match its 2:1 target, re-run (UNI-104)~~ | **Done, PASS.** `WORKERS_APP1` moved from 128 to 64 (keeping `WORKERS_APP2=32`), matching the offered-worker ratio to the pair's actual 2:1 target share ratio instead of reusing `full-contention`'s 4:1 dominant-tenant figure. Live re-run 2026-10-29: 68.4/31.6% against a 66.7/33.3% target (1.8pt max deviation) -- **PASS**. `contended_seconds_total` deltas (app1 1.46s, app2 1.50s) confirm both tenants were genuinely contending. Why the 4:1 ratio overshot so much more than 2:1 undershoots remains unexplained, same as UNI-103 left it -- see "UNI-104," below | root cause of the ratio's exact sensitivity: pending [UNI-100](/UNI/issues/UNI-100)'s scope decision |
 | — | ~~Build the timeline/chaos harness for the edge-case plan (UNI-127)~~ | **Done, development only.** Per-tenant join/leave + duty-cycle timing, EPP-pod-delete and vLLM-scale chaos hooks, windowed per-tenant share, and a time-to-converge figure -- see "UNI-127," above, for the full story including the live finding that a chaos scale-restore's actual capacity recovery (~3m39s on this backend) lags its patch by far more than a short `CHAOS_SCALE_HOLD` accounts for. `full-contention` regression confirmed the whole-run verdict is unchanged. No B1-B4/E1/E2 case was run or scored -- that is every ticket after this one in the chain | the board's edge-case cases themselves (B1-B4, E1, E2, "app3 joins at saturation"), each its own ticket |
 | — | ~~`MaaSSubscription` named `enduser-foo` for D2 (UNI-129)~~ | **Done.** Board approved and granted `create`/`get`/`list`/`watch` on `maassubscriptions.maas.opendatahub.io` in `models-as-a-service` to this role (narrowly, no write verbs). `enduser-foo` created, a key minted against it, and D2's specific case smoke-tested live: 70/70 requests `200`, `llm_d_epp_maas_fairness_unmatched_subscriptions_total` moved `0` -> `70`, confirming classification into `unclassified` | — |
-| — | ~~Decide whether terminally-unservable requests should be exempted/capped from provisional charging (UNI-148/UNI-190)~~ | **Done.** [UNI-148](/UNI/issues/UNI-148) (C6) found context-length rejections charged ~9-10x a normal request's cost, permanently (the ledger's own G2 cross-check flags it FAIL). [UNI-190](/UNI/issues/UNI-190) resolved the ~300s EPP/client timing gap this raised (a stuck gateway reply-path connection, confirmed not retry-amplified) and the board then decided the policy question: **exempt entirely, context-length 400s only**. Implemented in `pkg/fairness/weightedlas/plugin.go` -- the no-usage branch now reverses the dispatch-time hold via the same decayed true-up a normal completion uses, instead of booking it, when the backend's status (captured at `ResponseHeader`, since `ResponseBody`'s own headers are nil) is 400. Covered by `TestContextLengthRejectionIsExemptFromProvisionalCharge`; `go build ./...` and the package's tests pass. See "Policy decision and implementation," above, under UNI-190 | N/A -- closed |
-| 18 | **Live-exercise the no-usage/`ClientDisconnect` accounting path** | [UNI-149](/UNI/issues/UNI-149) (C5) confirmed provisional holds clear and the accounting-leak condition stays quiet, but found a graceful client-side cancel (killing the loadgen's own curl) never actually produces a no-usage response on this stack -- vLLM keeps generating and the EPP trues up against real usage instead, so `TestAbortedRequestStillBooksContendedService`'s own code path remains unverified live. Needs a harder abort (TCP-level severance, or killing the backend mid-stream) to reach it | a loadgen capability this chain's harness doesn't have yet |
+| — | ~~Decide whether terminally-unservable requests should be exempted/capped from provisional charging (UNI-148/UNI-190/UNI-213)~~ | **Done.** [UNI-148](/UNI/issues/UNI-148) (C6) found context-length rejections charged ~9-10x a normal request's cost, permanently. [UNI-190](/UNI/issues/UNI-190) exempted context-length `400`s only; [UNI-213](/UNI/issues/UNI-213) (the board's follow-up) widened that to any no-usage completion that never delivered anything -- any error status, a stream reset, or a cancelled context -- and found + fixed a real bug in UNI-190's own implementation along the way: it read the backend status from `response.Headers["status"]`, but Envoy's ext_proc HeaderMap represents it as the pseudo-header `":status"`, so the exemption had never actually fired on real traffic. Fixed, redeployed (the running EPP image had also silently been stale since `fc27130`, 2026-10-22 -- neither UNI-190's nor UNI-213's code had ever been live before this ticket), and confirmed live: `provisional_charges_exempted_total{app2,reason="error_status"}` incremented exactly once per no-usage completion, matching `requests_without_usage_total{app2}` 1:1, with zero reaching the SLI ledger. See "UNI-213," below, for the full story | N/A -- closed |
+| 18 | **Live-exercise the no-usage/`ClientDisconnect` accounting path** | [UNI-149](/UNI/issues/UNI-149) (C5) confirmed provisional holds clear and the accounting-leak condition stays quiet, but found a graceful client-side cancel (killing the loadgen's own curl) never actually produces a no-usage response on this stack -- vLLM keeps generating and the EPP trues up against real usage instead, so the no-usage/stream-reset code path (now `TestStreamResetIsRefunded`/`TestStreamResetNeverReachesContendedService`, UNI-213) remains unverified live. [UNI-213](/UNI/issues/UNI-213)'s own C5 re-run reproduced the identical finding (`truing_error_tokens_count` still equals `dispatch_total` for every group, aborts included) -- still needs a harder abort (TCP-level severance, or killing the backend mid-stream) to reach it | a loadgen capability this chain's harness doesn't have yet |
 | 19 | **`ENFORCE_LIVE`'s pod-recreate races the Job's first request wave** | [UNI-150](/UNI/issues/UNI-150) (C4) traced a batch of HTTP 500s (56 of them, 20-30% of app1/app2's requests) to a single 339ms window immediately after an `ENFORCE_LIVE` config flip recreates the EPP pod -- confirmed via the gateway access log: those requests never reached a vLLM backend at all, timestamped seconds after the benchmark applied the loadgen Job. `15-fairness-benchmark.sh` currently only waits for `llm_d_epp_maas_fairness_enforcing=1` to read back on both EPPs' metrics before applying the Job; it does not confirm the new pod/route mapping is actually accepting traffic. Harmless to every `ENFORCE_LIVE` run's actual fairness/ledger numbers so far (the failures land in a fixed one-time window, not spread through the run), but inflates the "overwhelmingly 200" status-tally check `run.sh` itself prints, and would confound a ticket that specifically needed a clean status tally | a short readiness probe (e.g. one throwaway request) after the enforce-flip confirms, before the Job is applied |
 
 ## Reproducing
@@ -8049,3 +8049,213 @@ job.batch/maas-loadgen   Complete   1/1           4m20s      12m
 `results/20261109T171935Z-uni-211-h2-shadow-baseline/` (shadow mode, unfixed threshold -- Step 1 evidence),
 `results/20261109T173014Z-uni-211-h2-fixed-ours/` (first post-fix enforcing re-run),
 `results/20261109T174820Z-uni-211-h2-fixed-ours-retry/` (repeat, confirms mechanism B reproduces deterministically).
+
+## UNI-213: widening the provisional-charge exemption beyond context-length 400 -- and finding the exemption had never actually fired
+
+[UNI-148](/UNI/issues/UNI-148) (C6) found rejected/errored requests charged ~9-10x a normal
+request's cost, permanently. [UNI-190](/UNI/issues/UNI-190) answered the board's policy
+question narrowly: exempt context-length `400`s only. This ticket is the board's follow-up
+from the [UNI-117 results review](/UNI/issues/UNI-117#document-results), asking for the
+broader fix UNI-190 deliberately didn't make: refund the provisional charge whenever a
+request ends without a usage block for *any* reason that means nothing was delivered -- an
+error status (not just `400`), a stream reset, or a cancelled context -- while still keeping
+the charge for the one case that must stay charged (a model server missing
+`--enable-force-include-usage` on a request it actually served).
+
+### Scope decision
+
+UNI-190's own text treated this as still open ("other no-usage causes... are unchanged") and
+explicitly reserved the broader question for the board. Read against UNI-148's own C6 data --
+14 of app2's 49 oversized-prompt requests came back a real `500`, not `400`, and stayed charged
+under UNI-190's scope -- this ticket's "error status, stream reset, or context cancel" wording
+is that broader decision, not a request to relitigate UNI-190's `400`-only call. Implemented
+accordingly in `pkg/fairness/weightedlas/plugin.go`:
+
+- A backend error status (`ResponseHeader`-captured, `TerminationCauseNatural`, any non-2xx --
+  generalizing UNI-190's literal `400` check) is refunded.
+- A stream reset (`TerminationCauseClientDisconnect` -- a client disconnect, an Envoy
+  drain/restart, or an upstream reset; the framework cannot and does not try to tell these
+  apart) is refunded. This reverses the plugin's original anti-abort-spam design, which kept
+  the charge on every no-usage completion precisely to stop a client from getting free compute
+  by aborting -- the board's decision here is that the charge should go to zero either way, so
+  that disincentive moves to CODE module.
+- A cancelled context (`TerminationCauseError` -- an EPP-side failure, or a cancellation that
+  reached the EPP before its propagation completed) is refunded.
+- `TerminationCauseEvicted` is deliberately **not** touched: an eviction is the EPP's own
+  capacity-reclaim decision, a different question this ticket doesn't name.
+- `provisional_charges_exempted_total` gained a `reason` label
+  (`error_status`/`stream_reset`/`context_cancel`) so the three paths are distinguishable in
+  metrics, not just inferable from a ledger that stops leaking.
+- New/updated unit tests cover every termination path: `TestGenericErrorStatusIsRefunded`,
+  `TestContextCancelIsRefunded`, `TestMissingUsageFlagStillBooksTheEstimate` (the regression
+  guard for the one case that must stay charged), `TestEvictedStreamStillBooksTheEstimate`,
+  and `TestStreamResetIsRefunded`/`TestStreamResetNeverReachesContendedService` (replacing the
+  two tests, `TestAbortKeepsTheEstimate`/`TestAbortedRequestStillBooksContendedService`, that
+  asserted the now-reversed abort-spam-prevention behavior).
+
+### A real bug found on the first live re-run: the exemption had never once fired
+
+The first live C6 re-run against the newly-deployed image (`results/20261109T182840Z-uni-213-c6-rerun2/`)
+came back with `requests_without_usage_total{app2}=32` -- the expected count, matching
+UNI-148's original finding exactly -- but **`provisional_charges_exempted_total` did not
+appear anywhere in the metrics snapshot.** The EPP's own log explained why: the
+"check `--enable-force-include-usage`" fallback message (gated on the no-usage branch
+*not* matching any exemption reason) fired for all 32 of app2's completions, meaning the
+exemption logic classified every one of them as "served, not exempted" -- the wrong answer,
+since these are app2's oversized-prompt rejections, the exact case this ticket (and UNI-190
+before it) targets.
+
+Root cause: `ResponseHeader` read the backend's status from `response.Headers["status"]`.
+Envoy's ext_proc `HeaderMap` is HTTP/2-shaped internally and represents the response status
+line as the pseudo-header **`:status`** (leading colon), even when the real upstream speaks
+HTTP/1.1 (`pkg/epp/handlers/response.go` in `llm-d-router@v0.11.0` copies `header.Key`
+verbatim from Envoy's `ResponseHeaders` message with no stripping). There is no plain
+`"status"` key. UNI-190's own unit test constructed its fixture with the same wrong key
+(`Headers: map[string]string{"status": "400"}`), so it exercised the bug's own assumption
+instead of the real header shape and passed anyway. Fixed the lookup to `":status"` and
+corrected all three existing header fixtures in `plugin_test.go` to match. This bug predates
+this ticket (introduced in UNI-190) but was never caught before now, for a second reason
+below.
+
+### A second, separate gap: the running EPP image was stale since before UNI-148 existed
+
+Before re-running anything, the deployed EPP image digest
+(`sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135`, referenced by all
+six manifests under `deploy/`) traced back to commit `fc27130` (2026-10-22, per
+`docs/runbook.md`'s own publish log) -- **before UNI-190's and this ticket's `plugin.go`
+changes existed at all.** `git log fc27130..HEAD -- pkg/fairness/weightedlas/` shows exactly
+two commits since that build: UNI-190 and this one, so the blast radius is contained to the
+provisional-charge exemption specifically, not the rest of the edge-case chain. Rebuilt via
+the existing `maas-epp-quay-publish` `BuildConfig` (no local `podman` on this host, same
+no-local-build-tool path `docs/runbook.md` documents for UNI-29) from this ticket's `HEAD`
+twice -- once before the `:status` fix (`sha256:6918308d...`, confirmed the bug live) and once
+after (`sha256:b0bc21af...`, confirmed the fix live) -- and re-pinned all six manifests both
+times, per the ticket's own "build and deploy through the normal image-pinning path"
+instruction. **One self-inflicted mistake along the way, caught and reverted within
+seconds:** `oc apply -f deploy/llmisvc.yaml` for the first digest bump also created a second,
+previously-unapplied `LLMInferenceService` (`maas-shared-model`, 2 GPU replicas) that
+manifest happens to define -- not something this ticket touches on purpose. Deleted
+immediately (`oc delete llminferenceservice maas-shared-model`); the GPU backend
+(`maas-vllm-gpu`'s own two pods) was never touched, only its scheduler pod recreated for the
+image bump, as intended. Every apply after that targeted `deploy/poc/09-vllm-gpu.yaml` only.
+
+### C6 re-run (`OVERSIZED_FRACTION_APP2=1`, `full-contention`), against the corrected, deployed build
+
+**Setup:** full-contention (app1/app2/end-users, 32/32/128 workers), live against
+`maas-vllm-gpu` (2 replicas, llama-3-1-8b), `ENFORCE_LIVE=true`, `OVERSIZED_FRACTION_APP2=1`,
+`OVERSIZED_PROMPT_WORDS_APP2=12000` -- identical setup to UNI-148's original C6 run. EPP image
+`sha256:b0bc21af3ebb7889cb20b574371e53a2b33c7efd610e73db48a60bccfa6acf4d`. Run
+`2026-11-09T18:49:14Z`-`18:54:39Z` (`results/20261109T184803Z-uni-213-c6-rerun3/`).
+
+**Verdict: UNCONTENDED** (benchmark's own weighted-split check) -- `contended_seconds_total`
+stayed under 1s for every offered group. This is **not** a new confound this ticket
+introduced: [UNI-211](/UNI/issues/UNI-211), merged hours before this ticket started, fixed
+the saturation-detector threshold that was pool-wide-blocking dispatch on this exact
+scenario's sizing, and its own write-up already documents that `full-contention` now scores
+UNCONTENDED cluster-wide for a different, already-named reason (a prefix-cache
+endpoint-lock-in bug, [UNI-214](/UNI/issues/UNI-214), unassigned) -- see "UNI-211," above,
+"`full-contention`'s split check." A scenario that can still show genuine, scoreable split
+contention is UNI-214's own follow-up work, not something to re-derive inside this ticket by
+hand-tuning worker counts for one-off verification.
+
+**The refund mechanism itself, verified directly against the metric, independent of the
+UNCONTENDED condition:**
+
+| metric | before | after | delta |
+|---|---|---|---|
+| `requests_without_usage_total{app2}` | (absent) | `32` | +32 |
+| `provisional_charges_exempted_total{app2,reason="error_status"}` | (absent) | `32` | +32 |
+| `contended_service_tokens_total{app2}` | (absent) | (absent) | 0 |
+
+Every one of app2's 32 dispatched oversized-prompt requests (`dispatch_total{app2}=32`,
+matching exactly) hit the no-usage branch and was refunded under the generalized
+`error_status` reason -- not one fell through to the still-charged fallback. None of them ever
+reached the SLI ledger. This is the exact property UNI-148's G2 cross-check was built to
+police (client-recorded tokens for app2 are `0`; the EPP's own contended cost for app2 is now
+also effectively `0`, not the `~423612` UNI-148 found), confirmed by direct metric delta
+rather than inferred from a ledger that stayed quiet because it was never populated for
+*anyone* in this run.
+
+**The automated report's own G2 check still shows FAIL/`n/a` for all three groups, including
+app1 and end-users, who have nothing to do with this ticket.** This is a pre-existing
+limitation of `15-fairness-report.py` surfaced by UNCONTENDED, not evidence against the fix:
+with `contended_seconds`/`contended cost` absent for every group (nothing was ever contended),
+the script has no "EPP contended cost" figure to compare against any group's client-recorded
+tokens, and renders that absence as `n/a`/FAIL rather than "not applicable." Scoring a
+G2-style ledger PASS the way the ticket's "Done when" literally asks for would require either
+a genuinely contended `full-contention` run (blocked on UNI-214) or a report-script change to
+treat an UNCONTENDED run's ledger check as `N/A` instead of `FAIL` (not attempted here --
+out of this ticket's scope, and changing report semantics isn't something to do as a side
+effect of a plugin fix). The decisive evidence for this ticket's own claim is the direct
+metric delta above, not the report's derived verdict.
+
+Error rates: app1 1104/1111 (99.4%) `200` (7 `500`), end-users 4378/4444 (98.5%) `200`
+(64 `500`), app2 0/53 `200` by design (2 `400`, 19 `500`, 32 `000` -- same "backend 400,
+stuck gateway reply" signature UNI-190 diagnosed, now all captured by the EPP's own
+`ResponseHeader` as status `400`/`500` and refunded regardless of what the client ever saw).
+Both app1/end-users rates are consistent with this chain's usual ~97-99% background rate, not
+a regression.
+
+### C5 re-run (`ABORT_FRACTION_APP1=0.3`, `full-contention`) -- no regression
+
+**Setup:** identical to [UNI-149](/UNI/issues/UNI-149)'s original C5 run: full-contention,
+`ABORT_FRACTION_APP1=0.3`, `ENFORCE_LIVE=true`, `SETTLE_SECONDS=60`. Run
+`2026-11-09T18:59:40Z`-`19:05:02Z` (includes the 60s settle window),
+`results/20261109T185824Z-uni-213-c5-rerun/`.
+
+**Verdict: UNCONTENDED**, same UNI-214-tracked condition as the C6 re-run above, not a
+regression from this ticket's changes.
+
+**No regression, confirmed directly:** app1's 269/938 (28.7%, target 30%) aborted requests
+all still trued up against **real** usage, exactly like UNI-149 found before this ticket --
+`truing_error_tokens_count` equals `dispatch_total` exactly for every group (app1 925/925,
+app2 926/926, end-users 3688/3688, unclassified 7/7), and `requests_without_usage_total` /
+`provisional_charges_exempted_total` are both completely absent from this run's metrics. On
+this cluster's real gateway+vLLM stack, killing the loadgen's client-side connection still
+does not stop the backend from generating or suppress its usage block (same mechanism as
+["A killed open-loop client does not relieve the
+backend"](#a-killed-open-loop-client-does-not-relieve-the-backend), UNI-34) -- so this
+ticket's new stream-reset refund path (`TerminationCauseClientDisconnect`) was not exercised
+by this run, same as UNI-149 found for the pre-existing charge-keeping behavior it replaced.
+Outstanding-work item 18 (above) still needs a harder abort (TCP-level severance, or killing
+the backend mid-stream) to reach it live either way.
+
+Error rates: app2 926/937 (98.8%) `200` (11 `500`), end-users 3694/3739 (98.8%) `200`
+(45 `500`) -- consistent background rate, not a regression.
+
+### Cluster left as found
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|halfLifeSeconds:'
+      enforce: false
+      halfLifeSeconds: 60
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='{.spec.replicas}{"\n"}'
+2
+$ oc get llminferenceservice -n maas-fairness-poc
+NAME            URL                                                                                               READY   REASON   AGE
+maas-vllm-cpu   https://maas-gateway-maas-fairness-poc.apps.ocp.paladinaura.com/maas-fairness-poc/maas-vllm-cpu   True             26d
+maas-vllm-gpu   https://maas-gateway-maas-fairness-poc.apps.ocp.paladinaura.com/maas-fairness-poc/maas-vllm-gpu   True             25d
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m12s      9m4s
+```
+
+`enforce` restored to its steady-state `false`. `maas-vllm-gpu`'s replica count and both GPU
+backend pods were never touched -- only the scheduler pod was recreated, for each image bump,
+same as every `ENFORCE_LIVE` flip in this chain. The accidental `maas-shared-model`
+`LLMInferenceService` is gone; only the two real services remain. The EPP image is now
+permanently re-pinned to `sha256:b0bc21af...` across all six manifests (not reverted -- this
+is this ticket's actual fix, same convention UNI-211 used for its own config change). No
+orphaned `oc logs -f` capture processes left running.
+
+**Raw results:** `results/20261109T180911Z-uni-213-c6-rerun/` and
+`results/20261109T182840Z-uni-213-c6-rerun2/` (diagnostic runs against the stale, then
+`:status`-buggy image -- kept because they're the evidence the bug and the stale pin were
+real, not just asserted), `results/20261109T184803Z-uni-213-c6-rerun3/` (decisive C6 run,
+corrected build), `results/20261109T185824Z-uni-213-c5-rerun/` (C5 regression check).
+
+**Not proven:** a genuinely contended `full-contention` G2 ledger PASS for app2, as the
+ticket's "Done when" literally asks -- blocked on [UNI-214](/UNI/issues/UNI-214)'s scheduling-
+profile fix, not on anything in this ticket's own change. The refund mechanism's correctness
+is proven directly at the metric level instead (table above), which is strictly more precise
+than a derived ledger PASS would have been.

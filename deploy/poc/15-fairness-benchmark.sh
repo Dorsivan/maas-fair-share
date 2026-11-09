@@ -388,6 +388,50 @@ enforce_log() {
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
 OC="oc --token=${OPENSHIFT_TOKEN:?set OPENSHIFT_TOKEN} --server=${OPENSHIFT_SERVER:-https://api.ocp.paladinaura.com:6443}"
+
+# UNI-210: maas-poc-gateway-authn is controller-owned (odh-model-controller/
+# KServe regenerates it when an LLMInferenceService reconciles) and this
+# script's scenarios routinely patch spec.replicas / scheduler.config.ref on
+# exactly the LLMInferenceServices that trigger that reconcile -- chaos-scale,
+# ENFORCE_LIVE, LIVE_SET_*, twenty-group-scale all do. The UNI-33 header-
+# stripping patch (deploy/maas/09-objective-header-stripping.patch.yaml) was
+# found silently reverted live on 2026-11-09 after three weeks of such runs
+# with nothing re-checking it -- see docs/gateway-header-stripping.md and
+# UNI-210. Re-check and, if needed, re-apply before any run touches the
+# LLMInferenceServices, instead of trusting the last manual verification.
+objective_header_stripped() {
+  $OC get authpolicy maas-poc-gateway-authn -n "$NAMESPACE" -o json 2>/dev/null \
+    | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+headers = (d.get("spec", {}).get("rules", {}).get("response", {})
+            .get("success", {}).get("headers", {}))
+entry = headers.get("x-llm-d-inference-objective")
+sys.exit(0 if isinstance(entry, dict) and entry.get("plain", {}).get("expression") else 1)
+'
+}
+
+gateway_header_gate() {
+  if objective_header_stripped; then
+    enforce_log "UNI-210 gate: x-llm-d-inference-objective is stripped at maas-poc-gateway-authn"
+    return
+  fi
+  echo "[benchmark] WARNING: x-llm-d-inference-objective is NOT stripped at maas-poc-gateway-authn (UNI-210 regression) -- re-applying deploy/maas/09-objective-header-stripping.patch.yaml" >&2
+  enforce_log "UNI-210 gate: objective header NOT stripped at run start -- re-applying patch"
+  $OC patch authpolicy maas-poc-gateway-authn -n "$NAMESPACE" --type=merge \
+    --patch-file=deploy/maas/09-objective-header-stripping.patch.yaml >/dev/null
+  if objective_header_stripped; then
+    enforce_log "UNI-210 gate: re-applied patch, objective header now stripped"
+  else
+    echo "[benchmark] FATAL: x-llm-d-inference-objective is still not stripped at maas-poc-gateway-authn after re-applying the patch -- a measurement run now would be against a gateway where a forged header can jump every priority band. See docs/gateway-header-stripping.md and UNI-210." >&2
+    exit 1
+  fi
+}
+gateway_header_gate
+
 EPP_SELECTOR="${EPP_SELECTOR:-app.kubernetes.io/component=llminferenceservice-router-scheduler,app.kubernetes.io/name=maas-vllm-gpu}"
 EPP_CONTAINER="${EPP_CONTAINER:-main}"
 BACKEND="${BACKEND:-vllm-gpu (real)}"

@@ -41,6 +41,41 @@ log() { echo "[smoke] $*" | tee -a "$OUT/smoke.log"; }
 
 log "identity: $($OC whoami)"
 
+# --- UNI-210: this script patches maas-vllm-cpu's LLMInferenceService spec
+# (config.ref, replicas below), which triggers an odh-model-controller/KServe
+# reconcile that can regenerate the Gateway-scoped maas-poc-gateway-authn
+# AuthPolicy and silently drop the hand-applied UNI-33 header-stripping patch
+# -- found reverted live on 2026-11-09 after three weeks of such reconciling
+# runs with nothing re-checking it. Re-check and, if needed, re-apply before
+# touching the LLMISVC. See docs/gateway-header-stripping.md and UNI-210.
+objective_header_stripped() {
+  $OC get authpolicy maas-poc-gateway-authn -n "$NAMESPACE" -o json 2>/dev/null \
+    | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+headers = (d.get("spec", {}).get("rules", {}).get("response", {})
+            .get("success", {}).get("headers", {}))
+entry = headers.get("x-llm-d-inference-objective")
+sys.exit(0 if isinstance(entry, dict) and entry.get("plain", {}).get("expression") else 1)
+'
+}
+if objective_header_stripped; then
+  log "UNI-210 gate: x-llm-d-inference-objective is stripped at maas-poc-gateway-authn"
+else
+  log "WARNING: x-llm-d-inference-objective is NOT stripped at maas-poc-gateway-authn (UNI-210 regression) -- re-applying deploy/maas/09-objective-header-stripping.patch.yaml"
+  $OC patch authpolicy maas-poc-gateway-authn -n "$NAMESPACE" --type=merge \
+    --patch-file="$HERE/../maas/09-objective-header-stripping.patch.yaml" >/dev/null
+  if objective_header_stripped; then
+    log "UNI-210 gate: re-applied patch, objective header now stripped"
+  else
+    log "ABORT: x-llm-d-inference-objective still not stripped after re-applying the patch -- see docs/gateway-header-stripping.md and UNI-210"
+    exit 1
+  fi
+fi
+
 # --- preflight: nothing else on the pool, every key present -----------------
 active="$($OC get jobs -n "$NAMESPACE" -o jsonpath='{range .items[?(@.status.active)]}{.metadata.name}{" "}{end}')"
 if [ -n "$active" ]; then

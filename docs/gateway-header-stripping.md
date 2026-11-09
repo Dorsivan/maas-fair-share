@@ -273,6 +273,77 @@ run the live-snapshot command above:
 - and whenever a new route is added anywhere in front of an `InferencePool`
   on this cluster, which is the scenario the ticket is actually about.
 
+## UNI-210: the patch regressed live, undetected, for an unknown window
+
+On 2026-11-09, while running UNI-166's alert drill, `oc get authpolicy
+maas-poc-gateway-authn -n maas-fairness-poc -o yaml | grep -i objective`
+showed only the deprecated `x-gateway-inference-objective` alias overwritten
+— the exact pre-UNI-33 shape. A forged-header `curl` against the real GPU
+route (`app1-production` key, `x-llm-d-inference-objective:
+exploit-high-priority`) returned `HTTP 200`, identical to baseline: the
+mechanism this document closed on 2026-10-19 was gone.
+
+**What actually reverted it was not pinned down**, and this is itself the
+finding. OpenShift's event retention on this cluster only reaches back about
+an hour (`oc get events -n maas-fairness-poc` on 2026-11-09 returned nothing
+earlier than the same day), and `maas-poc-gateway-authn`'s
+`managedFields` carried no field-manager history to read. Its `Enforced`
+condition's `lastTransitionTime` read `2026-11-04T23:39:42Z` — five days
+before discovery — but a condition timestamp updating is not proof the
+*content* changed then; it is circumstantial at best, not cited as the
+cause.
+
+What is provable: between UNI-33 closing (2026-10-19) and this discovery
+(2026-11-09), roughly thirty scenario runs of
+[`deploy/poc/15-fairness-benchmark.sh`](../deploy/poc/15-fairness-benchmark.sh)
+(UNI-139 through UNI-168) and at least one run of
+[`deploy/poc/20-n-group-smoke.sh`](../deploy/poc/20-n-group-smoke.sh)
+patched `spec.replicas` / `spec.router.scheduler.config.ref` on
+`maas-vllm-gpu` or `maas-vllm-cpu` — chaos-scale, `ENFORCE_LIVE`,
+`LIVE_SET_*`, `twenty-group-scale`, and the smoke test's config-ref swap all
+do this. Each of those is exactly the kind of `LLMInferenceService`
+reconcile the patch file's own "RISK" section named as the thing that could
+regenerate `maas-poc-gateway-authn` from its template. Any one of those
+thirty-odd runs could have been the one that reverted it — **and none of
+them would have noticed**, because the "standing check" this document and
+`docs/runbook.md` prescribed was a command a human was supposed to remember
+to run before trusting a result, not something either script actually ran.
+`grep -rln gateway-header-check deploy/poc/*.sh` returned nothing before this
+incident: the conformance tool UNI-33 built was never wired into anything
+that runs automatically. That gap — not the specific revert — is what
+[[process_restore_does_not_fix_the_automation]] means by fixing the
+automation, not just the object.
+
+**Restored and reverified live, 2026-11-09**, by re-running the exact
+command in `deploy/maas/09-objective-header-stripping.patch.yaml`:
+`x-llm-d-inference-objective` is back in `maas-poc-gateway-authn`'s
+`spec.rules.response.success.headers` (confirmed by direct manifest
+inspection — the Go toolchain was not available in this session to rebuild
+`bin/gateway-header-check`, so the check was done by hand against the same
+criteria `conformance/gatewayheaders.Check` applies: both
+`maas-vllm-cpu-kserve-route` and `maas-vllm-gpu-kserve-route` parent
+`Gateway/maas-poc-gateway`, route to an `InferencePool` backend, and
+`maas-poc-gateway-authn` — targeting that Gateway — now overwrites the
+header). The before/after forged-header `curl` against the GPU route still
+returns `HTTP 200` either way, for the same reason UNI-33's original proof
+did: zero `InferenceObjective` resources exist on this cluster, so there is
+still no behavioral queue-jump to show either way — the fix is proven at the
+manifest/mechanism level, not behaviorally, exactly as it was in October.
+
+**Made harder to silently recur**: both `15-fairness-benchmark.sh` and
+`20-n-group-smoke.sh` now check `maas-poc-gateway-authn` for the header
+override before doing anything else, and re-apply
+`09-objective-header-stripping.patch.yaml` automatically if it is missing,
+aborting the run (not just warning) if the re-apply does not hold. This
+turns "standing check" from a sentence a human has to remember into a gate
+every run that can trigger the underlying revert actually passes through.
+It does not stop `odh-model-controller` from reverting the patch — that is
+still outside this repo's control — it stops a reverted patch from being
+invisible to the next hour-long measurement run the way it was for three
+weeks here. The manual live-snapshot command above is still worth running
+before trusting `docs/poc-results.md` numbers from any run *not* launched
+through one of those two scripts.
+
 ## What this does not cover
 
 - **`deploy/poc/02-epp.yaml` / `deploy/poc/03-gateway.yaml`, the pre-MaaS

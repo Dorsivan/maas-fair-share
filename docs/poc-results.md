@@ -7952,3 +7952,100 @@ No resources found in maas-fairness-poc namespace.
 **Raw results:**
 `results/20261109T134057Z-uni-168-ours/` (our image, enforcing, scored PASS on the split itself),
 `results/20261109T135007Z-uni-168-stock/` (stock v0.11.0 image + upstream-only config, report generated with `--control`).
+
+## UNI-211: H2 follow-up — the 43% throughput loss is a mis-tuned saturation-detector threshold, and fixing it uncovers a second, unfixed scheduling-profile bug
+
+**Why this ticket exists:** UNI-168 (H2) measured a 43% throughput loss and 2-3x p95 inflation against the stock EPP and attributed it to "fairness queueing." The board rejected that explanation: on a saturated pool a fair scheduler should reorder dispatch, not reduce it. This ticket root-causes the actual mechanism with live evidence, per the board's ask.
+
+### Step 1 (live): does shadow mode (`enforce: false`) show the same gap?
+
+`pkg/fairness/weightedlas/plugin.go`'s own doc comment (lines 26-30) states the weighted-fairness plugin does zero saturation checking -- "writing one would be a bug." If the throughput loss tracked `enforce`, the plugin would be the cause; if it didn't, the cause has to be the framework layer underneath it.
+
+Ran `full-contention` unmodified against the live cluster's already-shadow (`enforce: false`) steady state -- no config touched for this run:
+
+| run | enforce | total requests (240s) | avg p95 |
+|---|---|---|---|
+| UNI-168 "ours" | `true` | 3241 | ~19-28s (per group) |
+| `results/20261109T171935Z-uni-211-h2-shadow-baseline/` | `false` | 3297 | ~16.1s |
+| UNI-168 "stock" (no flow control at all) | n/a | 5651 | ~8.68s |
+
+Shadow mode reproduces the same ~42-43%-below-stock gap (3297 vs 5651) as enforcing mode, within noise. **The weighted-fairness policy is not the cause.** Both ours-enforcing and ours-shadow run with the `flowControl` feature gate on; stock's A/B comparator in UNI-168 had no fairness plugin loaded at all, and (per `cmd/epp/runner/runner.go:957-958` in `github.com/llm-d/llm-d-router@v0.11.0`) a config with the `flowControl` feature gate unset falls back to a completely different "legacy admission control" code path with no FlowController, no queueing, no saturation detector -- so the real A/B was never "fairness vs no fairness," it was "the FlowController framework vs no FlowController framework at all."
+
+### Mechanism A: the default saturation-detector threshold is calibrated for a different backend than this one (confirmed, fixed)
+
+Neither `deploy/poc/00-config.yaml` nor `deploy/epp-config.yaml` ever configured a `flowControl.saturationDetector` -- both silently inherit the framework default: `utilization-detector` (`pkg/epp/framework/plugins/flowcontrol/saturationdetector/utilization/config.go` in the `llm-d-router` module), `queueDepthThreshold: 5`, `headroom: 0.0`. `controller/internal/processor.go:328-347`'s `dispatchCycle` computes pool saturation once per cycle and, if `saturation >= usageLimit` (the usage-limit policy defaults to a **static 1.0 ceiling**, `pkg/epp/framework/plugins/flowcontrol/usagelimits/usagelimitpolicy.go`), **returns immediately without dispatching anything, for any group, at any priority** -- this is a pool-wide stop, not a per-group throttle.
+
+Live evidence from `results/20261109T134057Z-uni-168-ours/` and this ticket's own shadow-baseline run, both using the unfixed default:
+
+| metric | observed |
+|---|---|
+| `llm_d_epp_flow_control_pool_saturation` | spikes to **14.6** (i.e. 14.6x over the 1.0 gating ceiling) |
+| `llm_d_epp_average_running_requests` (both vLLM pods) | mostly pinned at **~4**, dips to 0 |
+| `llm_d_epp_average_queue_size` / `llm_d_epp_per_endpoint_queue_size` | climbs past **140-150** per endpoint |
+| `llm_d_epp_average_kv_cache_utilization` | **0** for the entire run (never the limiting resource) |
+
+The two real vLLM replicas are started with `--max-num-seqs 8` (`oc get deployment maas-vllm-gpu-kserve -o jsonpath='{.spec.template.spec.containers[0].args}'`), so a single endpoint's "waiting" queue growing past 5 under this benchmark's deliberate 12x over-offer is **not** a sign of distress -- it's the queue vLLM's own engine is designed to buffer. `results/20261109T135007Z-uni-168-stock/metrics-timeseries.txt` (no admission gate at all) shows exactly that: `average_running_requests` pegged at **7.5-8** throughout (i.e. both replicas running flat-out at their real cap) while `average_queue_size`/`per_endpoint_queue_size` settles at a **healthy steady-state of ~85-90 per endpoint** -- a threshold of 5 reads a perfectly normal, fully-utilised backend as 15-18x saturated and halts dispatch almost every cycle, which is why both pods sat at ~50% of their configured capacity (~4 of 8 running) instead of the ~8 stock achieved.
+
+**Fix** (config-only, `deploy/poc/00-config.yaml`): added an explicit `utilization-detector` plugin instance (`maas-saturation`) with `queueDepthThreshold: 150, headroom: 0.3`, derived directly from stock's measured natural steady state (comfortably above the observed ~85-90, well under the ~184 a genuinely pathological backlog would need to reach to still trip it), and pointed `flowControl.saturationDetector.pluginRef` at it. Applied live; the EPP reloaded cleanly (`Filters: [maas-saturation/utilization-detector]` in the new pod's startup log, `1/1 Running`, 0 restarts).
+
+Confirmed live (`results/20261109T173014Z-uni-211-h2-fixed-ours/`, `results/20261109T174820Z-uni-211-h2-fixed-ours-retry/`, both `ENFORCE_LIVE=true`): `llm_d_epp_flow_control_pool_saturation` now sits at a **steady ~0.61**, under the 1.0 ceiling for the entire run -- the pool-wide HoL block never fires. Mechanism A is fixed.
+
+### Mechanism B: fixing the gate exposes a second, pre-existing bug -- prefix-cache affinity permanently locks dispatch onto one endpoint (found, NOT fixed)
+
+With the gate open, total throughput did **not** recover (2969 and 2940 requests across the two re-runs, vs 3241 before the fix and 5651 for stock -- if anything the delta against stock got slightly worse, -47 to -48% vs the original -43%). The two post-fix runs' own `per_endpoint_queue_size` explain why, and reproduce **identically** both times:
+
+| endpoint | run 1 queue-size samples | run 2 queue-size samples |
+|---|---|---|
+| `...-bbhg4-rank-0` | climbs to 73, 151, 181-184 (28/31 non-zero) | climbs to 73, 151, 181-184 (28/31 non-zero) |
+| `...-vcrhp-rank-0` | **0 for all 28 samples, the entire 240s** | **0 for all 28 samples, the entire 240s** |
+
+One of the two vLLM replicas received **zero traffic for the whole run, both times.** `average_running_requests` sits at ~4 post-fix too -- not because of HoL blocking this time (saturation is a steady 0.61), but because only one of the two 8-seq-capacity replicas is ever in use. This exactly accounts for the missing throughput: ~2950 is almost precisely half of stock's 5651.
+
+The mechanism is in the scheduling profile's scorer weights (`deploy/poc/00-config.yaml`'s `schedulingProfiles`: `queue-scorer` 2.0, `kv-cache-utilization-scorer` 2.0, `prefix-cache-scorer` 3.0), read from the `llm-d-router@v0.11.0` source:
+
+- `prefix/plugin.go`'s `Score()` returns up to **1.0 per endpoint** based on prefix-cache match ratio/length, so a near-complete cache hit on one endpoint (this benchmark's prompts run **98.9% cached** in every run checked, ours and stock alike) earns that endpoint close to its full **3.0**-weighted share.
+- `queuedepth/queue.go`'s `Score()` is **min-max normalized across just the 2 candidates**: the shortest queue always scores a flat `1.0` and the longest always `0.0`, *regardless of the actual magnitude of the imbalance* -- so its maximum possible counter-pressure is capped at exactly **2.0**, whether the queue gap is 5 or 5000.
+- `kvcacheutilization/kvcache_utilization.go`'s `Score()` is `1 - KVCacheUsagePercent`; since `average_kv_cache_utilization` reads **0 on both pods** for this model/workload the entire time, this scorer assigns both endpoints an identical `1.0` and contributes **zero** differentiation.
+
+Net: once one endpoint wins even a handful of early picks and warms its prefix cache, its score advantage is a constant `+3.0 (prefix) - 2.0 (queue) = +1.0` over the other endpoint, **independent of how deep its queue grows** -- `max-score-picker` therefore keeps choosing it forever. There is no finite amount of queueing on the "hot" endpoint that can flip the decision back, because `queue-scorer`'s influence is capped by normalization, not by magnitude. This was always true of this scheduling profile; mechanism A's constant HoL-blocking (which reset/interrupted dispatch cycles unpredictably) was incidentally disrupting the lock-in before it could run to completion inside a 240s window -- removing mechanism A exposed mechanism B, it did not create it.
+
+**This is a scheduling-profile weighting/design decision (how prefix-cache affinity should trade off against inter-endpoint load balancing), not a contained threshold tweak** -- per this ticket's own instructions, it is named and handed to the board rather than patched unilaterally. Filed as [UNI-214](/UNI/issues/UNI-214), unassigned, scoped to redesign or reweight the scheduling profile so `queue-scorer` (or a replacement) can actually overcome prefix-cache lock-in under sustained imbalance.
+
+### H2 re-run verdict
+
+| | ours (pre-fix, UNI-168) | ours (post-fix, this ticket) | stock (UNI-168, unchanged) |
+|---|---|---|---|
+| total requests (240s) | 3241 | 2940-2969 | 5651 |
+| throughput delta vs stock | -42.6% | **-47.9% to -47.5%** | -- |
+| p95 (per group, approx) | 19.3-27.7s | 17.3s (all 3 groups) | 8.68-8.69s |
+| p95 delta vs stock | +122% to +220% | **+99%** | -- |
+
+**Verdict: still FAIL against the <5% bar**, for a different, now fully-named reason than UNI-168 reported. Mechanism A (saturation-threshold miscalibration) is confirmed and fixed; mechanism B (scheduling-profile prefix-cache lock-in) is confirmed, live, reproduced twice, and is the new blocker, tracked as UNI-214.
+
+**`full-contention`'s split check:** both post-fix runs scored **UNCONTENDED**, not PASS or FAIL (`max_abs_deviation_points` is reported but explicitly not the verdict under this condition -- see `docs/runbook.md`). This is not a dodge: fixing mechanism A means the EPP's own per-group `FlowQueue` now drains on almost every ~1ms dispatch cycle (nothing blocks `dispatchCycle` from calling `selectItem` any more), so no two groups are ever simultaneously backlogged *inside the fairness layer* -- `contended_seconds_total` stays under 1s for every group. The weighted-fairness policy's job (reorder contending groups) is trivially satisfied because there is no longer any contention for it to arbitrate; the lost throughput now lives entirely downstream, in the routing layer's endpoint-selection bug (mechanism B), which the fairness plugin's own metrics cannot see. A scenario that can still show genuine split contention after mechanism B is fixed is future work, tracked under UNI-214.
+
+### Cluster left as found
+
+```
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o json | jq '.spec.router.scheduler'
+{
+  "config": { "ref": { "key": "epp", "name": "maas-epp-config" } },
+  "replicas": 1,
+  "template": { "containers": [ { "image": "quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135", "imagePullPolicy": "Always", "name": "main", "resources": {} } ] }
+}
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|queueDepthThreshold|headroom|pluginRef: maas-saturation'
+      enforce: false
+      queueDepthThreshold: 150
+      headroom: 0.3
+    pluginRef: maas-saturation
+$ oc get jobs,pods -n maas-fairness-poc -l job-name=maas-loadgen
+NAME                     STATUS     COMPLETIONS   DURATION   AGE
+job.batch/maas-loadgen   Complete   1/1           4m20s      12m
+```
+
+`enforce` is back at its steady-state `false` (same as every prior ticket in this series leaves it). The `maas-saturation` detector config is **not** reverted -- unlike the `enforce`/image flips, it is this ticket's actual fix, confirmed correct by live evidence, and is now part of the committed manifest.
+
+**Raw results:**
+`results/20261109T171935Z-uni-211-h2-shadow-baseline/` (shadow mode, unfixed threshold -- Step 1 evidence),
+`results/20261109T173014Z-uni-211-h2-fixed-ours/` (first post-fix enforcing re-run),
+`results/20261109T174820Z-uni-211-h2-fixed-ours-retry/` (repeat, confirms mechanism B reproduces deterministically).

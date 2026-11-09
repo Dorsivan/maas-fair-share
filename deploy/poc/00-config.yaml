@@ -101,6 +101,33 @@ data:
       - type: prefix-cache-scorer
       - type: max-score-picker
 
+      # UNI-211: the framework's own default saturation detector
+      # (utilization-detector, queueDepthThreshold=5) is calibrated for a
+      # single endpoint running near-interactive load, not for this backend.
+      # The two real vLLM replicas are started with --max-num-seqs 8 (see
+      # `oc get deployment maas-vllm-gpu-kserve -o jsonpath='{.spec.template
+      # .spec.containers[0].args}'`), and under full-contention's deliberate
+      # 12x over-offer their own internal waiting queue (vLLM's
+      # num_requests_waiting, surfaced here as llm_d_epp_per_endpoint_
+      # queue_size) settles at a steady-state depth of ~85-90 per endpoint
+      # even when the backend is fully and continuously utilised (confirmed
+      # from the stock-EPP UNI-168 comparison run, which has no admission
+      # gate at all: average_running_requests pegged at 7.5-8 throughout,
+      # average_queue_size steady around 86-89). A threshold of 5 reads that
+      # healthy backlog as 15-18x over saturated and makes dispatchCycle's
+      # HoL block (saturation >= usageLimit) fire on almost every cycle --
+      # see docs/poc-results.md "UNI-211" for the live evidence this was
+      # built from. 150 (headroom 0.3) sits comfortably above the observed
+      # steady state while still catching genuine runaway backlog; it is not
+      # a universal number and must be re-derived (same method: compare
+      # against a no-admission-control baseline) for any other backend or
+      # --max-num-seqs value -- see docs/design.md.
+      - type: utilization-detector
+        name: maas-saturation
+        parameters:
+          queueDepthThreshold: 150
+          headroom: 0.3
+
     flowControl:
       # 300s here, against 60s in deploy/epp-config.yaml, and this is the one
       # POC deviation that is NOT a simplification.
@@ -120,6 +147,8 @@ data:
       # reproduce. Watch llm_d_epp_flow_control_requests_evicted_total: if it
       # is non-zero in a run, that run measured shedding, not fairness.
       defaultRequestTTL: 300s
+      saturationDetector:
+        pluginRef: maas-saturation
       defaultPriorityBand:
         fairnessPolicyRef: maas-fairness
         orderingPolicyRef: fcfs-ordering-policy

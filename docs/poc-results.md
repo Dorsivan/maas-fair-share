@@ -7552,3 +7552,230 @@ checked-out 2-replica GPU count exactly.
 `live-config-events.log`, `k8s-events-timeseries.log`,
 `client-request-summary.jsonl`, `timeline-config.json`,
 `04-loadgen.patched.yaml`).
+
+## UNI-166: G1, alert drill — trigger and clear each of the five PrometheusRule alerts
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, "G" group: deliberately
+trigger and clear each of the five alerts in `deploy/prometheusrule.yaml`,
+reusing the methods from earlier cases (D2 for classification broken, E3 for
+shedding, C5 for the accounting leak, a forced non-converging scenario for
+not converging), recording timestamps from the rule's own state rather than
+a substitute.
+
+**Setup — the rule had to actually be loaded first.** `maas-fairness-alerts`
+had never been applied to `maas-fairness-poc`: [UNI-49](/UNI/issues/UNI-49)
+wrote and pushed the manifest but was stuck on the same RBAC gap
+[UNI-130](/UNI/issues/UNI-130)/UNI-150/UNI-153/UNI-157 all independently
+hit and had to substitute around (`create` on
+`prometheusrules.monitoring.coreos.com` in `maas-fairness-poc`, denied).
+This ticket started `blocked` on that gap, linked to UNI-49, and resumed
+once the grant landed (2026-11-09). `oc apply -f deploy/prometheusrule.yaml
+-n maas-fairness-poc` then succeeded, and Thanos Ruler loaded all five rules
+within one scrape cycle (`state: inactive`, `health: ok` on all five,
+confirmed idle baseline). This is the first ticket in the whole edge-case
+series able to read real `ALERTS`/rule-state transitions instead of
+evaluating an alert's `expr` by hand against raw metrics.
+
+A standalone watcher polled Thanos Ruler's `/api/v1/rules` every 15s for the
+full drill's duration (independent of each scenario's own runtime), logging
+every state transition with a timestamp — this is the source for every
+timestamp below.
+
+### 1. MaasFairnessClassificationBroken — PASS, full fire-and-clear cycle captured
+
+**Setup:** D2's `misclassified-prefix` scenario (`enduser-foo`, no hyphen
+after "end," lands in `unclassified`), full-contention background
+(app1/app2/end-users 32/32/128), `DURATION=420`, `SETTLE_SECONDS=120`,
+`ENFORCE_LIVE=true` — same method [UNI-153](/UNI/issues/UNI-153) used.
+
+**Expected:** `unmatched_subscriptions_total` rises continuously past the
+`for: 5m` latch; the three real tenants' weighted split stays undisturbed.
+
+**Observed:**
+
+| transition | time (UTC) |
+|---|---|
+| `inactive → pending` | 07:42:21Z |
+| `pending → firing` | 07:47:22Z (exactly the `for: 5m` latch) |
+| `firing → inactive` (cleared) | 07:53:53Z |
+
+Weighted split: app1 17.1% (-3.9pt), app2 13.6% (+3.1pt), end-users 69.3%
+(+0.9pt) against 21.1/10.5/68.4% — max deviation 3.9pts, well inside the
+10-point threshold. **Verdict: PASS.**
+
+A second, brief `inactive → pending → inactive` blip (07:58:38Z–07:59:08Z,
+30s) followed almost immediately after, with no new `enduser-foo` traffic
+running — most likely `increase()`'s counter-reset handling reacting to the
+EPP pod recreation that phase 2's `enforce` flip triggered a few minutes
+later (config edits recreate the pod and zero its counters — see
+[UNI-155](/UNI/issues/UNI-155)/[UNI-174](/UNI/issues/UNI-174)). Noted, not
+investigated further — it cleared on its own well under the 5-minute latch.
+
+### 2. MaasFairnessSheddingIsRealAllocator — condition real, never sustained long enough to latch
+
+**Setup:** E3's open-loop TTL-overload method
+(`RATE_APP1=RATE_APP2=RATE_END_USERS=12`, `DURATION=1200`,
+`CLIENT_TIMEOUT=340`, `MAX_WORKERS=9000`) — identical to
+[UNI-157](/UNI/issues/UNI-157). The open-loop path has no `ENFORCE_LIVE`
+wrapper, so `enforce` was flipped true by hand (same ConfigMap merge-patch
+technique `15-fairness-benchmark.sh` uses) and reverted/confirmed after.
+
+**Observed:** the same Gateway `istio-proxy` crash-loop UNI-157 found
+recurred (12 restarts total by the end of the run, +4 over this run's own
+8-restart starting baseline) and drove the same bursty eviction pattern.
+The rule's condition (`sum(rate(...outcome=~"Evicted.*"...)) > 0`) went
+`inactive → pending` three separate times, tracking the crash-loop's own
+restart timing, each burst subsiding before the `for: 10m` bar:
+
+| pending start | cleared | duration |
+|---|---|---|
+| 08:05:24Z | 08:09:55Z | 4m31s |
+| 08:11:25Z | 08:20:26Z | 8m31s (closest) |
+| 08:23:27Z | 08:27:57Z | 4m30s |
+
+Never reached `firing`. Benchmark's own weighted-split verdict: **PASS**.
+This both confirms the alert's condition is genuinely real on this cluster
+(not a modeling error) and sharpens UNI-157's own finding: the eviction rate
+this Gateway instability produces is bursty, not sustained, so the alert's
+`for: 10m` latch is a meaningfully higher bar than "the shedding condition
+is true" — which is itself a useful, previously-unmeasured property of this
+alert's threshold choice.
+
+### 3. MaasFairnessNotConverging — not reproduced in 3 attempts this session
+
+**Setup:** E1's chaos-restart method (full-contention 32/32/128,
+`CHAOS_EPP_DELETE_AT=120`, `ENFORCE_LIVE=true`) — identical to
+[UNI-155](/UNI/issues/UNI-155), with `DURATION` extended to 900s (UNI-155's
+own second run only had ~240s of post-restart observation, short of this
+alert's own `for: 10m`).
+
+**Observed:** all 3 attempts converged cleanly (PASS, max deviation
+5.3/6.1/4.2pts) — none reproduced the sustained end-users-starvation failure
+mode UNI-155's second run and UNI-193's fresh repro both documented
+mechanistically (end-users loses ~80% of its dispatch accounting on a chaos
+restart, tied to its 128-worker reconnect burst vs. app1/app2's 32). That
+prior history is 2 FAIL / 3 attempts; this session is 0 FAIL / 3 — the same
+chaos action against the same config, four more times, three different
+outcomes across the two tickets combined. **Verdict: condition not
+reproduced this session.** Stopping at 3 attempts rather than grinding
+further: the mechanism is already real and documented elsewhere in this
+file, and recording an honest non-reproduction is more useful than
+continuing to roll the dice. `MaasFairnessNotConverging` itself was never
+exercised.
+
+### 4. MaasFairnessAccountingLeak — attempted, stayed quiet as expected
+
+**Setup:** C5's exact method (`ABORT_FRACTION_APP1=0.3`, full-contention,
+`DURATION=240`, `SETTLE_SECONDS=60`, `ENFORCE_LIVE=true`) — identical to
+[UNI-149](/UNI/issues/UNI-149), which already found this method does not
+leak on this stack.
+
+**Observed:** reconfirmed UNI-149's finding —
+`truing_error_tokens_count{fairness_id=...}` equals `dispatch_total` for
+every group (app1 528/528 analog, app2 453/453, end-users 2206/2206,
+unclassified 24/24), meaning every dispatched request, aborts included, had
+its hold released through the normal completion path. No
+`MaasFairnessAccountingLeak` transition during or after this run. **Verdict:
+condition not exercised; the result itself is informative** (a graceful
+client-side cancel genuinely does not produce a leak on this stack, which is
+good news about the system, not a gap in the drill).
+
+**A separate, unexplained 30s blip** (`inactive → pending` 08:38:59Z →
+`inactive` 08:39:29Z) occurred earlier, shortly after phase 2's shedding
+traffic stopped — far too short to approach the alert's own `for: 15m` and
+not deliberately produced. Possibly connection-tearing residue from the
+Gateway crash-loop (a "harder abort" than C5's graceful cancel, which is
+exactly the mechanism [UNI-149](/UNI/issues/UNI-149)'s own follow-up
+speculated might be needed) momentarily nudging the condition true, or
+ordinary scrape noise. Recorded for completeness; not enough signal to
+conclude either way.
+
+### 5. MaasFairnessBandSplit — not exercised, per this ticket's own instruction
+
+This ticket explicitly allowed skipping this alert if triggering it needs
+creating an `InferenceObjective` (D4, not board-selected). Checked whether a
+lighter path exists: `docs/gateway-header-stripping.md` documents that a
+client-settable `x-llm-d-inference-objective` header reaches the EPP
+unstripped unless the Gateway's `AuthPolicy` overwrites it — if that gap
+were still open, naming a real high-priority `InferenceObjective` in the
+header would steal priority without creating anything new.
+
+**Found live:** the AuthPolicy fix **is no longer applied** —
+[UNI-33](/UNI/issues/UNI-33) closed this exact gap on 2026-10-19, but
+`maas-poc-gateway-authn` today only overwrites the deprecated
+`x-gateway-inference-objective` alias, not the current
+`x-llm-d-inference-objective` name the EPP actually prefers. Live-reproduced
+the forged-header request against the real GPU route (`app1-production`
+key): `HTTP 200`, identical treatment to a baseline request, and
+`llm_d_epp_flow_control_requests_total{outcome="Dispatched"}` stayed at
+`priority="0"` for both. **Filed as [UNI-210](/UNI/issues/UNI-210)** — likely
+cause is `odh-model-controller`/KServe reconciling the AuthPolicy back to
+its generated template, silently dropping the hand-applied patch, the same
+class of problem TRLP's own controller-reconciliation causes elsewhere in
+this project.
+
+That confirms the header-stripping hole is real again, but **not that
+band-split is triggerable without creating an `InferenceObjective`**: every
+forged-header request still resolved to `priority="0"`, because `exploit-
+high-priority` and `critical` don't name any real `InferenceObjective` this
+cluster has configured, and this role cannot even list
+`inferenceobjectives.inference.networking.x-k8s.io` to check
+(`Forbidden`), let alone create one. **Verdict: not exercised**, exactly as
+this ticket anticipated — recorded alongside the (unrelated) security
+regression finding rather than treated as a dead end.
+
+### What surprised us
+
+1. The shedding condition (#2) and the non-converging condition (#3) are
+   both real, documented failure modes in this project, but **neither is
+   reliably sustained long enough on demand to actually latch its alert** —
+   a meaningfully different question from "does the underlying bug exist,"
+   and one this drill is the first ticket positioned to even ask, now that
+   real rule state exists to measure against.
+2. Checking "is band-split exercisable" incidentally found a live security
+   regression ([UNI-210](/UNI/issues/UNI-210)) in a different, already-closed
+   ticket (UNI-33) — the header-stripping fix silently reverted, most likely
+   via controller reconciliation outside this project's control.
+
+### Verdict summary
+
+| alert | result |
+|---|---|
+| MaasFairnessClassificationBroken | **PASS** — fired 07:47:22Z, cleared 07:53:53Z |
+| MaasFairnessSheddingIsRealAllocator | condition real, never latched (closest: 8m31s vs. `for: 10m`) |
+| MaasFairnessNotConverging | not reproduced (0/3 this session; 2/3 in prior tickets) |
+| MaasFairnessAccountingLeak | not exercised — condition genuinely absent via this method |
+| MaasFairnessBandSplit | not exercised — no `InferenceObjective` to spoof; found unrelated regression [UNI-210](/UNI/issues/UNI-210) |
+
+**Cluster left as found**, confirmed after the drill:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'enforce:|weight:'
+      enforce: false
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+$ oc get llminferenceservice maas-vllm-gpu -n maas-fairness-poc -o jsonpath='replicas={.spec.replicas}{"\n"}'
+replicas=2
+$ oc get pods -n maas-fairness-poc | grep -E 'vllm-gpu|gateway'
+maas-poc-gateway-data-science-gateway-class-58b4f8c4b4-2zvgw   1/1     Running     12 (108m ago)   21d
+maas-vllm-gpu-kserve-74d8dd69bd-bbhg4                          1/1     Running     0               21d
+maas-vllm-gpu-kserve-74d8dd69bd-vcrhp                          1/1     Running     0               5d19h
+maas-vllm-gpu-kserve-router-scheduler-575669c495-4p4sb         1/1     Running     0               5m31s
+```
+
+Weights and replica count unchanged from the repo manifest. The Gateway's
+restart count (12, up from an 8-restart pre-existing baseline) is from
+phase 2's load and is not still unstable at rest (no restarts since).
+
+**Raw results:**
+`results/20261109T073935Z-uni-166-g1-alert-drill/` (the alert-state-
+transitions watcher log covering the whole drill),
+`results/20261109T074042Z-uni-166-g1-classification-broken/`,
+`results/20261109T075910Z-uni-166-g1-shedding/`,
+`results/20261109T085041Z-uni-166-g1-not-converging-attempt1/`,
+`results/20261109T091050Z-uni-166-g1-not-converging-attempt2/`,
+`results/20261109T093212Z-uni-166-g1-not-converging-attempt3/`,
+`results/20261109T095138Z-uni-166-g1-accounting-leak/`,
+`results/20261109T100349Z-uni-166-g1-band-split-not-exercised/`.

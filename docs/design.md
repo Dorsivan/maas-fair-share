@@ -575,8 +575,11 @@ Both default to **off**, both fail silently, and both go on the **vLLM container
 `data: [DONE]` is returned separately"*) and nothing in the EPP injects it. Without
 the flag, any streaming client that doesn't opt in never triggers a true-up and is
 charged the provisional estimate permanently — and interactive end users, the largest
-group, are the most likely to be streaming. (This case stays charged: see UNI-190
-below for the one no-usage case that is now exempted instead.)
+group, are the most likely to be streaming. (This case stays charged — a real
+completion happened and real GPU time was spent, so refunding it would
+undercharge, not correct a leak. See UNI-190/UNI-213 below for the no-usage
+cases that are exempted instead: an error status, a stream reset, or a
+cancelled context, none of which ever delivered anything.)
 
 **Why the second.** `cached_tokens` lives inside `prompt_tokens_details`. Without this
 flag the field is absent, the code reads zero, and `cachedInputTokenWeight` silently

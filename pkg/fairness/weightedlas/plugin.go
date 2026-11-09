@@ -82,15 +82,46 @@ var provisionalChargeKey = fwkplugin.NewDataKey("provisional-cost", PluginType)
 // "we never found out."
 var responseStatusKey = fwkplugin.NewDataKey("response-status", PluginType)
 
-// contextLengthStatusCode is vLLM's status for a context-length rejection.
-// This plugin never sees the response body, only the status header, so a
-// backend 400 that reaches ResponseBody's no-usage branch is treated as a
-// context-length rejection by proxy. In practice no other 400 cause reaches
-// that branch: malformed requests and auth failures are rejected before
-// PreRequest ever dispatches them (see UNI-148 C6, where only the oversized,
-// dispatched requests landed here). See UNI-190 for the board's scope
-// decision: exempt context-length 400s only, not 4xx/5xx broadly.
-const contextLengthStatusCode = "400"
+// isErrorStatus reports whether a captured backend HTTP status means the
+// backend rejected or failed the request rather than serving it. UNI-190
+// scoped this to exactly "400" (context-length rejections only); UNI-213
+// widened it to any non-2xx status -- the board's follow-up decision that a
+// request charged at dispatch and then rejected by the backend for *any*
+// reason, having delivered nothing, should not be booked at ~9-10x a served
+// request's cost either. A status that is missing entirely (never reached
+// ResponseHeader, or the backend never set one) is not an error by this
+// check -- see the comment in ResponseBody for why that case must stay
+// charged.
+func isErrorStatus(status string) bool {
+	return len(status) > 0 && status[0] != '2'
+}
+
+// exemptionReason classifies why a no-usage completion in ResponseBody
+// should be refunded rather than booked, for the "reason" label on
+// provisionalChargesExempted. Returns "" when the completion should NOT be
+// exempted -- a real request the model server simply didn't report usage
+// for (see ResponseBody).
+func exemptionReason(cause fwkrc.TerminationCause, status string, haveStatus bool) string {
+	switch {
+	case cause == fwkrc.TerminationCauseClientDisconnect:
+		// A stream reset: torn down somewhere between the client and the EPP
+		// (client disconnect, Envoy drain/restart, an upstream reset). The
+		// framework cannot tell these apart from the EPP's side of the
+		// stream, and neither can this plugin.
+		return "stream_reset"
+	case cause == fwkrc.TerminationCauseError:
+		// An EPP-side failure or a cancellation that reached the EPP before
+		// its propagation completed -- a context cancel, from the tenant's
+		// point of view.
+		return "context_cancel"
+	case cause == fwkrc.TerminationCauseNatural && haveStatus && isErrorStatus(status):
+		// The backend responded, but with an error -- UNI-190's original
+		// context-length-400 case, generalized to any error status.
+		return "error_status"
+	default:
+		return ""
+	}
+}
 
 type provisionalCharge struct {
 	cost float64
@@ -594,38 +625,45 @@ func (p *Plugin) ResponseBody(
 
 	if !ok {
 		// No usage block. Either a model server is missing
-		// --enable-force-include-usage, the stream was torn down before the final
-		// chunk, or the backend rejected the request outright (context-length
-		// 400) before it ever generated anything. The first two cases keep the
-		// provisional charge: refunding on abort would make abort-spam free, and
-		// the charge decays away on its own over a few half-lives if the request
-		// genuinely never ran. The third case is handled below.
+		// --enable-force-include-usage (a real completion that just didn't
+		// report usage), or the request never delivered anything: the backend
+		// rejected it outright (an error status), the stream was torn down
+		// before the final chunk (a reset somewhere between the client and the
+		// EPP), or its context was cancelled (an EPP-side failure or a
+		// cancellation that reached the EPP first). Only the first case keeps
+		// the provisional charge -- real generation work was measurably
+		// performed, so refunding it would undercharge, not correct a leak.
+		// UNI-148 (C6) found the second case charged ~9-10x a served request's
+		// cost, permanently, for exactly this reason; UNI-190 exempted the
+		// context-length-400 instance of it, and UNI-213 (board follow-up)
+		// widened that to every case below where nothing was ever delivered.
+		// TerminationCauseEvicted is deliberately NOT exempted here: that is
+		// the EPP's own capacity-reclaim decision, a different question this
+		// ticket doesn't address, so it stays charged, unchanged.
 		requestsWithoutUsage.WithLabelValues(boundID(id)).Inc()
-		if response.TerminationCause == fwkrc.TerminationCauseNatural {
-			fields := append([]any{"plugin", p.name, "group", id,
-				"band", request.Objectives.Priority, "enforcing", p.cfg.Enforce}, corr.logFields()...)
-			log.FromContext(ctx).V(1).Info("response completed with no usage block; check --enable-force-include-usage", fields...)
-		}
-		// UNI-190: the board decided a context-length rejection (HTTP 400) is
-		// terminally unservable through no fault of the tenant's traffic pattern
-		// -- the oversized prompt was rejected before a token was generated, so
-		// it should never have reached the ledger at ~9-10x a served request's
-		// cost. Reverse the hold with the same decayed true-up chargeInflight
-		// uses for a measured actual of zero, rather than booking it, so the
-		// tab ends up exactly as if PreRequest had never charged it.
-		if status, haveStatus := fwksched.ReadRequestAttribute[string](request, responseStatusKey); haveStatus && status == contextLengthStatusCode {
-			if charged {
-				gs.chargeInflight(now, -charge.cost, now.Sub(charge.at).Seconds())
+		status, haveStatus := fwksched.ReadRequestAttribute[string](request, responseStatusKey)
+		reason := exemptionReason(response.TerminationCause, status, haveStatus)
+		if reason == "" {
+			if response.TerminationCause == fwkrc.TerminationCauseNatural {
+				fields := append([]any{"plugin", p.name, "group", id,
+					"band", request.Objectives.Priority, "enforcing", p.cfg.Enforce}, corr.logFields()...)
+				log.FromContext(ctx).V(1).Info("response completed with no usage block; check --enable-force-include-usage", fields...)
 			}
-			provisionalChargesExempted.WithLabelValues(boundID(id)).Inc()
+			// No true-up will ever follow this charge, so the estimate IS the
+			// cost actually charged -- book it now, under the contention
+			// decided at dispatch, or it is never counted at all.
+			if charged && charge.contended {
+				addContendedService(id, charge.cost)
+			}
 			return
 		}
-		// No true-up will ever follow this charge, so the estimate IS the cost
-		// actually charged -- book it now, under the contention decided at
-		// dispatch, or it is never counted at all.
-		if charged && charge.contended {
-			addContendedService(id, charge.cost)
+		// Reverse the hold with the same decayed true-up chargeInflight uses
+		// for a measured actual of zero, rather than booking it, so the tab
+		// ends up exactly as if PreRequest had never charged it.
+		if charged {
+			gs.chargeInflight(now, -charge.cost, now.Sub(charge.at).Seconds())
 		}
+		provisionalChargesExempted.WithLabelValues(boundID(id), reason).Inc()
 		return
 	}
 

@@ -363,8 +363,162 @@ func TestContextLengthRejectionIsExemptFromProvisionalCharge(t *testing.T) {
 	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues(group))
 	assert.Zero(t, got, "an exempted request must never reach the SLI ledger")
 
-	exempted := testutil.ToFloat64(provisionalChargesExempted.WithLabelValues(group))
+	exempted := testutil.ToFloat64(provisionalChargesExempted.WithLabelValues(group, "error_status"))
 	assert.Equal(t, float64(1), exempted)
+}
+
+// 8a3. UNI-213 (board follow-up to UNI-190): a backend error status other
+// than 400 -- e.g. a 500 -- must be refunded the same way. UNI-148's C6 run
+// found 14 of app2's 49 oversized-prompt requests came back 500 rather than
+// 400, and those stayed charged under UNI-190's 400-only scope; this widens
+// the exemption to any non-2xx status.
+func TestGenericErrorStatusIsRefunded(t *testing.T) {
+	t.Parallel()
+	const group = "error-status-exempt-group"
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupConfig{
+		{Name: group, Weight: 1, Match: GroupMatch{Exact: []string{group}}},
+	}
+	cfg.DefaultGroup = DefaultGroupConfig{Name: "error-status-exempt-fallback", Weight: 1}
+	cfg.ProvisionalCharge = true
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+	gs := p.states[group]
+
+	p.lastContendedUnixNano.Store(clock.now().UnixNano())
+
+	req := &fwksched.InferenceRequest{FairnessID: group, RequestSizeBytes: 4000}
+	require.NoError(t, p.PreRequest(ctx, req, nil))
+	require.Positive(t, gs.normalizedService(clock.now()))
+
+	p.ResponseHeader(ctx, req, &fwkrc.Response{Headers: map[string]string{"status": "500"}}, nil)
+	p.ResponseBody(ctx, req, &fwkrc.Response{
+		EndOfStream:      true,
+		TerminationCause: fwkrc.TerminationCauseNatural,
+	}, nil)
+
+	assert.InDelta(t, 0, gs.normalizedService(clock.now()), 1e-9,
+		"a 500, like a 400, delivered nothing and must be fully reversed")
+	assert.Zero(t, gs.inFlight)
+
+	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues(group))
+	assert.Zero(t, got, "an exempted request must never reach the SLI ledger")
+
+	exempted := testutil.ToFloat64(provisionalChargesExempted.WithLabelValues(group, "error_status"))
+	assert.Equal(t, float64(1), exempted)
+}
+
+// 8a4. A completion that reports no usage but carries no error status at all
+// (TerminationCauseNatural, status 200 or no status captured) is a model
+// server genuinely missing --enable-force-include-usage -- real generation
+// happened and real GPU time was spent. This must stay charged; it is the one
+// no-usage case UNI-190 and UNI-213 both deliberately leave alone, and a
+// regression here would silently undercharge every tenant hitting that
+// misconfiguration.
+func TestMissingUsageFlagStillBooksTheEstimate(t *testing.T) {
+	t.Parallel()
+	const group = "missing-usage-flag-group"
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupConfig{
+		{Name: group, Weight: 1, Match: GroupMatch{Exact: []string{group}}},
+	}
+	cfg.DefaultGroup = DefaultGroupConfig{Name: "missing-usage-flag-fallback", Weight: 1}
+	cfg.ProvisionalCharge = true
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+
+	p.lastContendedUnixNano.Store(clock.now().UnixNano())
+
+	req := &fwksched.InferenceRequest{FairnessID: group, RequestSizeBytes: 4000}
+	require.NoError(t, p.PreRequest(ctx, req, nil))
+	est := p.estimateCost(req, p.states[group])
+
+	p.ResponseHeader(ctx, req, &fwkrc.Response{Headers: map[string]string{"status": "200"}}, nil)
+	p.ResponseBody(ctx, req, &fwkrc.Response{
+		EndOfStream:      true,
+		TerminationCause: fwkrc.TerminationCauseNatural,
+	}, nil)
+
+	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues(group))
+	assert.InDelta(t, est, got, 1e-9,
+		"a 200 with no usage block is a real, served request -- it must still book the estimate")
+
+	exempted := testutil.ToFloat64(provisionalChargesExempted.WithLabelValues(group, "error_status"))
+	assert.Zero(t, exempted, "a served (2xx) request must never be counted as exempted")
+}
+
+// 8a5. UNI-213: a cancelled context (TerminationCauseError -- an EPP-side
+// failure, or a cancellation that reached the EPP before its propagation
+// completed) must be refunded, same as an error status or a stream reset.
+func TestContextCancelIsRefunded(t *testing.T) {
+	t.Parallel()
+	const group = "context-cancel-exempt-group"
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupConfig{
+		{Name: group, Weight: 1, Match: GroupMatch{Exact: []string{group}}},
+	}
+	cfg.DefaultGroup = DefaultGroupConfig{Name: "context-cancel-exempt-fallback", Weight: 1}
+	cfg.ProvisionalCharge = true
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+	gs := p.states[group]
+
+	p.lastContendedUnixNano.Store(clock.now().UnixNano())
+
+	req := &fwksched.InferenceRequest{FairnessID: group, RequestSizeBytes: 4000}
+	require.NoError(t, p.PreRequest(ctx, req, nil))
+	require.Positive(t, gs.normalizedService(clock.now()))
+
+	// No ResponseHeader call: a cancelled context never got as far as a backend
+	// status.
+	p.ResponseBody(ctx, req, &fwkrc.Response{
+		EndOfStream:      true,
+		TerminationCause: fwkrc.TerminationCauseError,
+	}, nil)
+
+	assert.InDelta(t, 0, gs.normalizedService(clock.now()), 1e-9,
+		"a cancelled context delivered nothing and must be fully reversed")
+	assert.Zero(t, gs.inFlight)
+
+	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues(group))
+	assert.Zero(t, got, "an exempted request must never reach the SLI ledger")
+
+	exempted := testutil.ToFloat64(provisionalChargesExempted.WithLabelValues(group, "context_cancel"))
+	assert.Equal(t, float64(1), exempted)
+}
+
+// 8a6. TerminationCauseEvicted is deliberately NOT exempted -- an eviction is
+// the EPP's own capacity-reclaim decision, a different question UNI-213 does
+// not address, so it must keep booking the estimate exactly like it did
+// before this ticket.
+func TestEvictedStreamStillBooksTheEstimate(t *testing.T) {
+	t.Parallel()
+	const group = "evicted-group"
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupConfig{
+		{Name: group, Weight: 1, Match: GroupMatch{Exact: []string{group}}},
+	}
+	cfg.DefaultGroup = DefaultGroupConfig{Name: "evicted-fallback", Weight: 1}
+	cfg.ProvisionalCharge = true
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+
+	p.lastContendedUnixNano.Store(clock.now().UnixNano())
+
+	req := &fwksched.InferenceRequest{FairnessID: group, RequestSizeBytes: 4000}
+	require.NoError(t, p.PreRequest(ctx, req, nil))
+	est := p.estimateCost(req, p.states[group])
+
+	p.ResponseBody(ctx, req, &fwkrc.Response{
+		EndOfStream:      true,
+		TerminationCause: fwkrc.TerminationCauseEvicted,
+	}, nil)
+
+	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues(group))
+	assert.InDelta(t, est, got, 1e-9, "an eviction is out of this ticket's scope and must still book the estimate")
+
+	exempted := testutil.ToFloat64(provisionalChargesExempted.WithLabelValues(group, "context_cancel"))
+	assert.Zero(t, exempted)
 }
 
 // 8b. Estimator independence -- the decisive test for the DECAYED correction.
@@ -517,9 +671,14 @@ func TestContendedServiceTokensEqualChargedCostOnOverestimate(t *testing.T) {
 		"the SLI numerator must equal the real (lower) cost, not the estimate it overshot")
 }
 
-// 9. Abort. A stream that ends with no usage block keeps its estimate.
-// Refunding would make abort-spam free.
-func TestAbortKeepsTheEstimate(t *testing.T) {
+// 9. Stream reset (UNI-213, reversing the prior abort-spam-prevention design
+// that this test asserted before: see git history for
+// "TestAbortKeepsTheEstimate"). A client disconnect, an Envoy drain/restart,
+// or an upstream reset all surface as TerminationCauseClientDisconnect, and
+// the framework cannot tell them apart from the EPP's side of the stream; the
+// board's UNI-213 decision was that none of them delivered anything to the
+// tenant, so none of them should be booked.
+func TestStreamResetIsRefunded(t *testing.T) {
 	t.Parallel()
 	cfg := twoGroupConfig(1, 1)
 	cfg.ProvisionalCharge = true
@@ -529,51 +688,49 @@ func TestAbortKeepsTheEstimate(t *testing.T) {
 
 	req := &fwksched.InferenceRequest{FairnessID: "a-group", RequestSizeBytes: 4000}
 	require.NoError(t, p.PreRequest(ctx, req, nil))
-	charged := gs.normalizedService(clock.now())
-	require.Positive(t, charged)
+	require.Positive(t, gs.normalizedService(clock.now()))
 
 	p.ResponseBody(ctx, req, &fwkrc.Response{
 		EndOfStream:      true,
 		TerminationCause: fwkrc.TerminationCauseClientDisconnect,
 	}, nil)
 
-	assert.InDelta(t, charged, gs.normalizedService(clock.now()), 1e-9,
-		"an aborted request must not be refunded")
+	assert.InDelta(t, 0, gs.normalizedService(clock.now()), 1e-9,
+		"a stream reset delivered nothing and must be fully reversed")
 	assert.Zero(t, gs.inFlight, "in-flight accounting must still be released")
-
-	// The charge is not permanent: it decays away on its own.
-	clock.advance(10 * time.Minute)
-	assert.Less(t, gs.normalizedService(clock.now()), charged*0.01)
 }
 
-// 9b. An aborted request's estimate is also the cost actually charged to the
-// tab -- no true-up will ever arrive to correct it -- so it must still reach
-// the SLI numerator, under the contention decided at dispatch.
-func TestAbortedRequestStillBooksContendedService(t *testing.T) {
+// 9b. A refunded stream reset must never reach the SLI numerator either --
+// same assertion shape as TestContextLengthRejectionIsExemptFromProvisionalCharge,
+// for the path this test used to assert stayed charged
+// (TestAbortedRequestStillBooksContendedService, pre-UNI-213).
+func TestStreamResetNeverReachesContendedService(t *testing.T) {
 	t.Parallel()
+	const group = "stream-reset-exempt-group"
 	cfg := DefaultConfig()
 	cfg.Groups = []GroupConfig{
-		{Name: "contend-fix-group-abort", Weight: 1, Match: GroupMatch{Exact: []string{"contend-fix-group-abort"}}},
+		{Name: group, Weight: 1, Match: GroupMatch{Exact: []string{group}}},
 	}
-	cfg.DefaultGroup = DefaultGroupConfig{Name: "contend-fix-fallback-abort", Weight: 1}
+	cfg.DefaultGroup = DefaultGroupConfig{Name: "stream-reset-exempt-fallback", Weight: 1}
 	cfg.ProvisionalCharge = true
 	p, clock := newTestPlugin(t, cfg)
 	ctx := context.Background()
 
 	p.lastContendedUnixNano.Store(clock.now().UnixNano())
 
-	req := &fwksched.InferenceRequest{FairnessID: "contend-fix-group-abort", RequestSizeBytes: 4000}
+	req := &fwksched.InferenceRequest{FairnessID: group, RequestSizeBytes: 4000}
 	require.NoError(t, p.PreRequest(ctx, req, nil))
-	est := p.estimateCost(req, p.states["contend-fix-group-abort"])
 
 	p.ResponseBody(ctx, req, &fwkrc.Response{
 		EndOfStream:      true,
 		TerminationCause: fwkrc.TerminationCauseClientDisconnect,
 	}, nil)
 
-	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues("contend-fix-group-abort"))
-	assert.InDelta(t, est, got, 1e-9,
-		"an aborted request's estimate is the cost charged, and must still reach the SLI numerator")
+	got := testutil.ToFloat64(contendedServiceTokens.WithLabelValues(group))
+	assert.Zero(t, got, "an exempted request must never reach the SLI ledger")
+
+	exempted := testutil.ToFloat64(provisionalChargesExempted.WithLabelValues(group, "stream_reset"))
+	assert.Equal(t, float64(1), exempted)
 }
 
 // 10. Non-final chunks must not move the tab.

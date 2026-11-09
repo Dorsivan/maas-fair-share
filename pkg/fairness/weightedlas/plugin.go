@@ -728,6 +728,22 @@ func (p *Plugin) ResponseBody(
 // EmitAttributionHeaders -- that flag only governs what goes back to the
 // caller, and this is internal bookkeeping ResponseBody needs for the
 // provisional-charge exemption, not an attribution header.
+//
+// UNI-213 live verification (2026-11-09) found this read ":status" as
+// "status" (no colon) from UNI-190 onward, so it never once matched real
+// traffic: handlers/response.go populates response.Headers verbatim from
+// Envoy's ext_proc HeaderMap, whose internal model is HTTP/2-based and
+// represents the response status line as the pseudo-header ":status" even
+// for an HTTP/1.1 upstream -- there is no plain "status" key. The unit test
+// this ticket inherited constructed its fixture with the same wrong key, so
+// it passed without ever exercising the real header shape. Confirmed via a
+// live C6 re-run: `response completed with no usage block; check
+// --enable-force-include-usage` fired for every one of app2's oversized-
+// prompt completions (the fallback log, gated on an unmatched status) and
+// provisional_charges_exempted_total never incremented, despite
+// requests_without_usage_total{app2} and the EPP's own lifecycle log
+// confirming a backend 400 was received and processed normally
+// (TerminationCauseNatural) for each one.
 func (p *Plugin) ResponseHeader(
 	_ context.Context,
 	request *fwksched.InferenceRequest,
@@ -737,7 +753,7 @@ func (p *Plugin) ResponseHeader(
 	if request == nil || response == nil {
 		return
 	}
-	if status, ok := response.Headers["status"]; ok {
+	if status, ok := response.Headers[":status"]; ok {
 		request.PutAttribute(responseStatusKey, status)
 	}
 	if !p.cfg.EmitAttributionHeaders {

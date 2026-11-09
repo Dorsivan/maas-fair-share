@@ -348,7 +348,7 @@ func TestContextLengthRejectionIsExemptFromProvisionalCharge(t *testing.T) {
 
 	// The backend rejects the request before generating anything: status 400,
 	// no usage block. ResponseHeader runs first, same as in production.
-	p.ResponseHeader(ctx, req, &fwkrc.Response{Headers: map[string]string{"status": "400"}}, nil)
+	p.ResponseHeader(ctx, req, &fwkrc.Response{Headers: map[string]string{":status": "400"}}, nil)
 	resp := &fwkrc.Response{
 		EndOfStream:      true,
 		TerminationCause: fwkrc.TerminationCauseNatural,
@@ -391,7 +391,7 @@ func TestGenericErrorStatusIsRefunded(t *testing.T) {
 	require.NoError(t, p.PreRequest(ctx, req, nil))
 	require.Positive(t, gs.normalizedService(clock.now()))
 
-	p.ResponseHeader(ctx, req, &fwkrc.Response{Headers: map[string]string{"status": "500"}}, nil)
+	p.ResponseHeader(ctx, req, &fwkrc.Response{Headers: map[string]string{":status": "500"}}, nil)
 	p.ResponseBody(ctx, req, &fwkrc.Response{
 		EndOfStream:      true,
 		TerminationCause: fwkrc.TerminationCauseNatural,
@@ -433,7 +433,7 @@ func TestMissingUsageFlagStillBooksTheEstimate(t *testing.T) {
 	require.NoError(t, p.PreRequest(ctx, req, nil))
 	est := p.estimateCost(req, p.states[group])
 
-	p.ResponseHeader(ctx, req, &fwkrc.Response{Headers: map[string]string{"status": "200"}}, nil)
+	p.ResponseHeader(ctx, req, &fwkrc.Response{Headers: map[string]string{":status": "200"}}, nil)
 	p.ResponseBody(ctx, req, &fwkrc.Response{
 		EndOfStream:      true,
 		TerminationCause: fwkrc.TerminationCauseNatural,

@@ -8373,4 +8373,167 @@ three different ratios, two different flood levels -- lands on the offered-worke
 the configured weight. This is this POC's single clearest open gap; closing it would need a
 change beyond the newcomer-clamp timing this ticket fixed (see UNI-211's prefix-cache
 endpoint-lock-in, [UNI-214](/UNI/issues/UNI-214), still open pending board sign-off, as the
-most likely next lever).
+most likely next lever). *(UNI-214 has since landed and did not move the split: with both
+replicas in use, `full-contention` is still UNCONTENDED at threshold 150 and the split still
+follows the worker ratio. See the UNI-214 section below; the remaining lever is the threshold,
+[UNI-215](/UNI/issues/UNI-215).)*
+
+## UNI-214: equal `queue-scorer` / `prefix-cache-scorer` weights end the replica lock-in, and H2 now matches stock
+
+[UNI-214](/UNI/issues/UNI-214) fixes UNI-211's Mechanism B: under `full-contention`, one of
+the two vLLM replicas took zero requests for whole 240s runs because `prefix-cache-scorer`
+(weight 3.0) kept a constant lead over `queue-scorer` (weight 2.0) on the replica that had
+warmed the shared prompt prefix.
+
+**Fix chosen by the board:** option F, equal weights. `deploy/poc/00-config.yaml`
+`schedulingProfiles.default` now has `queue-scorer` at **3.0** (was 2.0), `prefix-cache-scorer`
+at 3.0 and `kv-cache-utilization-scorer` unchanged at 2.0. The board had already seen this
+lock-in in the air-gapped field environment, with no fairness plugin, and cleared it the same
+way. The fairness plugin's code is unchanged.
+
+**Why it works** (`llm-d-router@v0.11.0` source):
+- `queue-scorer` (`scorer/queuedepth/queue.go`) is min-max normalized: shorter queue 1.0,
+  longer 0.0, equal queues 1.0 each.
+- `prefix-cache-scorer` (`scorer/prefix/plugin.go`) is `matchBlocks/totalBlocks`, about 0.989
+  on a warm replica here and about 0 on a cold one.
+- `max-score-picker` (`picker/maxscore/picker.go`) round-robins exact ties.
+
+With queue weight `q` and prefix weight `P`, the cold replica wins once the warm replica's
+queue is longer if `q > P * (p_warm - p_cold)`. At 2.0 / 3.0 that never holds for a ~99% vs 0%
+split. At 3.0 / 3.0 it holds for anything short of an exact 100% vs 0% split, which would tie
+and round-robin. The cold replica takes traffic, warms its own cache, and from then on the
+shorter queue wins. Prefix affinity still decides between equal queues.
+
+**Measuring per-replica dispatch.** The EPP has no per-endpoint request counter, so the new
+`deploy/poc/21-replica-split.sh` reads each vLLM pod's own `vllm:request_success_total` and
+prefix-cache counters through the API-server pod proxy before and after each run (see
+`docs/runbook.md`, "Per-replica split"). Its request totals match each report's `200` count
+exactly (5536 and 5534 below).
+
+**Setup:** live against `maas-vllm-gpu` (2 replicas, `--max-num-seqs 8`), 240s,
+`ENFORCE_LIVE=true` (same as UNI-211's two lock-in runs), saturation threshold 150 (UNI-211,
+unchanged). Run order: C8 at the old weights as a same-day baseline, then apply F (EPP pod
+recreated; `--config-text` on the new pod shows `queue-scorer` weight 3), then H2 twice, then C8.
+
+### H2 (`full-contention`): both replicas used, throughput and p95 within 1% of stock
+
+Per-replica requests finished (vLLM's own counters):
+
+| run | replica `bbhg4` | replica `vcrhp` | prefix-cache hit ratio (each) |
+|---|---|---|---|
+| UNI-211, old weights (x2) | all traffic | **0** (queue 0 in 28/28 samples, both runs) | n/a |
+| UNI-214, F, run 1 | 2754 (**49.7%**) | 2782 (**50.3%**) | 98.9% / 98.9% |
+| UNI-214, F, run 2 | 2756 (**49.8%**) | 2778 (**50.2%**) | 98.9% / 98.9% |
+
+`llm_d_epp_per_endpoint_queue_size` now looks like stock's: non-zero in 24/28 samples on both
+replicas, peaking at 89-90 (stock, UNI-168: 23/28 and 24/28, peak 89). Previously one replica
+peaked at 184 while the other sat at 0.
+
+| | stock (UNI-168) | ours, old weights (UNI-211 x2) | ours, F (run 1 / run 2) |
+|---|---|---|---|
+| app1 requests | 944 | 499 / 490 | 938 / 933 |
+| app2 requests | 941 | 490 / 486 | 943 / 939 |
+| end-users requests | 3766 | 1980 / 1964 | 3742 / 3741 |
+| **total requests (240s)** | **5651** | 2969 / 2940 | **5623 / 5613** |
+| throughput delta vs stock | -- | -47.5% / -47.9% | **-0.5% / -0.7%** |
+| p95 (all groups) | 8.68-8.69s | 17.3s | 8.70-8.72s |
+| p95 delta vs stock | -- | +99% | **+0.1% to +0.5%** |
+| 500s | 129 (2.3%) | 112 / 87 | 87 (1.5%) / 79 (1.4%) |
+
+**H2 verdict: PASS against the <5% bar** on both throughput and p95, for the first time in
+this series. The board's fallback criteria for switching to option A were a replica under ~35%
+of dispatches or a >10-point cache-hit drop. Neither fired: the lowest replica share is 49.7%,
+and the cache result is in the next table.
+
+### C8 (`cache-heavy-vs-cache-cold`): no cache-affinity regression
+
+| | UNI-136 (Nov 1, threshold 5) | baseline today, old weights | F |
+|---|---|---|---|
+| app1 (hot) `prompt_tokens_cached_ratio` | 87.6% | 87.7% | **88.0%** |
+| app2 (cold) `prompt_tokens_cached_ratio` | 6.2% | 6.3% | 6.4% |
+| app1 / app2 requests | 2383 / 1047 | 3804 / 1863 | 3798 / 1858 |
+| app1 / app2 p95 | 8.6s / 10.75s | 4.35s / 4.39s | 4.35s / 4.39s |
+| replica split | not captured | 50.2% / 49.8% | 50.0% / 50.0% |
+| per-replica prefix-cache hit ratio | not captured | 57.3% / 55.6% | 57.9% / 55.7% |
+
+The hot tenant's cache-hit ratio moved +0.4 points, which is noise. C8 never showed the
+lock-in, even at the old weights: the cold tenant's unique prompts give neither replica a
+prefix advantage, so queue depth splits them, and the hot tenant's single shared prefix ends
+up warm on both replicas. That makes C8 a no-regression check here, not a lock-in reproducer.
+
+Both C8 reports carry a `FAIL` line, "offered groups delivered zero contended service tokens".
+This is the report's structural check, and it fires at old and new weights alike. It has the
+same cause as the `UNCONTENDED` below. C8 runs as an unscored control, and the
+cache-ratio and request columns it is used for are unaffected.
+
+### What this does NOT fix: `full-contention` is still `UNCONTENDED`
+
+Both H2 runs scored `UNCONTENDED` (`contended_seconds_total` under 1s for every group). The
+request split is 16.6 / 16.7 / 66.6%, which is the 32/32/128 worker ratio, not the 20/10/65
+weights. Even with both replicas in use, at `queueDepthThreshold: 150` the EPP's flow-control
+queue never holds a backlog. vLLM's own first-come-first-served queue decides who is served,
+and the fairness policy has nothing to arbitrate. That is the threshold question
+[UNI-215](/UNI/issues/UNI-215) sweeps, not a scheduling-profile question.
+
+Two earlier claims on UNI-214 were wrong:
+- "This bug is why `full-contention` can't exercise our plugin." Fixing it did not make the
+  run contended.
+- UNI-212's "most likely next lever" for making weights hold under flood was UNI-214. It is
+  not: the weights still follow workers after this fix.
+
+H2's PASS therefore measures the overhead of our EPP **with flow control holding nothing**. It
+answers "does our EPP cost throughput when the pool is saturated but uncontended at the EPP?":
+no, within 1%. It does not answer what admission queueing costs once UNI-215 finds a threshold
+where the EPP holds a backlog.
+
+### Also changed
+
+- `deploy/epp-config.yaml` (the reference config) gets the same 3.0 / 3.0 weights, so a
+  deployment built from it does not ship the lock-in. It is not deployed anywhere in this
+  cluster and was not separately tested.
+- `docs/design.md` scheduling-profile snippet and notes updated to match.
+- `deploy/poc/epp-groups/*.yaml` re-rendered from `00-config.yaml`. They were already stale
+  before this ticket: they lacked UNI-211's saturation detector and UNI-212's
+  `newcomerClampIdleSeconds`. `render.py --verify` now passes.
+
+### Cluster left as found
+
+The equal weights are this ticket's fix and stay live. `enforce` is back at its steady-state
+`false`.
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath={.data.epp} | grep -E "enforce:|queueDepthThreshold|pluginRef: (queue|prefix)"
+      enforce: false
+  # (utilization-detector, queueDepthThreshold=5) is calibrated for a
+      queueDepthThreshold: 150
+      - { pluginRef: queue-scorer, weight: 3.0 }
+      - { pluginRef: prefix-cache-scorer, weight: 3.0 }
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-cpu-kserve-router-scheduler-79869c447f-7kfv8   1/1     Running   0          59s
+maas-vllm-gpu-kserve-router-scheduler-5db5c69866-mrfp4   1/1     Running   0          61s
+$ oc get deployment maas-vllm-gpu-kserve -n maas-fairness-poc -o jsonpath={.status.readyReplicas}/{.status.replicas}
+2/2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           4m12s      5m55s
+```
+
+No orphaned `oc logs -f` process was left behind (checked by walking `/proc/*/cmdline`).
+
+**Raw results** (each directory includes `replica-counters-{before,after}.txt` and
+`replica-split.md`):
+`results/20261109T232621Z-uni-214-c8-baseline-q2p3/` (C8, old weights),
+`results/20261109T233500Z-uni-214-h2-equal-weights/` (H2, F, run 1),
+`results/20261109T234932Z-uni-214-h2-equal-weights-retry/` (H2, F, run 2),
+`results/20261109T234159Z-uni-214-c8-equal-weights/` (C8, F).
+
+**Not proven here:**
+- **Stock was not re-run.** The comparison is against UNI-168's stock run from earlier the same
+  day, on the same hardware and scenario.
+- **Repeats.** H2 was run twice and C8 once per weight setting, not the 5x of UNI-139.
+- **Other scenarios** (the A/B/C/D series) were not re-run against the new weights.
+- **Many distinct hot prefixes.** C8's hot tenant has a single shared prefix. A workload with
+  many large hot prefixes, where warming a prefix on both replicas costs real KV capacity, was
+  not tested. KV-cache utilization reads 0 on this backend, so capacity never binds here.
+- **Weighted split under contention.** This still needs UNI-215, as above.

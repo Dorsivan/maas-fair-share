@@ -196,10 +196,19 @@ data:
           fairnessPolicyRef: maas-fairness
           maxRequests: "5000"
 
+    # queue-scorer and prefix-cache-scorer carry EQUAL weight -- the one
+    # deviation from the KServe default (2.0 / 3.0). With prefix at 3.0 and
+    # queue at 2.0, a replica holding a ~99% prefix match keeps a constant lead
+    # however long its queue grows (queue-scorer is min-max normalized, so its
+    # swing is capped at its weight), and the other replica can sit idle for
+    # as long as the traffic keeps sharing that prefix. Equal weights let the
+    # shorter queue win once the warm replica's queue is longer; prefix
+    # affinity still decides between equal queues. Seen in the field and
+    # reproduced live -- see docs/poc-results.md "UNI-214".
     schedulingProfiles:
       - name: default
         plugins:
-          - { pluginRef: queue-scorer, weight: 2.0 }
+          - { pluginRef: queue-scorer, weight: 3.0 }
           - { pluginRef: kv-cache-utilization-scorer, weight: 2.0 }
           - { pluginRef: prefix-cache-scorer, weight: 3.0 }
           - { pluginRef: max-score-picker }

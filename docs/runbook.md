@@ -366,6 +366,26 @@ pipeline on that would be reporting the control for doing its job.
 `below-capacity` (UNI-135) gets a fourth verdict, UNCONTENDED, which also
 exits 0 -- see "A fourth verdict: UNCONTENDED" below.
 
+### Per-replica split (UNI-214)
+
+The report says nothing about *which* vLLM replica served each request. The
+EPP has no per-endpoint request counter, and `llm_d_epp_per_endpoint_queue_size`
+only shows whether a replica had a backlog. When one replica can sit idle for a
+whole run (UNI-211 Mechanism B), wrap the run with `deploy/poc/21-replica-split.sh`.
+It reads each vLLM pod's own counters through the API-server pod proxy:
+
+```sh
+deploy/poc/21-replica-split.sh snapshot /tmp/before.txt
+OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh full-contention my-label
+deploy/poc/21-replica-split.sh snapshot /tmp/after.txt
+deploy/poc/21-replica-split.sh diff /tmp/before.txt /tmp/after.txt
+```
+
+The diff prints requests finished, share, prompt tokens and prefix-cache hit
+ratio per replica. Requests finished should equal the report's total `200`
+count. A replica at ~0% share means the scheduling profile has locked onto
+the other one; see `docs/poc-results.md` "UNI-214".
+
 ### Expected share, and why it is not just "the configured weight"
 
 The report's "expected %" divides each **offered** group's weight by the sum

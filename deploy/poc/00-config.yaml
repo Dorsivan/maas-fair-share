@@ -161,10 +161,23 @@ data:
           fairnessPolicyRef: maas-fairness
           maxRequests: "5000"
 
+    # UNI-214: queue-scorer and prefix-cache-scorer carry EQUAL weight (was
+    # 2.0 / 3.0). queue-scorer is min-max normalized over the candidates
+    # (shorter queue 1.0, longer 0.0, equal queues 1.0 each), and
+    # prefix-cache-scorer is matchBlocks/totalBlocks. At 2.0 / 3.0, a replica
+    # holding a ~99% prefix match kept a constant +1.0 lead however deep its
+    # queue grew, so the other replica got zero traffic for whole runs
+    # (UNI-211 Mechanism B). With equal weights, the cold replica wins as soon
+    # as the warm one's queue is longer, warms its own cache, and from then on
+    # the queue decides; prefix affinity still decides between equal queues.
+    # Board-chosen fix (the same one that cleared this lock-in in the
+    # air-gapped field environment), validated live in docs/poc-results.md
+    # "UNI-214". kv-cache-utilization-scorer is left at 2.0: KV utilization
+    # reads 0 on both pods here, so it scores them identically.
     schedulingProfiles:
       - name: default
         plugins:
-          - { pluginRef: queue-scorer, weight: 2.0 }
+          - { pluginRef: queue-scorer, weight: 3.0 }
           - { pluginRef: kv-cache-utilization-scorer, weight: 2.0 }
           - { pluginRef: prefix-cache-scorer, weight: 3.0 }
           - { pluginRef: max-score-picker }

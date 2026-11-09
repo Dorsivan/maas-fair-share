@@ -557,8 +557,8 @@ how much of the pool it can claim, independent of this fix).
 **Not expected to fully close the UNI-161/UNI-160 gap on its own:**
 [UNI-211](/UNI/issues/UNI-211) separately found an independent
 scheduling-profile bug (prefix-cache-scorer endpoint lock-in,
-[UNI-214](/UNI/issues/UNI-214), still open, pending a board decision on the
-scorer-weight redesign). This plugin's own `contended_seconds_total`
+[UNI-214](/UNI/issues/UNI-214), since fixed by giving `queue-scorer` and
+`prefix-cache-scorer` equal weight). This plugin's own `contended_seconds_total`
 accounting (`bandState.contendedDelta`) also resets its single, band-shared
 timer to zero on *any* Pick call with only one candidate, which looks like a
 second, separate undercount of true contention — worth a follow-up, but it
@@ -790,7 +790,7 @@ plugins:
       evictionTtlSeconds: 3600
       evictionSweepSeconds: 300
 
-  # scheduling profile unchanged from the KServe default
+  # scheduling profile: KServe default plugins, re-weighted below (UNI-214)
   - type: single-profile-handler
   - type: queue-scorer
   - type: kv-cache-utilization-scorer
@@ -810,11 +810,24 @@ flowControl:
 schedulingProfiles:
   - name: default
     plugins:
-      - { pluginRef: queue-scorer, weight: 2.0 }
+      - { pluginRef: queue-scorer, weight: 3.0 }   # KServe default is 2.0 -- see below
       - { pluginRef: kv-cache-utilization-scorer, weight: 2.0 }
       - { pluginRef: prefix-cache-scorer, weight: 3.0 }
       - { pluginRef: max-score-picker }
 ```
+
+**`queue-scorer` and `prefix-cache-scorer` carry equal weight** (UNI-214). At
+the KServe default (queue 2.0, prefix 3.0), a replica holding a near-complete
+prefix match keeps a constant +1.0 lead no matter how long its queue grows,
+because `queue-scorer` is min-max normalized across the candidates and so can
+never swing by more than its own weight. With traffic that shares one prefix,
+the other replica then sits idle indefinitely: one of two replicas took zero
+requests for whole 240s runs in UNI-211, and the board saw the same in the
+field. With equal weights, the cold replica wins as soon as the warm one's
+queue is longer, warms its own cache, and from then on the shorter queue wins.
+Prefix affinity still decides between equal queues. Verified live: both
+replicas ~50/50 at a 98.9% hit ratio each, and no cache-hit regression for a
+cache-hot tenant (docs/poc-results.md "UNI-214").
 
 Fairness is **intra-band only**, so every weighted tenant must share one priority. Set
 both `defaultPriorityBand` and the explicit `priorityBands[0]` so stray traffic on
@@ -1384,8 +1397,9 @@ Things that are your call, not the implementation's:
    from the response body. A real limit of the signal, not a gap more analysis closes.
    One more reason to leave this at 1.0 absent a positive reason to move.
 
-   Secondary: `prefix-cache-scorer` carries the highest profile weight (3.0), so the
-   router actively manufactures these hits. Hit rates will be high by construction, and
+   Secondary: `prefix-cache-scorer` carries the joint-highest profile weight (3.0,
+   tied with `queue-scorer` since UNI-214), so the router actively manufactures
+   these hits. Hit rates will be high by construction, and
    a discount feeds back — cheaper tab ⇒ more dispatches ⇒ better locality ⇒ cheaper
    still. Bounded (hit rate caps at 100%, output still costs 2.0) but real.
 

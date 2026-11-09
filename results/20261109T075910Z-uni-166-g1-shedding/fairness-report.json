@@ -1,0 +1,236 @@
+{
+  "schema": "uni54.fairness_benchmark_report.v1",
+  "run": {
+    "scenario": "e3-queue-ttl-shedding",
+    "label": "uni-166-g1-shedding",
+    "control": false,
+    "generator": "open-loop",
+    "namespace": "maas-fairness-poc",
+    "enforce": true,
+    "duration_seconds": 1200,
+    "backend": "vllm-gpu (real)",
+    "epp_image_digest": "quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135",
+    "epp_pod": "maas-vllm-gpu-kserve-router-scheduler-676fd97cd-z7nql",
+    "run_start": "2026-11-09T07:59:11Z",
+    "run_end": "2026-11-09T08:20:03Z"
+  },
+  "groups": [
+    {
+      "group": "app1",
+      "configured_weight": 20.0,
+      "offered": true,
+      "offered_workers": 12.0,
+      "requests_total": 14297,
+      "status_tally": {
+        "0": 8317,
+        "502": 1817,
+        "503": 1432,
+        "200": 1424,
+        "429": 1282,
+        "500": 25
+      },
+      "p50_sec": 50.01,
+      "p95_sec": 50.01,
+      "delivered_tokens": 4668856.0,
+      "expected_share_pct": 21.05263157894737,
+      "observed_share_pct": 23.687462776330335,
+      "deviation_pts": 2.6348311973829652,
+      "request_share_pct": 33.406547187887,
+      "request_share_deviation_pts": 12.35391560893963,
+      "contended_seconds": 88.3711905,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 3536.0
+    },
+    {
+      "group": "app2",
+      "configured_weight": 10.0,
+      "offered": true,
+      "offered_workers": 12.0,
+      "requests_total": 14156,
+      "status_tally": {
+        "0": 8710,
+        "502": 1819,
+        "503": 1411,
+        "429": 1238,
+        "200": 950,
+        "500": 28
+      },
+      "p50_sec": 50.01,
+      "p95_sec": 50.03,
+      "delivered_tokens": 2685308.0,
+      "expected_share_pct": 10.526315789473685,
+      "observed_share_pct": 13.623922711041432,
+      "deviation_pts": 3.0976069215677473,
+      "request_share_pct": 33.07708484239549,
+      "request_share_deviation_pts": 22.550769052921808,
+      "contended_seconds": 88.39401951999999,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 2053.0
+    },
+    {
+      "group": "end-users",
+      "configured_weight": 65.0,
+      "offered": true,
+      "offered_workers": 12.0,
+      "requests_total": 14344,
+      "status_tally": {
+        "0": 6012,
+        "200": 3929,
+        "502": 1699,
+        "503": 1402,
+        "429": 1267,
+        "500": 35
+      },
+      "p50_sec": 46.75,
+      "p95_sec": 50.03,
+      "delivered_tokens": 12356077.0,
+      "expected_share_pct": 68.42105263157895,
+      "observed_share_pct": 62.688614512628234,
+      "deviation_pts": -5.732438118950711,
+      "request_share_pct": 33.51636796971751,
+      "request_share_deviation_pts": -34.90468466186144,
+      "contended_seconds": 88.08417458599999,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 9182.0
+    },
+    {
+      "group": "unclassified",
+      "configured_weight": 5.0,
+      "offered": false,
+      "offered_workers": 0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": 1358.0,
+      "expected_share_pct": null,
+      "observed_share_pct": null,
+      "deviation_pts": null,
+      "request_share_pct": null,
+      "request_share_deviation_pts": null,
+      "contended_seconds": 6.105234892000001,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 1.0
+    }
+  ],
+  "verdict": {
+    "result": "PASS",
+    "threshold_points": 10.0,
+    "max_abs_deviation_points": 5.732438118950711,
+    "reasons": [],
+    "epp_restarted_mid_run": false,
+    "epp_restarted_in_windows_but_not_snapshot_pair": false,
+    "solo_group": null,
+    "capped_groups": [],
+    "uncontended_threshold_seconds": 1.0
+  },
+  "sources": {
+    "delivered_tokens_and_observed_share": "llm_d_epp_maas_fairness_contended_service_tokens_total, scraped directly from the EPP's /metrics immediately before and after the run (same mechanism as deploy/poc/13-loadgen-poisson.sh). This is the EPP's own accounting -- the generator cannot see token usage. Reused unmodified from the SLI deploy/grafana-dashboard.yaml (UNI-50) already defines; this report does not invent a second definition of delivered share.",
+    "offered_and_delivered_requests": "deploy/poc/13-loadgen-poisson.py's own stdout (UNI-137/B5): the 'load: open-loop Poisson arrivals rate ...' line for each offered group's Poisson arrival rate in req/s -- NOT a worker count, this generator is open-loop -- and each group's own 'sent=... completion_tokens=... p50=...s p95=...s p99=...s codes=[...]' summary line for delivered requests, status tally, and latency.",
+    "expected_share": "each offered group's configured_weight divided by the sum of configured_weight over OFFERED groups only (excludes the never-offered 'unclassified' catch-all and any group this scenario left idle), so a work-conserving policy absorbing an idle group's share is not scored as a deviation. Also excludes any 'capped_groups' entry (UNI-134's app2-trickle): a group offered but structurally unable to reach a weight-proportional share at its own worker count is scored on a dedicated 'did it get served' check instead, not folded into the other groups' expected-share denominator.",
+    "request_share_pct": "UNI-146 (C1): the SAME expected_share target above, scored against requests_total (plain request count, from the loadgen log) instead of delivered weighted tokens -- informational only, never part of the verdict. Equal to observed_share_pct when every offered group's requests are uniform cost (every scenario before this ticket); expected to diverge when request cost is asymmetric across groups."
+  },
+  "timeline": null,
+  "ledger": null,
+  "shed": {
+    "shed_statuses": [
+      "429",
+      "503"
+    ],
+    "total_shed": 8032,
+    "rows": [
+      {
+        "group": "app1",
+        "state": "shed",
+        "requests_total": 14297,
+        "status_429": 1282,
+        "status_503": 1432,
+        "shed": 2714,
+        "shed_rate_pct": 18.983003427292438,
+        "weight_share_pct": 21.05263157894737,
+        "shed_share_pct": 33.7898406374502,
+        "shed_share_vs_weight_share": 1.6050174302788842
+      },
+      {
+        "group": "app2",
+        "state": "shed",
+        "requests_total": 14156,
+        "status_429": 1238,
+        "status_503": 1411,
+        "shed": 2649,
+        "shed_rate_pct": 18.712913252331166,
+        "weight_share_pct": 10.526315789473685,
+        "shed_share_pct": 32.98057768924303,
+        "shed_share_vs_weight_share": 3.1331548804780875
+      },
+      {
+        "group": "end-users",
+        "state": "shed",
+        "requests_total": 14344,
+        "status_429": 1267,
+        "status_503": 1402,
+        "shed": 2669,
+        "shed_rate_pct": 18.60708310094813,
+        "weight_share_pct": 68.42105263157895,
+        "shed_share_pct": 33.229581673306775,
+        "shed_share_vs_weight_share": 0.48566311676371443
+      }
+    ],
+    "epp_pool_wide": {
+      "state": "ok",
+      "outcome_deltas": {
+        "Dispatched": 14772.0,
+        "EvictedContextCancelled": 16316.0,
+        "EvictedTTL": 282.0,
+        "RejectedCapacity": 3787.0
+      },
+      "epp_shed_total": 4069.0,
+      "epp_429_upper_bound": 4069.0,
+      "client_429_total": 3787,
+      "non_epp_429_lower_bound": 0.0,
+      "epp_restarted": false
+    }
+  },
+  "pick_latency": {
+    "histograms": {
+      "scheduler_e2e": {
+        "metric": "llm_d_epp_scheduler_e2e_duration_seconds",
+        "state": "not_recorded",
+        "observations": null,
+        "p50_seconds": null,
+        "p99_seconds": null,
+        "p50_bucket": null,
+        "p99_bucket": null,
+        "p99_at_histogram_ceiling": null,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      },
+      "flow_control_dispatch_cycle": {
+        "metric": "llm_d_epp_flow_control_dispatch_cycle_duration_seconds",
+        "state": "ok",
+        "observations": 1226722.0,
+        "p50_seconds": 5.000595152685199e-05,
+        "p99_seconds": 9.901178402316694e-05,
+        "p50_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_at_histogram_ceiling": false,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      }
+    },
+    "epp_restarted": false,
+    "baseline_report": null,
+    "baseline_has_pick_latency": null
+  },
+  "alerts": null
+}

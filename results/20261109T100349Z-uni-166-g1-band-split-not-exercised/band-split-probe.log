@@ -1,0 +1,31 @@
+=== UNI-166 G1: MaasFairnessBandSplit -- attempted without creating an InferenceObjective ===
+
+--- live AuthPolicy, objective-header handling (2026-11-09) ---
+          fairness:
+            value: https://kubernetes.default.svc
+          objective:
+            expression: 'auth.identity.user.username.startsWith(''system:serviceaccount:'')
+              ? auth.identity.user.username.split('':'')[2] : ''authenticated'''
+--
+              expression: auth.identity.fairness
+            priority: 0
+          x-gateway-inference-objective:
+            metrics: false
+            plain:
+              expression: auth.identity.objective
+            priority: 0
+          x-maas-groups:
+
+--- baseline request (no forged header) ---
+{"id":"chatcmpl-c62185d6-da88-489d-99b5-8648b90a7777","object":"chat.completion","created":1794218630,"model":"llama-3-1-8b","choices":[{"index":0,"message":{"role":"assistant","content":"In the context of machine","refusal":null,"annotations":null,"audio":null,"function_call":null,"reasoning":null},"logprobs":null,"finish_reason":"length","stop_reason":null,"token_ids":null,"routed_experts":null}],"service_tier":null,"system_fingerprint":"vllm-0.24.0+rhaiv.9-1f7c9175","usage":{"prompt_tokens":33,"total_tokens":38,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":16,"multimodal_tokens":null}},"prompt_logprobs":null,"prompt_token_ids":null,"prompt_text":null,"kv_transfer_params":null}
+HTTP:200
+
+--- forged header request (x-llm-d-inference-objective: exploit-high-priority) ---
+{"id":"chatcmpl-6c00d280-3435-4eb0-bf41-d1b817db0074","object":"chat.completion","created":1794218630,"model":"llama-3-1-8b","choices":[{"index":0,"message":{"role":"assistant","content":"It seems like you might","refusal":null,"annotations":null,"audio":null,"function_call":null,"reasoning":null},"logprobs":null,"finish_reason":"length","stop_reason":null,"token_ids":null,"routed_experts":null}],"service_tier":null,"system_fingerprint":"vllm-0.24.0+rhaiv.9-1f7c9175","usage":{"prompt_tokens":36,"total_tokens":41,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":16,"multimodal_tokens":null}},"prompt_logprobs":null,"prompt_token_ids":null,"prompt_text":null,"kv_transfer_params":null}
+HTTP:200
+
+--- can-i list inferenceobjectives (to confirm one exists to name) ---
+no
+
+--- llm_d_epp_flow_control_requests_total by priority, after both requests ---
+llm_d_epp_flow_control_requests_total{inference_pool="maas-vllm-gpu-inference-pool",outcome="Dispatched",priority="0"} 5

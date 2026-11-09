@@ -1,0 +1,3750 @@
+{
+  "schema": "uni54.fairness_benchmark_report.v1",
+  "run": {
+    "scenario": "misclassified-prefix",
+    "label": "uni-166-g1-classification-broken",
+    "control": false,
+    "generator": "closed-loop",
+    "namespace": "maas-fairness-poc",
+    "enforce": true,
+    "duration_seconds": 420,
+    "backend": "vllm-gpu (real)",
+    "epp_image_digest": "quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135",
+    "epp_pod": "maas-vllm-gpu-kserve-router-scheduler-676fd97cd-qr7vq",
+    "run_start": "2026-11-09T07:41:54Z",
+    "run_end": "2026-11-09T07:51:24Z"
+  },
+  "groups": [
+    {
+      "group": "app1",
+      "configured_weight": 20.0,
+      "offered": true,
+      "offered_workers": 32,
+      "requests_total": 899,
+      "status_tally": {
+        "200": 883,
+        "500": 16
+      },
+      "p50_sec": 16.26,
+      "p95_sec": 26.56,
+      "delivered_tokens": 1176646.0,
+      "expected_share_pct": 21.05263157894737,
+      "observed_share_pct": 17.142098742553983,
+      "deviation_pts": -3.9105328363933864,
+      "request_share_pct": 17.078267477203646,
+      "request_share_deviation_pts": -3.974364101743724,
+      "contended_seconds": 15.270342898000012,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 880.0
+    },
+    {
+      "group": "app2",
+      "configured_weight": 10.0,
+      "offered": true,
+      "offered_workers": 32,
+      "requests_total": 724,
+      "status_tally": {
+        "200": 705,
+        "500": 19
+      },
+      "p50_sec": 21.68,
+      "p95_sec": 28.27,
+      "delivered_tokens": 932266.0,
+      "expected_share_pct": 10.526315789473685,
+      "observed_share_pct": 13.581821402805797,
+      "deviation_pts": 3.0555056133321123,
+      "request_share_pct": 13.753799392097264,
+      "request_share_deviation_pts": 3.227483602623579,
+      "contended_seconds": 14.743532548999998,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 702.0
+    },
+    {
+      "group": "end-users",
+      "configured_weight": 65.0,
+      "offered": true,
+      "offered_workers": 128,
+      "requests_total": 3641,
+      "status_tally": {
+        "200": 3561,
+        "500": 80
+      },
+      "p50_sec": 16.05,
+      "p95_sec": 20.39,
+      "delivered_tokens": 4755160.0,
+      "expected_share_pct": 68.42105263157895,
+      "observed_share_pct": 69.27607985464022,
+      "deviation_pts": 0.8550272230612705,
+      "request_share_pct": 69.16793313069908,
+      "request_share_deviation_pts": 0.7468804991201381,
+      "contended_seconds": 15.159092545,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 3547.0
+    },
+    {
+      "group": "unclassified",
+      "configured_weight": 5.0,
+      "offered": false,
+      "offered_workers": 0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": 317848.0,
+      "expected_share_pct": null,
+      "observed_share_pct": null,
+      "deviation_pts": null,
+      "request_share_pct": null,
+      "request_share_deviation_pts": null,
+      "contended_seconds": 15.096367520000005,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 237.0
+    }
+  ],
+  "verdict": {
+    "result": "PASS",
+    "threshold_points": 10.0,
+    "max_abs_deviation_points": 3.9105328363933864,
+    "reasons": [],
+    "epp_restarted_mid_run": false,
+    "epp_restarted_in_windows_but_not_snapshot_pair": false,
+    "solo_group": null,
+    "capped_groups": [],
+    "uncontended_threshold_seconds": 1.0
+  },
+  "sources": {
+    "delivered_tokens_and_observed_share": "llm_d_epp_maas_fairness_contended_service_tokens_total, scraped directly from the EPP's /metrics immediately before and after the run (same mechanism as deploy/poc/13-loadgen-poisson.sh). This is the EPP's own accounting -- the generator cannot see token usage. Reused unmodified from the SLI deploy/grafana-dashboard.yaml (UNI-50) already defines; this report does not invent a second definition of delivered share.",
+    "offered_and_delivered_requests": "deploy/poc/04-loadgen.yaml's own run.sh: the 'load: tenants=...' line for offered worker counts, and the TENANT/TOTAL/P50_SEC/P95_SEC/STATUSES table for delivered requests, status tally, and latency.",
+    "expected_share": "each offered group's configured_weight divided by the sum of configured_weight over OFFERED groups only (excludes the never-offered 'unclassified' catch-all and any group this scenario left idle), so a work-conserving policy absorbing an idle group's share is not scored as a deviation. Also excludes any 'capped_groups' entry (UNI-134's app2-trickle): a group offered but structurally unable to reach a weight-proportional share at its own worker count is scored on a dedicated 'did it get served' check instead, not folded into the other groups' expected-share denominator.",
+    "request_share_pct": "UNI-146 (C1): the SAME expected_share target above, scored against requests_total (plain request count, from the loadgen log) instead of delivered weighted tokens -- informational only, never part of the verdict. Equal to observed_share_pct when every offered group's requests are uniform cost (every scenario before this ticket); expected to diverge when request cost is asymmetric across groups."
+  },
+  "timeline": {
+    "window_seconds": 10.0,
+    "schedule": {
+      "app1": {
+        "start": 0.0,
+        "stop": 420.0,
+        "duty_on": null,
+        "duty_off": null
+      },
+      "app2": {
+        "start": 0.0,
+        "stop": 420.0,
+        "duty_on": null,
+        "duty_off": null
+      },
+      "end-users": {
+        "start": 0.0,
+        "stop": 420.0,
+        "duty_on": null,
+        "duty_off": null
+      }
+    },
+    "chaos_events": [],
+    "phase_edges": [
+      0.0,
+      420.0
+    ],
+    "windows": [
+      {
+        "start_s": 0.0,
+        "end_s": 10.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 4056.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 14.283701929849274,
+            "deviation_pts": -6.768929649098096
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 4064.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 14.31187491195943,
+            "deviation_pts": 3.785559122485745
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 20276.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 71.40442315819129,
+            "deviation_pts": 2.9833705266123474
+          }
+        ]
+      },
+      {
+        "start_s": 10.0,
+        "end_s": 20.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 33840.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 16.15459527583112,
+            "deviation_pts": -4.89803630311625
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 32420.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 15.476713322767287,
+            "deviation_pts": 4.950397533293602
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 143216.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 68.36869140140159,
+            "deviation_pts": -0.052361230177353946
+          }
+        ]
+      },
+      {
+        "start_s": 20.0,
+        "end_s": 30.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 31194.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 19.89870123242581,
+            "deviation_pts": -1.153930346521559
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 16278.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 10.383761577913296,
+            "deviation_pts": -0.14255421156038928
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 109292.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 69.71753718966089,
+            "deviation_pts": 1.2964845580819429
+          }
+        ]
+      },
+      {
+        "start_s": 30.0,
+        "end_s": 40.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 31126.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 20.55878467635403,
+            "deviation_pts": -0.4938469025933401
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 16238.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 10.725231175693526,
+            "deviation_pts": 0.1989153862198414
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 104036.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 68.71598414795244,
+            "deviation_pts": 0.29493151637349513
+          }
+        ]
+      },
+      {
+        "start_s": 40.0,
+        "end_s": 50.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 23010.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 14.189689195855944,
+            "deviation_pts": -6.862942383091426
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 35142.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 21.67118894918599,
+            "deviation_pts": 11.144873159712304
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 104008.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 64.13912185495806,
+            "deviation_pts": -4.281930776620882
+          }
+        ]
+      },
+      {
+        "start_s": 50.0,
+        "end_s": 60.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 36468.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 22.098871665596103,
+            "deviation_pts": 1.0462400866487336
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 10812.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 6.551853692234975,
+            "deviation_pts": -3.9744620972387104
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 117742.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 71.34927464216892,
+            "deviation_pts": 2.9282220105899768
+          }
+        ]
+      },
+      {
+        "start_s": 60.0,
+        "end_s": 70.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 28398.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 18.438344068148762,
+            "deviation_pts": -2.614287510798608
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 5426.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 3.523010596301683,
+            "deviation_pts": -7.003305193172002
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 120192.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 78.03864533554955,
+            "deviation_pts": 9.617592703970601
+          }
+        ]
+      },
+      {
+        "start_s": 70.0,
+        "end_s": 80.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 28426.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 17.947293321379416,
+            "deviation_pts": -3.1053382575679542
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 40564.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 25.610849443763968,
+            "deviation_pts": 15.084533654290283
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 89396.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 56.44185723485661,
+            "deviation_pts": -11.979195396722332
+          }
+        ]
+      },
+      {
+        "start_s": 80.0,
+        "end_s": 90.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 14916.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 8.824782279439606,
+            "deviation_pts": -12.227849299507763
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 154108.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 91.1752177205604,
+            "deviation_pts": 22.754165088981452
+          }
+        ]
+      },
+      {
+        "start_s": 90.0,
+        "end_s": 100.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 43168.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 27.07510129329269,
+            "deviation_pts": 6.02246971434532
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 47306.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 29.670467517154,
+            "deviation_pts": 19.144151727680317
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 68964.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 43.25443118955331,
+            "deviation_pts": -25.166621442025637
+          }
+        ]
+      },
+      {
+        "start_s": 100.0,
+        "end_s": 110.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 31078.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 21.894549963365833,
+            "deviation_pts": 0.841918384418463
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 10768.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 7.586090289128107,
+            "deviation_pts": -2.940225500345578
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 100098.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 70.51935974750606,
+            "deviation_pts": 2.0983071159271134
+          }
+        ]
+      },
+      {
+        "start_s": 110.0,
+        "end_s": 120.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 2708.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 1.59020975735795,
+            "deviation_pts": -19.46242182158942
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 167584.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 98.40979024264205,
+            "deviation_pts": 29.9887376110631
+          }
+        ]
+      },
+      {
+        "start_s": 120.0,
+        "end_s": 130.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 45980.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 29.834669988839575,
+            "deviation_pts": 8.782038409892206
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 63536.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 41.226089439123776,
+            "deviation_pts": 30.69977364965009
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 44600.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 28.93924057203665,
+            "deviation_pts": -39.48181205954229
+          }
+        ]
+      },
+      {
+        "start_s": 130.0,
+        "end_s": 140.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 35204.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 24.089888870641047,
+            "deviation_pts": 3.0372572916936775
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 1358.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.9292713636612471,
+            "deviation_pts": -9.597044425812438
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 109574.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 74.98083976569771,
+            "deviation_pts": 6.559787134118764
+          }
+        ]
+      },
+      {
+        "start_s": 140.0,
+        "end_s": 150.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 2716.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 1.6205250596658711,
+            "deviation_pts": -19.432106519281497
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 164884.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 98.37947494033413,
+            "deviation_pts": 29.95842230875519
+          }
+        ]
+      },
+      {
+        "start_s": 150.0,
+        "end_s": 160.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 50114.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 32.22682374729911,
+            "deviation_pts": 11.174192168351738
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 58180.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 37.41382858318757,
+            "deviation_pts": 26.88751279371389
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 47210.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 30.359347669513323,
+            "deviation_pts": -38.06170496206562
+          }
+        ]
+      },
+      {
+        "start_s": 160.0,
+        "end_s": 170.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 29696.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 20.33694014518559,
+            "deviation_pts": -0.7156914337617799
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 116324.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 79.6630598548144,
+            "deviation_pts": 11.242007223235461
+          }
+        ]
+      },
+      {
+        "start_s": 170.0,
+        "end_s": 180.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 4060.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 2.3809803070643567,
+            "deviation_pts": -18.671651271883015
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 4064.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 2.3833261004703314,
+            "deviation_pts": -8.142989689003354
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 162394.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 95.23569359246531,
+            "deviation_pts": 26.814640960886365
+          }
+        ]
+      },
+      {
+        "start_s": 180.0,
+        "end_s": 190.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 52748.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 34.80291893746453,
+            "deviation_pts": 13.750287358517163
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 55512.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 36.62659505680843,
+            "deviation_pts": 26.10027926733475
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 43302.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 28.57048600572703,
+            "deviation_pts": -39.85056662585191
+          }
+        ]
+      },
+      {
+        "start_s": 190.0,
+        "end_s": 200.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 21630.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 13.121974302042005,
+            "deviation_pts": -7.9306572769053645
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 143208.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 86.878025697958,
+            "deviation_pts": 18.45697306637905
+          }
+        ]
+      },
+      {
+        "start_s": 200.0,
+        "end_s": 210.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 18922.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 12.96027397260274,
+            "deviation_pts": -8.09235760634463
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 10818.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 7.409589041095891,
+            "deviation_pts": -3.1167267483777943
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 116260.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 79.63013698630137,
+            "deviation_pts": 11.209084354722421
+          }
+        ]
+      },
+      {
+        "start_s": 210.0,
+        "end_s": 220.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 54124.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 33.63076005368594,
+            "deviation_pts": 12.57812847473857
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 48704.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 30.262961674205897,
+            "deviation_pts": 19.736645884732212
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 58108.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 36.10627827210817,
+            "deviation_pts": -32.314774359470775
+          }
+        ]
+      },
+      {
+        "start_s": 220.0,
+        "end_s": 230.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -21.05263157894737
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 163690.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 100.0,
+            "deviation_pts": 31.578947368421055
+          }
+        ]
+      },
+      {
+        "start_s": 230.0,
+        "end_s": 240.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 41878.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 27.156122740123987,
+            "deviation_pts": 6.103491161176617
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 31130.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 20.186496511296138,
+            "deviation_pts": 9.660180721822453
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 81204.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 52.657380748579875,
+            "deviation_pts": -15.76367188299907
+          }
+        ]
+      },
+      {
+        "start_s": 240.0,
+        "end_s": 250.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 29688.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 19.60380348652932,
+            "deviation_pts": -1.4488280924180508
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 27064.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 17.871104067617537,
+            "deviation_pts": 7.344788278143852
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 94688.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 62.52509244585314,
+            "deviation_pts": -5.895960185725805
+          }
+        ]
+      },
+      {
+        "start_s": 250.0,
+        "end_s": 260.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 4060.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 2.4811469499003875,
+            "deviation_pts": -18.57148462904698
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 159574.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 97.51885305009961,
+            "deviation_pts": 29.097800418520663
+          }
+        ]
+      },
+      {
+        "start_s": 260.0,
+        "end_s": 270.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 44652.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 27.737951769807054,
+            "deviation_pts": 6.685320190859684
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 56822.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 35.297991029830165,
+            "deviation_pts": 24.77167524035648
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 59504.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 36.96405720036278,
+            "deviation_pts": -31.456995431216164
+          }
+        ]
+      },
+      {
+        "start_s": 270.0,
+        "end_s": 280.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 29838.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 20.79998884644341,
+            "deviation_pts": -0.2526427325039613
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 113614.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 79.20001115355659,
+            "deviation_pts": 10.778958521977643
+          }
+        ]
+      },
+      {
+        "start_s": 280.0,
+        "end_s": 291.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -21.05263157894737
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 167724.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 100.0,
+            "deviation_pts": 31.578947368421055
+          }
+        ]
+      },
+      {
+        "start_s": 291.0,
+        "end_s": 301.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 72942.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 46.550601809896996,
+            "deviation_pts": 25.497970230949626
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 58210.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 37.1488378623304,
+            "deviation_pts": 26.622522072856718
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 25542.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 16.3005603277726,
+            "deviation_pts": -52.120492303806344
+          }
+        ]
+      },
+      {
+        "start_s": 301.0,
+        "end_s": 311.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 1358.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 0.8299008763459916,
+            "deviation_pts": -20.22273070260138
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 1354.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.8274563965923952,
+            "deviation_pts": -9.698859392881289
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 160922.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 98.34264272706162,
+            "deviation_pts": 29.92159009548267
+          }
+        ]
+      },
+      {
+        "start_s": 311.0,
+        "end_s": 321.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 13560.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 9.116456683384653,
+            "deviation_pts": -11.936174895562717
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 6770.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 4.551505291040863,
+            "deviation_pts": -5.974810498432822
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 128412.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 86.33203802557449,
+            "deviation_pts": 17.910985393995546
+          }
+        ]
+      },
+      {
+        "start_s": 321.0,
+        "end_s": 331.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 48668.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 30.46700888944535,
+            "deviation_pts": 9.41437731049798
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 51486.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 32.23112557906598,
+            "deviation_pts": 21.704809789592296
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 59586.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 37.301865531488666,
+            "deviation_pts": -31.11918710009028
+          }
+        ]
+      },
+      {
+        "start_s": 331.0,
+        "end_s": 341.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 13498.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 8.178722476035823,
+            "deviation_pts": -12.873909102911547
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.526315789473685
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 151540.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 91.82127752396418,
+            "deviation_pts": 23.40022489238524
+          }
+        ]
+      },
+      {
+        "start_s": 341.0,
+        "end_s": 351.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 33768.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 23.57244575991958,
+            "deviation_pts": 2.5198141809722117
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 17592.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 12.280456817356825,
+            "deviation_pts": 1.75414102788314
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 91892.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 64.14709742272359,
+            "deviation_pts": -4.273955208855355
+          }
+        ]
+      },
+      {
+        "start_s": 351.0,
+        "end_s": 361.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 9478.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 5.517586652539906,
+            "deviation_pts": -15.535044926407464
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 28440.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 16.556252837965282,
+            "deviation_pts": 6.029937048491597
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 133860.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 77.9261605094948,
+            "deviation_pts": 9.505107877915862
+          }
+        ]
+      },
+      {
+        "start_s": 361.0,
+        "end_s": 371.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 48702.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 31.852190974493134,
+            "deviation_pts": 10.799559395545764
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 21668.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 14.171353826030085,
+            "deviation_pts": 3.6450380365564
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 82530.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 53.97645519947678,
+            "deviation_pts": -14.444597432102164
+          }
+        ]
+      },
+      {
+        "start_s": 371.0,
+        "end_s": 381.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 10810.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 6.5550111574658,
+            "deviation_pts": -14.497620421481571
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 20284.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 12.299893276414087,
+            "deviation_pts": 1.7735774869404022
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 133818.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 81.14509556612012,
+            "deviation_pts": 12.724042934541174
+          }
+        ]
+      },
+      {
+        "start_s": 381.0,
+        "end_s": 391.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -21.05263157894737
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 21660.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 13.695858362314258,
+            "deviation_pts": 3.169542572840573
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 136490.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 86.30414163768575,
+            "deviation_pts": 17.8830890061068
+          }
+        ]
+      },
+      {
+        "start_s": 391.0,
+        "end_s": 401.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 55464.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 35.33549094059784,
+            "deviation_pts": 14.282859361650473
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 29720.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 18.934277923600316,
+            "deviation_pts": 8.407962134126631
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 71780.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 45.73023113580184,
+            "deviation_pts": -22.690821495777108
+          }
+        ]
+      },
+      {
+        "start_s": 401.0,
+        "end_s": 411.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 1358.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 0.8035122597746852,
+            "deviation_pts": -20.249119319172685
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 21688.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 12.832528637697624,
+            "deviation_pts": 2.3062128482239395
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 145962.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 86.36395910252769,
+            "deviation_pts": 17.942906470948742
+          }
+        ]
+      },
+      {
+        "start_s": 411.0,
+        "end_s": 421.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 2684.0,
+            "expected_share_pct": 21.05263157894737,
+            "observed_share_pct": 1.7874029381601204,
+            "deviation_pts": -19.26522864078725
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 33884.0,
+            "expected_share_pct": 10.526315789473685,
+            "observed_share_pct": 22.564963173106378,
+            "deviation_pts": 12.038647383632693
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 113594.0,
+            "expected_share_pct": 68.42105263157895,
+            "observed_share_pct": 75.6476338887335,
+            "deviation_pts": 7.22658125715455
+          }
+        ]
+      },
+      {
+        "start_s": 421.0,
+        "end_s": 431.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 56858.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 13496.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 87810.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 431.0,
+        "end_s": 441.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 33800.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 29808.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 86648.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 441.0,
+        "end_s": 451.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 451.0,
+        "end_s": 461.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 461.0,
+        "end_s": 471.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 471.0,
+        "end_s": 481.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 481.0,
+        "end_s": 491.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 491.0,
+        "end_s": 501.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 501.0,
+        "end_s": 511.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 511.0,
+        "end_s": 521.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 521.0,
+        "end_s": 531.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 531.0,
+        "end_s": 541.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 541.0,
+        "end_s": 551.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 551.0,
+        "end_s": 561.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 561.0,
+        "end_s": 570.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      }
+    ],
+    "convergence": [
+      {
+        "phase_edge_s": 0.0,
+        "converged_at_s": null,
+        "seconds_to_converge": null
+      },
+      {
+        "phase_edge_s": 420.0,
+        "converged_at_s": null,
+        "seconds_to_converge": null
+      }
+    ],
+    "epp_restarted_during_windows": false,
+    "queue_wait_windows": [
+      {
+        "start_s": 0.0,
+        "end_s": 10.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 15.0,
+            "p50_seconds": 7.500000000000001e-05,
+            "p90_seconds": 1.375,
+            "p99_seconds": 2.3874999999999997
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 12.0,
+            "p50_seconds": 0.2,
+            "p90_seconds": 1.9000000000000004,
+            "p99_seconds": 2.4399999999999995
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 53.0,
+            "p50_seconds": 0.0075,
+            "p90_seconds": 0.8500000000000014,
+            "p99_seconds": 2.3409999999999997
+          }
+        ]
+      },
+      {
+        "start_s": 10.0,
+        "end_s": 20.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 44.0,
+            "p50_seconds": 1.3260869565217392,
+            "p90_seconds": 2.473913043478261,
+            "p99_seconds": 4.725000000000001
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 31.0,
+            "p50_seconds": 1.46875,
+            "p90_seconds": 4.2250000000000005,
+            "p99_seconds": 4.9225
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 163.0,
+            "p50_seconds": 1.35,
+            "p90_seconds": 3.3020833333333353,
+            "p99_seconds": 4.830208333333333
+          }
+        ]
+      },
+      {
+        "start_s": 20.0,
+        "end_s": 30.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 29.0,
+            "p50_seconds": 6.944444444444445,
+            "p90_seconds": 23.555555555555557,
+            "p99_seconds": 29.355555555555558
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 18.0,
+            "p50_seconds": 19.411764705882355,
+            "p90_seconds": 27.88235294117647,
+            "p99_seconds": 29.788235294117644
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 119.0,
+            "p50_seconds": 7.0673076923076925,
+            "p90_seconds": 21.79310344827587,
+            "p99_seconds": 29.179310344827588
+          }
+        ]
+      },
+      {
+        "start_s": 30.0,
+        "end_s": 40.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 40.0,
+        "end_s": 50.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 31.0,
+            "p50_seconds": 7.708333333333334,
+            "p90_seconds": 23.800000000000004,
+            "p99_seconds": 29.380000000000003
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 29.0,
+            "p50_seconds": 12.941176470588236,
+            "p90_seconds": 26.58823529411765,
+            "p99_seconds": 29.658823529411766
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 102.0,
+            "p50_seconds": 8.157894736842106,
+            "p90_seconds": 24.486486486486484,
+            "p99_seconds": 29.448648648648653
+          }
+        ]
+      },
+      {
+        "start_s": 50.0,
+        "end_s": 60.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 30.0,
+            "p50_seconds": 6.25,
+            "p90_seconds": 20.0,
+            "p99_seconds": 28.999999999999996
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 15.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.8
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 116.0,
+            "p50_seconds": 7.837837837837838,
+            "p90_seconds": 24.476190476190478,
+            "p99_seconds": 29.44761904761905
+          }
+        ]
+      },
+      {
+        "start_s": 60.0,
+        "end_s": 70.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 8.076923076923077,
+            "p90_seconds": 24.18181818181818,
+            "p99_seconds": 29.418181818181818
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 20.0,
+            "p50_seconds": 18.235294117647058,
+            "p90_seconds": 27.647058823529413,
+            "p99_seconds": 29.764705882352942
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 118.0,
+            "p50_seconds": 7.553191489361702,
+            "p90_seconds": 23.444444444444446,
+            "p99_seconds": 29.34444444444444
+          }
+        ]
+      },
+      {
+        "start_s": 70.0,
+        "end_s": 80.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 80.0,
+        "end_s": 90.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 6.25,
+            "p90_seconds": 20.85714285714286,
+            "p99_seconds": 29.085714285714285
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 20.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.8
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 6.538461538461538,
+            "p90_seconds": 22.400000000000006,
+            "p99_seconds": 29.240000000000002
+          }
+        ]
+      },
+      {
+        "start_s": 90.0,
+        "end_s": 100.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 25.0,
+            "p50_seconds": 1.825,
+            "p90_seconds": 4.21875,
+            "p99_seconds": 4.921875
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 24.0,
+            "p50_seconds": 5.0,
+            "p90_seconds": 26.000000000000004,
+            "p99_seconds": 29.599999999999998
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 111.0,
+            "p50_seconds": 10.178571428571429,
+            "p90_seconds": 26.03571428571429,
+            "p99_seconds": 29.603571428571428
+          }
+        ]
+      },
+      {
+        "start_s": 100.0,
+        "end_s": 110.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 110.0,
+        "end_s": 120.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 7.6923076923076925,
+            "p90_seconds": 23.6,
+            "p99_seconds": 29.36
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.8
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 6.190476190476191,
+            "p90_seconds": 20.880000000000006,
+            "p99_seconds": 29.088
+          }
+        ]
+      },
+      {
+        "start_s": 120.0,
+        "end_s": 130.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 30.0,
+            "p50_seconds": 2.35,
+            "p90_seconds": 4.464285714285714,
+            "p99_seconds": 4.946428571428571
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 17.0,
+            "p50_seconds": 2.05,
+            "p90_seconds": 4.392857142857143,
+            "p99_seconds": 4.939285714285713
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 117.0,
+            "p50_seconds": 13.285714285714285,
+            "p90_seconds": 26.65714285714286,
+            "p99_seconds": 29.665714285714284
+          }
+        ]
+      },
+      {
+        "start_s": 130.0,
+        "end_s": 140.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 140.0,
+        "end_s": 150.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 7.083333333333334,
+            "p90_seconds": 22.888888888888893,
+            "p99_seconds": 29.288888888888888
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 22.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.8
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 6.585365853658537,
+            "p90_seconds": 22.137931034482765,
+            "p99_seconds": 29.21379310344828
+          }
+        ]
+      },
+      {
+        "start_s": 150.0,
+        "end_s": 160.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 27.0,
+            "p50_seconds": 1.75,
+            "p90_seconds": 4.15625,
+            "p99_seconds": 4.915625
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 22.0,
+            "p50_seconds": 4.583333333333334,
+            "p90_seconds": 25.6,
+            "p99_seconds": 29.560000000000002
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 111.0,
+            "p50_seconds": 11.80327868852459,
+            "p90_seconds": 26.36065573770492,
+            "p99_seconds": 29.63606557377049
+          }
+        ]
+      },
+      {
+        "start_s": 160.0,
+        "end_s": 170.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 7.142857142857142,
+            "p90_seconds": 22.0,
+            "p99_seconds": 29.2
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 22.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.8
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 111.0,
+            "p50_seconds": 6.346153846153847,
+            "p90_seconds": 21.777777777777782,
+            "p99_seconds": 29.177777777777777
+          }
+        ]
+      },
+      {
+        "start_s": 170.0,
+        "end_s": 180.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 180.0,
+        "end_s": 190.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 26.0,
+            "p50_seconds": 1.8181818181818183,
+            "p90_seconds": 4.187500000000001,
+            "p99_seconds": 4.918749999999999
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 23.0,
+            "p50_seconds": 4.25,
+            "p90_seconds": 25.4,
+            "p99_seconds": 29.54
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 10.677966101694915,
+            "p90_seconds": 26.135593220338986,
+            "p99_seconds": 29.6135593220339
+          }
+        ]
+      },
+      {
+        "start_s": 190.0,
+        "end_s": 200.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 31.0,
+            "p50_seconds": 7.884615384615385,
+            "p90_seconds": 23.800000000000004,
+            "p99_seconds": 29.380000000000003
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 17.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.799999999999997
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 112.0,
+            "p50_seconds": 6.25,
+            "p90_seconds": 21.384615384615383,
+            "p99_seconds": 29.138461538461534
+          }
+        ]
+      },
+      {
+        "start_s": 200.0,
+        "end_s": 210.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 210.0,
+        "end_s": 220.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 23.0,
+            "p50_seconds": 1.65625,
+            "p90_seconds": 4.458333333333333,
+            "p99_seconds": 25.39999999999999
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 27.0,
+            "p50_seconds": 12.0,
+            "p90_seconds": 26.4,
+            "p99_seconds": 29.64
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 113.0,
+            "p50_seconds": 9.618644067796609,
+            "p90_seconds": 25.653846153846153,
+            "p99_seconds": 29.565384615384616
+          }
+        ]
+      },
+      {
+        "start_s": 220.0,
+        "end_s": 230.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.8
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 18.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.799999999999997
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 111.0,
+            "p50_seconds": 5.178571428571429,
+            "p90_seconds": 15.200000000000006,
+            "p99_seconds": 28.52
+          }
+        ]
+      },
+      {
+        "start_s": 230.0,
+        "end_s": 240.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 24.0,
+            "p50_seconds": 1.6,
+            "p90_seconds": 4.000000000000001,
+            "p99_seconds": 4.899999999999999
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 26.0,
+            "p50_seconds": 11.428571428571429,
+            "p90_seconds": 26.28571428571429,
+            "p99_seconds": 29.628571428571426
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 115.0,
+            "p50_seconds": 9.955357142857142,
+            "p90_seconds": 25.964912280701753,
+            "p99_seconds": 29.596491228070175
+          }
+        ]
+      },
+      {
+        "start_s": 240.0,
+        "end_s": 250.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 250.0,
+        "end_s": 260.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 31.0,
+            "p50_seconds": 8.653846153846153,
+            "p90_seconds": 24.833333333333336,
+            "p99_seconds": 29.483333333333334
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 18.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.799999999999997
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 5.833333333333333,
+            "p90_seconds": 19.636363636363644,
+            "p99_seconds": 28.963636363636365
+          }
+        ]
+      },
+      {
+        "start_s": 260.0,
+        "end_s": 270.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 24.0,
+            "p50_seconds": 1.8333333333333335,
+            "p90_seconds": 4.5,
+            "p99_seconds": 25.19999999999996
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 25.0,
+            "p50_seconds": 12.142857142857142,
+            "p90_seconds": 26.428571428571427,
+            "p99_seconds": 29.642857142857142
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 111.0,
+            "p50_seconds": 9.868421052631579,
+            "p90_seconds": 25.888888888888893,
+            "p99_seconds": 29.58888888888889
+          }
+        ]
+      },
+      {
+        "start_s": 270.0,
+        "end_s": 280.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 280.0,
+        "end_s": 291.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 8.333333333333334,
+            "p90_seconds": 24.666666666666664,
+            "p99_seconds": 29.466666666666665
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 16.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.8
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 113.0,
+            "p50_seconds": 6.193181818181818,
+            "p90_seconds": 20.173913043478265,
+            "p99_seconds": 29.01739130434783
+          }
+        ]
+      },
+      {
+        "start_s": 291.0,
+        "end_s": 301.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 23.0,
+            "p50_seconds": 1.5833333333333335,
+            "p90_seconds": 4.041666666666666,
+            "p99_seconds": 4.904166666666667
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 28.0,
+            "p50_seconds": 12.5,
+            "p90_seconds": 26.5,
+            "p99_seconds": 29.65
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 111.0,
+            "p50_seconds": 9.955357142857142,
+            "p90_seconds": 25.96363636363637,
+            "p99_seconds": 29.596363636363634
+          }
+        ]
+      },
+      {
+        "start_s": 301.0,
+        "end_s": 311.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 19.67741935483871,
+            "p90_seconds": 27.93548387096774,
+            "p99_seconds": 29.793548387096774
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 18.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.799999999999997
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 111.0,
+            "p50_seconds": 5.1875,
+            "p90_seconds": 16.941176470588243,
+            "p99_seconds": 28.694117647058825
+          }
+        ]
+      },
+      {
+        "start_s": 311.0,
+        "end_s": 321.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 321.0,
+        "end_s": 331.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 24.0,
+            "p50_seconds": 1.5454545454545454,
+            "p90_seconds": 3.8000000000000007,
+            "p99_seconds": 4.879999999999999
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 26.0,
+            "p50_seconds": 11.428571428571429,
+            "p90_seconds": 26.28571428571429,
+            "p99_seconds": 29.628571428571426
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 10.0,
+            "p90_seconds": 26.000000000000004,
+            "p99_seconds": 29.6
+          }
+        ]
+      },
+      {
+        "start_s": 331.0,
+        "end_s": 341.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 8.333333333333334,
+            "p90_seconds": 24.666666666666664,
+            "p99_seconds": 29.466666666666665
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 20.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.8
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 112.0,
+            "p50_seconds": 6.0,
+            "p90_seconds": 20.666666666666664,
+            "p99_seconds": 29.066666666666663
+          }
+        ]
+      },
+      {
+        "start_s": 341.0,
+        "end_s": 351.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 25.0,
+            "p50_seconds": 1.975,
+            "p90_seconds": 4.305555555555555,
+            "p99_seconds": 4.930555555555555
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 25.0,
+            "p50_seconds": 4.6875,
+            "p90_seconds": 25.833333333333336,
+            "p99_seconds": 29.583333333333332
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 127.0,
+            "p50_seconds": 9.342105263157894,
+            "p90_seconds": 25.464285714285715,
+            "p99_seconds": 29.546428571428574
+          }
+        ]
+      },
+      {
+        "start_s": 351.0,
+        "end_s": 361.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 361.0,
+        "end_s": 371.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 19.0,
+            "p50_seconds": 0.9583333333333333,
+            "p90_seconds": 24.571428571428577,
+            "p99_seconds": 29.457142857142856
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 20.0,
+            "p50_seconds": 15.714285714285715,
+            "p90_seconds": 27.142857142857142,
+            "p99_seconds": 29.714285714285715
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 126.0,
+            "p50_seconds": 8.673469387755102,
+            "p90_seconds": 24.96,
+            "p99_seconds": 29.496
+          }
+        ]
+      },
+      {
+        "start_s": 371.0,
+        "end_s": 381.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 22.0,
+            "p50_seconds": 19.523809523809526,
+            "p90_seconds": 27.904761904761905,
+            "p99_seconds": 29.79047619047619
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 30.0,
+            "p50_seconds": 11.25,
+            "p90_seconds": 26.25,
+            "p99_seconds": 29.625
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 5.897435897435898,
+            "p90_seconds": 20.880000000000006,
+            "p99_seconds": 29.088
+          }
+        ]
+      },
+      {
+        "start_s": 381.0,
+        "end_s": 391.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 391.0,
+        "end_s": 401.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 20.0,
+            "p50_seconds": 1.0,
+            "p90_seconds": 26.0,
+            "p99_seconds": 29.6
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 19.0,
+            "p50_seconds": 8.4375,
+            "p90_seconds": 24.571428571428577,
+            "p99_seconds": 29.457142857142856
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 123.0,
+            "p50_seconds": 8.826530612244898,
+            "p90_seconds": 25.08,
+            "p99_seconds": 29.507999999999996
+          }
+        ]
+      },
+      {
+        "start_s": 401.0,
+        "end_s": 411.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 24.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.799999999999997
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 30.0,
+            "p50_seconds": 10.0,
+            "p90_seconds": 26.0,
+            "p99_seconds": 29.6
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 115.0,
+            "p50_seconds": 5.46875,
+            "p90_seconds": 13.571428571428571,
+            "p99_seconds": 28.35714285714285
+          }
+        ]
+      },
+      {
+        "start_s": 411.0,
+        "end_s": 421.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 421.0,
+        "end_s": 431.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 21.0,
+            "p50_seconds": 0.95,
+            "p90_seconds": 24.750000000000007,
+            "p99_seconds": 29.474999999999998
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 20.0,
+            "p50_seconds": 9.285714285714285,
+            "p90_seconds": 25.555555555555557,
+            "p99_seconds": 29.555555555555557
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 126.0,
+            "p50_seconds": 9.0625,
+            "p90_seconds": 25.333333333333336,
+            "p99_seconds": 29.53333333333333
+          }
+        ]
+      },
+      {
+        "start_s": 431.0,
+        "end_s": 441.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 24.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.799999999999997
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 12.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.799999999999997
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 2.0,
+            "p50_seconds": 20.0,
+            "p90_seconds": 28.0,
+            "p99_seconds": 29.8
+          }
+        ]
+      },
+      {
+        "start_s": 441.0,
+        "end_s": 451.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 451.0,
+        "end_s": 461.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 461.0,
+        "end_s": 471.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 471.0,
+        "end_s": 481.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 481.0,
+        "end_s": 491.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 491.0,
+        "end_s": 501.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 501.0,
+        "end_s": 511.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 511.0,
+        "end_s": 521.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 521.0,
+        "end_s": 531.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 531.0,
+        "end_s": 541.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 541.0,
+        "end_s": 551.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 551.0,
+        "end_s": 561.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 561.0,
+        "end_s": 570.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      }
+    ],
+    "queue_wait_epp_restarted": false
+  },
+  "ledger": {
+    "tolerance_pct": 10.0,
+    "cost_model": {
+      "input_token_weight": 1.0,
+      "output_token_weight": 2.0,
+      "cached_input_token_weight": 1.0
+    },
+    "rows": [
+      {
+        "group": "app1",
+        "client_prompt_tokens": 1086090,
+        "client_completion_tokens": 54043,
+        "client_requests_sent": 899,
+        "client_aborts": 0,
+        "client_errors": 0,
+        "epp_total_input_tokens_delta": 1082400.0,
+        "epp_total_output_tokens_delta": 53866.0,
+        "epp_total_cached_tokens_delta": 1070080.0,
+        "epp_total_raw_tokens_delta": 1136266.0,
+        "raw_tokens_pct_diff": -0.3391709563708795,
+        "epp_contended_cost_delta": 1176646.0,
+        "expected_cost_from_client": 1194176.0,
+        "cost_pct_diff": -1.4679578219625917,
+        "within_tolerance": true
+      },
+      {
+        "group": "app2",
+        "client_prompt_tokens": 867150,
+        "client_completion_tokens": 43373,
+        "client_requests_sent": 724,
+        "client_aborts": 0,
+        "client_errors": 0,
+        "epp_total_input_tokens_delta": 863460.0,
+        "epp_total_output_tokens_delta": 43196.0,
+        "epp_total_cached_tokens_delta": 853632.0,
+        "epp_total_raw_tokens_delta": 906656.0,
+        "raw_tokens_pct_diff": -0.4247009685642208,
+        "epp_contended_cost_delta": 932266.0,
+        "expected_cost_from_client": 953896.0,
+        "cost_pct_diff": -2.2675427929250147,
+        "within_tolerance": true
+      },
+      {
+        "group": "end-users",
+        "client_prompt_tokens": 4380030,
+        "client_completion_tokens": 217307,
+        "client_requests_sent": 3641,
+        "client_aborts": 0,
+        "client_errors": 0,
+        "epp_total_input_tokens_delta": 4362810.0,
+        "epp_total_output_tokens_delta": 216452.0,
+        "epp_total_cached_tokens_delta": 4313152.0,
+        "epp_total_raw_tokens_delta": 4579262.0,
+        "raw_tokens_pct_diff": -0.39316238944414994,
+        "epp_contended_cost_delta": 4755160.0,
+        "expected_cost_from_client": 4814644.0,
+        "cost_pct_diff": -1.2354807541326005,
+        "within_tolerance": true
+      }
+    ],
+    "verdict": {
+      "result": "PASS",
+      "reasons": []
+    }
+  },
+  "shed": {
+    "shed_statuses": [
+      "429",
+      "503"
+    ],
+    "total_shed": 0,
+    "rows": [
+      {
+        "group": "app1",
+        "state": "never_shed",
+        "requests_total": 899,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 21.05263157894737,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      },
+      {
+        "group": "app2",
+        "state": "never_shed",
+        "requests_total": 724,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 10.526315789473685,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      },
+      {
+        "group": "end-users",
+        "state": "never_shed",
+        "requests_total": 3641,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 68.42105263157895,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      }
+    ],
+    "epp_pool_wide": {
+      "state": "ok",
+      "outcome_deltas": {
+        "Dispatched": 5366.0
+      },
+      "epp_shed_total": 0.0,
+      "epp_429_upper_bound": 0.0,
+      "client_429_total": 0,
+      "non_epp_429_lower_bound": 0.0,
+      "epp_restarted": false
+    }
+  },
+  "pick_latency": {
+    "histograms": {
+      "scheduler_e2e": {
+        "metric": "llm_d_epp_scheduler_e2e_duration_seconds",
+        "state": "not_recorded",
+        "observations": null,
+        "p50_seconds": null,
+        "p99_seconds": null,
+        "p50_bucket": null,
+        "p99_bucket": null,
+        "p99_at_histogram_ceiling": null,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      },
+      "flow_control_dispatch_cycle": {
+        "metric": "llm_d_epp_flow_control_dispatch_cycle_duration_seconds",
+        "state": "ok",
+        "observations": 547493.0,
+        "p50_seconds": 5.001799757352512e-05,
+        "p99_seconds": 9.903563519557972e-05,
+        "p50_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_at_histogram_ceiling": false,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      }
+    },
+    "epp_restarted": false,
+    "baseline_report": null,
+    "baseline_has_pick_latency": null
+  },
+  "alerts": null
+}

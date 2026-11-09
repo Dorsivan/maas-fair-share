@@ -370,7 +370,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -1198,8 +1198,31 @@ case "$SCENARIO" in
       WORKERS_APP2="${WORKERS_APP2:?six-group-board-case requires WORKERS_APP1..APP6}"
     )
     ;;
+  twenty-group-scale)
+    # UNI-167: H3, scale -- 20 configured groups (app1..app20), extending
+    # six-group-board-case's (UNI-165) multi-group tooling the same way that
+    # scenario extended app1-flood's. app3..app20 are the real
+    # MaaSSubscriptions UNI-187/189 already applied (no end-users
+    # substitution). Only the `equal` weight table is rendered for 20 groups
+    # (deploy/poc/epp-groups/render.py 20 -- no graded/dominant/pow2 variant
+    # exists at this N), so unlike six-group-board-case this block owns a
+    # fixed, equal sizing: every group is identical, so a single flat worker
+    # count cannot over-offer one share while under-offering another the way
+    # it would across unequal weights. 50 is comfortably above the 32-worker
+    # count that already saturated six-group-board-case's larger 16.7% equal
+    # share (UNI-165), and matches the exact count UNI-179's own loadgen-only
+    # dry run used at this N (docs/runbook.md: "20 groups x 50 workers").
+    # 20x50 = 1000, the ticket's own target. The EPP groups table is the
+    # operator's responsibility, same division of labor as
+    # six-group-board-case (render.py 20 | oc apply -f -- before this
+    # scenario, restored to 00-config.yaml after) -- this block never touches
+    # the ConfigMap.
+    TENANTS="app1 app2 app3 app4 app5 app6 app7 app8 app9 app10 app11 app12 app13 app14 app15 app16 app17 app18 app19 app20"
+    PER_TENANT_OVERRIDES=()
+    WORKERS="${WORKERS:-50}"
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale)" >&2
     exit 1
     ;;
 esac
@@ -1571,8 +1594,17 @@ snapshot_metrics() {
   # at all after the chaos-deleted pod's replacement came up. That is
   # upstream of this plugin, in the picker's endpoint/queue bookkeeping, and
   # this benchmark was never scraping that layer to see it.
+  # UNI-167 (H3): also capture the EPP's own scheduling-latency histograms --
+  # scheduler_e2e (the pick itself) and plugin_duration (per-plugin, includes
+  # plugin_type="maas-weighted-fairness") -- neither matched any prefix above,
+  # so 15-fairness-report.py's compute_pick_latency() read "not_recorded" out
+  # of every prior snapshot regardless of what the live EPP was doing
+  # (confirmed against results/20261101T224216Z-uni140-b6-full-contention-soak/
+  # metrics-full-before.txt, the one full un-grepped scrape on file: both
+  # families are present and well-formed there, just outside this filter).
+  # Purely additive, same as every prefix UNI-193 added before it.
   curl -sS -m 10 -H "Authorization: Bearer $METRICS_TOKEN" "http://${EPP_METRICS_SVC_IP}:9090/metrics" \
-    | grep -E '^llm_d_epp_maas_fairness_|^llm_d_epp_request_(input|output|cached)_tokens_(sum|count)\{|^llm_d_epp_flow_control_|^llm_d_epp_(ready_endpoints|per_endpoint_queue_size|average_|std_dev_)' \
+    | grep -E '^llm_d_epp_maas_fairness_|^llm_d_epp_request_(input|output|cached)_tokens_(sum|count)\{|^llm_d_epp_flow_control_|^llm_d_epp_scheduler_e2e_|^llm_d_epp_plugin_duration_|^llm_d_epp_(ready_endpoints|per_endpoint_queue_size|average_|std_dev_)' \
     | grep -v '^#'
 }
 

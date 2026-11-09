@@ -505,9 +505,10 @@ def compute_pick_latency(before_labeled, after_labeled, baseline=None):
     minus before, bucket by bucket). Each entry says which of three states it
     is in, never a bare blank:
       - "not_recorded": no _bucket line in either snapshot. Unknown, not zero
-        -- the benchmark's snapshot filter did not capture the family (as of
-        UNI-181 15-fairness-benchmark.sh's snapshot_metrics does not), or the
-        EPP never scheduled anything in its lifetime.
+        -- the benchmark's snapshot filter did not capture the family (true
+        for every run between UNI-181 and UNI-167; snapshot_metrics() did not
+        grep scheduler_e2e/plugin_duration at all until UNI-167 added them),
+        or the EPP never scheduled anything in its lifetime.
       - "no_observations": captured, but the count did not move during the run.
       - "ok": p50/p99 computed.
     `baseline` is another report's pick_latency section (UNI-181: the 3-group

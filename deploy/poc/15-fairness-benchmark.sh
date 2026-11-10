@@ -370,7 +370,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-2x end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -966,6 +966,30 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128)
     ;;
+  full-contention-discriminating)
+    # UNI-225: full-contention's own 1:1:4 worker ratio (16.7/16.7/66.7%)
+    # sits only 6.1 points from this scenario's 21.1/10.5/68.4% weight
+    # share -- under the 10-point threshold, so a PASS there cannot tell
+    # "the split follows the weights" apart from "the split follows the
+    # workers" (see the module's own UNI-225 finding and
+    # 15-fairness-report.py's worker_vs_weight_gap_pts). This variant keeps
+    # end-users -- the dominant, already-proven-sufficient tenant -- at its
+    # unchanged 128 workers (never reduce the group that needs the most
+    # concurrency to stay backlogged; docs/runbook.md "Per-tenant worker
+    # sizing and the saturation check") and instead boosts BOTH minority
+    # tenants 4x past their own already-over-offering 32 baseline, to 128
+    # each. Over-offering a tenant further is always safe -- the existing
+    # 32-worker baseline already over-offers app1/app2's 20%/10% shares
+    # without breaking anything -- so this cannot introduce a new
+    # saturation-floor artifact, only a larger worker-share-vs-weight-share
+    # gap: all three tenants now offer an EQUAL 128 workers (33.3% each)
+    # against the unchanged 21.1/10.5/68.4% weight target, a 35.1-point gap.
+    # Keep full-contention itself running too -- this is a sibling, not a
+    # replacement (UNI-225 asks for at least one discriminating sizing per
+    # scenario, not a removal of the proportional one).
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=128 WORKERS_APP2=128 WORKERS_END_USERS=128)
+    ;;
   full-contention-2x)
     # UNI-212: full-contention's own 1:1:4 ratio, offered workers doubled
     # (64/64/256, 384 total) to clear UNI-211's new queueDepthThreshold=150
@@ -975,6 +999,20 @@ case "$SCENARIO" in
     # 352 (256+32+64).
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=64 WORKERS_APP2=64 WORKERS_END_USERS=256)
+    ;;
+  full-contention-2x-discriminating)
+    # UNI-225: same confounding as full-contention-discriminating above
+    # (6.1-point gap, under the 10-point bar), same fix -- keep end-users at
+    # its proven-sufficient 256 workers, boost both minority tenants 4x past
+    # their own 64-worker baseline to 256 each, so all three offer an EQUAL
+    # 256 workers (33.3% each) against the unchanged 21.1/10.5/68.4% weight
+    # target (same 35.1-point gap as the 1x variant). 768 total offered
+    # workers is double full-contention-discriminating's 384, the same
+    # doubling relationship full-contention/full-contention-2x themselves
+    # already have (192 -> 384) -- not a new scale this backend hasn't
+    # already run load at (full-contention-2x's own 384 already passed).
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=256 WORKERS_APP2=256 WORKERS_END_USERS=256)
     ;;
   end-users-idle)
     # app1 is the higher-share tenant once end-users is excluded (66.7% vs
@@ -986,6 +1024,22 @@ case "$SCENARIO" in
     # actual 2:1 app1:app2 target instead.
     TENANTS="app1 app2"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=64 WORKERS_APP2=32)
+    ;;
+  end-users-idle-discriminating)
+    # UNI-225: end-users-idle's own worker ratio (66.7/33.3%) is an exact
+    # copy of its 20:10 weight ratio (0.0-point gap) -- "the split follows
+    # the weights" and "the split follows the workers" predict the identical
+    # number here, so its PASS is not evidence for weighted fairness
+    # specifically. Keep app1 -- the dominant, already-proven-sufficient
+    # tenant once end-users is excluded -- at its unchanged 64 workers, and
+    # boost app2 4x past its own already-over-offering 32-worker baseline to
+    # 128, the same boost factor and same "never reduce the dominant
+    # tenant's proven sizing" rule full-contention-discriminating uses
+    # above. New worker share is 33.3/66.7% -- app2 now offers MORE workers
+    # than app1 despite having half app1's weight -- against an unchanged
+    # 66.7/33.3% weight target: a 33.4-point gap.
+    TENANTS="app1 app2"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=64 WORKERS_APP2=128)
     ;;
   equal-workers-control)
     # UNI-103: the ORIGINAL full-contention shape (equal WORKERS for every
@@ -1021,6 +1075,20 @@ case "$SCENARIO" in
     TENANTS="app1 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_END_USERS=104)
     ;;
+  app2-idle-discriminating)
+    # UNI-225: app2-idle's worker ratio (32:104) is sized to match its 20:65
+    # weight ratio exactly -- the pair's worker share (23.5/76.5%) and
+    # weight share (23.5/76.5%) are identical, a 0.0-point gap, so a PASS
+    # here cannot distinguish "follows the weights" from "follows the
+    # workers." Keep end-users -- the dominant, already-proven-sufficient
+    # tenant -- at its unchanged 104 workers, and boost app1 4x past its own
+    # already-over-offering 32-worker baseline to 128, same rule and boost
+    # factor as the other UNI-225 variants above. New worker share is
+    # 55.2/44.8% against the unchanged 23.5/76.5% weight target: a
+    # 31.7-point gap.
+    TENANTS="app1 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=128 WORKERS_END_USERS=104)
+    ;;
   app1-idle)
     # UNI-133: A4 in the same series as app2-alone (A1, UNI-131) and app2-idle
     # (A3, UNI-132). app1 is excluded, so the pair's renormalized target is
@@ -1030,6 +1098,16 @@ case "$SCENARIO" in
     # to match the ratio exactly: 32*(65/10)=208.
     TENANTS="app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP2=32 WORKERS_END_USERS=208)
+    ;;
+  app1-idle-discriminating)
+    # UNI-225: app1-idle's worker ratio (32:208) is sized to match its 10:65
+    # weight ratio exactly (0.0-point gap), same confound as app2-idle
+    # above. Keep end-users at its unchanged, proven-sufficient 208 workers,
+    # boost app2 4x past its own 32-worker baseline to 128. New worker share
+    # is 38.1/61.9% against the unchanged 13.3/86.7% weight target: a
+    # 24.8-point gap.
+    TENANTS="app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP2=128 WORKERS_END_USERS=208)
     ;;
   app2-trickle)
     # UNI-134: A5, promoting the by-hand "S2"/"S4" checks (docs/poc-results.md
@@ -1044,6 +1122,20 @@ case "$SCENARIO" in
     # deviation threshold (see the "app2-trickle" branch there).
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=2 WORKERS_END_USERS=104)
+    ;;
+  app2-trickle-discriminating)
+    # UNI-225: the scored app1/end-users pair here is sized identically to
+    # app2-idle's 32/104 (0.0-point gap), same confound. app2's own 2-worker
+    # trickle is untouched -- it is scored on a dedicated "did it get
+    # served" check (15-fairness-report.py's capped_groups path), not the
+    # symmetric deviation threshold this variant targets, so there is
+    # nothing to make discriminating there. Same fix as
+    # app2-idle-discriminating: keep end-users at its proven-sufficient 104,
+    # boost app1 4x to 128. 15-fairness-report.py's capped_groups exclusion
+    # keys off the literal scenario name "app2-trickle", so this variant is
+    # matched there explicitly rather than inferred from TENANTS.
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=128 WORKERS_APP2=2 WORKERS_END_USERS=104)
     ;;
   asymmetric-demand)
     TENANTS="app1 app2 end-users"
@@ -1290,7 +1382,7 @@ case "$SCENARIO" in
     WORKERS="${WORKERS:-50}"
     ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention end-users-idle equal-workers-control app1-alone app2-alone app2-idle app1-idle app2-trickle asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale)" >&2
     exit 1
     ;;
 esac

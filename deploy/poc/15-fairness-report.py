@@ -1158,7 +1158,15 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     # renormalizes to 23.5/76.5 (20:65) exactly as app2-idle's pair, and give
     # app2 its own demand-capped check below instead of the symmetric
     # deviation threshold.
-    capped_groups = {"app2"} if scenario == "app2-trickle" and len(offered_groups) == 3 else set()
+    capped_groups = (
+        {"app2"}
+        # UNI-225: app2-trickle-discriminating reuses app2-trickle's own
+        # 2-worker trickle/capped-group scoring unchanged -- only the scored
+        # app1/end-users pair's sizing differs between the two scenarios
+        # (see 15-fairness-benchmark.sh).
+        if scenario in ("app2-trickle", "app2-trickle-discriminating") and len(offered_groups) == 3
+        else set()
+    )
     offered_weight_total = sum(
         (weight_after.get(g) if weight_after.get(g) is not None else weight_before.get(g)) or 0.0
         for g in offered_groups

@@ -8591,6 +8591,9 @@ timelines) lives under `results/<ts>-uni-216-<case>/`.
 | `full-contention` run 2/3 | PASS (series) | **UNCONTENDED** | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
 | `full-contention` run 3/3 | PASS (series) | **UNCONTENDED** | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
 | `full-contention-2x` (64/64/256, the one UNCONTENDED follow-up the sizing rule calls for) | n/a (new scenario, added by UNI-212) | **PASS** | 5.9pt (app2) | not measured | 49.6% / 50.4% | FAIL, all 3 groups outside tolerance (app1 -13.6%, app2 -13.5%, end-users -13.1%) — consistent with the documented G2 scope boundary (UNI-142): only 15.2-15.5s of this 240s run was genuinely contended per group, so most delivered tokens fall outside the contended-cost window by design, not a new accounting defect (raw token diff is ~-0.1% for all three) |
+| `end-users-idle` (64/32 workers) | PASS (series) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| `end-users-idle-2x` (128/64 workers, the one UNCONTENDED follow-up) | n/a (new, this pass) | **UNCONTENDED** (2x was not enough here — still never backs up the queue) | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause. Per "don't tune past that," no further escalation attempted |
+| F1 `shadow-mode-control` (UNI-159) | INFO (negative control, correctly unscored, 6.1pt max dev) | **FAIL (label only)** — same zero-contended-tokens path every UNCONTENDED row this pass hit, but `IS_CONTROL` scenarios don't get the UNCONTENDED carve-out, so the report falls back to the older literal "offered groups delivered zero contended service tokens" FAIL text. Functionally identical to UNCONTENDED, not a real weight-split failure | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
 | B1 `cold-join` (UNI-142) | PASS (7.6pt max dev) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.9% / 50.1% | FAIL — same structural cause |
 | B2 `tenant-leaves-mid-run` (UNI-141) | FAIL (-34.0pt whole-run; the ticket itself calls this a measurement artifact, not a real failure — see UNI-141) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 50.0% / 50.0% | FAIL — same structural cause |
 | B4 short idle return (UNI-143) | PASS (-5.3pt) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
@@ -8608,4 +8611,100 @@ timelines) lives under `results/<ts>-uni-216-<case>/`.
 | B5 open-loop 70% (UNI-137) | UNCONTENDED (after the is_uncontended fix) | **UNCONTENDED** (confirmed) | n/a (unscored) | not measured | 49.2% / 50.8% | N/A — the open-loop generator path records no client-request ledger (`--client-record-jsonl`), a documented gap, not a new one |
 | B5 open-loop 100% (UNI-137) | not run at threshold 5 (B5 only tested 70/100/120% once, series doc doesn't separately break out a 100% verdict distinct from above) | **UNCONTENDED** | n/a (unscored) | not measured | 49.6% / 50.4% | N/A — same documented gap |
 | B5 open-loop 120%, above saturation (UNI-137) | FAIL (-18.8pt end-users, severe weight inversion) | **FAIL** (confirmed, same inversion direction: end-users -35.1pt, app1 +13.3pt, app2 +21.8pt — larger magnitude than the original, not smaller) | 35.1pt (end-users) | not measured | 49.4% / 50.6% | N/A — same documented gap |
+| UNI-165 `equal-2x` (64 workers/group, the one UNI-165-family `-2x` follow-up the sizing rule calls for) | n/a (new, this pass) | **PASS** | 0.4pt (app4) | not measured | 49.5% / 50.5% | FAIL, all 6 groups outside tolerance (-15.2% to -16.6%) — same G2 scope boundary: 21.9-25.6s of a 240s run was genuinely contended per group, still well under "almost the whole run" |
+| H2 `overhead-vs-stock` (UNI-168, reused per the ticket — already run on this exact config by UNI-214) | FAIL (enforcement-queueing overhead, pre-UNI-214) | **PASS**, reused not re-run (−0.5%/−0.7% throughput vs stock, replica split 49.7/50.3) | within 1% | −0.5% / −0.7% | 49.7% / 50.3% | see UNI-214 section above for full detail; `results/20261109T233500Z-uni-214-h2-equal-weights/`, `results/20261109T234932Z-uni-214-h2-equal-weights-retry/` |
+| C8 `cache-heavy-vs-cache-cold` (UNI-136, reused per the ticket — already run on this exact config by UNI-214) | n/a (unscored control) | reused, not re-run — no cache-affinity regression, hot-tenant hit ratio 88.0% | n/a (unscored) | not measured | 50.0% / 50.0% | see UNI-214 section above; `results/20261109T234159Z-uni-214-c8-equal-weights/` |
+
+### Headline finding: the queue almost never backs up at threshold 150
+
+Of the 29 rows above, 21 came back **UNCONTENDED**. That is not a gap in this
+pass's execution — it is the result. [UNI-212](/UNI/issues/UNI-212)/[UNI-214](/UNI/issues/UNI-214)
+found this for `full-contention` specifically; this pass shows it generalizes
+to almost every case in the original 131-168 series at its original worker
+sizing, including ones that measured real contention at the old
+`queueDepthThreshold: 5` (B2, B4-long, E1, UNI-161's 128-worker flood, every
+weight set in UNI-165 except `dominant`). Doubling the worker count fixed it
+in exactly two of the four places this pass tried it (`full-contention-2x`,
+UNI-165's `equal-2x`) and did not fix it in the other two
+(`end-users-idle-2x` still UNCONTENDED; per "don't tune past that," not
+escalated further). Genuine contention at threshold 150, with the original
+or `-2x` sizing, only ever showed up in: `full-contention-2x`, UNI-161's
+256-worker flood, UNI-165's `dominant` weight set (app1 alone has 181
+workers — the sizing itself does it, not the weight shape), E2's
+post-chaos window, UNI-165's `equal-2x`, and B5's above-saturation
+(120%) open-loop run. Every one of those six is either PASS or a FAIL that
+reproduces an old, already-understood mechanism (UNI-104 worker-sizing
+overshoot, the open-loop weight inversion) — **nothing in this pass found a
+new fairness defect**, but it does mean the bulk of the 131-168 series'
+worker sizings can no longer exercise the policy they were built to test.
+That sizing-vs-threshold gap is exactly what [UNI-215](/UNI/issues/UNI-215)
+exists to close.
+
+**Ledger note.** Every UNCONTENDED row FAILs the ledger cross-check, and so
+does every genuinely-contended row in this pass. Both are expected, not new:
+an UNCONTENDED row has nothing for the contention-gated check to validate
+(UNI-142's documented G2 scope boundary), and every contended row this pass
+produced had contention lasting only a small fraction of its total runtime
+(2-26s of a 240-360s run), so most delivered tokens fall outside the
+contended-cost window the same way. No row's raw token diff (EPP vs client,
+contention-independent) exceeded 0.1% — the EPP's basic accounting is
+intact everywhere; it is only the *contended-cost* denominator that the
+ledger check was never designed to use outside a near-full-run-contention
+shape.
+
+**Cluster left as found**, confirmed after the last run:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath={.data.epp} | grep -E "enforce:|queueDepthThreshold|pluginRef: (queue|prefix)|name: app1,|name: app2,|name: end-users,|defaultGroup"
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+      queueDepthThreshold: 150
+      - { pluginRef: queue-scorer, weight: 3.0 }
+      - { pluginRef: prefix-cache-scorer, weight: 3.0 }
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-cpu-kserve-router-scheduler-79869c447f-wbr6f   1/1     Running   0          4m26s
+maas-vllm-gpu-kserve-router-scheduler-5db5c69866-55dvl   1/1     Running   0          4m29s
+$ oc get deployment maas-vllm-gpu-kserve -n maas-fairness-poc -o jsonpath='{.status.readyReplicas}/{.status.replicas}'
+2/2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           8m3s       14m
+```
+
+This matches the config this pass started with exactly — image digest
+unchanged throughout, both EPPs on the same ConfigMap, three-group weight
+table restored, `enforce` back at its steady-state `false`. No orphaned `oc
+logs -f` process was left behind (checked by walking `/proc/*/cmdline`
+after every run).
+
+**What was and wasn't proven here:**
+- **Proven:** the post-UNI-214 build is live and correct (equal scorer
+  weights, threshold 150, image digest matches). Every case the ticket
+  asked for ran, including the mandated `-2x` follow-ups. No new fairness
+  defect surfaced anywhere in the 29 rows. Two old, understood FAIL
+  mechanisms (UNI-104 worker-overshoot, the open-loop weight inversion)
+  reproduce unchanged. UNI-165's `dominant` and `equal-2x` and
+  `full-contention-2x` show the weighted-fairness policy still works
+  correctly whenever genuine contention occurs.
+- **Not proven:** whether the *other* 20+ scenarios that came back
+  UNCONTENDED would still PASS/FAIL the way their old series runs did, since
+  none of them were ever actually exercised against the policy this pass —
+  that question is exactly what UNI-215's threshold sweep exists to answer.
+  E2's per-replica split wasn't captured this run (the post-chaos snapshot
+  raced the replica-restore); the scored verdict itself is unaffected. The
+  `-2x` follow-up for UNI-165 was run once (`equal`) representing the whole
+  six-group-board-case family rather than once per weight set — the
+  ticket's sizing rule doesn't say which granularity "one scenario" means
+  here, and running all five would have meant 5 more full benchmark cycles
+  for a question `full-contention-2x` and `equal-2x` already answered
+  (doubling works when it works, and `dominant` already shows a sizing that
+  doesn't need doubling at all).
+- **If UNI-215 changes the threshold,** per the ticket, only the
+  split-scored rows above need a fresh run — the UNCONTENDED/PASS/FAIL
+  labels in this table are a snapshot of threshold 150 specifically, not a
+  permanent verdict.
 

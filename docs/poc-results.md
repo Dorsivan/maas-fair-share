@@ -8537,3 +8537,55 @@ No orphaned `oc logs -f` process was left behind (checked by walking `/proc/*/cm
   many large hot prefixes, where warming a prefix on both replicas costs real KV capacity, was
   not tested. KV-cache utilization reads 0 on this backend, so capacity never binds here.
 - **Weighted split under contention.** This still needs UNI-215, as above.
+
+## UNI-216: re-validation pass, split-scored edge cases on the post-UNI-214 build
+
+[UNI-117](/UNI/issues/UNI-117)'s edge-case plan, re-validation sweep. The
+38-case series (UNI-131..168) ran on EPP image `fc27130` with
+`queueDepthThreshold: 5`. Since then: the saturation threshold moved to 150
+([UNI-211](/UNI/issues/UNI-211)), the newcomer-clamp wall-clock-idleness fix
+([UNI-212](/UNI/issues/UNI-212)), the refund fix and image re-pin
+([UNI-213](/UNI/issues/UNI-213)), and the equal-weights scheduling fix
+([UNI-214](/UNI/issues/UNI-214)). Every split-scored case gets a fresh run on
+the exact build that is live for this whole pass — nothing changes mid-pass.
+
+**Confirmed before starting (2026-11-10):**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath={.data.epp} | grep -E "enforce:|queueDepthThreshold|pluginRef: (queue|prefix)"
+      enforce: false
+      queueDepthThreshold: 150
+      - { pluginRef: queue-scorer, weight: 3.0 }
+      - { pluginRef: prefix-cache-scorer, weight: 3.0 }
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+maas-vllm-cpu-kserve-router-scheduler-79869c447f-7kfv8 quay.io/rh-ee-dsivan/maas-fair-share@sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091
+maas-vllm-gpu-kserve-router-scheduler-5db5c69866-mrfp4 quay.io/rh-ee-dsivan/maas-fair-share@sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091
+$ oc get deployment maas-vllm-gpu-kserve -n maas-fairness-poc -o jsonpath='{.status.readyReplicas}/{.status.replicas}'
+2/2
+```
+
+Both replicas share the same image digest and `queue-scorer`/`prefix-cache-scorer`
+are the UNI-214 equal 3.0/3.0 weights — the fix is live. "Both replicas show
+traffic" is confirmed per-run below via `deploy/poc/21-replica-split.sh`
+rather than asserted up front, since it depends on the offered load.
+
+**Config held fixed for this whole pass:** image digest
+`sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091`,
+`queueDepthThreshold: 150`, `queue-scorer`/`prefix-cache-scorer` 3.0/3.0,
+`halfLifeSeconds: 60`, `newcomerClamp: true`, base weights
+`app1=20 app2=10 end-users=65 unclassified=5` (patched away from and back to
+this for the board cases that need a different weight set, each noted
+inline). Per-run detail (raw metrics, patched manifests, replica split, chaos
+timelines) lives under `results/<ts>-uni-216-<case>/`.
+
+### Results
+
+| case | old verdict (series) | new verdict | max deviation | throughput vs stock | per-replica split | ledger |
+|---|---|---|---|---|---|---|
+| A1 `app2-alone` (UNI-131) | PASS | PASS (solo) | n/a (solo carve-out) | not measured (no stock comparison run for this scenario; see H2 below) | 49.7% / 50.3% | FAIL — structural, not new: solo traffic is never contended, so the EPP's contended-cost ledger has nothing to check (same scope boundary UNI-142 documents) |
+| A3 `app2-idle` (UNI-132) | PASS | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause: zero contended seconds means the cost check has nothing to validate |
+| A4 `app1-idle` (UNI-133) | PASS | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| A5 `app2-trickle` (UNI-134) | PASS | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| A6 `below-capacity` (UNI-135) | PASS (-6.1pt max dev) | UNCONTENDED (already the designed outcome at this sizing — A6 was PASS, not UNCONTENDED, at threshold 5, so this is a real change in verdict, not a confirmation) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| `full-contention` run 1/3 (H1/UNI-139, UNI-212) | PASS (5×, 4.24±0.66pt at threshold 5) | **UNCONTENDED** (confirms UNI-212/214 finding: at threshold 150 the EPP's own queue never backs up at this sizing) | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
+

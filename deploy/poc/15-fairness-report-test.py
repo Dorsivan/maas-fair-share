@@ -2205,6 +2205,232 @@ def test_n_groups_line_missing_client_record_fails_ledger():
         assert any("app4" in r for r in report["ledger"]["verdict"]["reasons"]), report["ledger"]["verdict"]["reasons"]
 
 
+# UNI-226: per-tenant TTFT/ITL, from the upstream llm-d-router v0.11.0
+# framework's own fairness_id-labelled histograms (already scraped by
+# 15-fairness-benchmark.sh's snapshot_metrics since this ticket -- report-side
+# tests only, same split as the UNI-164 queue-wait tests above).
+
+def ttft_bucket_lines(fairness_id, cumulative, streaming="true"):
+    """Prometheus text for llm_d_epp_request_ttft_seconds, labelled the way
+    llm-d-router v0.11.0 actually emits it (model_name, target_model_name,
+    fairness_id, priority, streaming). `cumulative` is [(le, count)], with
+    le="+Inf" last."""
+    name = "llm_d_epp_request_ttft_seconds"
+    return "".join(
+        f'{name}_bucket{{model_name="llama-3-1-8b",target_model_name="llama-3-1-8b",'
+        f'fairness_id="{fairness_id}",priority="0",streaming="{streaming}",le="{le}"}} {c}\n'
+        for le, c in cumulative
+    )
+
+
+def itl_bucket_lines(fairness_id, cumulative):
+    """Prometheus text for llm_d_epp_request_streaming_itl_seconds -- same
+    label set as TTFT minus `streaming` (ITL is streaming-only by
+    definition, so the metric carries no such label)."""
+    name = "llm_d_epp_request_streaming_itl_seconds"
+    return "".join(
+        f'{name}_bucket{{model_name="llama-3-1-8b",target_model_name="llama-3-1-8b",'
+        f'fairness_id="{fairness_id}",priority="0",le="{le}"}} {c}\n'
+        for le, c in cumulative
+    )
+
+
+def test_compute_ttft_itl_whole_run_ok_not_recorded_no_observations():
+    same_itl = itl_bucket_lines("app1", [("0.01", 40), ("+Inf", 40)])  # identical both sides: no new streaming
+    before = ttft_bucket_lines("app1", [("0.1", 0), ("1", 0), ("+Inf", 0)]) + same_itl
+    after = ttft_bucket_lines("app1", [("0.1", 50), ("1", 100), ("+Inf", 100)]) + same_itl
+    before_labeled = fairness_report.parse_metrics_labeled_text(before)
+    after_labeled = fairness_report.parse_metrics_labeled_text(after)
+    result = fairness_report.compute_ttft_itl_whole_run(before_labeled, after_labeled, ["app1", "app2"])
+    app1 = result["groups"]["app1"]
+    assert app1["ttft"]["state"] == "ok" and app1["ttft"]["observations"] == 100
+    assert abs(app1["ttft"]["p50_seconds"] - 0.1) < 1e-9
+    # ITL count did not move between the two snapshots: captured, but no
+    # streaming happened in this run for app1.
+    assert app1["itl"]["state"] == "no_observations"
+    # app2 was never in either snapshot at all: unknown, not zero.
+    app2 = result["groups"]["app2"]
+    assert app2["ttft"]["state"] == "not_recorded"
+    assert app2["itl"]["state"] == "not_recorded"
+    # Pool level sums across fairness_id.
+    assert result["pool"]["ttft"]["observations"] == 100
+
+
+def test_compute_ttft_itl_whole_run_pool_sums_across_groups():
+    before = ttft_bucket_lines("app1", [("0.1", 0), ("+Inf", 0)]) + ttft_bucket_lines("app2", [("0.1", 0), ("+Inf", 0)])
+    after = ttft_bucket_lines("app1", [("0.1", 30), ("+Inf", 30)]) + ttft_bucket_lines("app2", [("0.1", 70), ("+Inf", 70)])
+    result = fairness_report.compute_ttft_itl_whole_run(
+        fairness_report.parse_metrics_labeled_text(before),
+        fairness_report.parse_metrics_labeled_text(after),
+        ["app1", "app2"],
+    )
+    assert result["pool"]["ttft"]["observations"] == 100
+
+
+def test_compute_ttft_itl_windows_mirrors_queue_wait_window_shape():
+    schedule = {"app1": fairness_report.default_schedule_entry(20)}
+    block0 = ttft_bucket_lines("app1", [("0.1", 0), ("1", 0), ("+Inf", 0)]) + itl_bucket_lines("app1", [("0.01", 0), ("+Inf", 0)])
+    block1 = ttft_bucket_lines("app1", [("0.1", 50), ("1", 100), ("+Inf", 100)]) + itl_bucket_lines("app1", [("0.01", 400), ("+Inf", 400)])
+    ts = [
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0), False),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1), False),
+    ]
+    windows, restarted, scrape_gap = fairness_report.compute_ttft_itl_windows(ts, schedule)
+    assert restarted is False and scrape_gap is False
+    assert len(windows) == 1
+    g = windows[0]["groups"][0]
+    assert g["group"] == "app1"
+    assert g["ttft"]["state"] == "ok" and g["ttft"]["observations"] == 100
+    assert abs(g["ttft"]["p50_seconds"] - 0.1) < 1e-9
+    assert g["itl"]["state"] == "ok" and g["itl"]["observations"] == 400
+
+
+def test_compute_ttft_itl_windows_flags_restart_like_queue_wait():
+    schedule = {"app1": fairness_report.default_schedule_entry(20)}
+    block0 = ttft_bucket_lines("app1", [("0.1", 5000), ("+Inf", 5000)])
+    block1 = ttft_bucket_lines("app1", [("0.1", 8), ("+Inf", 10)])
+    ts = [
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0), False),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1), False),
+    ]
+    windows, restarted, scrape_gap = fairness_report.compute_ttft_itl_windows(ts, schedule)
+    assert restarted is True and scrape_gap is False
+    assert windows[0]["groups"][0]["ttft"]["observations"] == 10
+
+
+def mk_ttft(p50, p95, observations=1000):
+    return {
+        "ttft": {"state": "ok", "observations": observations, "p50_seconds": p50, "p95_seconds": p95},
+        "itl": {"state": "no_observations", "observations": 0, "p50_seconds": None, "p95_seconds": None},
+    }
+
+
+def test_priority_verdict_not_applicable_when_primary_passed():
+    pv = fairness_report.compute_priority_verdict(
+        "PASS", ["app1", "app2"], {"app1": 20, "app2": 10},
+        {"app1": mk_ttft(0.1, 0.2), "app2": mk_ttft(0.5, 0.6)},
+    )
+    assert pv["applicable"] is False
+    assert pv["result"] == "N/A (share already PASS)"
+
+
+def test_priority_verdict_not_evaluated_when_ttft_missing():
+    ttft = {"app1": mk_ttft(0.1, 0.2), "app2": {"ttft": {"state": "not_recorded"}, "itl": {}}}
+    pv = fairness_report.compute_priority_verdict("FAIL", ["app1", "app2"], {"app1": 20, "app2": 10}, ttft)
+    assert pv["result"] == "not_evaluated"
+    assert "app2" in pv["reason"]
+
+
+def test_priority_verdict_ok_when_weights_distinct_and_order_correct():
+    groups = ["app1", "app2", "end-users"]
+    weights = {"app1": 20, "app2": 10, "end-users": 65}
+    ttft = {
+        "app1": mk_ttft(0.50, 0.60),
+        "app2": mk_ttft(0.60, 0.70),
+        "end-users": mk_ttft(0.10, 0.15),  # highest weight, lowest TTFT
+    }
+    pv = fairness_report.compute_priority_verdict("FAIL", groups, weights, ttft, noise_floor_seconds=0.05)
+    assert pv["result"] == "PRIORITY-OK", pv
+    assert pv["top_weighted_group"] == "end-users"
+    assert pv["no_inversions_among_distinct_weights"] is True
+    assert pv["rank_correlation"] == 1.0
+
+
+def test_priority_verdict_fails_on_a_genuine_inversion():
+    groups = ["app1", "app2", "end-users"]
+    weights = {"app1": 20, "app2": 10, "end-users": 65}
+    ttft = {
+        "app1": mk_ttft(0.10, 0.15),  # lower weight than end-users, but faster: wrong order
+        "app2": mk_ttft(0.20, 0.30),
+        "end-users": mk_ttft(0.50, 0.60),
+    }
+    pv = fairness_report.compute_priority_verdict("FAIL", groups, weights, ttft, noise_floor_seconds=0.05)
+    assert pv["result"] == "PRIORITY-FAIL"
+    assert pv["no_inversions_among_distinct_weights"] is False
+
+
+def test_priority_verdict_fails_on_insufficient_separation():
+    groups = ["app1", "app2", "end-users"]
+    weights = {"app1": 20, "app2": 10, "end-users": 65}
+    ttft = {
+        "app1": mk_ttft(0.50, 0.60),
+        "app2": mk_ttft(0.52, 0.62),
+        "end-users": mk_ttft(0.48, 0.58),  # correctly ordered, but barely
+    }
+    pv = fairness_report.compute_priority_verdict("FAIL", groups, weights, ttft, noise_floor_seconds=0.05)
+    assert pv["no_inversions_among_distinct_weights"] is True
+    assert pv["separation_state"] == "insufficient"
+    assert pv["result"] == "PRIORITY-FAIL"
+
+
+def test_priority_verdict_without_noise_floor_skips_separation_check():
+    groups = ["app1", "end-users"]
+    weights = {"app1": 20, "end-users": 65}
+    ttft = {"app1": mk_ttft(0.50, 0.60), "end-users": mk_ttft(0.499, 0.599)}
+    pv = fairness_report.compute_priority_verdict("FAIL", groups, weights, ttft, noise_floor_seconds=None)
+    assert pv["separation_state"] == "not_evaluated"
+    assert pv["result"] == "PRIORITY-OK"
+
+
+def test_priority_verdict_handles_weight_tie_without_false_failure():
+    # UNI-226 board direction (2026-11-10): 98/1/1 under equal load is a
+    # named, scored prioritisation row. app2 and end-users are BOTH weight 1
+    # -- a genuine tie this fixture reproduces. app1 (weight 98) is clearly,
+    # strictly fastest; app2 and end-users differ from each other by pure
+    # noise that the board does not ask to be ordered. This must read as
+    # PRIORITY-OK, not get penalised by the app2-vs-end-users noise the way
+    # a raw (uncorrected) rank-correlation-only gate would (confirmed as a
+    # real bug during implementation: tie-aware Spearman alone gives 0.866,
+    # not 1.0, for this exact fixture -- see compute_priority_verdict's own
+    # comment for the derivation).
+    groups = ["app1", "app2", "end-users"]
+    weights = {"app1": 98, "app2": 1, "end-users": 1}
+    ttft = {
+        "app1": mk_ttft(0.10, 0.15),
+        "app2": mk_ttft(0.50, 0.70),
+        "end-users": mk_ttft(0.60, 0.80),
+    }
+    pv = fairness_report.compute_priority_verdict("FAIL", groups, weights, ttft, noise_floor_seconds=0.1)
+    assert pv["rank_correlation"] is not None and pv["rank_correlation"] < 1.0, (
+        "fixture should reproduce the raw-correlation-under-1.0 artifact from a weight tie"
+    )
+    assert pv["no_inversions_among_distinct_weights"] is True
+    assert pv["top_group_strictly_lowest_p50"] is True
+    assert pv["top_group_strictly_lowest_p95"] is True
+    assert pv["result"] == "PRIORITY-OK", pv
+
+    # Swapping app2/end-users' relative order against EACH OTHER (both still
+    # tied on weight, so this must not change the verdict) confirms the gate
+    # really does ignore their mutual ordering, only app1's.
+    ttft_swapped = dict(ttft)
+    ttft_swapped["app2"], ttft_swapped["end-users"] = ttft["end-users"], ttft["app2"]
+    pv2 = fairness_report.compute_priority_verdict("FAIL", groups, weights, ttft_swapped, noise_floor_seconds=0.1)
+    assert pv2["result"] == "PRIORITY-OK", pv2
+
+
+def test_ttft_itl_integrates_into_report_and_markdown():
+    with tempfile.TemporaryDirectory() as tmp:
+        extra_before = ttft_bucket_lines("app1", [("0.1", 0), ("+Inf", 0)]) \
+            + ttft_bucket_lines("app2", [("0.1", 0), ("+Inf", 0)]) \
+            + ttft_bucket_lines("end-users", [("0.1", 0), ("+Inf", 0)])
+        extra_after = ttft_bucket_lines("app1", [("0.1", 20), ("0.6", 500), ("+Inf", 500)]) \
+            + ttft_bucket_lines("app2", [("0.1", 5), ("0.7", 480), ("+Inf", 480)]) \
+            + ttft_bucket_lines("end-users", [("0.05", 500), ("+Inf", 510)])
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS, extra_before=extra_before, extra_after=extra_after)
+        assert "ttft_itl" in report
+        groups = report["ttft_itl"]["groups"]
+        assert set(groups) == {"app1", "app2", "end-users"}
+        assert groups["end-users"]["ttft"]["state"] == "ok"
+        pv = report["ttft_itl"]["priority_verdict"]
+        # CLEAN_ROWS' shares (500/480/510, weights 20/10/65 via CONFIGURED_WEIGHT)
+        # are a share FAIL at these worker counts -- exercised here as "the
+        # section renders end-to-end", not asserting a specific verdict value.
+        assert pv["applicable"] in (True, False)
+        md = fairness_report.render_markdown(report)
+        assert "Per-tenant TTFT / ITL and the priority verdict (UNI-226)" in md
+        assert "pool (all groups)" in md
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

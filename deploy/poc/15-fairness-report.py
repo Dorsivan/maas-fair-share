@@ -1027,6 +1027,294 @@ def compute_queue_wait_windows(timeseries_labeled, schedule):
     return windows, any_restart, any_scrape_gap
 
 
+# UNI-226: per-tenant TTFT and ITL, from the upstream llm-d-router
+# framework's own histograms -- fairness_id-labelled since v0.11.0
+# (pkg/epp/handlers/response.go), not something this report or the loadgen
+# has ever had to measure client-side. TTFT is recorded for EVERY request
+# (streaming or not -- a non-streaming request's TTFT equals its total
+# duration, which is why it is only a useful *distinct* signal from
+# P50_SEC/P95_SEC under streaming); ITL is recorded per response chunk for
+# streaming requests only, so a run with STREAM_FRACTION=0 for a group
+# produces "no_observations" for that group here, not an error. Neither
+# histogram carries an `outcome` label (unlike queue-wait) -- there is
+# nothing to filter beyond fairness_id itself.
+TTFT_HISTOGRAM = "llm_d_epp_request_ttft_seconds"
+ITL_HISTOGRAM = "llm_d_epp_request_streaming_itl_seconds"
+
+
+def compute_ttft_itl_whole_run(before_labeled, after_labeled, group_ids):
+    """Whole-run p50/p95 TTFT and ITL per group, from the same single
+    before/after snapshot pair compute_pick_latency reads, via the same
+    _histogram_buckets/histogram_quantile bucket-diff compute_queue_wait_windows
+    uses. Same three-state contract as every other histogram section in this
+    file: "not_recorded" (no _bucket line in either snapshot -- the scrape
+    filter didn't capture this family, or the EPP never saw this group),
+    "no_observations" (captured, but the count did not move -- e.g. ITL for a
+    group that never streamed), "ok" (p50/p95 computed). Also returns a
+    pool-level entry (no fairness_id filter) for the vLLM cross-check."""
+    def one(histogram, filters):
+        b = _histogram_buckets(before_labeled, histogram, filters)
+        a = _histogram_buckets(after_labeled, histogram, filters)
+        entry = {"state": None, "observations": None, "p50_seconds": None, "p95_seconds": None}
+        if a is None and b is None:
+            entry["state"] = "not_recorded"
+            return entry
+        a = a or {}
+        b = b or {}
+        delta = {}
+        went_backwards = False
+        for bound in set(a) | set(b):
+            d = a.get(bound, 0.0) - b.get(bound, 0.0)
+            if d < 0:
+                went_backwards = True
+                d = 0.0
+            delta[bound] = d
+        if went_backwards:
+            delta = dict(a)
+        count = delta.get(float("inf"), 0.0)
+        entry["observations"] = count
+        if count <= 0:
+            entry["state"] = "no_observations"
+            return entry
+        p50, _ = histogram_quantile(0.50, delta)
+        p95, _ = histogram_quantile(0.95, delta)
+        entry.update({"state": "ok", "p50_seconds": p50, "p95_seconds": p95})
+        return entry
+
+    groups = {}
+    for gid in group_ids:
+        groups[gid] = {
+            "ttft": one(TTFT_HISTOGRAM, {"fairness_id": gid}),
+            "itl": one(ITL_HISTOGRAM, {"fairness_id": gid}),
+        }
+    pool = {
+        "ttft": one(TTFT_HISTOGRAM, None),
+        "itl": one(ITL_HISTOGRAM, None),
+    }
+    return {"groups": groups, "pool": pool}
+
+
+def compute_ttft_itl_windows(timeseries_labeled, schedule):
+    """Windowed p50/p95 TTFT and ITL per group -- same shape, same
+    restart/scrape-gap handling, same per-window structure as
+    compute_queue_wait_windows above, just without that function's
+    outcome="Dispatched" filter (TTFT/ITL carry no `outcome` label)."""
+    if len(timeseries_labeled) < 2:
+        return [], False, False
+    t0 = timeseries_labeled[0][0]
+    windows = []
+    any_restart = False
+    any_scrape_gap = False
+    for (e0, _, s0, _scrape_failed0), (e1, _, s1, scrape_failed1) in zip(timeseries_labeled, timeseries_labeled[1:]):
+        start_s, end_s = e0 - t0, e1 - t0
+        groups = []
+        for gid in schedule:
+            entry = {"group": gid}
+            for key, histogram in (("ttft", TTFT_HISTOGRAM), ("itl", ITL_HISTOGRAM)):
+                filters = {"fairness_id": gid}
+                b = _histogram_buckets(s0, histogram, filters)
+                a = _histogram_buckets(s1, histogram, filters)
+                sub = {"state": None, "observations": None, "p50_seconds": None, "p95_seconds": None}
+                if a is None and b is None:
+                    sub["state"] = "not_recorded"
+                    entry[key] = sub
+                    continue
+                a = a or {}
+                b = b or {}
+                delta = {}
+                went_backwards = False
+                for bound in set(a) | set(b):
+                    d = a.get(bound, 0.0) - b.get(bound, 0.0)
+                    if d < 0:
+                        went_backwards = True
+                        d = 0.0
+                    delta[bound] = d
+                if went_backwards:
+                    if scrape_failed1:
+                        any_scrape_gap = True
+                    else:
+                        any_restart = True
+                    delta = dict(a)
+                count = delta.get(float("inf"), 0.0)
+                sub["observations"] = count
+                if count <= 0:
+                    sub["state"] = "no_observations"
+                    entry[key] = sub
+                    continue
+                p50, _ = histogram_quantile(0.50, delta)
+                p95, _ = histogram_quantile(0.95, delta)
+                sub.update({"state": "ok", "p50_seconds": p50, "p95_seconds": p95})
+                entry[key] = sub
+            groups.append(entry)
+        windows.append({"start_s": start_s, "end_s": end_s, "groups": groups})
+    return windows, any_restart, any_scrape_gap
+
+
+def _average_ranks(values):
+    """Standard tie-aware ranking: equal values get the average of the rank
+    positions they'd occupy if broken arbitrarily (e.g. two values tied for
+    2nd/3rd both get rank 2.5). Ascending order (rank 1 = smallest value).
+    Used for Spearman correlation so a genuine weight tie (e.g. 98/1/1's
+    app2==end-users) never gets forced into an arbitrary strict order --
+    the two tied entries share a rank, so their relative order against each
+    other cannot affect the correlation either way."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg_rank = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _spearman(xs, ys):
+    """Pearson correlation of the two rank vectors -- the standard
+    tie-corrected Spearman rank correlation. Returns None if either side has
+    zero variance (e.g. every weight equal, or every TTFT identical), since
+    rank correlation is undefined there, not 0 or 1."""
+    n = len(xs)
+    if n < 2:
+        return None
+    rx, ry = _average_ranks(xs), _average_ranks(ys)
+    mx, my = sum(rx) / n, sum(ry) / n
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    vx = sum((a - mx) ** 2 for a in rx)
+    vy = sum((b - my) ** 2 for b in ry)
+    if vx <= 0 or vy <= 0:
+        return None
+    return cov / (vx * vy) ** 0.5
+
+
+def compute_priority_verdict(primary_verdict, offered_groups, weights, ttft_whole_run, noise_floor_seconds=None):
+    """The SPLIT-FAIL / PRIORITY-OK secondary verdict (UNI-226, board
+    direction 2026-11-10): when the primary share verdict FAILs, check
+    whether per-tenant TTFT was nonetheless ordered the way the configured
+    weights predict -- "the policy was prioritising correctly even though
+    the share target wasn't met" is a materially different, more favourable
+    outcome than a bare FAIL, and UNI-103's equal-workers-control run (app1
+    30.7%/+9.6, app2 30.7%/+20.1, end-users 38.7%/-29.7 on share, but
+    app1 7.5s/app2 7.4s/end-users 5.9s on latency -- the highest-weight
+    tenant served fastest) is exactly the case this exists to stop silently
+    discarding.
+
+    Only meaningful when the primary verdict is FAIL -- a PASS already means
+    the policy achieved the target split, so there is nothing for a
+    secondary ordering check to rescue. Ties in `weights` are handled via
+    tie-aware rank correlation (see _average_ranks/_spearman): two tenants
+    configured with equal weight are never forced into an arbitrary order
+    against each other, only against a tenant with a genuinely different
+    weight.
+    """
+    if primary_verdict != "FAIL":
+        return {
+            "applicable": False,
+            "result": "N/A (share already PASS)",
+            "reason": "secondary verdict only rescues a FAIL; primary verdict was not FAIL",
+        }
+
+    missing = [g for g in offered_groups if ttft_whole_run.get(g, {}).get("ttft", {}).get("state") != "ok"]
+    if missing:
+        return {
+            "applicable": True,
+            "result": "not_evaluated",
+            "reason": f"TTFT not available (state != ok) for: {', '.join(missing)}",
+            "groups": offered_groups,
+        }
+
+    weight_values = [weights[g] for g in offered_groups]
+    ttft_p50_values = [ttft_whole_run[g]["ttft"]["p50_seconds"] for g in offered_groups]
+    ttft_p95_values = [ttft_whole_run[g]["ttft"]["p95_seconds"] for g in offered_groups]
+
+    # Rank by weight descending == rank by TTFT ascending, for a correctly
+    # prioritising policy (higher weight -> lower TTFT). Spearman on
+    # (weight, -TTFT) reported as a continuous, informational summary of how
+    # close the two orderings are -- but NOT used as the pass/fail gate.
+    #
+    # Why not gate on correlation == 1.0, despite that being the board's own
+    # literal phrasing (2026-11-10): tie-aware (average-rank) Spearman does
+    # NOT make a weight tie "not count" the way a reader might expect. Two
+    # groups tied on weight still get compared against each other through
+    # their TTFT ranks' deviation from the shared average rank, so an
+    # otherwise-perfect result (the only distinctly-weighted group correctly
+    # fastest) scores well under 1.0 purely from noise between two tenants
+    # whose weights are equal and whose relative order the board does not
+    # care about -- confirmed numerically: weights (98,1,1) with TTFT
+    # correctly ordered (0.1s, 0.5s, 0.6s) gives correlation 0.866, not 1.0,
+    # for exactly this reason. 98/1/1 is precisely the row this matters for
+    # (app2 and end-users both weight 1).
+    #
+    # The gate actually used is the direct statement of what "the orderings
+    # agree" should mean under ties: no pairwise inversion between any two
+    # groups with GENUINELY DIFFERENT weights (equal-weight pairs are
+    # excluded from the pairwise check, same as they are mathematically
+    # inert in a tie-aware correlation of a fully-distinct ranking). This
+    # reduces to correlation == 1.0 exactly when every weight is distinct
+    # (the common case -- e.g. 20/10/65), and is strictly more correct than
+    # the raw correlation gate whenever any weight tie exists.
+    correlation = _spearman(weight_values, [-v for v in ttft_p50_values])
+    no_inversions = True
+    for i, gi in enumerate(offered_groups):
+        for j, gj in enumerate(offered_groups):
+            if i >= j or weight_values[i] == weight_values[j]:
+                continue
+            higher, lower = (gi, gj) if weight_values[i] > weight_values[j] else (gj, gi)
+            higher_p50 = ttft_whole_run[higher]["ttft"]["p50_seconds"]
+            lower_p50 = ttft_whole_run[lower]["ttft"]["p50_seconds"]
+            if not (higher_p50 < lower_p50):
+                no_inversions = False
+
+    top_group = max(offered_groups, key=lambda g: weights[g])
+    top_p50 = ttft_whole_run[top_group]["ttft"]["p50_seconds"]
+    top_p95 = ttft_whole_run[top_group]["ttft"]["p95_seconds"]
+    strictly_lowest_p50 = all(
+        top_p50 < ttft_p50_values[i] for i, g in enumerate(offered_groups)
+        if g != top_group and weights[g] != weights[top_group]
+    )
+    strictly_lowest_p95 = all(
+        top_p95 < ttft_p95_values[i] for i, g in enumerate(offered_groups)
+        if g != top_group and weights[g] != weights[top_group]
+    )
+
+    next_best_p50 = min(
+        (v for g, v in zip(offered_groups, ttft_p50_values) if g != top_group and weights[g] != weights[top_group]),
+        default=None,
+    )
+    separation_seconds = (next_best_p50 - top_p50) if next_best_p50 is not None else None
+    separation_state = "not_evaluated"
+    separation_ok = None
+    if noise_floor_seconds is not None and separation_seconds is not None:
+        separation_ok = separation_seconds > noise_floor_seconds
+        separation_state = "ok" if separation_ok else "insufficient"
+
+    rank_ok = no_inversions and strictly_lowest_p50 and strictly_lowest_p95
+    if rank_ok and (noise_floor_seconds is None or separation_ok):
+        result = "PRIORITY-OK"
+    else:
+        result = "PRIORITY-FAIL"
+
+    return {
+        "applicable": True,
+        "result": result,
+        "top_weighted_group": top_group,
+        "top_group_ttft_p50_seconds": top_p50,
+        "top_group_ttft_p95_seconds": top_p95,
+        "top_group_strictly_lowest_p50": strictly_lowest_p50,
+        "top_group_strictly_lowest_p95": strictly_lowest_p95,
+        "no_inversions_among_distinct_weights": no_inversions,
+        "rank_correlation": correlation,
+        "separation_from_next_seconds": separation_seconds,
+        "noise_floor_seconds": noise_floor_seconds,
+        "separation_state": separation_state,
+        "groups": offered_groups,
+        "weights": weights,
+    }
+
+
 def compute_convergence(windows, phase_edges, threshold_points):
     """For each phase edge, the first window at/after it from which every
     active group's deviation stays within threshold_points for the rest of
@@ -1067,7 +1355,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                   input_token_weight=1.0, output_token_weight=1.0,
                   cached_input_token_weight=1.0, ledger_tolerance_pct=10.0,
                   pick_latency_baseline_path=None,
-                  alerts_path=None, alert_rules_path=None, alerts_step_seconds=30.0):
+                  alerts_path=None, alert_rules_path=None, alerts_step_seconds=30.0,
+                  priority_noise_floor_seconds=None):
     before = parse_metrics(metrics_before_path)
     after = parse_metrics(metrics_after_path)
     offered_workers, loadgen_rows, logged_duration, generator = parse_loadgen_log(loadgen_log_path)
@@ -1687,6 +1976,37 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         alerts_section = compute_alerts(alerts_path, rule_names, run_start, run_end, alerts_step_seconds)
         alerts_section["rule_file"] = alert_rules_path
 
+    # UNI-226: per-tenant TTFT/ITL plus the SPLIT-FAIL/PRIORITY-OK secondary
+    # verdict -- purely additive like ledger/shed/pick_latency above, never
+    # reads or writes `verdict` itself (compute_priority_verdict only
+    # consumes its already-final value to decide whether the secondary
+    # verdict is applicable). Windowed TTFT/ITL needs the same
+    # --metrics-timeseries input the queue-wait/dispatch-share windows above
+    # do; omit it and the whole-run numbers and priority verdict still work,
+    # same "omit the flag, get the old shape" contract every other optional
+    # section in this report follows.
+    ttft_itl_whole_run = compute_ttft_itl_whole_run(before_labeled, after_labeled, offered_groups)
+    ttft_itl_windows = None
+    ttft_itl_epp_restarted = False
+    ttft_itl_scrape_gap = False
+    if metrics_timeseries_path:
+        ttft_itl_windows, ttft_itl_epp_restarted, ttft_itl_scrape_gap = compute_ttft_itl_windows(
+            timeseries_labeled, schedule
+        )
+    priority_verdict = compute_priority_verdict(
+        verdict, offered_groups, weights_for_shed, ttft_itl_whole_run["groups"],
+        noise_floor_seconds=priority_noise_floor_seconds,
+    )
+    ttft_itl_section = {
+        "window_seconds": window_seconds,
+        "groups": ttft_itl_whole_run["groups"],
+        "pool": ttft_itl_whole_run["pool"],
+        "windows": ttft_itl_windows,
+        "epp_restarted_during_windows": ttft_itl_epp_restarted,
+        "scrape_gap_in_windows": ttft_itl_scrape_gap,
+        "priority_verdict": priority_verdict,
+    }
+
     report = {
         "schema": "uni54.fairness_benchmark_report.v1",
         "run": {
@@ -1805,6 +2125,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         "shed": shed_section,
         "pick_latency": pick_latency_section,
         "alerts": alerts_section,
+        "ttft_itl": ttft_itl_section,
     }
     return report
 
@@ -1909,6 +2230,105 @@ def _render_uni181_sections(report):
                          "use the post-restart histogram only.")
 
     lines.append("")
+    lines.append("## Per-tenant TTFT / ITL and the priority verdict (UNI-226)")
+    lines.append("")
+    ti = report.get("ttft_itl")
+    if not ti:
+        lines.append("N/A: report predates UNI-226.")
+    else:
+        ti_state_label = {
+            "not_recorded": "not recorded (absent from both snapshots -- check the benchmark's "
+                             "scrape filter includes `llm_d_epp_request_(ttft|streaming_itl)_seconds_`)",
+            "no_observations": "no observations (e.g. ITL with STREAM_FRACTION=0 for this group)",
+        }
+
+        def tfmt(v):
+            return "n/a" if v is None else f"{v * 1000:.0f}ms"
+
+        lines.append(
+            "`llm_d_epp_request_ttft_seconds` (every request, streaming or not -- non-streaming "
+            "TTFT equals total duration) and `llm_d_epp_request_streaming_itl_seconds` (streaming "
+            "requests only) from the EPP's own framework-level histograms, fairness_id-labelled. "
+            "Whole-run, from the same before/after snapshot pair the verdict above uses."
+        )
+        lines.append("")
+        lines.append("| group | TTFT state | TTFT obs | TTFT p50 | TTFT p95 | ITL state | ITL obs | ITL p50 | ITL p95 |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
+        for gid, g in ti["groups"].items():
+            t_, i_ = g["ttft"], g["itl"]
+            t_state = ti_state_label.get(t_["state"], "ok")
+            i_state = ti_state_label.get(i_["state"], "ok")
+            lines.append(
+                f"| {gid} | {t_state} | {fmt(t_['observations'], '', '.0f')} | {tfmt(t_['p50_seconds'])} | "
+                f"{tfmt(t_['p95_seconds'])} | {i_state} | {fmt(i_['observations'], '', '.0f')} | "
+                f"{tfmt(i_['p50_seconds'])} | {tfmt(i_['p95_seconds'])} |"
+            )
+        pool_t, pool_i = ti["pool"]["ttft"], ti["pool"]["itl"]
+        lines.append(
+            f"| **pool (all groups)** | {ti_state_label.get(pool_t['state'], 'ok')} | "
+            f"{fmt(pool_t['observations'], '', '.0f')} | {tfmt(pool_t['p50_seconds'])} | "
+            f"{tfmt(pool_t['p95_seconds'])} | {ti_state_label.get(pool_i['state'], 'ok')} | "
+            f"{fmt(pool_i['observations'], '', '.0f')} | {tfmt(pool_i['p50_seconds'])} | {tfmt(pool_i['p95_seconds'])} |"
+        )
+        lines.append("")
+        lines.append(
+            "The pool row is the EPP-side number to compare against vLLM's own pool-level "
+            "`vllm:time_to_first_token_seconds` for the UNI-226 cross-check (done externally, "
+            "against live Prometheus, not by this script) -- a large gap between the two would "
+            "point at EPP/gateway-added overhead, not vLLM's own prefill time."
+        )
+
+        pv = ti["priority_verdict"]
+        lines.append("")
+        if not pv["applicable"]:
+            lines.append(f"**Secondary (priority) verdict: {pv['result']}** -- {pv['reason']}")
+        elif pv["result"] == "not_evaluated":
+            lines.append(f"**Secondary (priority) verdict: not evaluated** -- {pv['reason']}")
+        else:
+            sep = "n/a" if pv["separation_from_next_seconds"] is None else f"{pv['separation_from_next_seconds'] * 1000:.0f}ms"
+            floor = "not given (separation check skipped)" if pv["noise_floor_seconds"] is None else f"{pv['noise_floor_seconds'] * 1000:.0f}ms"
+            corr = "n/a" if pv["rank_correlation"] is None else f"{pv['rank_correlation']:.2f}"
+            lines.append(
+                f"**Secondary (priority) verdict: {pv['result']}** -- the share verdict above is "
+                "FAIL, so this is the board's second, independent success criterion (2026-11-10): "
+                "did the policy nonetheless order tenants by weight? Top-weighted group: "
+                f"`{pv['top_weighted_group']}` (TTFT p50 {tfmt(pv['top_group_ttft_p50_seconds'])}, "
+                f"p95 {tfmt(pv['top_group_ttft_p95_seconds'])}, strictly lowest among "
+                f"distinctly-weighted groups: p50={pv['top_group_strictly_lowest_p50']}/"
+                f"p95={pv['top_group_strictly_lowest_p95']}; no rank inversion among any "
+                f"distinctly-weighted pair: {pv['no_inversions_among_distinct_weights']} -- this, "
+                "not raw rank correlation, is what gates the verdict, since a genuine weight tie "
+                "(e.g. 98/1/1's app2==end-users) makes exact correlation 1.0 unreachable by "
+                f"construction even when ordering is otherwise perfect). Rank correlation {corr} "
+                "(1.00 = exact agreement, informational only) shown for reference. Separation from "
+                f"the next distinctly-weighted group: {sep} against a noise floor of {floor}."
+            )
+        if ti.get("windows") is not None:
+            lines.append("")
+            lines.append(
+                "**Windowed TTFT/ITL** "
+                f"({len(ti['windows'])} windows" +
+                (", EPP restart detected mid-window at least once" if ti.get("epp_restarted_during_windows") else "") +
+                (", a metrics scrape failed mid-window at least once (UNI-230, not a restart)" if ti.get("scrape_gap_in_windows") else "") +
+                "):"
+            )
+            lines.append("")
+            lines.append("| start (s) | end (s) | group | TTFT state | TTFT p50 | TTFT p95 | ITL state | ITL p50 | ITL p95 |")
+            lines.append("|---|---|---|---|---|---|---|---|---|")
+            for w in ti["windows"]:
+                for g in w["groups"]:
+                    t_, i_ = g["ttft"], g["itl"]
+                    lines.append(
+                        f"| {w['start_s']:.1f} | {w['end_s']:.1f} | {g['group']} | "
+                        f"{ti_state_label.get(t_['state'], 'ok')} | {tfmt(t_['p50_seconds'])} | "
+                        f"{tfmt(t_['p95_seconds'])} | {ti_state_label.get(i_['state'], 'ok')} | "
+                        f"{tfmt(i_['p50_seconds'])} | {tfmt(i_['p95_seconds'])} |"
+                    )
+        else:
+            lines.append("")
+            lines.append("N/A: no `--metrics-timeseries` recorded for this run, whole-run numbers above only.")
+
+    lines.append("")
     lines.append("## Alerts (UNI-181)")
     lines.append("")
     a = report.get("alerts")
@@ -1967,6 +2387,15 @@ def render_markdown(report):
         # not buried in the reasons list below.
         discriminating_note = " **(NON-DISCRIMINATING)**" if v.get("discriminating") is False else ""
         lines.append(f"**Verdict: {v['result']}**{discriminating_note} (threshold: {v['threshold_points']:g} points)")
+        # UNI-226: a share FAIL is not the whole story -- point straight at the
+        # secondary verdict (full detail in "Per-tenant TTFT / ITL" below)
+        # instead of leaving a reader to assume this row is a flat failure.
+        pv_top = (report.get("ttft_itl") or {}).get("priority_verdict")
+        if v["result"] == "FAIL" and pv_top and pv_top.get("applicable"):
+            lines.append(
+                f"**Secondary (priority) verdict: {pv_top['result']}** -- see \"Per-tenant TTFT / "
+                "ITL and the priority verdict (UNI-226)\" below for detail."
+            )
     if v.get("max_worker_vs_weight_gap_points") is not None:
         lines.append(
             f"Worker-share vs. weight-share gap (UNI-225): "
@@ -2266,6 +2695,14 @@ def main():
         help="UNI-181: the query_range step used for --alerts-json (ignored if the file carries "
              "its own step_seconds). Samples more than 1.5 steps apart start a new episode.",
     )
+    p.add_argument(
+        "--priority-noise-floor-seconds", type=float, default=None,
+        help="UNI-226: minimum TTFT p50 separation (seconds) the top-weighted group must beat "
+             "the next group by for the secondary SPLIT-FAIL/PRIORITY-OK verdict to count the "
+             "separation check as satisfied, established from a same-config repeat run -- not "
+             "asserted. Omit to compute rank correlation only and leave the separation check "
+             "'not_evaluated' rather than defaulting to an unjustified number.",
+    )
     args = p.parse_args()
 
     report = build_report(
@@ -2296,6 +2733,7 @@ def main():
         alerts_path=args.alerts_json,
         alert_rules_path=args.alert_rules,
         alerts_step_seconds=args.alerts_step_seconds,
+        priority_noise_floor_seconds=args.priority_noise_floor_seconds,
     )
 
     with open(args.out_json, "w") as f:

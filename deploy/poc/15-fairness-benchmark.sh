@@ -1894,11 +1894,25 @@ snapshot_metrics() {
   # prefix keeps this a no-op for parse_metrics_text/parse_metrics_labeled_text,
   # which already skip comment lines, so older callers and older captured
   # files are unaffected.
+  #
+  # UNI-226: also capture the upstream llm-d-router framework's own
+  # per-tenant TTFT/ITL histograms -- llm_d_epp_request_ttft_seconds
+  # (fairness_id-labelled, recorded for EVERY request in
+  # pkg/epp/handlers/response.go's HandleResponseBody at endOfStream via
+  # metrics.RecordRequestTTFT, streaming or not -- for a non-streaming
+  # request this equals total duration) and
+  # llm_d_epp_request_streaming_itl_seconds (fairness_id-labelled, recorded
+  # per response chunk for streaming requests only, via
+  # metrics.RecordInterTokenLatency). Neither was ever captured before this
+  # ticket despite already being listed in docs/runbook.md's metrics
+  # catalog table -- confirmed by grepping deploy/poc/*.py|*.sh and this
+  # file itself for the metric names before UNI-226, zero hits. Purely
+  # additive, same as every prefix before it.
   local raw rc=0
   raw="$(curl -sS -m 10 -H "Authorization: Bearer $METRICS_TOKEN" "http://${EPP_METRICS_SVC_IP}:9090/metrics")" || rc=$?
   echo "# scrape_exit=$rc"
   printf '%s\n' "$raw" \
-    | grep -E '^llm_d_epp_maas_fairness_|^llm_d_epp_request_(input|output|cached)_tokens_(sum|count)\{|^llm_d_epp_flow_control_|^llm_d_epp_scheduler_e2e_|^llm_d_epp_plugin_duration_|^llm_d_epp_(ready_endpoints|per_endpoint_queue_size|average_|std_dev_)' \
+    | grep -E '^llm_d_epp_maas_fairness_|^llm_d_epp_request_(input|output|cached)_tokens_(sum|count)\{|^llm_d_epp_request_(ttft|streaming_itl)_seconds_|^llm_d_epp_flow_control_|^llm_d_epp_scheduler_e2e_|^llm_d_epp_plugin_duration_|^llm_d_epp_(ready_endpoints|per_endpoint_queue_size|average_|std_dev_)' \
     | grep -v '^#' || true
 }
 

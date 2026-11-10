@@ -151,6 +151,34 @@ writes `verdict`:
 Every one of them distinguishes "never happened" (a measured zero) from "not
 recorded" (unknown) rather than printing a blank. See docs/runbook.md
 "Shed rate, EPP pick latency, and alert fire/clear (UNI-181)".
+
+UNI-225 adds one more per-group number and a verdict-level flag, computed
+purely from numbers this report already has -- no new input, no new cluster
+access. Most of this benchmark's scenarios size each offered group's workers
+(or, for the open-loop generator, its offered rate) to track its configured
+weight as closely as possible, on purpose: that is how a group is made to
+genuinely over-offer its own entitlement without accidentally under-offering
+the pool as a whole (see docs/runbook.md "Per-tenant worker sizing and the
+saturation check"). The side effect is that on those rows, "the split follows
+the configured weights" and "the split just follows how many workers each
+group happened to run" predict the identical number -- a PASS there confirms
+the policy did not BREAK, but is not evidence that it is weights, specifically,
+doing the enforcing. `worker_share_pct` is each offered group's share of the
+total OFFERED worker count/rate (same denominator convention as
+`expected_share_pct` above: offered groups only, excluding `solo` and any
+`capped_groups`), so it is directly comparable to `expected_share_pct`.
+`worker_vs_weight_gap_pts` is `worker_share_pct - expected_share_pct` per
+group; the verdict's `max_worker_vs_weight_gap_points` is the largest absolute
+value of that across the run's groups. When that gap stays under
+`threshold_points` -- the same bar the weighted-split deviation check itself
+uses -- the run cannot distinguish the two hypotheses, and `verdict.
+discriminating` is set to `False` (`render_markdown` prints this as a
+**(NON-DISCRIMINATING)** qualifier next to the verdict, in the same spirit as
+the UNCONTENDED carve-out above). `discriminating` is left `None` for a
+`solo`, `control`, UNCONTENDED, or demand-capped run, the same four cases
+already excluded from the symmetric deviation check -- there is no weights-
+vs-workers question to ask about a run that never reaches that check in the
+first place.
 """
 import argparse
 import json
@@ -1146,9 +1174,20 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     offered_requests_total = sum(
         loadgen_rows.get(g, {"total": 0}).get("total", 0) for g in offered_groups
     )
+    # UNI-225: same denominator convention as offered_weight_total (offered
+    # groups only, minus any capped_groups) so worker_share_pct is directly
+    # comparable to expected_share_pct -- see the module docstring's UNI-225
+    # paragraph. offered_workers holds a rate, not a count, under the
+    # open-loop generator, but the share computation is unit-agnostic.
+    offered_workers_total = sum(
+        offered_workers.get(g, 0) or 0.0
+        for g in offered_groups
+        if g not in capped_groups
+    )
 
     rows = []
     deviations_for_verdict = []
+    worker_vs_weight_gaps = []
     for gid in all_group_ids:
         weight = weight_after.get(gid)
         if weight is None:
@@ -1159,6 +1198,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         deviation_pts = None
         request_share_pct = None
         request_share_deviation_pts = None
+        worker_share_pct = None
+        worker_vs_weight_gap_pts = None
         if is_offered and gid != solo and gid not in capped_groups:
             if offered_weight_total > 0 and weight is not None:
                 expected_pct = 100.0 * weight / offered_weight_total
@@ -1170,6 +1211,11 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             if expected_pct is not None and observed_pct is not None:
                 deviation_pts = observed_pct - expected_pct
                 deviations_for_verdict.append((gid, deviation_pts))
+            if offered_workers_total > 0:
+                worker_share_pct = 100.0 * (offered_workers.get(gid, 0) or 0.0) / offered_workers_total
+            if expected_pct is not None and worker_share_pct is not None:
+                worker_vs_weight_gap_pts = worker_share_pct - expected_pct
+                worker_vs_weight_gaps.append((gid, worker_vs_weight_gap_pts))
             # UNI-146 (C1): same expected_pct target, but against this
             # group's share of total REQUEST COUNT rather than weighted
             # tokens -- informational only, never fed into
@@ -1203,6 +1249,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "deviation_pts": deviation_pts,
             "request_share_pct": request_share_pct,
             "request_share_deviation_pts": request_share_deviation_pts,
+            "worker_share_pct": worker_share_pct,
+            "worker_vs_weight_gap_pts": worker_vs_weight_gap_pts,
             "contended_seconds": contended_seconds_deltas.get(gid),
             "prompt_tokens_cached_ratio": cached_ratio_after.get(gid),
             "dispatch_total": dispatch_deltas.get(gid),
@@ -1387,6 +1435,33 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             f"{worst[0]} deviated {worst[1]:+.1f} points from its contention-adjusted expected "
             f"share, exceeding the {threshold_points:g}-point threshold"
         )
+
+    # UNI-225: does this run's own sizing let the weighted-split verdict above
+    # actually distinguish "the split follows the configured weights" from
+    # "the split follows however many workers each group happened to run"?
+    # See the module docstring's UNI-225 paragraph for the full rationale.
+    # `None` (not applicable) for the same four cases already excluded from
+    # the symmetric deviation check -- solo, control, UNCONTENDED, and the
+    # demand-capped scenario never reach a weights-vs-workers question in the
+    # first place.
+    max_worker_vs_weight_gap = max((abs(g) for _, g in worker_vs_weight_gaps), default=None)
+    is_discriminating = None
+    if (
+        solo is None
+        and not control
+        and not is_uncontended
+        and not is_demand_capped_scenario
+        and max_worker_vs_weight_gap is not None
+    ):
+        is_discriminating = max_worker_vs_weight_gap >= threshold_points
+        if not is_discriminating:
+            reasons.append(
+                f"NON-DISCRIMINATING (UNI-225): offered worker shares stay within "
+                f"{max_worker_vs_weight_gap:.1f} points of the configured weight shares, under "
+                f"the {threshold_points:g}-point bar -- 'follows the weights' and 'follows the "
+                f"workers' predict the same split here, so this {verdict} is not evidence for "
+                "weighted fairness specifically"
+            )
 
     # UNI-127: purely additive. Never reads or writes `verdict` above -- a run
     # with no timeseries/timeline-config, or one that doesn't use any of the
@@ -1606,6 +1681,9 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "solo_group": solo,
             "capped_groups": sorted(capped_groups),
             "uncontended_threshold_seconds": UNCONTENDED_SECONDS_THRESHOLD,
+            # UNI-225: see the module docstring's UNI-225 paragraph.
+            "max_worker_vs_weight_gap_points": max_worker_vs_weight_gap,
+            "discriminating": is_discriminating,
         },
         "sources": {
             "delivered_tokens_and_observed_share": (
@@ -1809,7 +1887,22 @@ def render_markdown(report):
             "weighted-split threshold; see docs/runbook.md."
         )
     else:
-        lines.append(f"**Verdict: {v['result']}** (threshold: {v['threshold_points']:g} points)")
+        # UNI-225: a PASS/FAIL that cannot distinguish weights-vs-workers (see
+        # the module docstring) is flagged right next to the verdict itself,
+        # not buried in the reasons list below.
+        discriminating_note = " **(NON-DISCRIMINATING)**" if v.get("discriminating") is False else ""
+        lines.append(f"**Verdict: {v['result']}**{discriminating_note} (threshold: {v['threshold_points']:g} points)")
+    if v.get("max_worker_vs_weight_gap_points") is not None:
+        lines.append(
+            f"Worker-share vs. weight-share gap (UNI-225): "
+            f"{v['max_worker_vs_weight_gap_points']:.1f} points"
+            + (
+                " -- below the pass bar, so this row cannot tell 'the split follows the "
+                "weights' apart from 'the split follows the workers'"
+                if v.get("discriminating") is False
+                else ""
+            )
+        )
     if v["reasons"]:
         lines.append("")
         for reason in v["reasons"]:
@@ -1851,17 +1944,24 @@ def render_markdown(report):
         "when every offered group sends uniform requests (every scenario "
         "before UNI-146) and are expected to diverge whenever request cost "
         "is asymmetric across groups (e.g. long-prompt/short-output vs. "
-        "short-prompt/long-output)."
+        "short-prompt/long-output). `worker share %`/`worker-vs-weight gap "
+        "(pts)` (UNI-225) compare this group's share of the offered worker "
+        "count/rate against its own `expected %` (weight share) -- a small "
+        "gap here means this row's sizing cannot distinguish 'the split "
+        "follows the weights' from 'the split follows the workers', "
+        "regardless of what the observed split did; see the verdict line "
+        "above and the module docstring."
     )
     lines.append("")
     offered_col = "offered req/s" if r.get("generator") == "open-loop" else "offered workers"
     lines.append(
         f"| group | weight | {offered_col} | requests | statuses | p50s | p95s | "
-        "delivered tokens | expected % | observed % | deviation (pts) | "
+        "delivered tokens | expected % | worker share % | worker-vs-weight gap (pts) | "
+        "observed % | deviation (pts) | "
         "request-count % | request-count deviation (pts) | contended_seconds | "
         "cached ratio | dispatch_total |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for g in report["groups"]:
         def fmt(v, suffix=""):
             return "n/a" if v is None else f"{v:.1f}{suffix}" if isinstance(v, float) else f"{v}{suffix}"
@@ -1872,6 +1972,7 @@ def render_markdown(report):
             f"| {g['group']} | {fmt(g['configured_weight'])} | {fmt(g['offered_workers'])} | "
             f"{g['requests_total']} | {statuses} | {fmt(g['p50_sec'])} | {fmt(g['p95_sec'])} | "
             f"{fmt(g['delivered_tokens'])} | {fmt(g['expected_share_pct'], '%')} | "
+            f"{fmt(g['worker_share_pct'], '%')} | {fmt(g['worker_vs_weight_gap_pts'])} | "
             f"{fmt(g['observed_share_pct'], '%')} | {fmt(g['deviation_pts'])} | "
             f"{fmt(g['request_share_pct'], '%')} | {fmt(g['request_share_deviation_pts'])} | "
             f"{fmt(g['contended_seconds'], 's')} | {fmt(cached_pct, '%')} | "

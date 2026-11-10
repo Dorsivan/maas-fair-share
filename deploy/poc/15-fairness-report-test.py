@@ -151,6 +151,145 @@ def test_converged_run_passes():
         assert by_group["unclassified"]["observed_share_pct"] is None
 
 
+def test_worker_sizing_proportional_to_weights_is_non_discriminating():
+    # UNI-225: app2-idle's actual historical sizing (20:65 weight ratio,
+    # workers sized 32:104 -- exactly the same ratio) landed close to its own
+    # target, which is a PASS by the symmetric threshold but cannot tell "the
+    # split follows the weights" apart from "the split follows the workers"
+    # -- the two hypotheses predict the identical split here. Mirrors A3 from
+    # the ticket's own table (worker share == weight share, 0.0pt gap).
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+        )
+        # app1:end-users delivered 2350:7650 (the 20:65 renormalized target,
+        # 23.5%/76.5%), landing on expected_share_pct almost exactly.
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2350\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 7650\n'
+        )
+        rows = [
+            ("app1", 235, "1.20", "2.40", "200=235"),
+            ("end-users", 765, "1.10", "2.30", "200=765"),
+        ]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 end-users", w_app1=32, w_app2=0, w_end=104, rows=rows,
+        )
+        assert report["verdict"]["result"] == "PASS", report["verdict"]
+        assert report["verdict"]["discriminating"] is False, report["verdict"]
+        assert report["verdict"]["max_worker_vs_weight_gap_points"] < 1.0, report["verdict"]
+        assert any("NON-DISCRIMINATING" in r for r in report["verdict"]["reasons"]), report["verdict"]["reasons"]
+        by_group = {g["group"]: g for g in report["groups"]}
+        assert abs(by_group["app1"]["worker_share_pct"] - by_group["app1"]["expected_share_pct"]) < 1e-6
+        assert abs(by_group["app1"]["worker_vs_weight_gap_pts"]) < 1e-6
+
+
+def test_worker_sizing_divergent_from_weights_is_discriminating():
+    # UNI-225: same 20:65 weight pair as above, but sized with EQUAL workers
+    # (32:32) instead of proportionally -- a worker-share prediction of
+    # 50/50 against a weight-share target of 23.5/76.5 is a 26.5pt gap, well
+    # over the 10pt bar. The observed split still lands on the configured
+    # weights (PASS), and -- unlike the proportional sizing above -- that
+    # PASS is now real evidence weights, not worker count, drove the split.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 2350\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 7650\n'
+        )
+        rows = [
+            ("app1", 235, "1.20", "2.40", "200=235"),
+            ("end-users", 765, "1.10", "2.30", "200=765"),
+        ]
+        report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 end-users", w_app1=32, w_app2=0, w_end=32, rows=rows,
+        )
+        assert report["verdict"]["result"] == "PASS", report["verdict"]
+        assert report["verdict"]["discriminating"] is True, report["verdict"]
+        assert report["verdict"]["max_worker_vs_weight_gap_points"] > 10.0, report["verdict"]
+        assert not any("NON-DISCRIMINATING" in r for r in report["verdict"]["reasons"]), report["verdict"]["reasons"]
+        by_group = {g["group"]: g for g in report["groups"]}
+        assert abs(by_group["app1"]["worker_share_pct"] - 50.0) < 1e-6
+
+
+def test_discriminating_is_none_for_solo_control_and_uncontended():
+    # UNI-225: there is no weights-vs-workers question to ask about a run
+    # that never reaches the symmetric deviation check in the first place --
+    # mirrors the same three carve-outs (solo, control, UNCONTENDED) the
+    # deviation check itself already has.
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = 'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+        tokens_after = 'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 1000\n'
+        rows = [("app1", 500, "1.20", "2.40", "200=500")]
+        solo_report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1", w_app1=32, w_app2=0, w_end=0, rows=rows,
+        )
+        assert solo_report["verdict"]["discriminating"] is None, solo_report["verdict"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 3100\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 3070\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 3830\n'
+        )
+        rows = [
+            ("app1", 500, "1.20", "2.40", "200=500"),
+            ("app2", 490, "1.30", "2.50", "200=490"),
+            ("end-users", 510, "1.10", "2.30", "200=510"),
+        ]
+        control_report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 app2 end-users", w_app1=32, w_app2=32, w_end=32, rows=rows,
+            scenario="equal-workers-control", control=True,
+        )
+        assert control_report["verdict"]["discriminating"] is None, control_report["verdict"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tokens_before = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 0\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 10.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 10.0\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 10.0\n'
+        )
+        tokens_after = (
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 40\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app2"} 35\n'
+            'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="end-users"} 90\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app1"} 10.2\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="app2"} 10.1\n'
+            'llm_d_epp_maas_fairness_contended_seconds_total{fairness_id="end-users"} 10.3\n'
+        )
+        rows = [
+            ("app1", 180, "0.80", "1.00", "200=180"),
+            ("app2", 180, "0.80", "1.00", "200=180"),
+            ("end-users", 780, "0.80", "1.00", "200=780"),
+        ]
+        uncontended_report = run_build(
+            tmp, tokens_before=tokens_before, tokens_after=tokens_after,
+            tenants="app1 app2 end-users", w_app1=6, w_app2=6, w_end=26, rows=rows,
+        )
+        assert uncontended_report["verdict"]["result"] == "UNCONTENDED", uncontended_report["verdict"]
+        assert uncontended_report["verdict"]["discriminating"] is None, uncontended_report["verdict"]
+
+
 def test_request_share_pct_matches_token_share_when_requests_are_uniform():
     # UNI-146 (C1): when every group's per-request token cost is the same
     # (every scenario before this ticket), request count and delivered

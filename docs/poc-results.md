@@ -9140,6 +9140,7 @@ disk (`results/20261106T213542Z-uni-165-dominant/`, `.../uni-165-pow2/`,
 | `uni161-app1-flood-moderate` (128/32/64) | app1:128, app2:32, end-users:64 | 30.0 / 10.0 / 60.0 | 57.1 / 14.3 / 28.6 | 31.4 | FAIL |
 | `uni165-pow2` (32/16/8/4/2/1) | app1:58, app2-6: 32,32,32,32,32 | 50.8 / 25.4 / 12.7 / 6.3 / 3.2 / 1.6 | 26.6 / 14.7 each | 24.2 | FAIL |
 | `uni164-app3-joins-at-saturation` (30/10/60) | app1:96, app2:32, end-users:128 | 30.0 / 10.0 / 60.0 | 37.5 / 12.5 / 50.0 | 10.0 (exactly on the bar) | **PASS** |
+| `e3-queue-ttl-shedding` (thr32, [UNI-227](/UNI/issues/UNI-227)) | open-loop Poisson, equal offered rate app1=app2=end-users=12/s (equal `offered_workers` field) | 21.1 / 10.5 / 68.4 | 33.3 / 33.3 / 33.3 | 35.1 | FAIL |
 
 **The named PASS changes, and it matters.** `uni164-app3-joins` -- not `33/33/33` -- is the one
 genuine settled-suite (thr32) discriminating PASS: workers skew 37.5/12.5/50.0% against a
@@ -9169,23 +9170,31 @@ documented worker-overshoot mechanism, not a new finding) and would not change t
 
 ### The restated, discriminating-only scorecard (corrected)
 
-Combining the five settled-suite (thr32) rows above with the six new `-discriminating` siblings
-from this ticket's item 3:
+Combining the six settled-suite (thr32) rows above (the fifth row now includes
+[UNI-227](/UNI/issues/UNI-227)'s `e3-queue-ttl-shedding` re-run -- see its own section below) with
+the six new `-discriminating` siblings from this ticket's item 3:
 
-- **Discriminating rows, suite-wide: 2 PASS, 9 FAIL out of 11** -- `uni164-app3-joins` (10.0pt,
+- **Discriminating rows, suite-wide: 2 PASS, 10 FAIL out of 12** -- `uni164-app3-joins` (10.0pt,
   weak evidence per UNI-201 above) and `app1-idle-discriminating` (24.8pt) PASS; `uni165-dominant`,
-  `b5-openloop-120pct`, `uni161-app1-flood-moderate`, `uni165-pow2`, `app2-idle-discriminating`,
-  `app2-trickle-discriminating`, `end-users-idle-discriminating`, `full-contention-discriminating`,
-  `full-contention-2x-discriminating` FAIL. (`33/33/33` and `40/20/40`/`98/1/1`/`app1-flood` are
-  **not** part of this count -- the first is a different config era than the thr32 settled suite,
-  the latter three are alternate-weight-set reuses from UNI-215 on `full-contention-2x` sizing,
-  cited separately in the UNI-218 section above, not rows of the base 20/10/65/5 settled suite this
-  reclassification restricts itself to.)
+  `b5-openloop-120pct`, `uni161-app1-flood-moderate`, `uni165-pow2`, `e3-queue-ttl-shedding` (thr32),
+  `app2-idle-discriminating`, `app2-trickle-discriminating`, `end-users-idle-discriminating`,
+  `full-contention-discriminating`, `full-contention-2x-discriminating` FAIL. (`33/33/33` and
+  `40/20/40`/`98/1/1`/`app1-flood` are **not** part of this count -- the first is a different config
+  era than the thr32 settled suite, the latter three are alternate-weight-set reuses from UNI-215 on
+  `full-contention-2x` sizing, cited separately in the UNI-218 section above, not rows of the base
+  20/10/65/5 settled suite this reclassification restricts itself to.)
 - **This, not "19 PASS / 6 FAIL," is the number the POC's core claim (configured weights, not
   offered worker counts, decide the split under contention) should be judged on.** The claim is
   not unsupported, but the breadth of positive evidence is thin and one of the two PASSes
   (`uni164-app3-joins`) is the weakest row in the set on its own terms. See the duration finding
   below for the more defensible read of *why* the FAILs cluster the way they do.
+- **`e3-queue-ttl-shedding` reversed expectation on re-run.** It PASSed twice at the pre-thr32
+  config with the two longest contended windows in this document's corpus (94-98s, see the UNI-157
+  section); the working assumption going into [UNI-227](/UNI/issues/UNI-227) was that re-running it
+  once at thr32 would convert the corpus's single strongest positive data point into a countable
+  settled-suite PASS. It did not -- it FAILed, at the same 35.1pt structural gap. See the
+  [UNI-227](/UNI/issues/UNI-227) section after the duration finding below for the per-group detail
+  and why this is a *refinement*, not a reversal, of the duration finding.
 
 ### The real headline: duration, not breadth of evidence, is what's decisive (review finding, Zeratul)
 
@@ -9217,24 +9226,97 @@ re-read directly for this correction, not estimated.
 
 **This reframes the finding.** It is not "the breadth of positive evidence is thin" as a standalone
 statement -- it is **the weighted-fairness mechanism converges on the configured weights given
-sustained contention, and reads as worker-following when the contended window is short.** Every
-discriminating run with roughly a minute or more of per-group contended time in this document's
-corpus PASSes; every one measured with contended time under 10s FAILs, with the sole exception of
-the boundary `uni164-app3-joins` row discussed above. That is a materially more defensible claim
-than "thin evidence," and the one the write-up leads with now. The honest caveat stays attached:
-`contended_seconds` co-varies with scenario and offered load rather than being independently
-dialed, so this is a strong association across the rows already measured plus one controlled
-within-scenario triplet (same weight set, same structural gap, three different contended-window
-lengths) -- not yet a dedicated, independently-randomized duration sweep.
+sustained contention, and reads as worker-following when the contended window is short.** Up to
+this document's UNI-225 pass, every discriminating run with roughly a minute or more of per-group
+contended time in this document's corpus PASSed; every one measured with contended time under 10s
+FAILed, with the sole exception of the boundary `uni164-app3-joins` row discussed above. That was a
+materially more defensible claim than "thin evidence." [UNI-227](/UNI/issues/UNI-227)'s re-run below
+adds a per-group counter-example that refines rather than overturns it -- see that section. The
+honest caveat stays attached: `contended_seconds` co-varies with scenario and offered load rather
+than being independently dialed, so this is an association across the rows measured plus one
+controlled within-scenario triplet (same weight set, same structural gap, three different
+contended-window lengths) -- not a dedicated, independently-randomized duration sweep.
 
-**One concrete, optional follow-up falls out of this.** `e3-queue-ttl-shedding` already PASSes
-twice (thr5 series and the measurement above) with the two longest contended windows in this
-document's corpus, at a 35.1pt structural gap, but it predates the thr32 settled config and so is
-not counted in either scorecard above. Re-running it once at thr32 would convert the single
-strongest piece of positive evidence in this entire investigation into a countable settled-suite
-row. This needs the GPU pool and is not required to close this ticket -- filed as
-[UNI-227](/UNI/issues/UNI-227) for the board to prioritise alongside the rest of this chain's
-follow-ups, not run here.
+## UNI-227: re-running `e3-queue-ttl-shedding` at thr32 -- FAIL, not the expected PASS, and why that still supports the duration finding
+
+`e3-queue-ttl-shedding` PASSed twice at the pre-thr32 config (thr5 era, see the UNI-157 section)
+with the two longest per-group contended windows in this document's corpus (94-98s). Going into
+this ticket, the working assumption (stated in the paragraph above as it read before this section)
+was that a single re-run at the current settled `queueDepthThreshold: 32` config would convert the
+corpus's strongest piece of positive evidence into a countable settled-suite PASS. It did not.
+
+**Setup**, matching the UNI-157 run exactly except for the settled thr32 config and image digest:
+
+```
+RATE_APP1=12 RATE_APP2=12 RATE_END_USERS=12 DURATION=240 SEED=1 \
+  CLIENT_TIMEOUT=340 DRAIN_TIMEOUT=380 MAX_WORKERS=9000 THRESHOLD_POINTS=10 \
+  ./deploy/poc/17-fairness-benchmark-openloop.sh e3-queue-ttl-shedding uni-227-e3-queue-ttl-shedding-thr32
+```
+
+`enforce` flipped live by hand (no `ENFORCE_LIVE` flag on the open-loop path, same technique as
+UNI-157), confirmed on both EPPs before the run. Image digest
+`sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091` (current settled digest),
+`queueDepthThreshold: 32` (current settled config), weights 20/10/65/5 (unchanged).
+
+**Result: FAIL**, 35.1pt structural gap (same as `full-contention-discriminating`'s equal-offer
+profile, by construction of the same 20/10/65 weight set against equal offered load -- the two are
+distinct scenarios, not duplicates, as the different `contended_seconds` below shows):
+
+| group | expected % | observed % | deviation (pts) | contended_seconds | requests | client status tally |
+|---|---|---|---|---|---|---|
+| app1 | 21.1% | 35.0% | +13.9 | 79.1s | 2812 | 0=2061, 200=750, 500=1 |
+| app2 | 10.5% | 17.9% | +7.4 | 79.1s | 2910 | 0=2608, 200=300, 500=2 |
+| end-users | 68.4% | 47.1% | **-21.3** | 64.7s | 2879 | 200=2878, 500=1 |
+
+Full report: `results/20261110T162156Z-uni-227-e3-queue-ttl-shedding-thr32/fairness-report.md`.
+
+**This refines the duration finding rather than breaking it.** end-users -- the group driving the
+FAIL verdict, at -21.3pt -- has the shortest contended window of the three (64.7s), squarely inside
+the FAIL band this document's duration finding already established (FAIL <=66.3s, PASS >=69.0s,
+measured across prior rows). app2 stayed inside the 10pt bar (+7.4pt) with a 79.1s window, consistent
+with the "sustained contention converges on the configured weights" claim. app1 is the genuine
+exception: 79.1s contended -- well past the 69.0s PASS floor -- yet still lands just over the bar at
++13.9pt. One exception in a corpus this size does not overturn the association, but it means the
+claim should read "a necessary condition, evidenced across the corpus" rather than "a guarantee"
+going forward; no further duration-sweep follow-up is proposed here beyond what UNI-225 already
+flagged as out of scope.
+
+**An unresolved client-side reliability anomaly, flagged but not blocking this result.** app1 and
+app2 show a large fraction of client status `0` (connection/timeout failure on the generator's side,
+not an HTTP response) with latencies clustered tightly at ~50.01s -- consistent with *something*
+closing the connection at a fixed ~50s mark, not a graceful HTTP error. end-users shows none of this
+(99.97% clean 200s, p50 10.5s). Ruled out as the cause: the generator's own `--client-timeout` (340s,
+confirmed passed through `13-loadgen-poisson.sh`'s `${CLIENT_TIMEOUT:-90}` env-var read); the live
+`flowControl.defaultRequestTTL` (300s, and in any case `EnableEviction:false` in this build's EPP
+config per its own startup log, so TTL eviction is not currently active at all); the Gateway
+HTTPRoute's `timeouts.backendRequest` (explicitly `0s` = disabled, `deploy/poc/03-gateway.yaml`); and
+a repeat of UNI-157's gateway crash-loop (the `istio-proxy` container's last restart was at
+`2026-11-10T15:10:53Z`, over an hour before this run started at `16:21:56Z`, confirmed via
+`oc get pod ... -o jsonpath='{.status.containerStatuses[?(@.name=="istio-proxy")].lastState}'` --
+no restart during the run window). Because the scored verdict (`observed_share_pct`/`deviation_pts`)
+is read from the EPP's own `contended_service_tokens_total` counter, not from client-side status or
+request counts, this anomaly does not appear to invalidate the FAIL verdict above -- but it does mean
+app1/app2's own p50/p95 latency and request-count figures from this run are not trustworthy
+client-observed numbers, and the root cause is still unknown. Filed as a non-blocking follow-up,
+[UNI-229](/UNI/issues/UNI-229), rather than investigated further here (out of this ticket's scope,
+and the GPU-pool slot was already spent on the re-run itself).
+
+**Cluster state.** The run's own `revert` trap flipped `enforce` back to `false` at the run's exit
+(`16:26:48Z`) but its 180s `wait_for_enforcing` confirmation timed out (`16:29:51Z`, both EPPs still
+read `enforcing=1`) -- consistent with this project's documented no-live-reload-on-configmap-edit
+behavior (pod restart, not a config poll, is what actually flips the metric, and a restart can take
+longer than 180s to land). A separate heartbeat on [UNI-228](/UNI/issues/UNI-228), picked up ~7
+minutes later, found `enforce: true` still live, diagnosed it as a stuck/stale state from an earlier
+session's unverifiable "currently running" claim, and hand-reverted it to `false` via the same
+merge-patch this run's own script uses. That diagnosis was itself mistaken in one detail worth
+recording: the "903 in-flight at the 60s mark" comment it called unverifiable (no matching `oc get
+job` entry) was a real, live observation of *this* run -- the open-loop harness (`13-loadgen-
+poisson.sh`) runs client-side via thread pool, never creating a Job object, so `oc get job` was never
+going to show it regardless of whether the run was real. Net effect is harmless (both patches target
+the same `false` end-state and this run's own exit had already set it), but the right verification
+step for an open-loop run's live status is the `llm_d_epp_maas_fairness_enforcing` metric or
+`results/uni227-run.log`, not `oc get job`. Current state reconfirmed as part of this write-up:
+`enforce: false` in the configmap, `llm_d_epp_maas_fairness_enforcing 0` on both GPU and CPU EPPs.
 
 **What this doesn't cover.**
 - `uni165-equal`, `graded`, `subset-3-idle`, `equal-2x` (0.0-8.6pt) and `twenty-group-scale` (flat

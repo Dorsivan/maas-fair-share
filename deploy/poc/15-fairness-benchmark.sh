@@ -1880,9 +1880,26 @@ snapshot_metrics() {
   # metrics-full-before.txt, the one full un-grepped scrape on file: both
   # families are present and well-formed there, just outside this filter).
   # Purely additive, same as every prefix UNI-193 added before it.
-  curl -sS -m 10 -H "Authorization: Bearer $METRICS_TOKEN" "http://${EPP_METRICS_SVC_IP}:9090/metrics" \
+  #
+  # UNI-230: emit the curl call's own exit code as a leading `# scrape_exit=`
+  # comment line, ahead of the grepped metric lines. A Prometheus text scrape
+  # and a connection-level scrape failure (curl exit 7 during an overloaded
+  # run, observed live on twenty-group-scale-discriminating) both end up as
+  # zero matching lines once grepped -- indistinguishable to a downstream
+  # consumer that only sees the grepped body. A real EPP restart also empties
+  # every llm_d_epp_maas_fairness_* series (fresh process, fresh metric
+  # registry), so "zero lines" alone can never tell "the scrape never reached
+  # the EPP" apart from "the EPP really did restart." Recording curl's own
+  # exit code is the only way to tell them apart after the fact; the `#`
+  # prefix keeps this a no-op for parse_metrics_text/parse_metrics_labeled_text,
+  # which already skip comment lines, so older callers and older captured
+  # files are unaffected.
+  local raw rc=0
+  raw="$(curl -sS -m 10 -H "Authorization: Bearer $METRICS_TOKEN" "http://${EPP_METRICS_SVC_IP}:9090/metrics")" || rc=$?
+  echo "# scrape_exit=$rc"
+  printf '%s\n' "$raw" \
     | grep -E '^llm_d_epp_maas_fairness_|^llm_d_epp_request_(input|output|cached)_tokens_(sum|count)\{|^llm_d_epp_flow_control_|^llm_d_epp_scheduler_e2e_|^llm_d_epp_plugin_duration_|^llm_d_epp_(ready_endpoints|per_endpoint_queue_size|average_|std_dev_)' \
-    | grep -v '^#'
+    | grep -v '^#' || true
 }
 
 echo "[benchmark] metrics snapshot: before"

@@ -9425,6 +9425,28 @@ on the run itself); filed as [UNI-230](/UNI/issues/UNI-230) rather than left as 
 following the same non-blocking-anomaly precedent as UNI-227's own unresolved `~50s` connection
 anomaly (filed as UNI-229).
 
+**[UNI-230](/UNI/issues/UNI-230) update: root cause confirmed by code reading, not by spending another
+GPU-pool slot.** `compute_windows`/`compute_queue_wait_windows` (`15-fairness-report.py`) read a
+family's absence from a snapshot as "every group's value is 0," the same shape a genuine EPP restart
+produces (fresh process, fresh metric registry) -- so a scrape that never reached the EPP at all
+(`curl` exiting nonzero, as this run's own `curl: (7) Failed to connect` lines show) was
+indistinguishable from a real restart once grepped, and the detector had no way to tell them apart
+after the fact. `15-fairness-benchmark.sh`'s `snapshot_metrics()` now records the scrape's own curl
+exit code as a `# scrape_exit=` comment line ahead of the grepped metrics (harmless to every existing
+parser, which already skips `#` lines); `15-fairness-report.py` uses it to add a new, additive
+`verdict.scrape_gap_in_windows` field, separate from `epp_restarted_in_windows_but_not_snapshot_pair`,
+so a dropped scrape is reported as a dropped scrape instead of a process restart with no corroborating
+pod/container evidence. Covered by `test_compute_windows_treats_failed_scrape_as_scrape_gap_not_restart`,
+`test_compute_queue_wait_windows_treats_failed_scrape_as_scrape_gap_not_restart`, and
+`test_failed_scrape_mid_run_is_flagged_as_scrape_gap_not_restart` (`15-fairness-report-test.py`, all
+passing). This fix is prospective only: `twenty-group-scale-discriminating`'s own
+`metrics-timeseries.txt` was never committed (consistent with this project's run-artifact retention --
+see this document's other "not preserved" caveats) and the GPU EPP pod that served the run
+(`...787d544dbd-jgjfj`) has since been replaced by ordinary redeploys, so there is nothing left to
+re-score with the fixed detector; the caveat paragraph above stands as the final word on that specific
+run's numbers. The fix's value is that the *next* high-worker-count run that hits this failure mode
+gets reported correctly the first time, without spending a GPU-pool slot on a confirmatory re-run.
+
 **Cluster state, confirmed via `oc get` after the batch's final restore (not assumed):**
 
 ```

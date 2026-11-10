@@ -997,12 +997,13 @@ def test_compute_windows_matches_whole_run_math_over_one_window():
     weights = {"app1": 20.0, "app2": 10.0, "end-users": 65.0}
     timeseries = [
         (0, "t0", {"llm_d_epp_maas_fairness_contended_service_tokens_total":
-                   {"app1": 1000.0, "app2": 1000.0, "end-users": 1000.0}}),
+                   {"app1": 1000.0, "app2": 1000.0, "end-users": 1000.0}}, False),
         (240, "t1", {"llm_d_epp_maas_fairness_contended_service_tokens_total":
-                     {"app1": 3100.0, "app2": 2000.0, "end-users": 7900.0}}),
+                     {"app1": 3100.0, "app2": 2000.0, "end-users": 7900.0}}, False),
     ]
-    windows, epp_restarted = fairness_report.compute_windows(timeseries, schedule, weights)
+    windows, epp_restarted, scrape_gap = fairness_report.compute_windows(timeseries, schedule, weights)
     assert epp_restarted is False
+    assert scrape_gap is False
     assert len(windows) == 1
     w = windows[0]
     assert w["start_s"] == 0.0 and w["end_s"] == 240.0
@@ -1023,11 +1024,11 @@ def test_compute_windows_respects_schedule_membership_per_window():
     weights = {"app1": 20.0, "app2": 10.0, "end-users": 65.0}
     tok = "llm_d_epp_maas_fairness_contended_service_tokens_total"
     timeseries = [
-        (0, "t0", {tok: {"app1": 0.0, "app2": 0.0, "end-users": 0.0}}),
-        (10, "t1", {tok: {"app1": 100.0, "app2": 100.0, "end-users": 0.0}}),
-        (20, "t2", {tok: {"app1": 150.0, "app2": 150.0, "end-users": 300.0}}),
+        (0, "t0", {tok: {"app1": 0.0, "app2": 0.0, "end-users": 0.0}}, False),
+        (10, "t1", {tok: {"app1": 100.0, "app2": 100.0, "end-users": 0.0}}, False),
+        (20, "t2", {tok: {"app1": 150.0, "app2": 150.0, "end-users": 300.0}}, False),
     ]
-    windows, _ = fairness_report.compute_windows(timeseries, schedule, weights)
+    windows, _, _ = fairness_report.compute_windows(timeseries, schedule, weights)
     assert len(windows) == 2
     w0 = {g["group"]: g for g in windows[0]["groups"]}
     assert w0["end-users"]["active"] is False
@@ -1048,13 +1049,33 @@ def test_compute_windows_flags_counter_going_backwards():
     weights = {"app1": 20.0, "app2": 10.0}
     tok = "llm_d_epp_maas_fairness_contended_service_tokens_total"
     timeseries = [
-        (0, "t0", {tok: {"app1": 9000.0, "app2": 1000.0}}),
-        (10, "t1", {tok: {"app1": 50.0, "app2": 1200.0}}),  # app1 went backwards
+        (0, "t0", {tok: {"app1": 9000.0, "app2": 1000.0}}, False),
+        (10, "t1", {tok: {"app1": 50.0, "app2": 1200.0}}, False),  # app1 went backwards
     ]
-    windows, epp_restarted = fairness_report.compute_windows(timeseries, schedule, weights)
+    windows, epp_restarted, scrape_gap = fairness_report.compute_windows(timeseries, schedule, weights)
     assert epp_restarted is True
+    assert scrape_gap is False
     by_group = {g["group"]: g for g in windows[0]["groups"]}
     assert by_group["app1"]["delivered_tokens"] == 0.0  # clamped, not negative
+
+
+def test_compute_windows_treats_failed_scrape_as_scrape_gap_not_restart():
+    # UNI-230: a window's closing scrape failing outright (curl exit != 0)
+    # looks exactly like app1's counter "going backwards" to zero once
+    # grepped -- the only thing that tells it apart from a real restart is
+    # the closing snapshot's own recorded scrape_failed flag.
+    schedule = fairness_report.resolve_schedule(None, {"app1", "app2"}, 20)
+    weights = {"app1": 20.0, "app2": 10.0}
+    tok = "llm_d_epp_maas_fairness_contended_service_tokens_total"
+    timeseries = [
+        (0, "t0", {tok: {"app1": 9000.0, "app2": 1000.0}}, False),
+        (10, "t1", {}, True),  # scrape failed outright: empty snapshot, not a reset
+    ]
+    windows, epp_restarted, scrape_gap = fairness_report.compute_windows(timeseries, schedule, weights)
+    assert epp_restarted is False
+    assert scrape_gap is True
+    by_group = {g["group"]: g for g in windows[0]["groups"]}
+    assert by_group["app1"]["delivered_tokens"] == 0.0  # still clamped: true value unknown
 
 
 def test_compute_convergence_finds_first_window_that_stays_in_threshold():
@@ -1231,8 +1252,13 @@ def test_mid_run_restart_invisible_to_snapshot_pair_is_flagged_from_windows():
         # confirming the gap exists, not asserting that's correct.
         assert v["epp_restarted_mid_run"] is False, v
         assert v["epp_restarted_in_windows_but_not_snapshot_pair"] is True, v
+        # write_timeseries' blocks carry no `# scrape_exit=` marker at all,
+        # same as every run captured before UNI-230 -- the real restart this
+        # run simulates must still read as a restart, not a scrape gap.
+        assert v["scrape_gap_in_windows"] is False, v
         md = fairness_report.render_markdown(report)
         assert "Caveat (UNI-163)" in md
+        assert "Caveat (UNI-230)" not in md
 
 
 def test_epp_restarted_in_windows_but_not_snapshot_pair_is_false_when_consistent():
@@ -1265,7 +1291,57 @@ def test_epp_restarted_in_windows_but_not_snapshot_pair_is_false_when_consistent
         v = report["verdict"]
         assert v["epp_restarted_mid_run"] is False, v
         assert v["epp_restarted_in_windows_but_not_snapshot_pair"] is False, v
+        assert v["scrape_gap_in_windows"] is False, v
         assert "Caveat (UNI-163)" not in fairness_report.render_markdown(report)
+
+
+def test_failed_scrape_mid_run_is_flagged_as_scrape_gap_not_restart():
+    # UNI-230: found on twenty-group-scale-discriminating's run (the heaviest
+    # in the suite, 1350 total offered workers) -- the windowed restart
+    # detector (UNI-163's mechanism) tripped with none of the usual
+    # corroborating restart evidence (no pod-identity change, no k8s restart
+    # event, container restart count 0, no panic/restart marker in the EPP's
+    # own stderr capture). The run also logged sustained
+    # `curl: (7) Failed to connect ... port 9090` against the EPP's metrics
+    # port during the load. This reproduces that mechanism directly: a
+    # mid-run scrape whose own recorded exit code is nonzero, sandwiched
+    # between two successful scrapes that keep growing -- the same "counter
+    # went backwards, then recovered" shape the real run's raw evidence
+    # couldn't explain.
+    with tempfile.TemporaryDirectory() as tmp:
+        before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON +
+                       'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 0\n')
+        after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON +
+                      'llm_d_epp_maas_fairness_contended_service_tokens_total{fairness_id="app1"} 9000\n')
+        log = write(tmp, "loadgen.log", loadgen_log("app1", 32, 0, 0, 30, [
+            ("app1", 500, "1.20", "2.40", "200=500"),
+        ]))
+        ts = write_timeseries_raw(tmp, "ts.txt", [
+            (0, "# scrape_exit=0\n" + metrics_block({"app1": 0.0})),
+            (10, "# scrape_exit=0\n" + metrics_block({"app1": 4000.0})),
+            (20, "# scrape_exit=7\n"),  # curl: (7) Failed to connect -- empty body, not a reset
+            (30, "# scrape_exit=0\n" + metrics_block({"app1": 9000.0})),
+        ])
+        cfg = write_timeline_config(tmp, "timeline.json")
+        report = fairness_report.build_report(
+            scenario="test-scenario", enforce=True, duration_seconds=30, backend="vllm-gpu",
+            epp_image_digest="sha256:deadbeef", namespace="maas-fairness-poc",
+            epp_pod="test-pod", run_start="2026-11-01T00:00:00Z", run_end="2026-11-01T00:00:30Z",
+            threshold_points=10.0, metrics_before_path=before, metrics_after_path=after,
+            loadgen_log_path=log, metrics_timeseries_path=ts, timeline_config_path=cfg,
+            window_seconds=10.0,
+        )
+        v = report["verdict"]
+        assert v["epp_restarted_mid_run"] is False, v
+        # The fix: a scrape that failed outright must not be read as a
+        # restart, even though it leaves the same zero-line snapshot a real
+        # restart would.
+        assert v["epp_restarted_in_windows_but_not_snapshot_pair"] is False, v
+        assert v["scrape_gap_in_windows"] is True, v
+        md = fairness_report.render_markdown(report)
+        assert "Caveat (UNI-230)" in md
+        assert "Caveat (UNI-163)" not in md
+        assert "a metrics scrape failed mid-window at least once (UNI-230, not a restart)" in md
 
 
 # UNI-164: per-group, per-window flow-control queue-wait distribution, from
@@ -1279,11 +1355,12 @@ def test_compute_queue_wait_windows_computes_quantiles_per_window():
     block0 = queue_wait_bucket_lines("app1", "Dispatched", [("0.01", 0), ("0.1", 0), ("1", 0), ("+Inf", 0)])
     block1 = queue_wait_bucket_lines("app1", "Dispatched", [("0.01", 50), ("0.1", 90), ("1", 100), ("+Inf", 100)])
     ts = [
-        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
-        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0), False),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1), False),
     ]
-    windows, restarted = fairness_report.compute_queue_wait_windows(ts, schedule)
+    windows, restarted, scrape_gap = fairness_report.compute_queue_wait_windows(ts, schedule)
     assert restarted is False
+    assert scrape_gap is False
     assert len(windows) == 1
     g = windows[0]["groups"][0]
     assert g["group"] == "app1" and g["state"] == "ok" and g["observations"] == 100
@@ -1306,10 +1383,10 @@ def test_compute_queue_wait_windows_filters_outcome_dispatched_only():
     block1 = (queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 10), ("+Inf", 10)]) +
               queue_wait_bucket_lines("app1", "EvictedTTL", [("0.1", 0), ("+Inf", 500)]))
     ts = [
-        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
-        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0), False),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1), False),
     ]
-    windows, _ = fairness_report.compute_queue_wait_windows(ts, schedule)
+    windows, _, _ = fairness_report.compute_queue_wait_windows(ts, schedule)
     g = windows[0]["groups"][0]
     assert g["observations"] == 10
 
@@ -1319,10 +1396,10 @@ def test_compute_queue_wait_windows_distinguishes_not_recorded_from_no_observati
     block0 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 20), ("+Inf", 20)])
     block1 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 20), ("+Inf", 20)])  # unchanged
     ts = [
-        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
-        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0), False),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1), False),
     ]
-    windows, _ = fairness_report.compute_queue_wait_windows(ts, schedule)
+    windows, _, _ = fairness_report.compute_queue_wait_windows(ts, schedule)
     by_group = {g["group"]: g for g in windows[0]["groups"]}
     assert by_group["app1"]["state"] == "no_observations"
     assert by_group["app2"]["state"] == "not_recorded"
@@ -1333,12 +1410,27 @@ def test_compute_queue_wait_windows_flags_epp_restart_and_uses_post_restart_snap
     block0 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 5000), ("+Inf", 5000)])
     block1 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 8), ("+Inf", 10)])
     ts = [
-        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
-        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0), False),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1), False),
     ]
-    windows, restarted = fairness_report.compute_queue_wait_windows(ts, schedule)
+    windows, restarted, scrape_gap = fairness_report.compute_queue_wait_windows(ts, schedule)
     assert restarted is True
+    assert scrape_gap is False
     assert windows[0]["groups"][0]["observations"] == 10
+
+
+def test_compute_queue_wait_windows_treats_failed_scrape_as_scrape_gap_not_restart():
+    # UNI-230 sibling of the compute_windows case above: the same loop shape
+    # (an "after" snapshot that scraped empty) appears here too.
+    schedule = {"app1": fairness_report.default_schedule_entry(20)}
+    block0 = queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 5000), ("+Inf", 5000)])
+    ts = [
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0), False),
+        (10.0, "t1", {}, True),  # scrape failed outright
+    ]
+    windows, restarted, scrape_gap = fairness_report.compute_queue_wait_windows(ts, schedule)
+    assert restarted is False
+    assert scrape_gap is True
 
 
 def test_compute_queue_wait_windows_excludes_groups_without_schedule_entry():
@@ -1348,10 +1440,10 @@ def test_compute_queue_wait_windows_excludes_groups_without_schedule_entry():
     block1 = (queue_wait_bucket_lines("app1", "Dispatched", [("0.1", 5), ("+Inf", 5)]) +
               queue_wait_bucket_lines("app2", "Dispatched", [("0.1", 50), ("+Inf", 50)]))
     ts = [
-        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0)),
-        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1)),
+        (0.0, "t0", fairness_report.parse_metrics_labeled_text(block0), False),
+        (10.0, "t1", fairness_report.parse_metrics_labeled_text(block1), False),
     ]
-    windows, _ = fairness_report.compute_queue_wait_windows(ts, schedule)
+    windows, _, _ = fairness_report.compute_queue_wait_windows(ts, schedule)
     assert [g["group"] for g in windows[0]["groups"]] == ["app1"]
 
 

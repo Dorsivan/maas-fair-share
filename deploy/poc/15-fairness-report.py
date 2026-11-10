@@ -255,15 +255,27 @@ def parse_metrics(path):
 
 
 TIMESERIES_HEADER = re.compile(r'^#\s*ts=(?P<ts>\S+)\s+epoch=(?P<epoch>\d+)\s*$')
+# UNI-230: 15-fairness-benchmark.sh's snapshot_metrics() emits this as the
+# first line of its own output, ahead of the grepped metric lines, so a
+# connection-level scrape failure (curl exit != 0) can be told apart from a
+# real EPP restart even though both leave zero metric lines in the block --
+# see that function's own comment for why the distinction isn't otherwise
+# recoverable after the fact. Absent entirely in files captured before this
+# change; treated as a successful scrape for backward compatibility.
+SCRAPE_EXIT = re.compile(r'^#\s*scrape_exit=(?P<rc>\d+)\s*$')
 
 
 def _split_timeseries_blocks(text):
-    """A sequence of (epoch_seconds: float, iso_ts: str, block_text: str) from
-    deploy/poc/15-fairness-benchmark.sh's metrics-timeseries.txt: blocks of
-    Prometheus text, each preceded by a '# ts=<iso> epoch=<unix seconds>'
-    header. Returns entries sorted by epoch (they are written in order, but a
-    clock that is not monotonic -- NTP step, not a backend restart -- would
-    otherwise silently produce a negative-duration window)."""
+    """A sequence of (epoch_seconds: float, iso_ts: str, block_text: str,
+    scrape_failed: bool) from deploy/poc/15-fairness-benchmark.sh's
+    metrics-timeseries.txt: blocks of Prometheus text, each preceded by a
+    '# ts=<iso> epoch=<unix seconds>' header. Returns entries sorted by epoch
+    (they are written in order, but a clock that is not monotonic -- NTP
+    step, not a backend restart -- would otherwise silently produce a
+    negative-duration window). `scrape_failed` is True only when the block's
+    own `# scrape_exit=` marker (see SCRAPE_EXIT) is present and nonzero --
+    never inferred from the block being empty, since a real restart produces
+    an equally empty block."""
     entries = []
     epoch = None
     ts = None
@@ -271,7 +283,13 @@ def _split_timeseries_blocks(text):
 
     def flush():
         if epoch is not None:
-            entries.append((epoch, ts, '\n'.join(block_lines)))
+            scrape_failed = False
+            for line in block_lines:
+                m = SCRAPE_EXIT.match(line)
+                if m:
+                    scrape_failed = m.group('rc') != '0'
+                    break
+            entries.append((epoch, ts, '\n'.join(block_lines), scrape_failed))
 
     for line in text.splitlines():
         m = TIMESERIES_HEADER.match(line)
@@ -286,11 +304,13 @@ def _split_timeseries_blocks(text):
 
 
 def parse_timeseries(path):
-    """A sequence of (epoch_seconds, iso_ts, series) -- series as
-    parse_metrics_text returns it (one value per fairness_id, other labels
-    dropped). See _split_timeseries_blocks for the block format."""
+    """A sequence of (epoch_seconds, iso_ts, series, scrape_failed) -- series
+    as parse_metrics_text returns it (one value per fairness_id, other labels
+    dropped). See _split_timeseries_blocks for the block format and for
+    scrape_failed's meaning."""
     text = open(path).read()
-    return [(epoch, ts, parse_metrics_text(block)) for epoch, ts, block in _split_timeseries_blocks(text)]
+    return [(epoch, ts, parse_metrics_text(block), scrape_failed)
+            for epoch, ts, block, scrape_failed in _split_timeseries_blocks(text)]
 
 
 def parse_timeseries_labeled(path):
@@ -300,7 +320,8 @@ def parse_timeseries_labeled(path):
     to a single fairness_id key per metric would silently overwrite one `le`
     bucket with another."""
     text = open(path).read()
-    return [(epoch, ts, parse_metrics_labeled_text(block)) for epoch, ts, block in _split_timeseries_blocks(text)]
+    return [(epoch, ts, parse_metrics_labeled_text(block), scrape_failed)
+            for epoch, ts, block, scrape_failed in _split_timeseries_blocks(text)]
 
 
 def parse_loadgen_log(path):
@@ -873,15 +894,23 @@ def compute_windows(timeseries, schedule, weights):
     and (for active groups) expected/observed share and deviation -- the same
     definitions build_report uses for the whole-run numbers, just applied to a
     slice instead of the whole run. A counter going backwards within a window
-    means the EPP restarted between those two scrapes; clamp to zero and flag
-    it, same as the whole-run calculation does, rather than reporting a
-    negative delivered-tokens number."""
+    means either the EPP restarted between those two scrapes, or the window's
+    closing scrape itself failed outright (UNI-230: a connection-level curl
+    failure and a real restart both leave zero matching metric lines in the
+    closing snapshot, so the two are only distinguishable via that snapshot's
+    own `scrape_failed` flag -- see _split_timeseries_blocks). Either way the
+    true delta for this window is unknown, so it is clamped to zero the same
+    as before, but only a real restart sets any_restart; a failed scrape sets
+    any_scrape_gap instead, so a flaky scrape doesn't get misread as a process
+    restart with no corroborating pod/container evidence. Returns (windows,
+    any_restart, any_scrape_gap)."""
     if len(timeseries) < 2:
-        return [], False
+        return [], False, False
     t0 = timeseries[0][0]
     windows = []
     any_restart = False
-    for (e0, _, s0), (e1, _, s1) in zip(timeseries, timeseries[1:]):
+    any_scrape_gap = False
+    for (e0, _, s0, _scrape_failed0), (e1, _, s1, scrape_failed1) in zip(timeseries, timeseries[1:]):
         tok0 = s0.get("llm_d_epp_maas_fairness_contended_service_tokens_total", {})
         tok1 = s1.get("llm_d_epp_maas_fairness_contended_service_tokens_total", {})
         start_s, end_s = e0 - t0, e1 - t0
@@ -891,7 +920,10 @@ def compute_windows(timeseries, schedule, weights):
             b, a = tok0.get(gid, 0.0), tok1.get(gid, 0.0)
             d = a - b
             if d < 0:
-                any_restart = True
+                if scrape_failed1:
+                    any_scrape_gap = True
+                else:
+                    any_restart = True
                 d = 0.0
             deltas[gid] = d
         active = [g for g in schedule if tenant_active_at(schedule[g], mid_s)]
@@ -915,7 +947,7 @@ def compute_windows(timeseries, schedule, weights):
                 "deviation_pts": deviation,
             })
         windows.append({"start_s": start_s, "end_s": end_s, "groups": groups})
-    return windows, any_restart
+    return windows, any_restart, any_scrape_gap
 
 
 # UNI-164: per-group, per-window queue-wait distribution from the upstream
@@ -936,18 +968,22 @@ def compute_queue_wait_windows(timeseries_labeled, schedule):
     scheduled group: p50/p90/p99 queue wait (seconds) for requests that
     reached outcome=Dispatched in that window, bucket-diffed the same way
     compute_pick_latency diffs its histograms. A bucket going backwards means
-    the EPP restarted between the two scrapes; the post-restart snapshot
-    alone is used for that window, same fallback compute_pick_latency uses,
-    and any_restart is flagged rather than silently clamped away. A group
-    with no schedule entry (never offered this run) is absent, not zeroed --
-    the same "never happened" vs. "not recorded" distinction every other
-    histogram-backed section in this report makes."""
+    either the EPP restarted between the two scrapes, or the window's closing
+    scrape itself failed outright (UNI-230 -- see compute_windows, the same
+    failure mode applies to this histogram); the post-restart/post-gap
+    snapshot alone is used for that window either way, same fallback
+    compute_pick_latency uses, but only a real restart sets any_restart -- a
+    failed scrape sets any_scrape_gap instead. A group with no schedule entry
+    (never offered this run) is absent, not zeroed -- the same "never
+    happened" vs. "not recorded" distinction every other histogram-backed
+    section in this report makes."""
     if len(timeseries_labeled) < 2:
-        return [], False
+        return [], False, False
     t0 = timeseries_labeled[0][0]
     windows = []
     any_restart = False
-    for (e0, _, s0), (e1, _, s1) in zip(timeseries_labeled, timeseries_labeled[1:]):
+    any_scrape_gap = False
+    for (e0, _, s0, _scrape_failed0), (e1, _, s1, scrape_failed1) in zip(timeseries_labeled, timeseries_labeled[1:]):
         start_s, end_s = e0 - t0, e1 - t0
         groups = []
         for gid in schedule:
@@ -971,7 +1007,10 @@ def compute_queue_wait_windows(timeseries_labeled, schedule):
                     d = 0.0
                 delta[bound] = d
             if went_backwards:
-                any_restart = True
+                if scrape_failed1:
+                    any_scrape_gap = True
+                else:
+                    any_restart = True
                 delta = dict(a)
             count = delta.get(float("inf"), 0.0)
             entry["observations"] = count
@@ -985,7 +1024,7 @@ def compute_queue_wait_windows(timeseries_labeled, schedule):
             entry.update({"state": "ok", "p50_seconds": p50, "p90_seconds": p90, "p99_seconds": p99})
             groups.append(entry)
         windows.append({"start_s": start_s, "end_s": end_s, "groups": groups})
-    return windows, any_restart
+    return windows, any_restart, any_scrape_gap
 
 
 def compute_convergence(windows, phase_edges, threshold_points):
@@ -1488,7 +1527,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         weights = {g: (weight_after.get(g) if weight_after.get(g) is not None else weight_before.get(g)) or 0.0
                    for g in schedule}
         timeseries = parse_timeseries(metrics_timeseries_path)
-        windows, windows_epp_restarted = compute_windows(timeseries, schedule, weights)
+        windows, windows_epp_restarted, windows_scrape_gap = compute_windows(timeseries, schedule, weights)
         phase_edges = compute_phase_edges(schedule, chaos_events, run_duration)
         convergence = compute_convergence(windows, phase_edges, threshold_points)
         # UNI-164: same metrics-timeseries.txt file, parsed a second time with
@@ -1496,7 +1535,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         # the queue-wait histogram has a `le` label per bucket, which
         # parse_timeseries' single-fairness_id-key dict would collapse.
         timeseries_labeled = parse_timeseries_labeled(metrics_timeseries_path)
-        queue_wait_windows, queue_wait_epp_restarted = compute_queue_wait_windows(timeseries_labeled, schedule)
+        queue_wait_windows, queue_wait_epp_restarted, queue_wait_scrape_gap = compute_queue_wait_windows(timeseries_labeled, schedule)
         timeline_section = {
             "window_seconds": window_seconds,
             "schedule": schedule,
@@ -1505,8 +1544,16 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             "windows": windows,
             "convergence": convergence,
             "epp_restarted_during_windows": windows_epp_restarted,
+            # UNI-230: a window's closing scrape failing outright (curl exit
+            # != 0) looks identical to a restart once grepped (zero matching
+            # lines either way) -- compute_windows/compute_queue_wait_windows
+            # only tell them apart via that scrape's own recorded exit code,
+            # so this stays a separate flag rather than folding into
+            # *_epp_restarted above.
+            "windows_scrape_gap": windows_scrape_gap,
             "queue_wait_windows": queue_wait_windows,
             "queue_wait_epp_restarted": queue_wait_epp_restarted,
+            "queue_wait_scrape_gap": queue_wait_scrape_gap,
         }
 
     # UNI-138 (G2): purely additive, like the timeline section above -- never
@@ -1685,6 +1732,26 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                 timeline_section
                 and timeline_section.get("epp_restarted_during_windows")
                 and not epp_restarted
+            ),
+            # UNI-230: a window's delivered-tokens counter going backwards
+            # because its closing /metrics scrape failed outright (curl
+            # exit != 0), not because the EPP actually restarted. Unlike
+            # epp_restarted_in_windows_but_not_snapshot_pair above, this is
+            # never folded into epp_restarted_mid_run or into that field --
+            # it is a harness data-collection gap, not process evidence, and
+            # treating it as a restart signal is exactly the false positive
+            # that misdiagnosed twenty-group-scale-discriminating's run (see
+            # UNI-230: no pod-identity change, no k8s restart event, and a
+            # container restart count of 0 all corroborated "no restart
+            # happened" against a report that nonetheless set the restart
+            # flag). True means at least one window's delta was clamped to
+            # zero because its closing scrape failed, not because a group's
+            # counter genuinely reset -- that window's numbers still
+            # undercount real traffic for the same reason a real restart's
+            # would, but it is not evidence of an EPP process restart.
+            "scrape_gap_in_windows": bool(
+                timeline_section
+                and (timeline_section.get("windows_scrape_gap") or timeline_section.get("queue_wait_scrape_gap"))
             ),
             "solo_group": solo,
             "capped_groups": sorted(capped_groups),
@@ -1928,6 +1995,21 @@ def render_markdown(report):
             "real traffic; read them as a measurement of the time since the restart, not the "
             "whole run."
         )
+    if v.get("scrape_gap_in_windows"):
+        lines.append("")
+        lines.append(
+            "**Caveat (UNI-230): a mid-run metrics scrape failed outright, not an EPP "
+            "restart.** At least one windowed delta below was clamped to zero because its "
+            "closing `/metrics` scrape itself failed (the benchmark's own recorded curl exit "
+            "code was nonzero), not because a group's counter genuinely went backwards. A "
+            "connection-level scrape failure and a real restart produce identical zero-line "
+            "output once grepped, so this is flagged separately from "
+            "`epp_restarted_in_windows_but_not_snapshot_pair` rather than folded into it or "
+            "into `epp_restarted_mid_run`. The affected window's own numbers still undercount "
+            "real traffic for that window, but this is evidence of a dropped scrape, not of a "
+            "process restart -- check for corroborating restart evidence (pod identity change, "
+            "k8s restart events, container restart count) before treating it as one."
+        )
     lines.append("")
     lines.append("## Run metadata")
     lines.append("")
@@ -2022,6 +2104,7 @@ def render_markdown(report):
         lines.append("")
         lines.append(f"**Windows** ({len(t['windows'])} total" +
                       (", EPP restart detected mid-window at least once" if t["epp_restarted_during_windows"] else "") +
+                      (", a metrics scrape failed mid-window at least once (UNI-230, not a restart)" if t.get("windows_scrape_gap") else "") +
                       "):")
         lines.append("")
         lines.append("| start (s) | end (s) | group | active | delivered tokens | expected % | observed % | deviation (pts) |")
@@ -2040,6 +2123,7 @@ def render_markdown(report):
             "**Flow-control queue wait, dispatched requests only** "
             f"(`{QUEUE_WAIT_HISTOGRAM}`, `outcome=\"Dispatched\"`" +
             (", EPP restart detected mid-window at least once" if t.get("queue_wait_epp_restarted") else "") +
+            (", a metrics scrape failed mid-window at least once (UNI-230, not a restart)" if t.get("queue_wait_scrape_gap") else "") +
             "):"
         )
         lines.append("")

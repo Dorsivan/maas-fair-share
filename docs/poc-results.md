@@ -8588,4 +8588,6 @@ timelines) lives under `results/<ts>-uni-216-<case>/`.
 | A5 `app2-trickle` (UNI-134) | PASS | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
 | A6 `below-capacity` (UNI-135) | PASS (-6.1pt max dev) | UNCONTENDED (already the designed outcome at this sizing — A6 was PASS, not UNCONTENDED, at threshold 5, so this is a real change in verdict, not a confirmation) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
 | `full-contention` run 1/3 (H1/UNI-139, UNI-212) | PASS (5×, 4.24±0.66pt at threshold 5) | **UNCONTENDED** (confirms UNI-212/214 finding: at threshold 150 the EPP's own queue never backs up at this sizing) | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
+| `full-contention` run 2/3 | PASS (series) | **UNCONTENDED** | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| `full-contention` run 3/3 | PASS (series) | **UNCONTENDED** | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
 

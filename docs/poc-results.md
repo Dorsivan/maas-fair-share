@@ -8708,3 +8708,86 @@ after every run).
   labels in this table are a snapshot of threshold 150 specifically, not a
   permanent verdict.
 
+
+## UNI-215: sweeping `queueDepthThreshold` — no value in 8-150 both holds the split and keeps throughput, but 32 is the clear best tradeoff
+
+[UNI-216](/UNI/issues/UNI-216)'s re-validation pass found that almost the whole 131-168
+series comes back `UNCONTENDED` at `queueDepthThreshold: 150` — the EPP's own queue never
+backs up, so vLLM's first-come-first-served queue (worker-count-blind to weights) decides the
+split instead. This ticket sweeps the threshold to find whether a lower value makes the EPP
+hold enough of the backlog for the weights to bite again, without giving back the throughput
+that the original `queueDepthThreshold: 5` cost (~43%, [UNI-211](/UNI/issues/UNI-211)).
+
+**Setup.** Same build as UNI-214/216 (`be57e82`, equal 3.0/3.0 `queue-scorer`/`prefix-cache-scorer`
+weights, image digest `sha256:617509368126...`, unchanged — the ticket's "if UNI-214 chose
+`load-aware-scorer`" branch doesn't apply; UNI-214's fix was scorer weights, not a different
+scorer plugin). Weights patched to 30/10/60 for the whole sweep. One scenario, UNI-161's
+`app1-flood` (`TENANTS="app1 app2 end-users"`, `WORKERS_APP1=256 WORKERS_APP2=32
+WORKERS_END_USERS=64` — **not** re-sized to the weights, per the ticket), `ENFORCE_LIVE=true`,
+`DURATION=240`, run once per threshold value `{8, 16, 32, 64, 150}`. 150 was re-run fresh here
+rather than reusing UNI-216's row, so every point in the table has identical instrumentation —
+in particular two pieces that didn't exist anywhere in this repo before this ticket:
+
+- **EPP queue-duration p50/p95**: `uni215-work/queue_percentile.py`, a `histogram_quantile`
+  implementation over the before/after diff of `llm_d_epp_flow_control_request_queue_duration_seconds`'s
+  buckets (summed across all three groups' label series — this ticket wants one whole-run
+  number, not a per-group breakdown).
+- **vLLM `num_requests_running`/`num_requests_waiting` per replica**: `uni215-work/vllm_poll.sh`,
+  sampling both gauges on every GPU replica via the API-server pod proxy every 10s for the run's
+  duration. Neither gauge existed in any prior capture path (`21-replica-split.sh` only diffs
+  cumulative counters before/after, which is wrong for a gauge that's back near 0 once the run
+  ends).
+
+Namespace confirmed idle (no active Job) before the sweep started and after it finished.
+
+### Results
+
+| `queueDepthThreshold` | verdict | max deviation (pts) | app1 obs% (dev) | app2 obs% (dev) | end-users obs% (dev) | total requests (vs stock 5651) | EPP queue p50 / p95 | vLLM running avg/max (per replica) | vLLM waiting avg/max (per replica) |
+|---|---|---|---|---|---|---|---|---|---|
+| 8 | FAIL | 32.4 | 61.2% (+31.2) | 11.2% (+1.2) | 27.6% (-32.4) | 3490 (**-38.2%**) | 17.02s / 45.56s | 2.7 / 8 | 23-26 / 153-154 |
+| 16 | FAIL | 34.6 | 64.2% (+34.2) | 10.3% (+0.3) | 25.4% (-34.6) | 3905 (**-30.9%**) | 15.32s / 28.61s | 3.1-3.7 / 8 | 28-34 / 136-177 |
+| **32** | FAIL | **31.3** | 58.7% (+28.7) | 12.7% (+2.7) | 28.7% (-31.3) | 5489 (**-2.9%**) | 10.63s / 28.06s | 2.6-3.2 / 8 | 16-23 / 125-148 |
+| 64 | FAIL | 34.2 | 62.7% (+32.7) | 11.5% (+1.5) | 25.8% (-34.2) | 5763 (**+2.0%**) | 6.60s / 26.64s | 4.6-4.7 / 8 | 48-49 / 126-175 |
+| 150 | FAIL | 39.0 | 68.9% (+38.9) | 10.1% (+0.1) | 21.0% (-39.0) | 5773 (**+2.2%**) | 0.64s / 2.26s | 5.0-5.1 / 8 | 93-95 / 175-179 |
+
+Raw artifacts: `results/20261110T070039Z-uni-215-thr8-app1-flood/`,
+`results/20261110T070759Z-uni-215-thr16-app1-flood/`,
+`results/20261110T071453Z-uni-215-thr32-app1-flood/`,
+`results/20261110T072535Z-uni-215-thr64-app1-flood/`,
+`results/20261110T073306Z-uni-215-thr150-app1-flood/`.
+
+### The mechanism holds exactly as the ticket describes — it just isn't enough
+
+The vLLM-side numbers show the EPP doing textbook more-vs-less holding across the sweep:
+`num_requests_running` climbs from 2.7 (threshold 8, well under `--max-num-seqs 8`) to 5.0-5.1
+(threshold 150, closer to saturating the backend), and `num_requests_waiting` climbs from
+~23-26 to ~93-95 in step. EPP queue p95 falls from 45.6s to 2.26s over the same range. Lower
+thresholds genuinely hold more work upstream in the EPP, where the fairness plugin can see and
+reorder it, exactly as designed.
+
+**What that holding does not do here: fix the split.** All five points cluster in a 31-39 point
+FAIL band against a 10-point bar — more than 3x over budget at every threshold tested,
+including 8 (the most aggressive value swept, well below the original pre-UNI-211 default of
+5's own territory). Going lower still seems unlikely to close a 21-point gap given the range
+8→150 (18x) only moved the deviation by 8 points (31.3 to 39.0) and non-monotonically. The
+likely cause is the same one the series already found in
+[UNI-104](/UNI/issues/UNI-104)/[UNI-160](/UNI/issues/UNI-160)'s F3: `app1-flood`'s worker
+sizing (256 : 32 : 64, an 8x/4x over-offer for app1 against its 30% weight) is extreme enough
+that admission-side holding — which can only reorder and pace requests already queued, not
+invent capacity for the groups it's trying to protect — has a limited ceiling on how much it
+can correct, and that ceiling sits well above the 10-point bar for this scenario.
+
+**Threshold 32 is the clear best point in the swept range**, not by assumption but because it
+wins on *both* axes other thresholds trade off against each other: lowest deviation of the five
+(31.3, vs 32.4-39.0 elsewhere) **and** throughput within 3% of stock (-2.9%, inside the ticket's
+implicit 10% band), while 8 and 16 buy a similar or worse deviation at a 31-38% throughput cost,
+and 64/150 give back 3-8 points of deviation for no further throughput gain (both are already at
+or above stock). That is a genuine knee — just one that tops out below the pass bar.
+
+### Confirming 32 doesn't regress elsewhere, or accidentally pass somewhere it shouldn't
+
+Per the ticket, `queueDepthThreshold: 32` was then run against F3's three alternative weight
+sets at `full-contention-2x` (64/64/256 workers) and an H2 A/B against the existing stock-EPP
+baseline, to check whether this value's tradeoff holds outside the one scenario the sweep
+itself used.
+

@@ -9339,7 +9339,7 @@ step for an open-loop run's live status is the `llm_d_epp_maas_fairness_enforcin
   uncontrolled association documented above) is follow-up work, not something this ticket's scope
   asked for.
 
-## UNI-228: the equal-weight family's five remaining non-discriminating rows get their own sibling -- 2 PASS, 3 FAIL, all five clear the bar
+## UNI-228: the equal-weight family cannot discriminate under the mandated equal-load baseline -- five unequal-load runs, kept as latency evidence and as UNI-226's TTFT noise-floor null
 
 UNI-225's own "what this doesn't cover" note (above) flagged five rows the ticket's item-2 scope
 never touched: `uni165-equal`, `uni165-graded`, `uni165-subset-3-idle`, `uni165-equal-2x` (0.0-8.6pt
@@ -9349,6 +9349,19 @@ by the workers are the same split). UNI-225's own siblings only covered the six 
 *unequal* weight set sized *proportionally*; none of the five above have an unequal weight set at
 all, so the "never reduce the dominant tenant, boost the minority" rule doesn't directly apply --
 there is no dominant tenant by weight when every weight is equal.
+
+**Board ruling, 2026-11-10 (disposition `noise-floor`, [UNI-228](/UNI/issues/UNI-228) interaction
+`a0834609`): these five rows do not enter the scored discriminating scorecard.** For an *equal*
+weight set, equal load across tenants and weight-proportional load are the same configuration, so
+the worker-vs-weight gap is 0.0pt by construction under the board's mandated equal-load baseline.
+The only way to open a gap at all is to break that baseline -- which is exactly what the batch below
+does (4x-8x unequal worker counts against an equal weight set). That same property is what makes
+this family useful for a different purpose: equal weights under equal load is the one configuration
+where no ordering between tenants is expected, so it is the right between-tenant TTFT null for
+[UNI-226](/UNI/issues/UNI-226) -- using these five scenarios' *unboosted* (1x, equal-worker) sizing,
+not the boosted sizing run and documented below. The scored discriminating scorecard stays at the
+**12 rows / 2 PASS / 10 FAIL** stated in "The restated, discriminating-only scorecard (corrected)"
+above; nothing below updates it.
 
 **The fix: boost one arbitrarily-chosen group 4x past the scenario's own baseline, hold the rest
 unchanged.** `full-contention-discriminating` already demonstrated the mirror-image shape is
@@ -9389,13 +9402,16 @@ over 20 groups -- a thinner margin than every other row in this document's discr
 so the multiplier was raised until the margin matched the rest (24.6pt, in line with 24.8-35.1pt
 elsewhere).
 
-**Two genuine PASSes, both on the `equal` weight table.** `uni165-equal-discriminating` and its 2x
-scale-up both converge to within 7 points of the weight-predicted even split despite one group
-offering 4x (`uni165-equal-discriminating`, 128 vs 32) or 4x again on the doubled baseline
-(`uni165-equal-2x-discriminating`, 256 vs 64) the others' workers -- the split followed the
-*configured weight*, not the worker count, exactly the claim this document's core result rests on.
-This adds two more rows to the discriminating-PASS column, which before this ticket held exactly two
-(`uni164-app3-joins`, `app1-idle-discriminating`, both in the UNI-218/UNI-225 section above).
+**Two rows clear the bar, but neither can be booked as a PASS for the core claim.**
+`uni165-equal-discriminating` and its 2x scale-up both converge to within 7 points of the
+weight-predicted even split despite one group offering 4x (`uni165-equal-discriminating`, 128 vs 32)
+or 4x again on the doubled baseline (`uni165-equal-2x-discriminating`, 256 vs 64) the others' workers.
+But under an *equal* weight set, equal load and weight-proportional load are the same configuration
+-- so the only reason either row has a nonzero gap at all is that the load here is *not* equal, by
+this section's own 4x boost. Neither hypothesis ("split follows weight" vs "split follows worker
+count") predicts a gap under true equal load, so a gap observed only after load is made unequal
+cannot distinguish between them. These two rows do not add to the discriminating-PASS column counted
+in the scorecard above -- it stays at the 2 PASS stated there, unchanged by this ticket.
 
 **Ledger cross-check on both PASSes and on `uni165-graded-discriminating`: the EPP's own contended
 counter under-reports the boosted group's cost relative to what the client sent, and the bias runs in
@@ -9416,8 +9432,9 @@ number alone suggests (see the boundary note below). Not reinvestigated further 
 out-of-ticket-scope reasoning as the counter-reset caveat below) -- worth tracking if a future ticket
 needs tighter PASS margins on the equal-weight rows specifically.
 
-**Duration cross-check: the tightest matched pair in this document's duration-vs-verdict association,
-and it does not fit the established band cleanly.** `uni165-equal-discriminating` (PASS, 59.9-61.0s
+**Duration cross-check (unequal-load observation, not a scored row -- see the scorecard note above):
+the tightest matched pair in this document's duration-vs-verdict association, and it does not fit the
+established band cleanly.** `uni165-equal-discriminating` (PASS, 59.9-61.0s
 contended per group) and `uni165-graded-discriminating` (FAIL, 59.1-61.9s contended per group) are the
 same batch, same image, same config, essentially the same contended-window length, and differ only in
 the weight table -- a stronger same-batch control on the duration hypothesis (see "The real headline:
@@ -9514,12 +9531,25 @@ Matches the repo's committed `deploy/poc/00-config.yaml` defaults exactly -- the
 table swaps this batch needed (6-group equal, 6-group graded, 20-group equal) were all reverted by
 the batch's own trap before it exited.
 
-**The discriminating-only scorecard, updated.** Combining this ticket's five new rows with
-UNI-218/UNI-225/UNI-227's twelve (the "restated, discriminating-only scorecard (corrected)" section
-above): **17 discriminating rows total, 4 PASS / 13 FAIL.** Still thin evidence for the core claim in
-absolute row count, but the PASS column doubled by this ticket alone (2 -> 4), and both new PASSes
-sit on the cleanest possible confound to rule out -- an *equal* weight set, where "the split follows
-the weights" has no worker-ratio lookalike to hide behind at all.
+**Scored discriminating scorecard: unchanged.** Per the board's 2026-11-10 ruling on this ticket
+(stated at the top of this section), these five rows are not folded into the discriminating-only
+scorecard above -- it stays at **12 rows / 2 PASS / 10 FAIL**. The structural reason is the same one
+given there: under an equal weight set, equal load and weight-proportional load are the same
+configuration, so a nonzero gap here is only obtainable by breaking the board's mandated equal-load
+baseline, which is what every row in this section's table does.
+
+**What this section is for instead: [UNI-226](/UNI/issues/UNI-226)'s between-tenant TTFT null.** The
+finding this section does support is that end-to-end latency here tracks offered worker count, not
+configured weight -- `uni165-graded-discriminating` has app1 at weight 40 running 8.54s p50 while
+app6, weight 5 but 128 workers, runs 26.53s p50 / 65.69s p95. A tenant that over-offers waits behind
+its own backlog (self-queueing, consistent with [UNI-117](/UNI/issues/UNI-117)'s standing "splits
+follow workers" finding), which is not evidence about prioritization in either direction. The
+*unboosted* (1x, equal-worker) sizing of these same five scenarios is the right source for UNI-226's
+between-tenant TTFT noise floor: equal weights under equal load is the one configuration where no
+ordering between tenants is expected, so the TTFT spread measured there under true equal load is the
+null every other row's PRIORITY-OK claim should be judged against. A same-config repeat run measures
+run-to-run variance of the aggregate instead -- a different quantity, since tenants sharing one run's
+batch and scrape window have correlated errors a repeat run can't see.
 
 **Result directories force-added.** All five of this ticket's `results/` directories are now committed
 past `.gitignore` (`git add -f`, same precedent as every settled-suite run back through UNI-214) -- the

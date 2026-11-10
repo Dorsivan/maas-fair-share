@@ -9035,3 +9035,101 @@ shaped re-validation pass against the new default, and is recommended as explici
 work, not assumed to be clean. Treat every PASS/UNCONTENDED verdict recorded anywhere in this
 document prior to this section as a snapshot of whatever threshold was live at the time it ran,
 not a permanent property of the scenario.
+
+## UNI-225: most PASS rows size workers proportionally to weights -- they cannot test the core claim, and re-running the confounded rows with a deliberately mismatched worker ratio drops the discriminating pass rate to 2 of 11
+
+**The defect.** Every PASS/FAIL verdict in this document is a comparison of the *observed*
+token-share split against the *configured weight* share. But most of this suite's scenarios also
+size each tenant's offered worker count (or open-loop request rate) **proportionally to that same
+weight**. When workers already track weights 1:1, "the split follows the weights" and "the split
+follows the workers" predict identical numbers, so a PASS on one of these rows is not evidence
+that weights -- rather than worker allocation -- decided the outcome. Computing each row's
+worker-share-vs-weight-share gap against every scenario already run in this document found that
+of the 19 PASS rows above, only **one** -- F3 `33/33/33` -- had a worker ratio different enough
+from its weight ratio to tell the two apart (max gap 33.3pt, comfortably over this report's
+10-point bar). A3 `app2-idle`, A4 `app1-idle`, A5 `app2-trickle`, and `end-users-idle` are exact
+1:1 worker:weight ratios (0.0pt gap) by explicit construction -- `end-users-idle`'s own sizing
+comment in `deploy/poc/15-fairness-benchmark.sh` says the ratio was deliberately tuned to "track
+...the actual 2:1 app1:app2 target." `full-contention` and `full-contention-2x` fall just under
+the bar (6.1pt). Restated as the number this POC should actually be judged on: **of the
+discriminating rows run so far, it was 1 PASS (`33/33/33`) to 4 FAIL** (`40/20/40`, `98/1/1`,
+`app1-flood`, `app1-flood-moderate`) -- the opposite ratio the "19 PASS / 6 FAIL" headline implies.
+
+**What this does not mean.** The confounded rows are not worthless. They still verify the split
+doesn't break under the policy, throughput holds, accounting reconciles, and nothing regresses --
+real and useful checks, just not evidence for *this specific* claim. And the claim was never
+unsupported: `33/33/33`'s 33-point separation (observed 30.9/31.1/38.1 against a worker-share
+prediction of 16.7/16.7/66.7) is real and it lands on the weights. This is a measurement-design
+defect in the suite, not a finding that the plugin regressed.
+
+**The fix, in two parts (ticket ask items 1-2, already committed).**
+[`15-fairness-report.py`](http://10.241.0.4/unified-protoss/maas-fair-share/-/commit/b767a9a) now
+computes `worker_vs_weight_gap_pts` per group and sets `verdict.discriminating=False` (rendered
+`(NON-DISCRIMINATING)`) whenever a row's max gap stays under the pass bar --
+`None` for solo/control/UNCONTENDED/demand-capped rows that already have their own carve-out. The
+worked numbers above all come straight from that new report field, run retroactively against the
+on-disk results already in this document, no GPU time required.
+[A `-discriminating` sibling scenario](http://10.241.0.4/unified-protoss/maas-fair-share/-/commit/82b06cb)
+was added for every one of the six confounded scenarios (A3, A4, A5, `end-users-idle`,
+`full-contention`, `full-contention-2x`), each keeping its original proportional version running
+unchanged as its own control. The sizing rule: never size the scenario's dominant tenant below
+its own already-proven-sufficient worker count (the saturation-floor risk `docs/runbook.md`
+warns about); boost the minority tenant(s) past their own already-over-offering baseline instead
+-- safe because over-offering a minority tenant further can only reduce its queueing, never break
+the measurement. Every one of the six siblings landed a gap of 24.8-35.1 points, clear of the bar.
+
+**The re-run (ticket ask item 3).** All six ran back-to-back at the documented live baseline
+(`enforce: false` steady-state, `ENFORCE_LIVE=true` per-run, `queueDepthThreshold: 32`, weights
+20/10/65/5, `queue-scorer`/`prefix-cache-scorer` 3.0/3.0, image digest
+`sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091`), one GPU batch,
+`deploy/poc/21-replica-split.sh` on every run (both replicas held a healthy ~48/52% split
+throughout -- no lock-in):
+
+| scenario | workers | weight share % | worker share % | gap (pt) | observed % | deviation (pt) | verdict |
+|---|---|---|---|---|---|---|---|
+| `app1-idle-discriminating` | app2:128 / end-users:208 | 13.3 / 86.7 | 38.1 / 61.9 | 24.8 | 15.0 / 85.0 | +1.6 / -1.6 | **PASS** |
+| `app2-idle-discriminating` | app1:128 / end-users:104 | 23.5 / 76.5 | 55.2 / 44.8 | 31.6 | 43.5 / 56.5 | +20.0 / -20.0 | FAIL |
+| `app2-trickle-discriminating` | app1:128 / app2:2 / end-users:104 | 23.5 / -- / 76.5 (scored pair) | 55.2 / -- / 44.8 | 31.6 | 48.6 / -- / 50.3 | +25.1 / -- / -26.2 | FAIL |
+| `end-users-idle-discriminating` | app1:64 / app2:128 | 66.7 / 33.3 | 33.3 / 66.7 | 33.3 | 33.8 / 66.2 | -32.8 / +32.8 | FAIL |
+| `full-contention-discriminating` | 128 / 128 / 128 | 21.1 / 10.5 / 68.4 | 33.3 / 33.3 / 33.3 | 35.1 (max) | 33.4 / 19.6 / 47.0 | +12.4 / +9.0 / -21.4 | FAIL |
+| `full-contention-2x-discriminating` | 256 / 256 / 256 | 21.1 / 10.5 / 68.4 | 33.3 / 33.3 / 33.3 | 35.1 (max) | 26.9 / 15.5 / 57.6 | +5.8 / +5.0 / -10.8 | FAIL |
+
+**Only one of the six generalises the `33/33/33` result: `app1-idle-discriminating`.** It has the
+longest per-group contended window of the six single-pair runs (72.3s vs 24.5-47.6s elsewhere)
+and the smallest worker skew among the pairwise cases, and its observed split (15.0/85.0) lands on
+the *weight* prediction (13.3/86.7), not the *worker* prediction (38.1/61.9) -- a second, genuine,
+independent discriminating PASS. Every other new row's observed split sits closer to its
+worker-share prediction than its weight-share prediction: `end-users-idle-discriminating`'s
+33.8/66.2 is nearly exact to its 33.3/66.7 worker-share column and nowhere near its 66.7/33.3
+weight-share column; the two `full-contention` rows' dominant `end-users` group lands roughly
+halfway between the two predictions in the 1x case (47.0 vs worker 33.3 / weight 68.4) and much
+closer to the worker-share side even after doubling worker counts 1x->2x (57.6 vs worker 33.3 /
+weight 68.4, deviation shrinking from -21.4pt to -10.8pt as contended time roughly doubled --
+suggestive that more contended seconds narrows but does not close the gap, consistent with this
+project's LAS-style running-tab mechanism needing sustained backlog to overcome a worker-driven
+head start, not evidence the mechanism is broken).
+
+**The restated, discriminating-only scorecard this ticket's ask (item 3/4) asked for, combining
+the original 5 discriminating rows with these 6 new ones:**
+
+- **Discriminating rows, suite-wide: 2 PASS, 9 FAIL** (`33/33/33`, `app1-idle-discriminating` PASS;
+  `40/20/40`, `98/1/1`, `app1-flood`, `app1-flood-moderate`, `app2-idle-discriminating`,
+  `app2-trickle-discriminating`, `end-users-idle-discriminating`, `full-contention-discriminating`,
+  `full-contention-2x-discriminating` FAIL).
+- **This, not "19 PASS / 6 FAIL," is the number the POC's core claim (configured weights, not
+  offered worker counts, decide the split under contention) should be judged on.** The claim is
+  not unsupported -- two independent rows confirm it, under two different weight-set/worker-ratio
+  combinations -- but the breadth of positive evidence is thin, and the majority of discriminating
+  rows attempted so far land closer to "the split follows the workers" than "the split follows the
+  weights" whenever the worker ratio diverges sharply and briefly from the weight ratio. The
+  non-discriminating rows remain valid evidence that the policy doesn't break the split, that
+  throughput holds, and that accounting reconciles -- just not evidence for this specific claim.
+
+**What this doesn't cover.** No saturation-limb capture (queue-depth vs KV-cache, [UNI-224](/UNI/issues/UNI-224))
+was added to this batch, so which limb bound on each of these six runs is not recorded -- that
+instrumentation is still open on UNI-224 and the live Prometheus window for these runs has since
+rolled off (short UWM retention; see the general caveat earlier in this document). A natural next
+step given the pattern above -- failures cluster where the worker-skewed minority tenant's
+contended window is short -- is a controlled sweep of contended-window duration at fixed worker
+skew, to separate "weights need more sustained backlog to bite" from "weights lose outright to a
+large worker-count mismatch." That is follow-up work, not something this ticket's scope asked for.

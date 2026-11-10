@@ -278,6 +278,19 @@ reserve capacity for requests that haven't arrived. Pair the ratio guarantee wit
 ordinary capacity planning: the sum of promised floors should fit inside measured
 capacity with margin.
 
+**A measurement-design caveat on the evidence itself (UNI-225).** Most of the benchmark
+suite's scored scenarios size each tenant's offered worker count proportionally to its
+configured weight. When offered workers already track weights 1:1, a PASS on that row
+cannot distinguish "the split follows the weights" from "the split follows the workers" —
+both predict the same number. Of the suite's PASS rows, only a handful use a worker ratio
+deliberately different from the weight ratio, and of those *discriminating* rows, the
+large majority still FAIL: the observed split tracks the offered worker ratio more closely
+than the configured weight ratio whenever the two diverge sharply over a short contended
+window. Two rows do confirm the core claim cleanly — see `docs/poc-results.md`'s UNI-225
+section for the restated scorecard — but treat this as the headline evidence count, not
+the suite's overall PASS/FAIL tally, which overstates support for weighted fairness
+specifically.
+
 ## How you'll know it works in production
 
 Three layers, because the bench test won't tell you anything at 3am.

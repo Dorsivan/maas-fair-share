@@ -282,14 +282,27 @@ capacity with margin.
 suite's scored scenarios size each tenant's offered worker count proportionally to its
 configured weight. When offered workers already track weights 1:1, a PASS on that row
 cannot distinguish "the split follows the weights" from "the split follows the workers" —
-both predict the same number. Of the suite's PASS rows, only a handful use a worker ratio
-deliberately different from the weight ratio, and of those *discriminating* rows, the
-large majority still FAIL: the observed split tracks the offered worker ratio more closely
-than the configured weight ratio whenever the two diverge sharply over a short contended
-window. Two rows do confirm the core claim cleanly — see `docs/poc-results.md`'s UNI-225
-section for the restated scorecard — but treat this as the headline evidence count, not
-the suite's overall PASS/FAIL tally, which overstates support for weighted fairness
-specifically.
+both predict the same number. Restricting the check to rows where the worker ratio is
+deliberately different from the weight ratio — the only rows that can actually tell the
+two apart — currently stands at 2 PASS, 9 FAIL out of 11 across this project's settled
+config. Treat that, not the suite's overall PASS/FAIL tally, as the headline evidence count
+for weighted fairness specifically; the tally overstates support because most of its rows
+can't distinguish the claim from the alternative at all.
+
+**That FAIL majority has a cause, and it is the one thing in this list worth leading
+with: contended-window duration, not worker-ratio mismatch on its own, is what decides the
+outcome.** Every discriminating row with roughly a minute or more of per-group contended
+time converges on the configured weights; every one measured under ten seconds tracks the
+offered worker ratio instead. The cleanest evidence holds the scenario, the weight set, and
+the gap size fixed and varies only the contended window: the same `33/33/33` weight set
+with the same ~33-point worker-vs-weight gap lands on the weights at 69s of contention and
+on the worker ratio at 8-9s. This is a strong association across every discriminating row
+measured so far plus one controlled within-scenario comparison — not yet an independently
+randomized duration sweep — but it means the right reading of a short-window FAIL is "the
+mechanism hasn't had time to converge yet," not "the mechanism doesn't hold." See
+`docs/poc-results.md`'s UNI-225 section for the full scorecard, the duration evidence, and
+what still isn't covered (the equal-weight scenarios and the saturation-limb instrumentation
+from UNI-224).
 
 ## How you'll know it works in production
 

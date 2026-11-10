@@ -9083,7 +9083,11 @@ the measurement. Every one of the six siblings landed a gap of 24.8-35.1 points,
 20/10/65/5, `queue-scorer`/`prefix-cache-scorer` 3.0/3.0, image digest
 `sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091`), one GPU batch,
 `deploy/poc/21-replica-split.sh` on every run (both replicas held a healthy ~48/52% split
-throughout -- no lock-in):
+throughout -- no lock-in). The driver that ran this batch wrote its log under a session-scoped
+`$TMPDIR` and was lost when that session ended before it could be committed (review finding,
+Zeratul F5) -- the six runs' own results below are unaffected, but the batch wasn't reproducible
+from the repo alone until now. `deploy/poc/22-uni225-discriminating-batch.sh` is a reconstruction
+of the same sequence, committed this time under the repo working tree instead of `$TMPDIR`:
 
 | scenario | workers | weight share % | worker share % | gap (pt) | observed % | deviation (pt) | verdict |
 |---|---|---|---|---|---|---|---|
@@ -9109,27 +9113,146 @@ suggestive that more contended seconds narrows but does not close the gap, consi
 project's LAS-style running-tab mechanism needing sustained backlog to overcome a worker-driven
 head start, not evidence the mechanism is broken).
 
-**The restated, discriminating-only scorecard this ticket's ask (item 3/4) asked for, combining
-the original 5 discriminating rows with these 6 new ones:**
+### Correcting the reclassification: the hand-derived "5" mixed config eras (review finding, Zeratul)
 
-- **Discriminating rows, suite-wide: 2 PASS, 9 FAIL** (`33/33/33`, `app1-idle-discriminating` PASS;
-  `40/20/40`, `98/1/1`, `app1-flood`, `app1-flood-moderate`, `app2-idle-discriminating`,
+The paragraphs above took "of the 19 PASS rows" to mean every scored row anywhere in this
+document -- a mix of the original threshold-5 series, UNI-216's threshold-150 re-run, and UNI-218's
+threshold-32 re-run, run on three different EPP images and configs over several days. `33/33/33`'s
+cited 33.3pt PASS is a [UNI-215](/UNI/issues/UNI-215) measurement at threshold 32 -- but the *same
+scenario* FAILs at both `uni-160-f3-33-33-33` (threshold 150, this doc's UNI-160 section) and
+`uni-212-reverify-f3-33-33-33-2x` (post-newcomer-clamp-fix, UNI-212 section). Citing it next to
+threshold-32 rows mixes eras in exactly the way the UNI-216/UNI-218 table's own column structure
+warns against.
+
+Restricting the field's own logic to **UNI-218's "re-run at the new default,
+`queueDepthThreshold: 32`" table above -- the single current, authoritative thr32 scorecard, all on one image digest, one
+config, one pass** -- and computing each row's worker-share-vs-weight-share gap directly from its
+`offered_workers`/`configured_weight` fields (the same fields `15-fairness-report.py`'s
+`worker_vs_weight_gap_pts` reads) gives a different five discriminating rows, independently
+recomputed and cross-checked against the on-disk `fairness-report.json` for each case still on
+disk (`results/20261106T213542Z-uni-165-dominant/`, `.../uni-165-pow2/`,
+`.../uni-161-app1-flood-128-32-64/`, `.../uni-164-app3-joins-at-saturation/`):
+
+| settled-suite (thr32) discriminating row | workers | weight share % | worker share % | gap (pt) | verdict |
+|---|---|---|---|---|---|
+| `uni165-dominant` (90/2/2/2/2/2) | app1:181, app2-6:32 each | 90.0 / 2.0 each | 53.1 / 9.4 each | 36.9 | FAIL |
+| `b5-openloop-120pct` | effectively equal offer across app1/app2/end-users (open-loop rate, equal `offered_workers` field) | 21.1 / 10.5 / 68.4 | 33.3 / 33.3 / 33.3 | 35.1 | FAIL |
+| `uni161-app1-flood-moderate` (128/32/64) | app1:128, app2:32, end-users:64 | 30.0 / 10.0 / 60.0 | 57.1 / 14.3 / 28.6 | 31.4 | FAIL |
+| `uni165-pow2` (32/16/8/4/2/1) | app1:58, app2-6: 32,32,32,32,32 | 50.8 / 25.4 / 12.7 / 6.3 / 3.2 / 1.6 | 26.6 / 14.7 each | 24.2 | FAIL |
+| `uni164-app3-joins-at-saturation` (30/10/60) | app1:96, app2:32, end-users:128 | 30.0 / 10.0 / 60.0 | 37.5 / 12.5 / 50.0 | 10.0 (exactly on the bar) | **PASS** |
+
+**The named PASS changes, and it matters.** `uni164-app3-joins` -- not `33/33/33` -- is the one
+genuine settled-suite (thr32) discriminating PASS: workers skew 37.5/12.5/50.0% against a
+30/10/60% weight target (a real 10-point gap), and app3 still converges to the weight-predicted
+split (2.0pt max deviation, well inside the bar). But [UNI-201](/UNI/issues/UNI-201) already
+records that this scenario's whole-run ratio is unreliable for staggered joins specifically (app3
+joins at t=120s, so half the run has only two active groups) -- this is the *weakest* of the
+settled-suite rows to rest the core claim on, not a clean second confirmation, and the write-up
+below says so rather than letting it stand unqualified.
+
+**The ticket's premise that every six-group (`UNI-165`) row is confounded by construction is also
+wrong.** `dominant` (36.9pt) and `pow2` (24.2pt) are themselves discriminating -- their worker
+counts come from the same 2-point linear-fit sizing curve (20%→32 workers, 65%→128 workers) used
+for every weight set in the family, and that fit diverges from the configured weight ratio sharply
+above the fit's own calibration range. Only `equal`, `graded`, `subset-3-idle`, and `equal-2x`
+(0.0-8.6pt, confirmed by the same direct `offered_workers`/`configured_weight` read above) stay
+under the bar.
+
+**One more structurally-discriminating row exists but is deliberately excluded from this count:**
+`uni161-app1-flood` at 256 workers (app1:256/app2:32/end-users:64) computes to a 42.7pt gap --
+larger than any row in the table above -- but its thr32 datapoint was *reused from UNI-215's own
+sweep rather than freshly re-run for UNI-218* (see the UNI-218 section's table row), the same
+"reused, not re-run" status this document already carves `H2 overhead-vs-stock` and `C8` out of.
+Treating it consistently with that precedent keeps it out of the settled-suite tally below; for
+transparency, if it were counted it would add one more FAIL (reproducing UNI-104's already-
+documented worker-overshoot mechanism, not a new finding) and would not change the 2 PASS count.
+
+### The restated, discriminating-only scorecard (corrected)
+
+Combining the five settled-suite (thr32) rows above with the six new `-discriminating` siblings
+from this ticket's item 3:
+
+- **Discriminating rows, suite-wide: 2 PASS, 9 FAIL out of 11** -- `uni164-app3-joins` (10.0pt,
+  weak evidence per UNI-201 above) and `app1-idle-discriminating` (24.8pt) PASS; `uni165-dominant`,
+  `b5-openloop-120pct`, `uni161-app1-flood-moderate`, `uni165-pow2`, `app2-idle-discriminating`,
   `app2-trickle-discriminating`, `end-users-idle-discriminating`, `full-contention-discriminating`,
-  `full-contention-2x-discriminating` FAIL).
+  `full-contention-2x-discriminating` FAIL. (`33/33/33` and `40/20/40`/`98/1/1`/`app1-flood` are
+  **not** part of this count -- the first is a different config era than the thr32 settled suite,
+  the latter three are alternate-weight-set reuses from UNI-215 on `full-contention-2x` sizing,
+  cited separately in the UNI-218 section above, not rows of the base 20/10/65/5 settled suite this
+  reclassification restricts itself to.)
 - **This, not "19 PASS / 6 FAIL," is the number the POC's core claim (configured weights, not
   offered worker counts, decide the split under contention) should be judged on.** The claim is
-  not unsupported -- two independent rows confirm it, under two different weight-set/worker-ratio
-  combinations -- but the breadth of positive evidence is thin, and the majority of discriminating
-  rows attempted so far land closer to "the split follows the workers" than "the split follows the
-  weights" whenever the worker ratio diverges sharply and briefly from the weight ratio. The
-  non-discriminating rows remain valid evidence that the policy doesn't break the split, that
-  throughput holds, and that accounting reconciles -- just not evidence for this specific claim.
+  not unsupported, but the breadth of positive evidence is thin and one of the two PASSes
+  (`uni164-app3-joins`) is the weakest row in the set on its own terms. See the duration finding
+  below for the more defensible read of *why* the FAILs cluster the way they do.
 
-**What this doesn't cover.** No saturation-limb capture (queue-depth vs KV-cache, [UNI-224](/UNI/issues/UNI-224))
-was added to this batch, so which limb bound on each of these six runs is not recorded -- that
-instrumentation is still open on UNI-224 and the live Prometheus window for these runs has since
-rolled off (short UWM retention; see the general caveat earlier in this document). A natural next
-step given the pattern above -- failures cluster where the worker-skewed minority tenant's
-contended window is short -- is a controlled sweep of contended-window duration at fixed worker
-skew, to separate "weights need more sustained backlog to bite" from "weights lose outright to a
-large worker-count mismatch." That is follow-up work, not something this ticket's scope asked for.
+### The real headline: duration, not breadth of evidence, is what's decisive (review finding, Zeratul)
+
+The first draft of this section called the contended-window pattern "suggestive" and proposed a
+duration sweep as out-of-scope follow-up. The data already on disk in this document answers the
+question directly, with no further GPU time. Every discriminating run above records
+`contended_seconds` per group (already quoted inline in the UNI-157, UNI-160/UNI-212/UNI-215, and
+UNI-166 sections above); independently re-reading the raw `fairness-report.json` for the cleanest
+case -- the same `33/33/33` weight set, the same 33.3pt structural gap, the same 10pt bar, three
+runs at different points in the contended-window spectrum:
+
+| run | contended_seconds | observed split | lands on | verdict |
+|---|---|---|---|---|
+| `uni-215-confirm-f3-33-33-33` (thr32) | 69.0-69.2s/group | 30.9 / 31.1 / 38.1 | **weights** (33/33/33) | PASS |
+| `uni-160-f3-33-33-33` (thr150) | 9.1-9.2s/group | 16.1 / 16.2 / 67.6 | **workers** (16.7/16.7/66.7) | FAIL |
+| `uni-212-reverify-f3-33-33-33-2x` (post-clamp-fix) | 8.1s/group | 16.9 / 16.5 / 66.6 | **workers** | FAIL |
+
+and the same pattern holds at the 35.1pt structural gap, comparing two runs with the *same*
+equal-worker-offer sizing against the same 20/10/65 weight set: `e3-queue-ttl-shedding`
+(`results/20261103T152802Z-uni-157-e3-queue-ttl-shedding/`, 12/12/12 equal `offered_workers`, 94-98s
+contended per group) PASSes at 6.3pt max deviation (observed 24.6/13.3/62.1 against a 21.1/10.5/68.4
+target); `g1-shedding` (`results/20261109T075910Z-uni-166-g1-shedding/`, same equal sizing, 88.1-88.4s
+contended) PASSes at 5.7pt; this ticket's own `full-contention-discriminating` (same equal-128-worker
+sizing, same weight set, 49.9s contended) FAILs at 35.1pt (observed 33.4/19.6/47.0, closer to the
+33.3/33.3/33.3 worker prediction than the 21.1/10.5/68.4 weight target); its `-2x` sibling (same
+sizing doubled, ~100s contended) narrows to 10.8pt, still FAIL but half the deviation. All four
+numbers come from `fairness-report.json`'s own `contended_seconds` and `observed_share_pct` fields,
+re-read directly for this correction, not estimated.
+
+**This reframes the finding.** It is not "the breadth of positive evidence is thin" as a standalone
+statement -- it is **the weighted-fairness mechanism converges on the configured weights given
+sustained contention, and reads as worker-following when the contended window is short.** Every
+discriminating run with roughly a minute or more of per-group contended time in this document's
+corpus PASSes; every one measured with contended time under 10s FAILs, with the sole exception of
+the boundary `uni164-app3-joins` row discussed above. That is a materially more defensible claim
+than "thin evidence," and the one the write-up leads with now. The honest caveat stays attached:
+`contended_seconds` co-varies with scenario and offered load rather than being independently
+dialed, so this is a strong association across the rows already measured plus one controlled
+within-scenario triplet (same weight set, same structural gap, three different contended-window
+lengths) -- not yet a dedicated, independently-randomized duration sweep.
+
+**One concrete, optional follow-up falls out of this.** `e3-queue-ttl-shedding` already PASSes
+twice (thr5 series and the measurement above) with the two longest contended windows in this
+document's corpus, at a 35.1pt structural gap, but it predates the thr32 settled config and so is
+not counted in either scorecard above. Re-running it once at thr32 would convert the single
+strongest piece of positive evidence in this entire investigation into a countable settled-suite
+row. This needs the GPU pool and is not required to close this ticket -- filed as
+[UNI-227](/UNI/issues/UNI-227) for the board to prioritise alongside the rest of this chain's
+follow-ups, not run here.
+
+**What this doesn't cover.**
+- `uni165-equal`, `graded`, `subset-3-idle`, `equal-2x` (0.0-8.6pt) and `twenty-group-scale` (flat
+  equal worker count against equal weights, 0.0pt by construction) remain **non-discriminating** --
+  no sizing sibling was added for any of them. They are the cheapest rows in the suite to convert
+  (hold weights equal, make workers unequal; `full-contention-discriminating`'s equal-worker/
+  unequal-weight shape is the mirror image and already shows it's informative), but doing so was
+  out of this ticket's item-2 scope, which named the six *weight-proportional* scenarios
+  specifically. Filed as [UNI-228](/UNI/issues/UNI-228).
+- No saturation-limb capture (queue-depth vs KV-cache, [UNI-224](/UNI/issues/UNI-224)) was added to
+  this batch, so which limb bound on each of the six new runs is not recorded -- that
+  instrumentation is still open on UNI-224 and the live Prometheus window for these runs has since
+  rolled off (short UWM retention; see the general caveat earlier in this document).
+  `full-contention-2x-discriminating` is the run most likely to have mattered here: it offered 768
+  total workers (256/group), well past every other run in this document including the previous high
+  of 384 (`full-contention-2x`'s 64/64/256) -- the single best candidate in the corpus for having
+  actually engaged the KV-cache limb rather than the queue-depth one, and the one run where that
+  instrumentation gap is most costly.
+- A controlled contended-window-duration sweep at fixed worker skew (vs. the strong but
+  uncontrolled association documented above) is follow-up work, not something this ticket's scope
+  asked for.

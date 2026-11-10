@@ -8580,40 +8580,55 @@ timelines) lives under `results/<ts>-uni-216-<case>/`.
 
 ### Results
 
-| case | old verdict (series) | new verdict | max deviation | throughput vs stock | per-replica split | ledger |
-|---|---|---|---|---|---|---|
-| A1 `app2-alone` (UNI-131) | PASS | PASS (solo) | n/a (solo carve-out) | not measured (no stock comparison run for this scenario; see H2 below) | 49.7% / 50.3% | FAIL — structural, not new: solo traffic is never contended, so the EPP's contended-cost ledger has nothing to check (same scope boundary UNI-142 documents) |
-| A3 `app2-idle` (UNI-132) | PASS | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause: zero contended seconds means the cost check has nothing to validate |
-| A4 `app1-idle` (UNI-133) | PASS | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
-| A5 `app2-trickle` (UNI-134) | PASS | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
-| A6 `below-capacity` (UNI-135) | PASS (-6.1pt max dev) | UNCONTENDED (already the designed outcome at this sizing — A6 was PASS, not UNCONTENDED, at threshold 5, so this is a real change in verdict, not a confirmation) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
-| `full-contention` run 1/3 (H1/UNI-139, UNI-212) | PASS (5×, 4.24±0.66pt at threshold 5) | **UNCONTENDED** (confirms UNI-212/214 finding: at threshold 150 the EPP's own queue never backs up at this sizing) | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
-| `full-contention` run 2/3 | PASS (series) | **UNCONTENDED** | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
-| `full-contention` run 3/3 | PASS (series) | **UNCONTENDED** | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
-| `full-contention-2x` (64/64/256, the one UNCONTENDED follow-up the sizing rule calls for) | n/a (new scenario, added by UNI-212) | **PASS** | 5.9pt (app2) | not measured | 49.6% / 50.4% | FAIL, all 3 groups outside tolerance (app1 -13.6%, app2 -13.5%, end-users -13.1%) — consistent with the documented G2 scope boundary (UNI-142): only 15.2-15.5s of this 240s run was genuinely contended per group, so most delivered tokens fall outside the contended-cost window by design, not a new accounting defect (raw token diff is ~-0.1% for all three) |
-| `end-users-idle` (64/32 workers) | PASS (series) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
-| `end-users-idle-2x` (128/64 workers, the one UNCONTENDED follow-up) | n/a (new, this pass) | **UNCONTENDED** (2x was not enough here — still never backs up the queue) | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause. Per "don't tune past that," no further escalation attempted |
-| F1 `shadow-mode-control` (UNI-159) | INFO (negative control, correctly unscored, 6.1pt max dev) | **FAIL (label only)** — same zero-contended-tokens path every UNCONTENDED row this pass hit, but `IS_CONTROL` scenarios don't get the UNCONTENDED carve-out, so the report falls back to the older literal "offered groups delivered zero contended service tokens" FAIL text. Functionally identical to UNCONTENDED, not a real weight-split failure | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
-| B1 `cold-join` (UNI-142) | PASS (7.6pt max dev) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.9% / 50.1% | FAIL — same structural cause |
-| B2 `tenant-leaves-mid-run` (UNI-141) | FAIL (-34.0pt whole-run; the ticket itself calls this a measurement artifact, not a real failure — see UNI-141) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 50.0% / 50.0% | FAIL — same structural cause |
-| B4 short idle return (UNI-143) | PASS (-5.3pt) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
-| B4 long idle return (UNI-143) | FAIL (-15.5pt, app1) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
-| E1 `epp-restart-mid-run` (UNI-155) | mixed (run 1 PASS -1.4pt, run 2 FAIL -68.4pt/never-converged) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
-| E2 `lose-replica-mid-run` (UNI-156) | PASS (ratio held tighter than baseline) | **PASS** (confirmed — ratio still holds: -2.0/+7.6/-5.5pt) | 7.6pt (app2) | not measured | not captured — the post-run snapshot raced the chaos loop's post-hold replica-restore and returned an empty scrape; the scored fairness-report.md itself is unaffected | FAIL, -54.1%/-55.4%/-62.4% (all 3 groups) — same G2 scope boundary, more pronounced here: only 1.2-1.4s of a 360s run was genuinely contended, so most of the run's tokens were delivered outside the contended-cost window by design |
-| UNI-161 `app1-flood` at 256 workers, weights 30/10/60 | FAIL (UNI-104 overshoot) | **FAIL** (confirmed — app1 +34.6pt, end-users -36.2pt) | 36.2pt (end-users) | not measured | 49.7% / 50.3% | PASS — raw diff and cost diff both within tolerance (this run had 28.8-35.6s contended_seconds per group, enough for the ledger's contention-gated check to be meaningful) |
-| UNI-161 `app1-flood-moderate` at 128 workers, weights 30/10/60 | FAIL (per UNI-161) | **UNCONTENDED** (changed — threshold 150 no longer backs up at 128 workers either) | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
-| UNI-164 `app3-joins-at-saturation`, weights 30/10/60, join at t=120s | mixed (clean pre-join convergence, real post-join queueing, whole-run ratio misleading for staggered joins — UNI-201 open) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
-| UNI-165 `equal` (16.7 each, 6 real groups) | PASS (-4.3pt, app2) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
-| UNI-165 `graded` (40/20/15/10/10/5) | PASS (+7.1pt, app6) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
-| UNI-165 `dominant` (90/2/2/2/2/2) | PASS, close (-9.5pt, app1) | **FAIL** (changed, and the only UNI-165 weight set that stayed contended at threshold 150 — 181 workers on app1 alone is enough to back up the queue even at this threshold; 2.3-2.7s contended_seconds per group) | 36.9pt (app1, under-delivered: 53.1% observed vs 90.0% target) | not measured | 49.5% / 50.5% | FAIL, all 6 groups outside tolerance (-13.1% to -18.2%) — same G2 scope boundary as `full-contention-2x`/E2: contention was real (~2.5s/group) but still brief relative to the 240s run |
-| UNI-165 `pow2` (32/16/8/4/2/1) | FAIL (-19.3pt, app1, >50% entitlement breaks the linear worker-sizing fit) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
-| UNI-165 `subset-3-idle` (equal table, app4/5/6 idled) | PASS (+0.0pt, app2) | **UNCONTENDED** (changed) | n/a (unscored) | not measured | 49.5% / 50.5% | FAIL — same structural cause |
-| B5 open-loop 70% (UNI-137) | UNCONTENDED (after the is_uncontended fix) | **UNCONTENDED** (confirmed) | n/a (unscored) | not measured | 49.2% / 50.8% | N/A — the open-loop generator path records no client-request ledger (`--client-record-jsonl`), a documented gap, not a new one |
-| B5 open-loop 100% (UNI-137) | not run at threshold 5 (B5 only tested 70/100/120% once, series doc doesn't separately break out a 100% verdict distinct from above) | **UNCONTENDED** | n/a (unscored) | not measured | 49.6% / 50.4% | N/A — same documented gap |
-| B5 open-loop 120%, above saturation (UNI-137) | FAIL (-18.8pt end-users, severe weight inversion) | **FAIL** (confirmed, same inversion direction: end-users -35.1pt, app1 +13.3pt, app2 +21.8pt — larger magnitude than the original, not smaller) | 35.1pt (end-users) | not measured | 49.4% / 50.6% | N/A — same documented gap |
-| UNI-165 `equal-2x` (64 workers/group, the one UNI-165-family `-2x` follow-up the sizing rule calls for) | n/a (new, this pass) | **PASS** | 0.4pt (app4) | not measured | 49.5% / 50.5% | FAIL, all 6 groups outside tolerance (-15.2% to -16.6%) — same G2 scope boundary: 21.9-25.6s of a 240s run was genuinely contended per group, still well under "almost the whole run" |
-| H2 `overhead-vs-stock` (UNI-168, reused per the ticket — already run on this exact config by UNI-214) | FAIL (enforcement-queueing overhead, pre-UNI-214) | **PASS**, reused not re-run (−0.5%/−0.7% throughput vs stock, replica split 49.7/50.3) | within 1% | −0.5% / −0.7% | 49.7% / 50.3% | see UNI-214 section above for full detail; `results/20261109T233500Z-uni-214-h2-equal-weights/`, `results/20261109T234932Z-uni-214-h2-equal-weights-retry/` |
-| C8 `cache-heavy-vs-cache-cold` (UNI-136, reused per the ticket — already run on this exact config by UNI-214) | n/a (unscored control) | reused, not re-run — no cache-affinity regression, hot-tenant hit ratio 88.0% | n/a (unscored) | not measured | 50.0% / 50.0% | see UNI-214 section above; `results/20261109T234159Z-uni-214-c8-equal-weights/` |
+Columns below now span all three thresholds the series has lived at:
+`series (thr 5)` is the original 131-168 run, `thr 150` is UNI-216's own
+pass, and **`thr 32` is this ticket's (UNI-218) re-run**, against the exact
+build UNI-215 committed live (image digest
+`sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091`,
+`queueDepthThreshold: 32`, `queue-scorer`/`prefix-cache-scorer` 3.0/3.0,
+`halfLifeSeconds: 60`, `newcomerClamp: true`). The `max deviation` /
+`throughput vs stock` / `per-replica split` / `ledger` columns to the right
+of `thr 32` describe the **thr 150** run only (unchanged from UNI-216,
+kept for reference); the `thr 32` cell itself carries that same set of facts
+for the new run inline. Per-run detail for every `thr 32` row lives under
+`results/<ts>-uni-218-<case>/`.
+
+| case | series (thr 5) | thr 150 | thr 32 (UNI-218) | max deviation (thr 150) | throughput vs stock (thr 150) | per-replica split (thr 150) | ledger (thr 150) |
+|---|---|---|---|---|---|---|---|
+| A1 `app2-alone` (UNI-131) | PASS | PASS (solo) | **PASS (solo)** (unchanged) — solo carve-out, n/a max dev; ledger FAIL, same structural cause (zero contended cost, nothing to validate); split 49.7%/50.3% | n/a (solo carve-out) | not measured (no stock comparison run for this scenario; see H2 below) | 49.7% / 50.3% | FAIL — structural, not new: solo traffic is never contended, so the EPP's contended-cost ledger has nothing to check (same scope boundary UNI-142 documents) |
+| A3 `app2-idle` (UNI-132) | PASS | **UNCONTENDED** (changed) | **PASS** (changed back) — 1.5pt max dev (end-users); ledger FAIL (end-users -16.3%, same structural cause); split 49.7%/50.3% | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause: zero contended seconds means the cost check has nothing to validate |
+| A4 `app1-idle` (UNI-133) | PASS | **UNCONTENDED** (changed) | **PASS** (changed back) — 0.7pt max dev (end-users); ledger PASS (-6.5%/-5.9%, both within tolerance); split 48.0%/52.0% | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| A5 `app2-trickle` (UNI-134) | PASS | **UNCONTENDED** (changed) | **PASS** (changed back) — 2.1pt max dev (end-users); ledger FAIL (end-users -16.5%); split 49.4%/50.6% | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| A6 `below-capacity` (UNI-135) | PASS (-6.1pt max dev) | UNCONTENDED (already the designed outcome at this sizing — A6 was PASS, not UNCONTENDED, at threshold 5, so this is a real change in verdict, not a confirmation) | **UNCONTENDED** (unchanged from thr150) — 6/6/26 workers still never backs up the queue even at thr32; ledger FAIL, same structural cause; split 49.5%/50.5% | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| `full-contention` run 1/3 (H1/UNI-139, UNI-212) | PASS (5×, 4.24±0.66pt at threshold 5) | **UNCONTENDED** (confirms UNI-212/214 finding: at threshold 150 the EPP's own queue never backs up at this sizing) | **PASS** (changed back, reused from UNI-215's own H2 thr32 confirm rather than re-run 3× — see UNI-215 section) — 4.1pt max dev (app1); 5452 total requests (-3.5% vs stock); ledger PASS (-2.6% to -4.6%); split 48.3%/51.7% | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
+| `full-contention` run 2/3 | PASS (series) | **UNCONTENDED** | **PASS** (changed back, same reused UNI-215 point as run 1/3) | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| `full-contention` run 3/3 | PASS (series) | **UNCONTENDED** | **PASS** (changed back, same reused UNI-215 point as run 1/3) | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
+| `full-contention-2x` (64/64/256, the one UNCONTENDED follow-up the sizing rule calls for) | n/a (new scenario, added by UNI-212) | **PASS** | **PASS** (unchanged, deviation tightened) — 0.6pt max dev (app2), down from 5.9pt; ledger **PASS** (changed from FAIL — contended_seconds jumped from 15.2-15.5s to 68-69s/group, so the G2 scope boundary no longer applies); split 49.3%/50.7% | 5.9pt (app2) | not measured | 49.6% / 50.4% | FAIL, all 3 groups outside tolerance (app1 -13.6%, app2 -13.5%, end-users -13.1%) — consistent with the documented G2 scope boundary (UNI-142): only 15.2-15.5s of this 240s run was genuinely contended per group, so most delivered tokens fall outside the contended-cost window by design, not a new accounting defect (raw token diff is ~-0.1% for all three) |
+| `end-users-idle` (64/32 workers) | PASS (series) | **UNCONTENDED** (changed) | **PASS** (changed back) — ~0.0pt max dev; ledger PASS (-3.0%/-3.1%); split 49.6%/50.4% | n/a (unscored) | not measured | 49.8% / 50.2% | FAIL — same structural cause |
+| `end-users-idle-2x` (128/64 workers, the one UNCONTENDED follow-up) | n/a (new, this pass) | **UNCONTENDED** (2x was not enough here — still never backs up the queue) | **PASS** (changed back — 2x is now enough at thr32, unlike at thr150) — ~0.0pt max dev; ledger PASS (-3.7%/-3.6%); split 49.5%/50.5% | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause. Per "don't tune past that," no further escalation attempted |
+| F1 `shadow-mode-control` (UNI-159) | INFO (negative control, correctly unscored, 6.1pt max dev) | **FAIL (label only)** — same zero-contended-tokens path every UNCONTENDED row this pass hit, but `IS_CONTROL` scenarios don't get the UNCONTENDED carve-out, so the report falls back to the older literal "offered groups delivered zero contended service tokens" FAIL text. Functionally identical to UNCONTENDED, not a real weight-split failure | **INFO** (changed — genuinely contended at 59.1s/group now, so the report returns to its normal unscored-control label instead of the zero-contended fallback text) — 6.3pt max dev (app2), still unscored (control); ledger PASS (-4.1% to -4.8%); split 48.7%/51.3% | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
+| B1 `cold-join` (UNI-142) | PASS (7.6pt max dev) | **UNCONTENDED** (changed) | **PASS** (changed back) — 6.7pt max dev (app1); ledger FAIL (app1 -77.0%, app2 -77.6% — same structural request-count-vs-cost mismatch B1/B2 always show); split 48.9%/51.1% | n/a (unscored) | not measured | 49.9% / 50.1% | FAIL — same structural cause |
+| B2 `tenant-leaves-mid-run` (UNI-141) | FAIL (-34.0pt whole-run; the ticket itself calls this a measurement artifact, not a real failure — see UNI-141) | **UNCONTENDED** (changed) | **PASS** (changed back) — 3.6pt max dev (app1); ledger FAIL (app1 -72.5%, app2 -76.8%); split 50.0%/50.0% | n/a (unscored) | not measured | 50.0% / 50.0% | FAIL — same structural cause |
+| B4 short idle return (UNI-143) | PASS (-5.3pt) | **UNCONTENDED** (changed) | **PASS** (changed back) — 5.3pt max dev (app1); ledger PASS (-3.4% to -4.4%); split 49.1%/50.9% | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
+| B4 long idle return (UNI-143) | FAIL (-15.5pt, app1) | **UNCONTENDED** (changed) | **FAIL** (changed back — a genuine measured failure, matching the original thr5 series result almost exactly) — 15.6pt max dev (app1); ledger PASS (-3.9% to -7.5%); split 49.1%/50.9% | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
+| E1 `epp-restart-mid-run` (UNI-155) | mixed (run 1 PASS -1.4pt, run 2 FAIL -68.4pt/never-converged) | **UNCONTENDED** (changed) | **PASS** (changed back) — 4.7pt max dev (app1); ledger FAIL (all 3 groups, raw tokens -40% to -44% — the restart resets accumulated per-group counters mid-run, same documented mechanism, not a new defect); split 49.2%/50.8% | n/a (unscored) | not measured | 49.7% / 50.3% | FAIL — same structural cause |
+| E2 `lose-replica-mid-run` (UNI-156) | PASS (ratio held tighter than baseline) | **PASS** (confirmed — ratio still holds: -2.0/+7.6/-5.5pt) | **PASS** (unchanged, tighter) — 3.1pt max dev (app1), down from 7.6pt; ledger **PASS** (changed from FAIL — contended_seconds jumped from 1.2-1.4s to 66.7-67.2s/group, G2 scope boundary no longer applies); **replica-split snapshot captured this time** (UNI-216's own gap, closed per this ticket's instruction): one replica served 0.0% of requests, the other 100.0% — exactly what "lose a replica mid-run" should show | 7.6pt (app2) | not measured | not captured — the post-run snapshot raced the chaos loop's post-hold replica-restore and returned an empty scrape; the scored fairness-report.md itself is unaffected | FAIL, -54.1%/-55.4%/-62.4% (all 3 groups) — same G2 scope boundary, more pronounced here: only 1.2-1.4s of a 360s run was genuinely contended, so most of the run's tokens were delivered outside the contended-cost window by design |
+| UNI-161 `app1-flood` at 256 workers, weights 30/10/60 | FAIL (UNI-104 overshoot) | **FAIL** (confirmed — app1 +34.6pt, end-users -36.2pt) | **FAIL** (unchanged, reused from UNI-215's own sweep rather than re-run — see UNI-215 section) — 31.3pt max dev (end-users), down from 36.2pt; 5489 total requests (-2.9% vs stock); ledger PASS (-2.7% to -8.8%); split 47.9%/52.1% | 36.2pt (end-users) | not measured | 49.7% / 50.3% | PASS — raw diff and cost diff both within tolerance (this run had 28.8-35.6s contended_seconds per group, enough for the ledger's contention-gated check to be meaningful) |
+| UNI-161 `app1-flood-moderate` at 128 workers, weights 30/10/60 | FAIL (per UNI-161) | **UNCONTENDED** (changed — threshold 150 no longer backs up at 128 workers either) | **FAIL** (changed — a genuine *new* failure: the 128-worker sizing no longer evades the policy at thr32) — 28.6pt max dev (end-users); ledger PASS (-5.3% to -5.9%); split 48.8%/51.2% | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
+| UNI-164 `app3-joins-at-saturation`, weights 30/10/60, join at t=120s | mixed (clean pre-join convergence, real post-join queueing, whole-run ratio misleading for staggered joins — UNI-201 open) | **UNCONTENDED** (changed) | **PASS** (changed back) — 2.0pt max dev (end-users); ledger FAIL (app1 -70.2%, app2 -69.7% — same staggered-join whole-run-ratio distortion UNI-201 already documents, not new); split 49.2%/50.8% | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
+| UNI-165 `equal` (16.7 each, 6 real groups) | PASS (-4.3pt, app2) | **UNCONTENDED** (changed) | **PASS** (changed back) — 0.3pt max dev; ledger PASS (-4.0% to -5.3%); split 48.9%/51.1% | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
+| UNI-165 `graded` (40/20/15/10/10/5) | PASS (+7.1pt, app6) | **UNCONTENDED** (changed) | **PASS** (changed back) — 4.2pt max dev (app2); ledger PASS (-3.9% to -8.5%); split 49.4%/50.6% | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
+| UNI-165 `dominant` (90/2/2/2/2/2) | PASS, close (-9.5pt, app1) | **FAIL** (changed, and the only UNI-165 weight set that stayed contended at threshold 150 — 181 workers on app1 alone is enough to back up the queue even at this threshold; 2.3-2.7s contended_seconds per group) | **FAIL** (unchanged, deviation shrank a lot) — 17.0pt max dev (app1, under-delivered: 73.0% observed vs 90.0% target), down from 36.9pt (53.1% observed) at thr150; ledger FAIL (app2 only, -10.2% — down from all 6 groups at thr150, since contended_seconds grew from 2.3-2.7s to 50-53s/group); split 48.4%/51.6% | 36.9pt (app1, under-delivered: 53.1% observed vs 90.0% target) | not measured | 49.5% / 50.5% | FAIL, all 6 groups outside tolerance (-13.1% to -18.2%) — same G2 scope boundary as `full-contention-2x`/E2: contention was real (~2.5s/group) but still brief relative to the 240s run |
+| UNI-165 `pow2` (32/16/8/4/2/1) | FAIL (-19.3pt, app1, >50% entitlement breaks the linear worker-sizing fit) | **UNCONTENDED** (changed) | **FAIL** (changed back — the same >50%-entitlement mechanism the original thr5 series found reproduces again) — 20.3pt max dev (app1, 30.5% observed vs 50.8% target); ledger PASS (-3.1% to -8.1%); split 48.1%/51.9% | n/a (unscored) | not measured | 49.6% / 50.4% | FAIL — same structural cause |
+| UNI-165 `subset-3-idle` (equal table, app4/5/6 idled) | PASS (+0.0pt, app2) | **UNCONTENDED** (changed) | **PASS** (changed back) — 0.1pt max dev; ledger PASS (-3.8% to -3.9%); split 49.6%/50.4% | n/a (unscored) | not measured | 49.5% / 50.5% | FAIL — same structural cause |
+| B5 open-loop 70% (UNI-137) | UNCONTENDED (after the is_uncontended fix) | **UNCONTENDED** (confirmed) | **UNCONTENDED** (unchanged) — split 49.8%/50.2%; ledger N/A, same documented gap | n/a (unscored) | not measured | 49.2% / 50.8% | N/A — the open-loop generator path records no client-request ledger (`--client-record-jsonl`), a documented gap, not a new one |
+| B5 open-loop 100% (UNI-137) | not run at threshold 5 (B5 only tested 70/100/120% once, series doc doesn't separately break out a 100% verdict distinct from above) | **UNCONTENDED** | **UNCONTENDED** (unchanged) — split 49.6%/50.4%; ledger N/A, same documented gap | n/a (unscored) | not measured | 49.6% / 50.4% | N/A — same documented gap |
+| B5 open-loop 120%, above saturation (UNI-137) | FAIL (-18.8pt end-users, severe weight inversion) | **FAIL** (confirmed, same inversion direction: end-users -35.1pt, app1 +13.3pt, app2 +21.8pt — larger magnitude than the original, not smaller) | **FAIL** (unchanged, same inversion mechanism, essentially the same magnitude) — 33.1pt max dev (end-users: -33.1pt; app1 +15.0pt; app2 +18.0pt), vs 35.1pt at thr150; ledger N/A, same documented gap; **replica-split not captured** — this run's `$TMPDIR` was torn down mid-run by an unrelated session teardown before the post-run snapshot could be taken (a background-task/session-lifecycle gap, not a benchmark defect — see caveats below) | 35.1pt (end-users) | not measured | 49.4% / 50.6% | N/A — same documented gap |
+| UNI-165 `equal-2x` (64 workers/group, the one UNI-165-family `-2x` follow-up the sizing rule calls for) | n/a (new, this pass) | **PASS** | **PASS** (unchanged, similar deviation) — 0.2pt max dev (app5), vs 0.4pt at thr150; ledger PASS (-2.3% to -2.7%); split 47.8%/52.2% | 0.4pt (app4) | not measured | 49.5% / 50.5% | FAIL, all 6 groups outside tolerance (-15.2% to -16.6%) — same G2 scope boundary: 21.9-25.6s of a 240s run was genuinely contended per group, still well under "almost the whole run" |
+| H2 `overhead-vs-stock` (UNI-168, reused per the ticket — already run on this exact config by UNI-214) | FAIL (enforcement-queueing overhead, pre-UNI-214) | **PASS**, reused not re-run (−0.5%/−0.7% throughput vs stock, replica split 49.7/50.3) | reused, not re-run — same precedent UNI-216 set reusing this from UNI-214 (not one of the "split-scored rows" this ticket's re-run instruction targets); carried forward unchanged | within 1% | −0.5% / −0.7% | 49.7% / 50.3% | see UNI-214 section above for full detail; `results/20261109T233500Z-uni-214-h2-equal-weights/`, `results/20261109T234932Z-uni-214-h2-equal-weights-retry/` |
+| C8 `cache-heavy-vs-cache-cold` (UNI-136, reused per the ticket — already run on this exact config by UNI-214) | n/a (unscored control) | reused, not re-run — no cache-affinity regression, hot-tenant hit ratio 88.0% | reused, not re-run — same precedent, carried forward unchanged | n/a (unscored) | not measured | 50.0% / 50.0% | see UNI-214 section above; `results/20261109T234159Z-uni-214-c8-equal-weights/` |
+
+**Also reused from UNI-215 at thr32 (not UNI-216 table rows, cited here for completeness since the ticket named them explicitly):** F3's three alternative weight sets at `full-contention-2x` sizing (64/64/256) — 40/20/40 FAIL -12.5pt (closed from -21.6pt at thr150), 98/1/1 FAIL -66.9pt (closed from -78.9pt, still the floor case), 33/33/33 **PASS** 4.8pt (changed from FAIL +34.3pt at thr150). Full detail already lives in the UNI-215 section above; not re-run here because UNI-215 already measured them on the identical live config this pass used throughout.
 
 ### Headline finding: the queue almost never backs up at threshold 150
 
@@ -8708,6 +8723,153 @@ after every run).
   labels in this table are a snapshot of threshold 150 specifically, not a
   permanent verdict.
 
+### UNI-218: re-run at the new default, `queueDepthThreshold: 32`
+
+[UNI-215](/UNI/issues/UNI-215) (next section) swept the threshold and moved
+the live default from 150 to 32. Per that ticket's own caveat and this
+table's own closing note, that re-opens exactly the question the table
+above answers for 150: do the 21 rows that came back UNCONTENDED there stay
+UNCONTENDED at 32? This is that re-run — every split-scored row above
+except the identity/accounting/platform rows UNI-216 itself didn't re-run
+(`H2 overhead-vs-stock`, `C8`), using the exact same scenarios and worker
+sizing, in the same order, with `app1-flood` (256 workers), `full-contention`
+(all 3 reps), and F3's three alternative weight sets reused from UNI-215's
+own thr32 measurements rather than re-run a second time. Config held fixed
+throughout: image digest
+`sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091`,
+`queueDepthThreshold: 32`, `queue-scorer`/`prefix-cache-scorer` 3.0/3.0,
+`halfLifeSeconds: 60`, `newcomerClamp: true`. `ENFORCE_LIVE=true` and
+`deploy/poc/21-replica-split.sh` ran on every scenario. Results are folded
+into the table above as the `thr 32` column; this subsection is the summary
+the ticket asked for.
+
+**The headline: threshold 32 restores genuine contention almost everywhere
+it was lost at 150.** Of the 30 rows in the table above (excluding the two
+reused-unchanged `H2 overhead-vs-stock`/`C8` rows), only **3 remain
+UNCONTENDED** even at 32 — `A6 below-capacity` (6/6/26 workers is too light
+to back up the queue at any threshold tried so far) and both sub-saturation
+B5 open-loop points (70%, 100%). One further row, `A1 app2-alone`, is the
+solo carve-out and is never contended by design regardless of threshold, so
+it's excluded from this count on the same basis UNI-216 excluded it. That
+leaves **26 of 30 rows genuinely contended** at threshold 32, up from 8 of
+29 at threshold 150 — every row that regained contention got a real,
+load-bearing exercise of the weighted-split policy instead of silently
+falling through to vLLM's FCFS queue.
+
+**Three counts, as asked:**
+- **Genuinely contended: 26 of 30.** (At thr150: 8 of 29.)
+- **Of those 26 — PASS / FAIL / still UNCONTENDED:** **19 PASS**, **6 FAIL**,
+  and (restating) **3 UNCONTENDED** (`A6`, B5 70%, B5 100%) plus the 1
+  never-contended solo case (`A1`) outside this count. The 6 FAILs are:
+  `B4 long idle return` (-15.6pt, app1), `UNI-161 app1-flood` 256 workers
+  (-31.3pt, end-users), `UNI-161 app1-flood-moderate` 128 workers (-28.6pt,
+  end-users), `UNI-165 dominant` (-17.0pt, app1), `UNI-165 pow2` (-20.3pt,
+  app1), and `B5 open-loop 120%` (-33.1pt, end-users).
+- **New failure modes: zero.** Every one of the 6 FAILs above reproduces an
+  already-documented mechanism, not a new defect: both `app1-flood` rows are
+  [UNI-104](/UNI/issues/UNI-104)'s worker-count-overshoot pattern (128 and
+  256 workers are both over-offers against app1's 30% weight); `dominant`
+  is the same app1-alone-at-181-workers self-saturation UNI-216 already
+  named for this exact weight set; `B5 120%` is the same open-loop
+  above-saturation weight inversion [UNI-137](/UNI/issues/UNI-137)/UNI-216
+  already found, essentially unchanged in magnitude (33.1pt vs 35.1pt);
+  `B4 long idle return` reproduces its own original [UNI-143](/UNI/issues/UNI-143)
+  finding from the thr5 series almost exactly (-15.6pt here vs -15.5pt
+  originally) — it only looked "fixed" at thr150 because the threshold
+  itself suppressed contention, not because the underlying mechanism went
+  away; `UNI-165 pow2` likewise reproduces its own original series finding
+  (>50% single-group entitlement breaking the linear worker-sizing fit,
+  -20.3pt here vs -19.3pt originally). None of the 6 is a previously-unseen
+  failure shape.
+
+**A second, quieter effect: the ledger cross-check starts passing.** At
+threshold 150, essentially every contended row FAILed [UNI-138](/UNI/issues/UNI-138)'s
+ledger cross-check on the same G2 scope-boundary grounds (contention lasted
+only a few seconds of a multi-minute run, so most delivered tokens fell
+outside the contended-cost window by design). At threshold 32, contended
+windows are an order of magnitude longer per group (50-111s typical, vs
+1-27s at 150), which is enough for several rows' ledgers to flip to PASS
+outright: `full-contention-2x` (FAIL→PASS), `E2 lose-replica-mid-run`
+(FAIL→PASS), and `UNI-165 dominant` (6-group FAIL→1-group FAIL, app2 only).
+This is a side effect of the same mechanism the headline finding describes,
+not a separate fix.
+
+**`E2`'s missing replica-split snapshot, closed.** UNI-216 flagged that its
+`E2` run never captured a before/after replica split because the post-chaos
+snapshot raced the restore. This run's `E2` captured it cleanly: one replica
+at 0.0% share, the other at 100.0% — exactly the picture "lose a replica
+mid-run" should produce, confirming the gap was a timing race in UNI-216's
+run, not a missing capability in `21-replica-split.sh`.
+
+**A new, different capture gap surfaced on `B5 open-loop 120%`.** That run's
+replica-split snapshot is missing for a different reason: its benchmark
+script ran under a `$TMPDIR` scoped to an earlier run (`f014f717-...`) whose
+owning session had already ended by the time the 120% scenario reached its
+post-run snapshot step, so the directory the before/after counter files
+lived in no longer existed (`deploy/poc/21-replica-split.sh: ... No such
+file or directory`). The scored `fairness-report.md` itself was unaffected
+— the FAIL verdict and all per-group numbers above are intact — only the
+supplementary replica-split artifact for that one scenario is missing. The
+same failure mode had a more serious consequence this run: the script's
+final `enforce: true -> false` restore step depended on that same
+`$TMPDIR` and also failed silently, leaving the cluster at `enforce: true`
+until this was caught and fixed by hand (see below). Scripts launched as
+long-running background work going forward should write scratch files
+under the repo working tree, not `$TMPDIR`, when there's any chance the
+launching session ends before the script does.
+
+**Cluster left as found**, confirmed after the last run (and after
+manually correcting the `enforce` flag the `$TMPDIR` gap above had left at
+`true`):
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath={.data.epp} | grep -E "enforce:|queueDepthThreshold|pluginRef: (queue|prefix)|name: app1,|name: app2,|name: end-users,|defaultGroup"
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+      queueDepthThreshold: 32
+      - { pluginRef: queue-scorer, weight: 3.0 }
+      - { pluginRef: prefix-cache-scorer, weight: 3.0 }
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-cpu-kserve-router-scheduler-85b9c94cdd-cjhxl   1/1     Running   0          39s
+maas-vllm-gpu-kserve-router-scheduler-685b49fd45-lwgbf   1/1     Running   0          37s
+$ oc get deployment maas-vllm-gpu-kserve -n maas-fairness-poc -o jsonpath='{.status.readyReplicas}/{.status.replicas}'
+2/2
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           8m52s      10m
+```
+
+Both EPPs' `/metrics` additionally confirmed `llm_d_epp_maas_fairness_enforcing
+0` on both the GPU and CPU pool after the fix. Image digest unchanged
+throughout, both EPPs on the same ConfigMap, three-group default weight
+table and `queueDepthThreshold: 32` restored (the current default per
+UNI-215, not 150 — this pass never changed it, it was already 32 going in).
+No orphaned `oc logs -f` process was left behind (checked by walking
+`/proc/*/cmdline`).
+
+**What was and wasn't proven here:**
+- **Proven:** threshold 32 (UNI-215's recommendation) genuinely restores
+  the fairness policy's ability to exercise contention for the large
+  majority of the 131-168 series' original scenarios and worker sizings —
+  26 of 30 rows, up from 8 of 29 at 150. Zero new failure modes surfaced;
+  every FAIL reproduces an already-understood mechanism. `E2`'s replica-
+  split gap from UNI-216 is closed. The live cluster was left exactly as
+  found, including after manually recovering from the `enforce`-stuck-true
+  incident documented above.
+- **Not proven:** whether the 3 rows still UNCONTENDED at 32 (`A6`, B5 70%,
+  B5 100%) would ever become contended at some lower threshold — this
+  ticket's scope was a fixed re-run at 32, not a further sweep, and
+  UNI-215 already showed escalating worker count past "double" isn't
+  recommended practice ("don't tune past that"). `B5 open-loop 120%`'s
+  replica-split snapshot is missing for the `$TMPDIR` reason above; the
+  scored verdict is unaffected. Whether the `$TMPDIR`-scoped-to-a-session
+  pattern caused any other silent gaps in long-running background scripts
+  across this series was not separately audited beyond the two instances
+  (`B5 120%`'s snapshot, the `enforce` restore) found and fixed here.
 
 ## UNI-215: sweeping `queueDepthThreshold` — no value in 8-150 both holds the split and keeps throughput, but 32 is the clear best tradeoff
 

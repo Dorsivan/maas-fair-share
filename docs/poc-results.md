@@ -8791,3 +8791,85 @@ sets at `full-contention-2x` (64/64/256 workers) and an H2 A/B against the exist
 baseline, to check whether this value's tradeoff holds outside the one scenario the sweep
 itself used.
 
+
+`queueDepthThreshold: 32`, default weights (20/10/65) for H2, patched weights for each F3 set.
+
+| case | weight set | offered workers | verdict | max deviation (pts) | total requests | throughput vs stock | EPP queue p50/p95 |
+|---|---|---|---|---|---|---|---|
+| F3 `full-contention-2x` | 40/20/40 | 64/64/256 | FAIL | -12.5 (app1) | 5378 | **-4.8%** | 9.39s / 27.90s |
+| F3 `full-contention-2x` | 98/1/1 | 64/64/256 | FAIL | -66.9 (app1) | 5449 | **-3.6%** | 6.31s / 27.45s |
+| F3 `full-contention-2x` | 33/33/33 | 64/64/256 | **PASS** | 4.8 (end-users) | 5629 | **-0.4%** | 4.39s / 28.47s |
+| H2 `full-contention` | 20/10/65 (default) | 32/32/128 | **PASS** | 4.1 (app1) | 5452 | **-3.5%** | 3.04s / 7.94s |
+
+Raw artifacts: `results/20261110T074905Z-uni-215-confirm-f3-40-20-40/`,
+`results/20261110T080019Z-uni-215-confirm-f3-98-1-1/`,
+`results/20261110T080924Z-uni-215-confirm-f3-33-33-33/`,
+`results/20261110T081631Z-uni-215-confirm-h2-thr32/`.
+
+**This is a real improvement, not just "the least-bad FAIL."** Compare to the same three F3
+weight sets' original run at `queueDepthThreshold: 150` ([UNI-160](/UNI/issues/UNI-160)):
+
+| weight set | deviation @ 150 | deviation @ 32 | verdict change |
+|---|---|---|---|
+| 40/20/40 | -21.6 | -12.5 | FAIL -> FAIL, but closed by 9.1 points |
+| 98/1/1 | -78.9 | -66.9 | FAIL -> FAIL, closed by 12.0 points, still the floor case |
+| 33/33/33 | +34.3 | +4.8 | **FAIL -> PASS** |
+
+And H2's `full-contention` -- `UNCONTENDED` at threshold 150 (split just follows the 32:32:128
+worker ratio, [UNI-214](/UNI/issues/UNI-214)) -- is now genuinely contended (57-58s per group,
+not under-1s) **and PASSes the split** at max deviation 4.1 points, with throughput within the
+H2 bar's 5% tolerance of the UNI-168 stock baseline (5651).
+
+**What still fails, and why that's expected, not a gap in this result:** `app1-flood` (this
+ticket's own sweep, 256:32:64 worker ratio) and F3's 98/1/1 both stay well outside the 10-point
+bar at every threshold tried, 8 through 150. Both are the series' own deliberately-extreme
+cases -- 98/1/1 was flagged in [UNI-160](/UNI/issues/UNI-160) itself as "likely to fail, stresses
+the small-weight floor," and `app1-flood`'s 8x/4x worker over-offer is the same
+[UNI-104](/UNI/issues/UNI-104) worker-overshoot pattern the series has reproduced repeatedly.
+Admission-side holding has a real, measured ability to restore weighted ordering (it flips
+`full-contention` and `33/33/33` to PASS, and meaningfully narrows `40/20/40`), but that ability
+has a ceiling, and these two cases sit above it at any threshold in the swept range.
+
+### Recommendation: `queueDepthThreshold: 32`, committed and applied live
+
+Per the ticket's done-criteria, this is the "one value recommended and committed" branch, not
+the negative-result branch -- 32 measurably restores the fairness policy's ability to hold the
+weighted split under genuine contention for the series' normal case (H2/full-contention) and
+most weight sets (F3 33/33/33, and a large partial improvement on 40/20/40), at a throughput
+cost under 5% of the no-admission-control baseline in every run tested here. It does not fix the
+two most adversarial cases in the whole series (`app1-flood`, F3's 98/1/1), but no threshold
+from 8 to 150 does, and both were already flagged or reproduced as extreme-by-design.
+
+Committed in `deploy/poc/00-config.yaml` (queueDepthThreshold 150 -> 32, comment updated with
+the full rationale and a caution for future readers) and applied live:
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath={.data.epp} | grep -E "enforce:|queueDepthThreshold|pluginRef: (queue|prefix)|name: app1,|name: app2,|name: end-users,|defaultGroup"
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+      queueDepthThreshold: 32
+      - { pluginRef: queue-scorer, weight: 3.0 }
+      - { pluginRef: prefix-cache-scorer, weight: 3.0 }
+$ oc get pods -n maas-fairness-poc -l app.kubernetes.io/component=llminferenceservice-router-scheduler
+NAME                                                     READY   STATUS    RESTARTS   AGE
+maas-vllm-cpu-kserve-router-scheduler-85b9c94cdd-kgc9l   1/1     Running   0          54s
+maas-vllm-gpu-kserve-router-scheduler-685b49fd45-lcnjx   1/1     Running   0          56s
+$ oc get jobs -n maas-fairness-poc
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+maas-loadgen   Complete   1/1           7m32s      12m
+```
+
+`enforce` is left at its steady-state `false` -- this ticket's runs each flip it on for their own
+duration via `ENFORCE_LIVE=true` and revert it, same as every other ticket in the series.
+
+**Important caveat, explicitly not covered by this ticket's scope:** lowering the default from
+150 to 32 means the ~21 of [UNI-216](/UNI/issues/UNI-216)'s 29 scenarios that came back
+`UNCONTENDED` at 150 -- and so never actually exercised the fairness policy -- will likely show
+genuine contention again at 32. This ticket did not re-run them; doing so would be a UNI-216-
+shaped re-validation pass against the new default, and is recommended as explicit follow-up
+work, not assumed to be clean. Treat every PASS/UNCONTENDED verdict recorded anywhere in this
+document prior to this section as a snapshot of whatever threshold was live at the time it ran,
+not a permanent property of the scenario.

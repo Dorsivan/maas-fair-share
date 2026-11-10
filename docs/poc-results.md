@@ -9338,3 +9338,126 @@ step for an open-loop run's live status is the `llm_d_epp_maas_fairness_enforcin
 - A controlled contended-window-duration sweep at fixed worker skew (vs. the strong but
   uncontrolled association documented above) is follow-up work, not something this ticket's scope
   asked for.
+
+## UNI-228: the equal-weight family's five remaining non-discriminating rows get their own sibling -- 2 PASS, 3 FAIL, all five clear the bar
+
+UNI-225's own "what this doesn't cover" note (above) flagged five rows the ticket's item-2 scope
+never touched: `uni165-equal`, `uni165-graded`, `uni165-subset-3-idle`, `uni165-equal-2x` (0.0-8.6pt
+worker-vs-weight gap) and `twenty-group-scale` (flat equal worker count against equal weights,
+0.0pt by construction, since an equal split predicted by the weights and an equal split predicted
+by the workers are the same split). UNI-225's own siblings only covered the six scenarios with an
+*unequal* weight set sized *proportionally*; none of the five above have an unequal weight set at
+all, so the "never reduce the dominant tenant, boost the minority" rule doesn't directly apply --
+there is no dominant tenant by weight when every weight is equal.
+
+**The fix: boost one arbitrarily-chosen group 4x past the scenario's own baseline, hold the rest
+unchanged.** `full-contention-discriminating` already demonstrated the mirror-image shape is
+informative (equal workers against an *unequal* weight set); this is the same technique run the
+other direction (unequal workers against an *equal* weight set), so no new mechanism needed
+designing. All five needed a new entry in `15-fairness-benchmark.sh`'s scenario `case` (committed
+in this change). While wiring up the four six-group ones, every one of them needed its `app3`-`app6`
+worker overrides to be plain shell variables rather than `PER_TENANT_OVERRIDES` array entries --
+putting them in the array fails with "override target not found" because `04-loadgen.yaml` has no
+pre-existing placeholder for `app3`+ (only `app1`/`app2`/`end-users` do); those names only reach
+the Job spec through the script's later UNI-179 generic per-group pass-through loop, which reads
+them as plain env vars already present in the shell when that loop runs. Fixed in the same commit
+as the new scenarios.
+
+**The re-run**, same live baseline as UNI-225/UNI-227 (`enforce: false` steady-state,
+`ENFORCE_LIVE=true` per-run, `queueDepthThreshold: 32`, weights 20/10/65/5 restored between
+batches, `queue-scorer`/`prefix-cache-scorer` 3.0/3.0, image digest
+`sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091`), one GPU batch via
+`deploy/poc/23-uni228-discriminating-batch.sh` (a committed reconstruction of the actual sequence,
+which also needed the `PER_TENANT_OVERRIDES` fix above discovered mid-run; the actual driver used
+while finding that bug is not committed, same as UNI-225's own session-local working script):
+
+| scenario | weight set (6/20 groups) | boosted group workers | weight share % | worker share % | gap (pt) | observed % | deviation (pt) | verdict |
+|---|---|---|---|---|---|---|---|---|
+| `uni165-equal-discriminating` | equal, 16.7% each | app1: 128 (others 32) | 16.7 | 44.4 | 27.8 | 23.6 | +6.9 | **PASS** |
+| `uni165-subset-3-idle-discriminating` | equal table, app4-6 idled | app1: 128 (app2/3: 32) | 33.3 (renorm.) | 66.7 | 33.3 | 65.6 | +32.2 | FAIL |
+| `uni165-equal-2x-discriminating` | equal, 16.7% each | app1: 256 (others 64) | 16.7 | 44.4 | 27.8 | 18.9 | +2.2 | **PASS** |
+| `uni165-graded-discriminating` | graded 40/20/15/10/10/5 | app6: 128 (app1: 75, app2-5: 32) | 5.0 | 38.7 | 33.7 | 15.8 | +10.8 | FAIL |
+| `twenty-group-scale-discriminating` | equal, 5% each (20 groups) | app1: 400 (others 50) | 5.0 | 29.6 | 24.6 | 24.4 | +19.4 | FAIL |
+
+All five clear the 10-point discriminating bar by a comfortable margin (24.6-33.7pt), confirmed
+from each run's own `fairness-report.json` `verdict.discriminating: true` /
+`max_worker_vs_weight_gap_points` fields (`15-fairness-report.py`'s UNI-225 field, not a
+hand-computed number). `twenty-group-scale-discriminating`'s 8x boost (400 vs the usual 4x, to 200)
+is the one deliberate deviation from UNI-225's "4x past baseline" rule: at this scenario's 5%
+per-group weight share, a plain 4x boost only clears the bar by 2.4pt (12.4pt gap) once renormalized
+over 20 groups -- a thinner margin than every other row in this document's discriminating family,
+so the multiplier was raised until the margin matched the rest (24.6pt, in line with 24.8-35.1pt
+elsewhere).
+
+**Two genuine PASSes, both on the `equal` weight table.** `uni165-equal-discriminating` and its 2x
+scale-up both converge to within 7 points of the weight-predicted even split despite one group
+offering 4x/8x the others' workers -- the split followed the *configured weight*, not the worker
+count, exactly the claim this document's core result rests on. This adds two more rows to the
+discriminating-PASS column, which before this ticket held exactly two (`uni164-app3-joins`,
+`app1-idle-discriminating`, both in the UNI-218/UNI-225 section above).
+
+**Three FAILs, each a real negative data point, not a repeat of the same mechanism.**
+`uni165-subset-3-idle-discriminating`'s observed split (65.6/17.5/16.9%) lands almost exactly on the
+*worker* prediction (66.7/16.7/16.7%), not the weight prediction (33.3% each) -- the cleanest
+worker-driven split in this new batch. `uni165-graded-discriminating` is more ambiguous: app6's
+observed 15.8% sits *between* the weight prediction (5.0%) and the worker prediction (38.7%), closer
+to the weight side but still 10.8pt over the bar -- partial resistance, not full capture by either
+hypothesis. `twenty-group-scale-discriminating` also lands between the two predictions (24.4%
+observed vs. 5.0% weight / 29.6% worker) but carries the caveat below, so it is the weakest of the
+three FAILs to read confidently.
+
+**Caveat on `twenty-group-scale-discriminating`: a mid-run counter reset with no corresponding pod
+restart.** This run's own `fairness-report.json` sets
+`verdict.epp_restarted_in_windows_but_not_snapshot_pair: true` (the UNI-163 mechanism) -- at least
+one group's `contended_service_tokens_total` counter went backwards between two in-run scrapes, which
+per that field's documentation means every before/after delta above (including the verdict) is
+computed from a post-reset window and undercounts real traffic. Unlike UNI-163's original case,
+nothing else here corroborates an actual EPP restart: no "target pod is now X" pod-identity change
+was logged (the benchmark script does log that, and did at every other table-swap point in this
+same batch), `k8s-events-timeseries.log` shows no new-pod event for the GPU EPP during the run
+window, and the container restart count read 0 both during and after. This run was also the
+heaviest in the suite to date (1350 total offered workers, 400 on one group) and saw sustained
+`curl: (7) Failed to connect ... port 9090` failures against the GPU EPP's own metrics port for
+several minutes during the load -- plausibly related (a scrape that caught the EPP mid-overload and
+read a fresh/empty response as a reset, rather than a genuine counter reset), but unconfirmed. Not
+reinvestigated further here (out of this ticket's scope, and its one GPU-pool slot was already spent
+on the run itself); filed as [UNI-230](/UNI/issues/UNI-230) rather than left as only this paragraph,
+following the same non-blocking-anomaly precedent as UNI-227's own unresolved `~50s` connection
+anomaly (filed as UNI-229).
+
+**Cluster state, confirmed via `oc get` after the batch's final restore (not assumed):**
+
+```
+$ oc get configmap maas-epp-config -n maas-fairness-poc -o jsonpath='{.data.epp}' | grep -E 'name: app|name: end-users|weight:|defaultGroup|enforce:'
+        - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
+        - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
+        - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      defaultGroup: { name: unclassified, weight: 5 }
+      enforce: false
+      - { pluginRef: queue-scorer, weight: 3.0 }
+      - { pluginRef: kv-cache-utilization-scorer, weight: 2.0 }
+      - { pluginRef: prefix-cache-scorer, weight: 3.0 }
+```
+
+Matches the repo's committed `deploy/poc/00-config.yaml` defaults exactly -- the three `render.py`
+table swaps this batch needed (6-group equal, 6-group graded, 20-group equal) were all reverted by
+the batch's own trap before it exited.
+
+**The discriminating-only scorecard, updated.** Combining this ticket's five new rows with
+UNI-218/UNI-225/UNI-227's twelve (the "restated, discriminating-only scorecard (corrected)" section
+above): **17 discriminating rows total, 4 PASS / 13 FAIL.** Still thin evidence for the core claim in
+absolute row count, but the PASS column doubled by this ticket alone (2 -> 4), and both new PASSes
+sit on the cleanest possible confound to rule out -- an *equal* weight set, where "the split follows
+the weights" has no worker-ratio lookalike to hide behind at all.
+
+**What this doesn't cover.**
+- No saturation-limb capture ([UNI-224](/UNI/issues/UNI-224)) was added here either, for the same
+  reason UNI-225's own note gives: that instrumentation is still open on UNI-224, independent of
+  which scenario is run. `twenty-group-scale-discriminating`'s 1350 total offered workers is a new
+  high for this document (past `full-contention-2x-discriminating`'s 768), making it the next-best
+  candidate (after that run) for having engaged the KV-cache limb -- though its counter-reset caveat
+  above means this run specifically is a weaker candidate to invest further instrumentation effort
+  against until UNI-230 is understood.
+- The mid-run counter-reset anomaly (UNI-230) is unresolved, not just undocumented -- re-running
+  `twenty-group-scale-discriminating` cleanly (ideally with the UNI-230 root cause understood first)
+  would turn its FAIL into a fully trustworthy row rather than one carrying an explicit caveat.

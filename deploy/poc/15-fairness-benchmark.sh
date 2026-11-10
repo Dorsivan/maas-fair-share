@@ -370,7 +370,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -1358,6 +1358,97 @@ case "$SCENARIO" in
       WORKERS_APP2="${WORKERS_APP2:?six-group-board-case requires WORKERS_APP1..APP6}"
     )
     ;;
+  uni165-equal-discriminating)
+    # UNI-228: six-group-board-case's `equal` weight set (16.7% each) was run
+    # with all six groups floored to the same 32-worker baseline (worker
+    # share == weight share, 0.0pt gap, docs/poc-results.md's UNI-165
+    # section) -- an equal split predicted by the weights and an equal split
+    # predicted by the workers are the same split, so a PASS there is not
+    # evidence for weighted fairness specifically (the same UNI-225 confound,
+    # just with an equal rather than unequal weight set). Unlike the UNI-225
+    # siblings, there is no "dominant" tenant to hold fixed by weight here --
+    # every weight share is identical -- so this applies the same "boost past
+    # an already-proven-sufficient baseline, never reduce it" rule to
+    # ONE arbitrarily chosen group (app1) instead: app2-6 stay at the
+    # unchanged, already-over-offering 32-worker baseline, app1 is boosted 4x
+    # to 128, the same boost factor UNI-225's siblings use. New worker share
+    # is 44.4% (app1) / 11.1% each (app2-6) against the unchanged 16.7% each
+    # weight target -- a 27.7-point gap, comfortably clear of the 10-point
+    # bar. This is the equal-weight mirror image of
+    # `full-contention-discriminating` (equal workers against unequal
+    # weights there; unequal workers against equal weights here).
+    #
+    # app1/app2 have a pre-existing commented-out placeholder in
+    # 04-loadgen.yaml (set_override's "active or commented" regex), so they
+    # go through PER_TENANT_OVERRIDES like every other scenario above. app3-6
+    # do not -- same as six-group-board-case, they only reach the Job spec
+    # via the later UNI-179 generic per-group pass-through loop, which reads
+    # them as plain env vars already present when that loop runs, not
+    # through PER_TENANT_OVERRIDES's own set_override call (confirmed the
+    # hard way: putting them in PER_TENANT_OVERRIDES fails with "override
+    # target not found" because GROUP_VAR_PREFIXES, which the UNI-179
+    # fallback needs, is not built yet at that point in the script).
+    TENANTS="app1 app2 app3 app4 app5 app6"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=128 WORKERS_APP2=32)
+    WORKERS_APP3=32 WORKERS_APP4=32 WORKERS_APP5=32 WORKERS_APP6=32
+    ;;
+  uni165-graded-discriminating)
+    # UNI-228: six-group-board-case's `graded` weight set (40/20/15/10/10/5)
+    # used the same 2-point linear-fit sizing (20%->32, 65%->128, floored at
+    # 32 below 20%) as `equal`/`dominant`/`pow2` -- app1(40%)=75,
+    # app2(20%)=32, app3-6(15/10/10/5%, all <20%)=32 each -- which tracks the
+    # weight ratio closely enough (0.0-8.6pt per the UNI-225 review finding)
+    # that it cannot discriminate either. Same fix as the `equal` sibling
+    # above: keep app1 -- the one group already sized past the fit's floor,
+    # and the dominant weight here -- at its unchanged 75 workers, and boost
+    # the smallest-weight group (app6, 5%) 4x past its own 32-worker floor to
+    # 128. New worker share is app1 22.7% (vs 40.0% weight, -17.3pt) and app6
+    # 38.7% (vs 5.0% weight, +33.7pt) -- both clear of the 10-point bar, the
+    # larger taken for the scenario's own max-gap scoring
+    # (worker_vs_weight_gap_pts in 15-fairness-report.py already takes the
+    # max absolute gap across all offered groups, so no report-side change is
+    # needed here). app3-5 are plain env vars for the same reason the `equal`
+    # sibling above documents (no pre-existing PER_TENANT_OVERRIDES route for
+    # app3+); app6 is boosted so it goes through the same mechanism too.
+    TENANTS="app1 app2 app3 app4 app5 app6"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=75 WORKERS_APP2=32)
+    WORKERS_APP3=32 WORKERS_APP4=32 WORKERS_APP5=32 WORKERS_APP6=128
+    ;;
+  uni165-subset-3-idle-discriminating)
+    # UNI-228: `subset-3-idle` runs the `equal` weight table with app4/5/6
+    # idled (WORKERS_APP{4,5,6}=0, kept in TENANTS so they stay on the
+    # client-side ledger as offered-zero groups rather than silently
+    # dropping out of the report -- see the six-group-board-case comment
+    # above). The three active groups (app1/2/3) share the same confound as
+    # `equal`: 32 workers each against an equal, renormalized 33.3% weight
+    # share apiece, 0.0pt gap. Same fix: boost app1 4x to 128, keep app2/app3
+    # at the unchanged 32-worker baseline, leave app4-6 idled at 0 (idle
+    # groups are excluded from offered_groups entirely, so they do not
+    # participate in the gap computation either way). New worker share is
+    # 66.7% (app1) / 16.7% each (app2/app3) against the unchanged,
+    # renormalized 33.3% each weight target -- a 33.4-point gap. app3 (active,
+    # unchanged) and app4-6 (idled, unchanged) are plain env vars for the
+    # same reason the `equal` sibling above documents.
+    TENANTS="app1 app2 app3 app4 app5 app6"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=128 WORKERS_APP2=32)
+    WORKERS_APP3=32 WORKERS_APP4=0 WORKERS_APP5=0 WORKERS_APP6=0
+    ;;
+  uni165-equal-2x-discriminating)
+    # UNI-228: `equal-2x` doubled every group's worker count to 64 (the one
+    # UNI-165-family `-2x` follow-up the sizing rule calls for), still an
+    # equal split against an equal weight set -- 0.2pt gap, same confound.
+    # Same fix, scaled: boost app1 4x past its own 64-worker baseline to 256,
+    # keep app2-6 at the unchanged 64-worker baseline. Because the boost
+    # factor is relative to each scenario's own baseline, the resulting gap
+    # is identical to the 1x sibling's by construction -- 44.4% (app1) /
+    # 11.1% each (app2-6) against 16.7% each, a 27.7-point gap -- the same
+    # 1x->2x doubling relationship `full-contention`/`full-contention-2x`
+    # and their own `-discriminating` siblings already have. app3-6 are plain
+    # env vars for the same reason the `equal` sibling above documents.
+    TENANTS="app1 app2 app3 app4 app5 app6"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=256 WORKERS_APP2=64)
+    WORKERS_APP3=64 WORKERS_APP4=64 WORKERS_APP5=64 WORKERS_APP6=64
+    ;;
   twenty-group-scale)
     # UNI-167: H3, scale -- 20 configured groups (app1..app20), extending
     # six-group-board-case's (UNI-165) multi-group tooling the same way that
@@ -1381,8 +1472,34 @@ case "$SCENARIO" in
     PER_TENANT_OVERRIDES=()
     WORKERS="${WORKERS:-50}"
     ;;
+  twenty-group-scale-discriminating)
+    # UNI-228: twenty-group-scale's flat 50-workers-per-group sizing against
+    # its flat 5%-per-group equal weight table is a 0.0pt gap by
+    # construction (every group gets an identical worker count AND an
+    # identical weight, so there is no pair of numbers that could diverge) --
+    # the one row in this family that cannot even be made marginally
+    # confounded, it is non-discriminating by definition. Same fix as the
+    # six-group `uni165-equal-discriminating` sibling: hold 19 of the 20
+    # groups at the unchanged 50-worker baseline (WORKERS_APP2..APP20 fall
+    # through to the scenario's own WORKERS="${WORKERS:-50}" default, exactly
+    # as twenty-group-scale's own PER_TENANT_OVERRIDES=() relies on already)
+    # and boost app1 past it. A plain 4x boost (to 200) only clears the
+    # 10-point bar by 2.4pt (12.4pt gap) -- each baseline group here holds
+    # just 5% weight instead of the six-group family's 16.7-40%, so the same
+    # multiple buys far less separation once renormalized over 20 groups.
+    # Boost 8x instead, to 400: new worker share is 29.6% (app1) / 3.7% each
+    # (app2-20) against the unchanged 5.0% each weight target -- a 24.6-point
+    # gap, back in line with this ticket's other four siblings (27.7-33.7pt).
+    # 1350 total offered workers (950 + 400) is a new high for this suite,
+    # but not a new order of magnitude -- `full-contention-2x-discriminating`
+    # already ran 768, and this scenario's own 1x sizing already proved 1000
+    # workers safe against this backend.
+    TENANTS="app1 app2 app3 app4 app5 app6 app7 app8 app9 app10 app11 app12 app13 app14 app15 app16 app17 app18 app19 app20"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=400)
+    WORKERS="${WORKERS:-50}"
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating)" >&2
     exit 1
     ;;
 esac

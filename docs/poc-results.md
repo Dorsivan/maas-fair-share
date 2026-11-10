@@ -9371,13 +9371,13 @@ batches, `queue-scorer`/`prefix-cache-scorer` 3.0/3.0, image digest
 which also needed the `PER_TENANT_OVERRIDES` fix above discovered mid-run; the actual driver used
 while finding that bug is not committed, same as UNI-225's own session-local working script):
 
-| scenario | weight set (6/20 groups) | boosted group workers | weight share % | worker share % | gap (pt) | observed % | deviation (pt) | verdict |
-|---|---|---|---|---|---|---|---|---|
-| `uni165-equal-discriminating` | equal, 16.7% each | app1: 128 (others 32) | 16.7 | 44.4 | 27.8 | 23.6 | +6.9 | **PASS** |
-| `uni165-subset-3-idle-discriminating` | equal table, app4-6 idled | app1: 128 (app2/3: 32) | 33.3 (renorm.) | 66.7 | 33.3 | 65.6 | +32.2 | FAIL |
-| `uni165-equal-2x-discriminating` | equal, 16.7% each | app1: 256 (others 64) | 16.7 | 44.4 | 27.8 | 18.9 | +2.2 | **PASS** |
-| `uni165-graded-discriminating` | graded 40/20/15/10/10/5 | app6: 128 (app1: 75, app2-5: 32) | 5.0 | 38.7 | 33.7 | 15.8 | +10.8 | FAIL |
-| `twenty-group-scale-discriminating` | equal, 5% each (20 groups) | app1: 400 (others 50) | 5.0 | 29.6 | 24.6 | 24.4 | +19.4 | FAIL |
+| scenario | weight set (6/20 groups) | boosted group workers | weight share % | worker share % | gap (pt) | observed % | deviation (pt) | contended_seconds (range) | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| `uni165-equal-discriminating` | equal, 16.7% each | app1: 128 (others 32) | 16.7 | 44.4 | 27.8 | 23.6 | +6.9 | 59.9-61.0 | **PASS** |
+| `uni165-subset-3-idle-discriminating` | equal table, app4-6 idled | app1: 128 (app2/3: 32) | 33.3 (renorm.) | 66.7 | 33.3 | 65.6 | +32.2 | 37.2-38.4 | FAIL |
+| `uni165-equal-2x-discriminating` | equal, 16.7% each | app1: 256 (others 64) | 16.7 | 44.4 | 27.8 | 18.9 | +2.2 | 63.0-63.1 | **PASS** |
+| `uni165-graded-discriminating` | graded 40/20/15/10/10/5 | app6: 128 (app1: 75, app2-5: 32) | 5.0 | 38.7 | 33.7 | 15.8 | +10.8 (10.81 exact) | 59.1-61.9 | FAIL (boundary) |
+| `twenty-group-scale-discriminating` | equal, 5% each (20 groups) | app1: 400 (others 50) | 5.0 | 29.6 | 24.6 | 24.4 | +19.4 | 16.2-21.8 | FAIL |
 
 All five clear the 10-point discriminating bar by a comfortable margin (24.6-33.7pt), confirmed
 from each run's own `fairness-report.json` `verdict.discriminating: true` /
@@ -9391,61 +9391,110 @@ elsewhere).
 
 **Two genuine PASSes, both on the `equal` weight table.** `uni165-equal-discriminating` and its 2x
 scale-up both converge to within 7 points of the weight-predicted even split despite one group
-offering 4x/8x the others' workers -- the split followed the *configured weight*, not the worker
-count, exactly the claim this document's core result rests on. This adds two more rows to the
-discriminating-PASS column, which before this ticket held exactly two (`uni164-app3-joins`,
-`app1-idle-discriminating`, both in the UNI-218/UNI-225 section above).
+offering 4x (`uni165-equal-discriminating`, 128 vs 32) or 4x again on the doubled baseline
+(`uni165-equal-2x-discriminating`, 256 vs 64) the others' workers -- the split followed the
+*configured weight*, not the worker count, exactly the claim this document's core result rests on.
+This adds two more rows to the discriminating-PASS column, which before this ticket held exactly two
+(`uni164-app3-joins`, `app1-idle-discriminating`, both in the UNI-218/UNI-225 section above).
+
+**Ledger cross-check on both PASSes and on `uni165-graded-discriminating`: the EPP's own contended
+counter under-reports the boosted group's cost relative to what the client sent, and the bias runs in
+the direction that flatters the PASS verdicts.** Re-reading each report's `ledger.rows` (the
+UNI-166/UNI-179 client-vs-EPP reconciliation, not a new check): `cost_pct_diff` for the boosted group
+is substantially more negative than every other group in the same run -- `uni165-equal-discriminating`
+app1 -11.9% (others -3.7 to -4.4%), `uni165-equal-2x-discriminating` app1 -22.4% (others -2.1 to
+-3.0%), `uni165-graded-discriminating` app6 -12.9% (others -3.4 to -5.4%) -- while `raw_tokens_pct_diff`
+stays under 1% everywhere in all three runs, so client and EPP agree on tokens actually delivered; the
+discrepancy is confined to the contended-cost window, on the boosted group, every time. Re-scoring
+`observed_share_pct` on the client-reported cost (`expected_cost_from_client`) instead of the EPP's own
+`epp_contended_cost_delta` widens every deviation in this document's own favor: `uni165-equal-
+discriminating` app1 +6.9pt -> **+8.4pt**, `uni165-equal-2x-discriminating` app1 +2.2pt -> **+5.9pt**,
+`uni165-graded-discriminating` app6 +10.8pt -> **+12.1pt**. No verdict flips, but both PASS margins
+shrink materially under the more-conservative, client-observed read, and `uni165-graded-discriminating`
+reads as a more solidly-over-the-bar FAIL rather than the 0.8pt-margin boundary call its EPP-counter
+number alone suggests (see the boundary note below). Not reinvestigated further here (same
+out-of-ticket-scope reasoning as the counter-reset caveat below) -- worth tracking if a future ticket
+needs tighter PASS margins on the equal-weight rows specifically.
+
+**Duration cross-check: the tightest matched pair in this document's duration-vs-verdict association,
+and it does not fit the established band cleanly.** `uni165-equal-discriminating` (PASS, 59.9-61.0s
+contended per group) and `uni165-graded-discriminating` (FAIL, 59.1-61.9s contended per group) are the
+same batch, same image, same config, essentially the same contended-window length, and differ only in
+the weight table -- a stronger same-batch control on the duration hypothesis (see "The real headline:
+duration..." above) than UNI-227's own single-run app1 exception. Both land at 60-63s, well *under* the
+69.0s PASS floor that section establishes from the rest of the corpus, yet `uni165-equal-discriminating`
+and `uni165-equal-2x-discriminating` both PASS there; `uni165-subset-3-idle-discriminating` (37.2-38.4s)
+and `twenty-group-scale-discriminating` (16.2-21.8s) FAIL at shorter windows still, consistent with the
+band, but the 60-63s equal-weight PASSes are a second exception alongside UNI-227's app1 row. Read
+together with that one, the duration association now has two same-corpus counter-examples rather than
+one -- still not overturned (every FAIL in this batch has a shorter window than every PASS), but the
+"necessary condition" framing from the UNI-227 section applies here too, not a tighter one.
 
 **Three FAILs, each a real negative data point, not a repeat of the same mechanism.**
 `uni165-subset-3-idle-discriminating`'s observed split (65.6/17.5/16.9%) lands almost exactly on the
 *worker* prediction (66.7/16.7/16.7%), not the weight prediction (33.3% each) -- the cleanest
-worker-driven split in this new batch. `uni165-graded-discriminating` is more ambiguous: app6's
-observed 15.8% sits *between* the weight prediction (5.0%) and the worker prediction (38.7%), closer
-to the weight side but still 10.8pt over the bar -- partial resistance, not full capture by either
-hypothesis. `twenty-group-scale-discriminating` also lands between the two predictions (24.4%
-observed vs. 5.0% weight / 29.6% worker) but carries the caveat below, so it is the weakest of the
-three FAILs to read confidently.
+worker-driven split in this new batch. `uni165-graded-discriminating` is a boundary call, not a clear
+FAIL: app6's observed 15.8% sits *between* the weight prediction (5.0%) and the worker prediction
+(38.7%), closer to the weight side, and the 10.81pt deviation clears the 10.0pt bar by only 0.81pt --
+the ledger cross-check above (which would put it at ~12.1pt on client-observed cost) is the more
+confident read of this one. `twenty-group-scale-discriminating` also lands between the two predictions
+(24.4% observed vs. 5.0% weight / 29.6% worker); see below for why this FAIL stands on its own despite
+an initial misreading of its mid-run metrics gap.
 
-**Caveat on `twenty-group-scale-discriminating`: a mid-run counter reset with no corresponding pod
-restart.** This run's own `fairness-report.json` sets
-`verdict.epp_restarted_in_windows_but_not_snapshot_pair: true` (the UNI-163 mechanism) -- at least
-one group's `contended_service_tokens_total` counter went backwards between two in-run scrapes, which
-per that field's documentation means every before/after delta above (including the verdict) is
-computed from a post-reset window and undercounts real traffic. Unlike UNI-163's original case,
-nothing else here corroborates an actual EPP restart: no "target pod is now X" pod-identity change
-was logged (the benchmark script does log that, and did at every other table-swap point in this
-same batch), `k8s-events-timeseries.log` shows no new-pod event for the GPU EPP during the run
-window, and the container restart count read 0 both during and after. This run was also the
-heaviest in the suite to date (1350 total offered workers, 400 on one group) and saw sustained
-`curl: (7) Failed to connect ... port 9090` failures against the GPU EPP's own metrics port for
-several minutes during the load -- plausibly related (a scrape that caught the EPP mid-overload and
-read a fresh/empty response as a reset, rather than a genuine counter reset), but unconfirmed. Not
-reinvestigated further here (out of this ticket's scope, and its one GPU-pool slot was already spent
-on the run itself); filed as [UNI-230](/UNI/issues/UNI-230) rather than left as only this paragraph,
-following the same non-blocking-anomaly precedent as UNI-227's own unresolved `~50s` connection
-anomaly (filed as UNI-229).
+**Correction: `twenty-group-scale-discriminating`'s FAIL is clean. The original caveat below and
+[UNI-230](/UNI/issues/UNI-230)'s initial write-up were both wrong about what happened, and about
+whether the evidence to check still existed.** This run's own `fairness-report.json` sets
+`verdict.epp_restarted_in_windows_but_not_snapshot_pair: true` (the UNI-163 mechanism), which was
+first read as a possible mid-run EPP restart and filed, uninvestigated, as
+[UNI-230](/UNI/issues/UNI-230) on the strength of a `curl: (7) Failed to connect ... port 9090` line
+that turned out not to exist in any surviving artifact -- `uni228-batch.sh`'s `: > "$LOG"` truncated
+the first (partial) pass's console log when the batch was re-run after the `app3`+ override bug fix
+above, and that first-pass log was itself never committed. The claim that the run's own
+`metrics-timeseries.txt` "was never committed" and that there was "nothing left to re-score" was also
+wrong: the file exists in this ticket's own result directory
+(`results/20261110T195734Z-uni-228-twenty-group-scale-discriminating/metrics-timeseries.txt`), it was
+just not yet force-added past `.gitignore` (fixed below, F5). Reading it directly: of 37 ten-second
+scrapes, **15 consecutive scrapes from `20:00:44Z` to `20:03:05Z` returned zero metric lines** -- a
+scrape failure, not a restart. app1's `contended_service_tokens_total` **crosses that gap
+monotonically** (304,230 at `20:00:34Z`, the last scrape before the gap, to 313,698 at `20:03:15Z`, the
+first after it -- a restart would have zeroed the counter, not continued it), stays flat at 313,698
+through four more scrapes (dispatch stalled, not just unobserved) and then jumps to 599,230 by
+`20:04:45Z`. `k8s-events-timeseries.log` shows exactly one GPU EPP pod name
+(`maas-vllm-gpu-kserve-router-scheduler-787d544dbd-jgjfj`) for the entire run, matching `run.epp_pod`,
+with no new-Scheduled event for a replacement pod -- no restart, corroborated independently of the
+counter. **The FAIL verdict stands on its own and does not carry the "weakest of the three FAILs to
+read confidently" caveat this section originally gave it** -- what actually happened is more interesting
+than a counter reset: this run (1350 total offered workers, the heaviest in the suite) dispatched only
+5,094 requests against 5,469-5,631 in the six-group runs in this same batch, and 2.5 minutes of that gap
+is the GPU EPP's own `/metrics` endpoint being unreachable while the backend was overloaded -- a real
+operational signal about this configuration's behavior at scale, not a measurement artifact: app1 (the
+400-worker boosted group) logged 132 HTTP 500s out of 1,058 requests (12.5%, the highest error rate of
+any group in this batch), and its own `client-request-summary.jsonl` row shows p95 latency well past
+the rest of the suite -- both consistent with the backend being overloaded during the gap. This also
+means the scenario comment's premise (that the scenario's own 1x sizing "already proved 1000 workers
+safe against this backend") does not hold at the 1350-worker level this discriminating sibling actually
+drove.
 
-**[UNI-230](/UNI/issues/UNI-230) update: root cause confirmed by code reading, not by spending another
-GPU-pool slot.** `compute_windows`/`compute_queue_wait_windows` (`15-fairness-report.py`) read a
-family's absence from a snapshot as "every group's value is 0," the same shape a genuine EPP restart
-produces (fresh process, fresh metric registry) -- so a scrape that never reached the EPP at all
-(`curl` exiting nonzero, as this run's own `curl: (7) Failed to connect` lines show) was
-indistinguishable from a real restart once grepped, and the detector had no way to tell them apart
-after the fact. `15-fairness-benchmark.sh`'s `snapshot_metrics()` now records the scrape's own curl
-exit code as a `# scrape_exit=` comment line ahead of the grepped metrics (harmless to every existing
-parser, which already skips `#` lines); `15-fairness-report.py` uses it to add a new, additive
+**[UNI-230](/UNI/issues/UNI-230) re-pointed: the report-script fix (still correct and still landed) was
+responding to a mischaracterized incident.** `compute_windows`/`compute_queue_wait_windows`
+(`15-fairness-report.py`) reading a metric family's absence from a snapshot as "every group's value is
+0" is a real bug -- the same shape a genuine EPP restart produces (fresh process, fresh metric registry)
+or a failed scrape produces (never reached the EPP at all), and the detector had no way to tell the two
+apart after the fact. `15-fairness-benchmark.sh`'s `snapshot_metrics()` now records the scrape's own
+curl exit code as a `# scrape_exit=` comment line ahead of the grepped metrics (harmless to every
+existing parser, which already skips `#` lines); `15-fairness-report.py` uses it to add a new, additive
 `verdict.scrape_gap_in_windows` field, separate from `epp_restarted_in_windows_but_not_snapshot_pair`,
 so a dropped scrape is reported as a dropped scrape instead of a process restart with no corroborating
 pod/container evidence. Covered by `test_compute_windows_treats_failed_scrape_as_scrape_gap_not_restart`,
 `test_compute_queue_wait_windows_treats_failed_scrape_as_scrape_gap_not_restart`, and
 `test_failed_scrape_mid_run_is_flagged_as_scrape_gap_not_restart` (`15-fairness-report-test.py`, all
-passing). This fix is prospective only: `twenty-group-scale-discriminating`'s own
-`metrics-timeseries.txt` was never committed (consistent with this project's run-artifact retention --
-see this document's other "not preserved" caveats) and the GPU EPP pod that served the run
-(`...787d544dbd-jgjfj`) has since been replaced by ordinary redeploys, so there is nothing left to
-re-score with the fixed detector; the caveat paragraph above stands as the final word on that specific
-run's numbers. The fix's value is that the *next* high-worker-count run that hits this failure mode
-gets reported correctly the first time, without spending a GPU-pool slot on a confirmatory re-run.
+passing). What was wrong is the premise that prompted the fix: there was no restart to misdiagnose here
+at all, this run's own data was recoverable the whole time (the correction above re-scores it by hand
+from the raw `metrics-timeseries.txt`, since that file predates the new `# scrape_exit=` capture and so
+has nothing for the new field to key off), and `twenty-group-scale-discriminating`'s FAIL needed a
+by-hand correction, not a shrug. The fix's forward-looking value is unchanged: the *next* high-
+worker-count run that hits a mid-run scrape failure gets `verdict.scrape_gap_in_windows` set directly,
+without needing this kind of after-the-fact reconstruction.
 
 **Cluster state, confirmed via `oc get` after the batch's final restore (not assumed):**
 
@@ -9472,14 +9521,22 @@ absolute row count, but the PASS column doubled by this ticket alone (2 -> 4), a
 sit on the cleanest possible confound to rule out -- an *equal* weight set, where "the split follows
 the weights" has no worker-ratio lookalike to hide behind at all.
 
+**Result directories force-added.** All five of this ticket's `results/` directories are now committed
+past `.gitignore` (`git add -f`, same precedent as every settled-suite run back through UNI-214) -- the
+shared gap this section's review flagged across UNI-225/UNI-227/UNI-228 is closed here for all three,
+since the underlying artifacts live in the same working tree. No further action needed on those two
+tickets specifically.
+
 **What this doesn't cover.**
 - No saturation-limb capture ([UNI-224](/UNI/issues/UNI-224)) was added here either, for the same
   reason UNI-225's own note gives: that instrumentation is still open on UNI-224, independent of
   which scenario is run. `twenty-group-scale-discriminating`'s 1350 total offered workers is a new
   high for this document (past `full-contention-2x-discriminating`'s 768), making it the next-best
-  candidate (after that run) for having engaged the KV-cache limb -- though its counter-reset caveat
-  above means this run specifically is a weaker candidate to invest further instrumentation effort
-  against until UNI-230 is understood.
-- The mid-run counter-reset anomaly (UNI-230) is unresolved, not just undocumented -- re-running
-  `twenty-group-scale-discriminating` cleanly (ideally with the UNI-230 root cause understood first)
-  would turn its FAIL into a fully trustworthy row rather than one carrying an explicit caveat.
+  candidate (after that run) for having engaged the KV-cache limb -- its FAIL now reads clean (see the
+  correction above), so this is a stronger candidate for further instrumentation effort than it first
+  appeared, not a weaker one.
+- The ledger cross-check above shows the EPP's own contended-cost counter under-reports the boosted
+  group's cost specifically during a discriminating run, confined to `uni165-equal`/`uni165-equal-2x`/
+  `uni165-graded`'s boosted group so far -- whether this is general to every discriminating sizing in
+  this document (UNI-225's six included) or specific to the equal-weight family is not established;
+  re-reading UNI-225's own `ledger.rows` for the same pattern is cheap follow-up, no GPU time needed.

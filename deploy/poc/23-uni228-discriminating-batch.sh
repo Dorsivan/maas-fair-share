@@ -15,6 +15,17 @@
 # table and is scheduled last so the 6-group table is only ever live for the
 # three 6-group `equal`-table runs plus the one `graded`-table run.
 #
+# Note on the documented results: the real run that produced
+# docs/poc-results.md's UNI-228 section did NOT follow this order --
+# twenty-group-scale-discriminating ran first, alone, in an earlier partial
+# pass of the session-local driver (before the app3+ PER_TENANT_OVERRIDES bug
+# this ticket fixed was found), and the four 6-group scenarios were queued
+# and run afterward in a second pass. This script runs all five in the order
+# above instead, which is equally valid (each scenario's EPP table is
+# self-contained and the trap always restores the 3-group default), but a
+# literal re-run will not reproduce the original session's exact wall-clock
+# sequence.
+#
 # Usage:
 #   OPENSHIFT_TOKEN=... ./23-uni228-discriminating-batch.sh
 #
@@ -125,6 +136,7 @@ run() {
   local scenario="$1" label="$2"
   log "=== $label ==="
   wait_for_no_active_job
+  "$SCRIPT_DIR/21-replica-split.sh" snapshot "$LOG_DIR/.uni228-rs-before.txt" >>"$BATCH_LOG" 2>&1 || true
   if ! DURATION="$DURATION" ENFORCE_LIVE=true NAMESPACE="$NAMESPACE" \
       "$SCRIPT_DIR/15-fairness-benchmark.sh" "$scenario" "$label" 2>&1 | tee -a "$BATCH_LOG"; then
     log "FAIL: $label did not complete -- checking cluster state before stopping (does not re-run automatically)"
@@ -132,6 +144,17 @@ run() {
     exit 1
   fi
   confirm_enforce_false
+  "$SCRIPT_DIR/21-replica-split.sh" snapshot "$LOG_DIR/.uni228-rs-after.txt" >>"$BATCH_LOG" 2>&1 || true
+  local dir
+  dir="$(ls -dt "$LOG_DIR"/*-"${label}" 2>/dev/null | head -1)"
+  if [ -n "$dir" ]; then
+    cp "$LOG_DIR/.uni228-rs-before.txt" "$dir/replica-counters-before.txt" 2>/dev/null || true
+    cp "$LOG_DIR/.uni228-rs-after.txt" "$dir/replica-counters-after.txt" 2>/dev/null || true
+    "$SCRIPT_DIR/21-replica-split.sh" diff "$LOG_DIR/.uni228-rs-before.txt" "$LOG_DIR/.uni228-rs-after.txt" \
+      > "$dir/replica-split.md" 2>>"$BATCH_LOG" || true
+  else
+    log "WARNING: no results dir found for label $label -- replica-split not captured"
+  fi
   log "=== $label done ==="
 }
 

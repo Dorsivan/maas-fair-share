@@ -9612,8 +9612,8 @@ ticket's run in flight.
 | `app1-flood-moderate` | 30/10/60 | 128/32/64 | FAIL, -28.6 (end-users) | **FAIL, -12.2** (end-users) | app2 1, end-users 1 (baseline breakdown not separately recorded) |
 | `six-group-board-case` `dominant` | 90/2/2/2/2/2 | app1 @ 181 | FAIL, -17.0 (app1) | **PASS, -3.1 max (app1)** | app2-6: 3-4 each (baseline breakdown not separately recorded) |
 | `six-group-board-case` `pow2` | 32/16/8/4/2/1 | app1 @ 58 | FAIL, -20.3 (app1) | **FAIL, -12.2 (app1)** | app1-6: 1-4 each (baseline breakdown not separately recorded) |
-| `full-contention` | 20/10/65 | 32/32/128 | PASS (must stay PASS) | **PASS**, -1.4 max (app1), NON-DISCRIMINATING per UNI-225 (worker shares already within 6.1pt of weight shares, so this PASS alone isn't evidence of weighted fairness) | app1 2, app2 1 |
-| H2 throughput A/B vs UNI-168 stock (5651 req/240s) | — | — | bar: within 5% | **PASS: 5753 requests, +1.8%** | — |
+| `full-contention` | 20/10/65 | 32/32/128 | PASS (must stay PASS) | **PASS**, app1 -1.4, max deviation +1.8 (end-users), NON-DISCRIMINATING per UNI-225 (worker shares already within 6.1pt of weight shares, so this PASS alone isn't evidence of weighted fairness) | app1 2, app2 1 |
+| H2 throughput A/B vs UNI-168 stock (5651 req/240s) | — | — | bar: within 5% | **PASS: 5753 gross requests (+1.8%); 5312 successful-only (-3.8%)** — both inside the 5% bar | — |
 
 Artifacts: `results/20261111T100257Z-uni-220-diag-clamp-off-app1-flood/`,
 `results/20261111T103042Z-uni-220-fix-app1-flood/`,
@@ -9622,6 +9622,31 @@ Artifacts: `results/20261111T100257Z-uni-220-diag-clamp-off-app1-flood/`,
 `results/20261111T110758Z-uni-220-fix-pow2/`,
 `results/20261111T111904Z-uni-220-fix-full-contention/` (all force-added past `.gitignore`, same
 precedent as every settled-suite run back through UNI-214).
+
+### Request failure rate across this run set (review correction, not caught at the time)
+
+All six runs above show an elevated HTTP 500 rate: 4.3-11.1% of sent requests, against 0.4-3.8%
+for comparator runs of the same scenarios elsewhere in this document (`app1-flood` fix run 5.7%,
+`app1-flood-moderate` fix run 4.3%, `dominant` fix run 9.7%, `pow2` fix run 6.8%,
+`full-contention`/H2 fix run 7.7%, the clamp-off diagnostic on the old image 11.1% — all computed
+from each run's `client-request-summary.jsonl`). The benchmark harness itself warns in every one
+of these logs that a run is only meaningful if statuses are overwhelmingly 200. This is not caused
+by the clamp fix: the highest rate (11.1%) is the diagnostic run on the **old**, pre-fix image.
+
+It is not characterized further here, but it touches the evidence in two ways and the verdicts
+above should be read with that in mind:
+- 500s are refunded by the benchmark's own accounting, so they leave the delivered-cost
+  denominator rather than counting against the failing group.
+- The failures are not symmetric across groups. In `dominant`, the only row that flips to PASS,
+  app1 fails at 6.8% (326/4765 sent) while app2-app6 each fail at 20-24% (e.g. app2 50/232,
+  app6 54/227) — confirmed directly against that run's `client-request-summary.jsonl`. That
+  asymmetry flatters app1's share in exactly the row where the verdict changed. The PASS almost
+  certainly survives on its own margin (app1's deviation is -3.1 against a 10-point bar), but the
+  margin is smaller than the headline number alone suggests.
+
+Root-causing the elevated failure rate itself is tracked separately (it's a property of this
+2026-11-11 run set, not of the clamp fix, and plausibly affects other rows in this document too)
+rather than re-litigated here.
 
 ### Reading the result: real, uneven, incomplete correction
 
@@ -9651,9 +9676,13 @@ precedent as every settled-suite run back through UNI-214).
   -12.2) by letting app1 keep the credit it earns instead of losing it to repeated false clamps,
   but closing it fully needs worker counts sized to express a >50% weight at all, which is a
   loadgen sizing question, not a policy one.
-- **`full-contention` stays PASS and throughput is unaffected**: 5753 requests against the
-  UNI-168 stock baseline of 5651 is +1.8%, inside the 5% bar, and well inside the noise this
-  series has already characterized for repeat runs.
+- **`full-contention` stays PASS and throughput is within bar on both countings**: 5753 gross
+  requests against the UNI-168 stock baseline of 5651 is +1.8%; counting only the 5312 that
+  succeeded (this run's elevated failure rate — see above — pulls the 500s out of the delivered
+  total) gives -3.8%. Both are inside the 5% bar, and well inside the noise this series has
+  already characterized for repeat runs, but the gross number alone overstates the margin by 5.6
+  points and both should be read together, per the counting convention UNI-213/UNI-214 already
+  established for totals that include failures.
 
 ### The evidenced ceiling
 
@@ -9680,4 +9709,10 @@ router-scheduler is running the new image
 (`sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f`); `deploy/llmisvc.yaml`,
 `deploy/poc/02-epp.yaml`, `deploy/poc/05-llmisvc-sim.yaml`, `deploy/poc/06-rhoai34-shape.yaml`,
 `deploy/poc/07-vllm-cpu.yaml` and `deploy/poc/09-vllm-gpu.yaml` all pin it, same two-manifest
-(now six-manifest) drift discipline UNI-29 established.
+(now six-manifest) drift discipline UNI-29 established. **Caveat on the CPU lane specifically:**
+`deploy/poc/07-vllm-cpu.yaml` pins the new digest, but the live CPU router-scheduler pod
+(`maas-vllm-cpu-kserve-router-scheduler-...`) is still running the old
+`sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091` image — confirmed
+directly against the running pod, not just the manifest. This benchmark exercises the GPU lane
+only, so nothing here is functionally wrong, but the manifest and the live CPU pod have drifted
+and the "six manifests pin it" statement above does not mean all six are also *running* it.

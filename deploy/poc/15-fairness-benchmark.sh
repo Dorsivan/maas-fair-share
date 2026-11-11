@@ -510,6 +510,7 @@ CAPTURE_PID=""
 CAPTURE_OC_PIDFILE=""
 EVENTS_PID=""
 TS_PID=""
+GATEWAY_MEMORY_PID=""
 CHAOS_PID=""
 ORIGINAL_REPLICAS=""
 ENFORCE_FLIPPED="false"
@@ -878,8 +879,8 @@ restore_live_set() {
 }
 
 stop_background_loops() {
-  kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" "$EVENTS_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
-  wait "$CAPTURE_PID" "$EVENTS_PID" "$TS_PID" "$CHAOS_PID" 2>/dev/null || true
+  kill "$CAPTURE_PID" "$(cat "$CAPTURE_OC_PIDFILE" 2>/dev/null)" "$EVENTS_PID" "$TS_PID" "$GATEWAY_MEMORY_PID" "$CHAOS_PID" 2>/dev/null || true
+  wait "$CAPTURE_PID" "$EVENTS_PID" "$TS_PID" "$GATEWAY_MEMORY_PID" "$CHAOS_PID" 2>/dev/null || true
 }
 
 # UNI-174: the single, unconditional owner of every piece of live cluster
@@ -2053,6 +2054,36 @@ events_loop() {
 }
 events_loop &
 EVENTS_PID=$!
+
+# UNI-250: periodic snapshot of the shared gateway's own memory. That
+# gateway is a 24-day-old pod other tenants/lanes depend on, not something
+# this run creates or owns, and it was observed OOMKilled mid-run on
+# 2026-11-11 after creeping toward its limit for hours beforehand -- a run
+# that happens to land in that window degrades (dropped connections) for a
+# reason this harness otherwise has no record of. `oc adm top` rather than a
+# Prometheus/Thanos query: this script has no other PromQL dependency, and
+# `top` needs no port-forward or extra auth beyond the token it already has.
+# Selector (not a fixed pod name) survives the gateway pod restarting or
+# rescheduling mid-run, same reason EPP_POD_FILE exists for the EPP pod.
+GATEWAY_MEMORY_LOG="$ARTIFACT_DIR/gateway-memory-timeseries.txt"
+snapshot_gateway_memory() {
+  $OC adm top pod -n "$NAMESPACE" -l gateway.networking.k8s.io/gateway-name=maas-poc-gateway \
+    --containers --no-headers 2>/dev/null
+}
+{ echo "# ts=$RUN_START epoch=$RUN_START_EPOCH"; snapshot_gateway_memory; } > "$GATEWAY_MEMORY_LOG"
+gateway_memory_loop() {
+  # Same set -e exposure as timeseries_loop/events_loop above: `oc adm top`
+  # returns nothing for a few seconds around the gateway pod being replaced
+  # (metrics-server has no data for a brand-new pod yet), which must skip
+  # that one window, not kill every window for the rest of the run.
+  set +e
+  while kill -0 "$$" 2>/dev/null; do
+    sleep "$WINDOW_SECONDS"
+    { echo "# ts=$(date -u +%Y-%m-%dT%H:%M:%SZ) epoch=$(date +%s)"; snapshot_gateway_memory; } >> "$GATEWAY_MEMORY_LOG"
+  done
+}
+gateway_memory_loop &
+GATEWAY_MEMORY_PID=$!
 
 # --- UNI-127 chaos loop: fires the configured hooks at their t+offset and
 # logs each one, with a timestamp, to chaos-events.log. A no-op loop (nothing

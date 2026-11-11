@@ -436,12 +436,28 @@ func (p *Plugin) Pick(
 	// handles the cold start where every group legitimately begins at zero;
 	// the minimum over current candidates handles a band that went fully empty
 	// and left virtualTime stale.
+	//
+	// UNI-220: the edge test alone is not enough to mean "gone." A group whose
+	// own offered concurrency is below the pool's capacity cycles its FlowQueue
+	// between empty and non-empty on the timescale of one request's latency --
+	// not because it stopped wanting service, but because the request it does
+	// have outstanding is still being served. hasInFlight() excludes exactly
+	// this case: a group with a dispatched-but-not-yet-completed request has
+	// never actually left, so clamping it to the floor on every such gap
+	// discards the deficit its weight earned it, over and over, for as long as
+	// it keeps cycling. Live evidence (UNI-218's app1-flood at the settled
+	// config): the clamp fired 28 times on the starved, concurrency-limited
+	// end-users group and 0 times on the continuously-flooding app1 -- almost
+	// every firing was this false case, not a genuine return from idle. A
+	// group that is truly gone -- zero queue depth AND zero in-flight -- is
+	// unaffected: this adds a condition to when the clamp may fire, it does
+	// not relax the wall-clock gate that already decides genuine absence.
 	idleThreshold := time.Duration(p.cfg.NewcomerClampIdleSeconds * float64(time.Second))
 	if p.cfg.NewcomerClamp {
 		floor := math.Max(bs.virtualTime, minNormalized)
 		for i := range candidates {
 			edge := bs.isBacklogEdge(candidates[i].id, seq, now, idleThreshold)
-			if edge && candidates[i].normalized < floor {
+			if edge && candidates[i].normalized < floor && !candidates[i].state.hasInFlight() {
 				candidates[i].state.setNormalizedService(now, floor)
 				candidates[i].normalized = floor
 				newcomerClamps.WithLabelValues(boundID(candidates[i].id)).Inc()

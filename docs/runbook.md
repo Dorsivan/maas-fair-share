@@ -62,10 +62,13 @@ else needs to be recreated:
 oc patch llminferenceservice maas-vllm-cpu -n maas-fairness-poc --type=merge -p '{"spec":{"replicas":2}}'
 ```
 
-It comes back on `deploy/poc/07-vllm-cpu.yaml`'s current scheduler pin,
-`quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135`
-— the same digest the GPU path runs (UNI-97). Allow ~1-2 minutes for the two
-Qwen2.5-0.5B CPU pods to become `Ready`.
+It comes back on `deploy/poc/07-vllm-cpu.yaml`'s current scheduler pin —
+the same digest the GPU path runs, kept in lockstep since UNI-97/UNI-212. That pin has
+moved several times since this note was written (most recently to
+`sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f` at UNI-220); check
+`git log --oneline -- deploy/poc/07-vllm-cpu.yaml` for the live value rather than trusting
+a digest printed in prose. Allow ~1-2 minutes for the two Qwen2.5-0.5B CPU pods to become
+`Ready`.
 
 ---
 
@@ -201,8 +204,8 @@ service account as above — this only replaces the build/push step, not the pul
 `maas-vllm-gpu-epp-sa` already carries it, so an image pushed this way to the same
 repository needs no further pull-secret work.
 
-Digest produced from `fc27130` and now referenced by `deploy/llmisvc.yaml` and
-`deploy/poc/09-vllm-gpu.yaml` (UNI-29, 2026-10-22):
+Digest produced from `fc27130` and referenced by `deploy/llmisvc.yaml` and
+`deploy/poc/09-vllm-gpu.yaml` as of UNI-29 (2026-10-22):
 
 ```
 quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135
@@ -211,6 +214,14 @@ quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5d
 This closes the drift described in the next section: `main`, checked out clean, now
 deploys an image built from its own `HEAD`, published somewhere a different cluster
 could also reach it from (subject to the private-repo pull-secret note above).
+
+**This digest is historical, not current — it has moved four times since.** Every code
+change to the plugin forces a rebuild (see [§11](../AIRGAP-HANDOFF.md#11-changing-it)'s
+rule), and each of UNI-213 (twice), UNI-212, and UNI-220 re-pinned all six manifests, not
+just the two UNI-29 fixed. The live digest as of UNI-220 is
+`sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f` — but do not trust
+that value either without checking `git log --oneline -- deploy/llmisvc.yaml` first; by the
+time you read this it may have moved again.
 
 ### Interim in-cluster build used to verify UNI-53 — superseded by UNI-29's Quay publish
 
@@ -244,9 +255,12 @@ commit that touched the EPP (14 commits as of UNI-53, 31 by the time UNI-29 caug
 That gap is now closed, but not by publishing *this* digest — see "Publishing to Quay
 without a local podman" above. UNI-29 rebuilt from a later `HEAD` (`fc27130`, after
 UNI-75's EPP rebuild) and pushed *that* to Quay instead, since a current build is more
-useful to pin than this now-stale one. Both manifests reference the UNI-29 digest as of
-2026-10-22. If the EPP changes again, re-run that procedure and bump both manifests in
-the same commit — do not let the pin drift a third time.
+useful to pin than this now-stale one. Both manifests referenced the UNI-29 digest as of
+2026-10-22; the discipline "re-run the procedure and bump every manifest in the same
+commit" held across each subsequent re-pin (UNI-213 twice, UNI-212, UNI-220 — now six
+manifests, not two, since UNI-98 extended it to the rest). It is the discipline that
+matters, not this specific digest: check `git log --oneline -- deploy/llmisvc.yaml` for
+whichever one is live now.
 
 Do **not** "fix" a future drift like this by repointing those two manifests at an
 in-cluster-registry digest like the one above instead: that image is reachable only

@@ -9,9 +9,18 @@ to test it the first time, and which healthy-looking outcomes are actually failu
 Read this top to bottom once before touching the cluster. The order matters more than any
 individual command.
 
-> **Status of this snapshot.** Cut 2026-11-02 at commit `bdd9c15` (UNI-190), **while the
-> edge-case test series was still running**. This is a deliberate mid-series promotion, not
-> a finished POC. [§10](#10-what-is-and-is-not-proven) says exactly what that leaves open.
+> **Status of this snapshot.** Cut 2026-11-11 at commit `c8a069d` (UNI-220). The edge-case
+> test series (UNI-117's plan) has continued well past the UNI-190 cut this doc was last
+> updated from — through at least UNI-230, with a further UNI-220 re-run landing as the
+> final commit on `main` — and `docs/poc-results.md` is the authoritative, current record;
+> its own ticket-ordered sections are the source of truth, not this paragraph or
+> [§10](#10-what-is-and-is-not-proven) below. The cluster was left at its documented
+> baseline (`enforce: false`, `queueDepthThreshold: 32`, weights `20/10/65/5`,
+> `newcomerClamp: true`) after the last run. Two threads are open, not closed, as of this
+> cut: a dispatch-accounting gap under an EPP restart for a high-concurrency tenant
+> ([UNI-193](/UNI/issues/UNI-193)/[UNI-194](/UNI/issues/UNI-194)), and whether the 8x-over-offer
+> correction ceiling [§10](#10-what-is-and-is-not-proven) documents needs an admission-side
+> fix — nothing further is in flight on either as of this commit.
 
 ---
 
@@ -151,14 +160,14 @@ Do not treat anything in it as a dependency.
 
 ## 3. Orientation — which document answers which question
 
-The repository carries ~11,700 lines of documentation. You do not need to read it all. Go
+The repository carries ~16,900 lines of documentation. You do not need to read it all. Go
 to the one that answers your question:
 
 | Your question | Document |
 |---|---|
-| Why does this exist, what are the design decisions and their rejected alternatives | `docs/design.md` (1,380 lines; Part 1 is plain-language) |
-| What was measured, on what hardware, and what the numbers were | `docs/poc-results.md` (4,752 lines — the evidence record) |
-| How do I actually run a thing on the cluster | `docs/runbook.md` (2,367 lines — task-indexed, start from its headings) |
+| Why does this exist, what are the design decisions and their rejected alternatives | `docs/design.md` (1,616 lines; Part 1 is plain-language) |
+| What was measured, on what hardware, and what the numbers were | `docs/poc-results.md` (9,683 lines — the evidence record) |
+| How do I actually run a thing on the cluster | `docs/runbook.md` (2,631 lines — task-indexed, start from its headings) |
 | What version is pinned, why, and how do I bump it | `docs/version-pinning.md` |
 | `outputTokenWeight` is 2.0 — what do I set it to here | `docs/calibrating-output-token-weight.md` ← **you must do this** |
 | How does header forgery work and how is it closed | `docs/gateway-header-stripping.md` |
@@ -229,7 +238,7 @@ Every external dependency, with a verdict. `mirrorable` = copyable as bytes;
 
 | Item | Verdict | Evidence / note |
 |---|---|---|
-| `quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135` — **the EPP image, the actual deliverable** | mirrorable, **but see §6.1** | Built from commit `fc27130` (UNI-29). Referenced by digest from six manifests. The Quay repository is **private**: an anonymous pull token is issued but the manifest GET returns `UNAUTHORIZED`, so it cannot be mirrored without the robot credential. |
+| `quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f` — **the EPP image, the actual deliverable** | mirrorable, **but see §6.1** | Built from commit `86159ee` (UNI-220's newcomer-clamp in-flight-gate fix), published via the `maas-epp-quay-publish` BuildConfig. Referenced by digest from six manifests. This is the fourth re-pin since UNI-29's original `fc27130` build — each code change to the plugin forces a rebuild (UNI-213 twice, UNI-212, UNI-220); check `git log --oneline -- deploy/llmisvc.yaml` before trusting any digest cited anywhere in this repository's prose, including this one. The Quay repository is **private**: an anonymous pull token is issued but the manifest GET returns `UNAUTHORIZED`, so it cannot be mirrored without the robot credential. |
 | `gcr.io/distroless/static:nonroot` | mirrorable | Runtime base, via `ARG BASE_IMAGE` in `Dockerfile.epp`. **Floating tag** — resolve to a digest before mirroring. |
 | `golang:1.26.8` | mirrorable | Builder image. Needed only if you rebuild. Must be **≥** the `go` directive in upstream's go.mod (currently `go 1.26.6`). **Floating tag.** |
 | `registry.redhat.io/rhaii/vllm-cpu-rhel9:3.5.0` | mirrorable | CPU inference path. Version tag, not a digest. |
@@ -324,9 +333,12 @@ Two. Both have a known unblock; neither is a design flaw in the plugin.
 ### 6.1 The EPP image lives in a private Quay repository
 
 **Finding.** `quay.io/rh-ee-dsivan/maas-fair-share` does not permit anonymous pulls. A
-registry auth token is issued, then the manifest GET for digest `sha256:5ddee9a7…` returns
-`UNAUTHORIZED`. An air-gapped mirror run without the robot credential will fail on the one
-image that *is* the deliverable, and it will fail at mirror time, not at deploy time.
+registry auth token is issued, then the manifest GET for the digest currently pinned
+(`sha256:c8a08820…`, see [§5.1](#51-container-images) — **confirm the live digest with
+`git log --oneline -- deploy/llmisvc.yaml` before mirroring; it has moved four times since
+this repository's first Quay publish and will move again**) returns `UNAUTHORIZED`. An
+air-gapped mirror run without the robot credential will fail on the one image that *is*
+the deliverable, and it will fail at mirror time, not at deploy time.
 
 **Unblock — one of:**
 
@@ -334,7 +346,7 @@ image that *is* the deliverable, and it will fail at mirror time, not at deploy 
    credential:
    ```sh
    skopeo copy --all \
-     docker://quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a790480658854cb99fc254f71cbc5db949990641adca8dfbdf8a9ce135 \
+     docker://quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f \
      dir:/transfer/maas-fair-share-epp
    ```
    Carry the directory; load it with `skopeo copy dir:… docker://<internal-registry>/…`.
@@ -659,7 +671,15 @@ set `x-llm-d-inference-objective` to pick its own band. Fairness is **intra-band
 one tenant in a different band is not competing at all and the whole measurement is
 meaningless. The only thing that catches this is the `gateway-header-check` run in §7.4 —
 not the Tenant status. `docs/gateway-header-stripping.md` has the live proof of the
-unpatched behaviour.
+unpatched behaviour. **This patch can silently revert on its own** — it did, for an unknown
+window, discovered on 2026-11-09 (UNI-210): `odh-model-controller` regenerates
+`maas-poc-gateway-authn` from its template on certain `LLMInferenceService` reconciles, and
+nothing was running the check automatically, so roughly thirty benchmark runs executed
+against a reverted patch before anyone noticed. `deploy/poc/15-fairness-benchmark.sh` and
+`deploy/poc/20-n-group-smoke.sh` now check for the override before doing anything else and
+re-apply the patch automatically (aborting, not just warning, if the re-apply doesn't hold)
+— but if you write a new script that drives traffic through this gateway, it does not get
+that protection for free; wire in the same check.
 
 **4. The two vLLM flags default off and fail silently.**
 `--enable-force-include-usage` and `--enable-prompt-tokens-details`. Without them the
@@ -698,6 +718,20 @@ same-shape 200 OK control request completes normally. Live-reproduced in UNI-190
 this on your side, do not go looking in `pkg/fairness/weightedlas/` — and note that it is
 **not** retry amplification: there is one charge per request.
 
+**10. A metrics-scrape gap during backend overload reads exactly like an EPP restart in the
+report's own verdict fields — it is not one.** The report's restart-detection field
+(`verdict.epp_restarted_in_windows_but_not_snapshot_pair`) was set on a 1,350-worker run and
+taken at face value as a counter reset (filed as UNI-230, uninvestigated). Reading the raw
+`metrics-timeseries.txt` instead showed
+the contended-token counter crossing the gap **monotonically** (no restart would preserve
+that) and the k8s events log showing one unchanged EPP pod name for the whole run — what
+actually happened was 2.5 minutes of the `/metrics` endpoint being unreachable while the
+backend was overloaded, a real operational signal, not a measurement artifact. The report
+script (`15-fairness-report.py`) now records each scrape's own exit code and reports a
+`verdict.scrape_gap_in_windows` field separate from the restart flag, but **a result scored
+before this fix needs the same by-hand cross-check** (monotonic counter + stable pod name)
+before you treat an apparent restart as real.
+
 ---
 
 ## 10. What is and is not proven
@@ -718,10 +752,54 @@ this on your side, do not go looking in `pkg/fairness/weightedlas/` — and note
 - A weight is a **floor, not a ceiling** — a trickling tenant is not throttled further, and
   its unused entitlement is redistributed in the others' own ratio.
 - The header-forgery hole is real, and the AuthPolicy patch closes it. Both demonstrated
-  live.
+  live. The patch has been seen to revert on its own in service (UNI-210) — see
+  [§9](#9-failures-that-look-like-success) item 3 — and the two benchmark harnesses now
+  check and re-apply it automatically before every run.
 - Unit tests pass under `-race`.
-- The earlier concern that the newcomer clamp hurt the split was **refuted** on GPUs; those
-  runs were demand-starved.
+- **The live default `queueDepthThreshold` is 32, not a smaller value this plugin
+  originally shipped with.** A threshold sweep (UNI-215) found no value in the 8–150 range
+  that both holds the split and keeps throughput, and settled on 32 as the best tradeoff; a
+  full re-run of the 131–168 edge-case series at that default (UNI-218) restored genuine
+  contention for 26 of 30 previously-scored rows (up from 8 of 29 at the old default of
+  150), with zero new failure modes — every row that still FAILs reproduces an
+  already-documented mechanism.
+- **The newcomer clamp's credit-confiscation bug is real, was fixed in two stages, and the
+  fix has a measured, evidenced limit — it is not a closed, binary "fixed."** The earlier
+  write-up's claim that the concern was "refuted on GPUs" because those runs were
+  demand-starved did not hold up: UNI-212 found and fixed a wall-clock-idleness false
+  positive, and UNI-220 found and fixed a second one (a group with a dispatched-but-not-yet-
+  completed request was still treated as a returning "newcomer"). The second fix closes
+  57% of the over-offer gap at a 4x over-offer ratio and 39% at 8x — a real, large,
+  **partial** correction, not a full one. The residual at high ratios is structural (an 8x
+  over-offer needs roughly an 8x latency spread between the flooding and starved tenant to
+  fully correct, and this ordering-only mechanism does not produce that), not a remaining
+  bug to patch — closing it further needs an admission-side mechanism (a per-group cap or
+  backpressure), deliberately out of scope here. Treat "the over-offer problem is fixed" as
+  false for ratios above ~4x.
+- **A secondary, latency-based verdict backs the share verdict even where the percentage
+  target is structurally unreachable (UNI-226).** The EPP's own per-tenant TTFT/ITL
+  histogram metrics (`llm_d_epp_request_ttft_seconds_bucket` and the streaming-ITL
+  equivalent), already emitted `fairness_id`-labelled by the upstream framework, are now
+  read into a per-tenant report. On a `98/1/1` weight set under equal load, the share
+  verdict FAILs as predicted
+  (app1 delivered 61.8% against an unreachable 98% target) — but app1's TTFT is still
+  strictly the lowest, with a 55.4s gap to the next tenant that is ~330x the same-run,
+  between-tenant noise floor (167ms, measured on an equal-weight/equal-load control). The
+  policy is doing its job even on a target it cannot structurally hit.
+- **Most PASS verdicts elsewhere in `docs/poc-results.md` are weaker evidence than a bare
+  PASS count implies, and this does not change the two headline numbers above.** Most
+  scenarios size each tenant's offered worker count proportionally to its configured
+  weight, so a PASS there cannot distinguish "the policy enforces the weight" from "the
+  split just follows offered concurrency" — they predict the same split. Restricted to rows
+  where worker share and weight share diverge by more than the 10-point pass bar (the
+  "discriminating" scorecard, UNI-225/UNI-228): **2 PASS, 10 FAIL, out of 12.** The two
+  headline results above are themselves discriminating (equal worker counts against
+  unequal weights) and are unaffected. Equal-weight scenarios (e.g. `uni165-equal`) are
+  excluded from this scorecard by board ruling (UNI-228) — under an equal weight set, equal
+  load and weight-proportional load are the same configuration, so they cannot produce a
+  gap without breaking the board's mandated equal-load baseline — and are kept instead as
+  the TTFT noise-floor control cited above. Before citing any other PASS in this repository
+  as evidence the policy works, check its own worker-vs-weight gap the same way.
 
 ### Not proven
 
@@ -754,9 +832,20 @@ this on your side, do not go looking in `pkg/fairness/weightedlas/` — and note
    cross-check flags it FAIL). This is by design, not a bug in the strict sense, but the
    design predates the evidence. It is an **open board policy decision**, not a defect
    waiting on a fix — do not "correct" it locally without reading UNI-148 first.
-10. **The edge-case series was still in flight when this version was cut.** `docs/poc-results.md`
-   is complete through UNI-190; later tickets in the chain are not in this snapshot. Check
-   that document's own ticket ordering before concluding a case was never examined.
+10. **EPP-restart resilience for a high-concurrency tenant.** Chaos-deleting the scheduler
+    pod mid-run reproducibly leaves the highest-concurrency tenant's dispatch accounting
+    broken afterward — not a simple "never re-converges." A fresh, instrumented repro
+    (UNI-193, after the original E1 case's harness bugs were fixed) showed ~80% of that
+    tenant's requests completing successfully at the client (`200`) while never registering
+    in the EPP's own `dispatch_total`, token ledger, or `contended_*` metrics at all —
+    four times the ~20% accounting loss every tenant sees around any snapshot boundary.
+    Root cause needs tracing the upstream `gateway-api-inference-extension` flow-control
+    path, which is imported, not vendored, and is out of scope here. Open as
+    [UNI-194](/UNI/issues/UNI-194).
+11. **This snapshot is current through commit `c8a069d` (UNI-220).** `docs/poc-results.md`
+    is complete through that point. Check that document's own ticket-ordered sections,
+    not this file, for anything landed after it — and note that ticket number and commit
+    order do not always agree (UNI-220 itself landed in two separate commits, days apart).
 
 ### Not examined in this transfer review
 
@@ -780,7 +869,7 @@ loading and no config-only path to changing policy logic. What *is* config:
 | Change | Where | Rebuild? |
 |---|---|---|
 | Group names, prefixes, weights | ConfigMap `maas-epp-config` (`deploy/epp-config.yaml`) | no |
-| `enforce`, `halfLife`, `newcomerClamp`, `outputTokenWeight`, `cachedInputTokenWeight` | same ConfigMap | no |
+| `enforce`, `halfLife`, `newcomerClamp`, `outputTokenWeight`, `cachedInputTokenWeight`, `queueDepthThreshold` | same ConfigMap | no |
 | Policy logic, cost model, metrics | `pkg/fairness/weightedlas/` | **yes** |
 | Upstream `llm-d-router` version | `go.mod` **and** `Dockerfile.epp`'s builder image, together | **yes** |
 

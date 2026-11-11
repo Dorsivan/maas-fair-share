@@ -403,6 +403,23 @@ node that hosts none of the shared components, raise instance 1's gateway
 memory, then repeat the three-lane A/A. Until then, use lanes 2 and 3 for
 serial runs, harness work and dry runs.
 
+**Loadgen sizing and placement (UNI-249).** The loadgen now requests 1 core
+with a 4-core limit, up from 100m and 2 cores. Each instance's loadgen is
+pinned to its own CPU node: instance 1 on `ocp-worker-3`, lane 2 on
+`ocp-worker-0`, lane 3 on `ocp-worker-1`. None goes on `ocp-worker-2`
+(gateways, lane EPPs, Authorino, maas-api). `ocp-worker-3` is not clean. It
+also runs instance 1's own GPU EPP, Limitador (which every lane shares
+wherever it runs) and paperclip-server. Instance 1 goes there because that is
+the only placement where no lane's loadgen shares a node with another
+instance's EPP. A required anti-affinity on `job-name=maas-loadgen` across
+all namespaces keeps two loadgens off one node. If a loadgen finds its node
+taken, it stays Pending, and `15-fairness-benchmark.sh` gives up after 3
+minutes. Unpinned, the scheduler only ever chose workers 2 and 3. Workers 0
+and 1 are more CPU-*requested*, though barely used. **This changes the
+instrument**, so serial results from before and after it may not be directly
+comparable. Open-loop runs (`17-…-openloop.sh`) are a local process, not a
+Job, and this change does not affect them.
+
 **Every run records concurrent load.** `15-fairness-benchmark.sh` lists every
 other instance's loadgen Jobs at the start and end of a run, and
 `deploy/poc/concurrent-runs.py` writes `concurrent-runs.txt` into the run's

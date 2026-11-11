@@ -31,10 +31,12 @@ inst1_busy(){
   done; return 1; }
 
 monitor(){ while [ ! -f "$D/DONE" ]; do
+  # UNI-249: loadgens now sit on ocp-worker-3/0/1 (lanes.py), so sample every CPU worker
   n=$($OC adm top node ocp-worker-2 --no-headers 2>/dev/null | awk '{print $2,$3}'); n3=$($OC adm top node ocp-worker-3 --no-headers 2>/dev/null | awk '{print $2,$3}')
+  n0=$($OC adm top node ocp-worker-0 --no-headers 2>/dev/null | awk '{print $2,$3}'); n1=$($OC adm top node ocp-worker-1 --no-headers 2>/dev/null | awk '{print $2,$3}')
   k=$($OC adm top pod -n kuadrant-system --no-headers 2>/dev/null | awk '/authorino-[0-9a-f]+-|limitador-limitador/{printf "%s=%s ", substr($1,1,12), $2}')
   b=$(inst1_busy || echo idle)
-  echo "$(date -u +%FT%TZ) phase=$(cat $D/phase) worker2=[$n] worker3=[$n3] $k other-inst1-run=$b" >> "$D/monitor.log"; sleep 20; done; }
+  echo "$(date -u +%FT%TZ) phase=$(cat $D/phase) worker2=[$n] worker3=[$n3] worker0=[$n0] worker1=[$n1] $k other-inst1-run=$b" >> "$D/monitor.log"; sleep 20; done; }
 
 wasm(){ for L in maas-fairness-poc poc-maas-lane2 poc-maas-lane3; do
   $OC -n $L exec deploy/maas-poc-gateway-data-science-gateway-class -c istio-proxy -- pilot-agent request GET stats 2>/dev/null | grep -E 'wasmcustom' > "$D/wasm-$1-$L.txt"; done; }

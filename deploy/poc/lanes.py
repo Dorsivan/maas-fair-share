@@ -4,10 +4,13 @@
 Every lane is the same stack under the same object names, in its own
 namespace, on its own pair of GPU nodes:
 
-    lane  namespace           GPU nodes                            suffix
-    1     maas-fairness-poc   ocp-gpu-worker-0, ocp-gpu-worker-1   (none)
-    2     poc-maas-lane2      ocp-gpu-worker-2, ocp-gpu-worker-3   -l2
-    3     poc-maas-lane3      ocp-gpu-worker-4, ocp-gpu-worker-5   -l3
+    lane  namespace           GPU nodes                            suffix  loadgen node
+    1     maas-fairness-poc   ocp-gpu-worker-0, ocp-gpu-worker-1   (none)  ocp-worker-3
+    2     poc-maas-lane2      ocp-gpu-worker-2, ocp-gpu-worker-3   -l2     ocp-worker-0
+    3     poc-maas-lane3      ocp-gpu-worker-4, ocp-gpu-worker-5   -l3     ocp-worker-1
+
+Each lane's load generator gets its own CPU node too (UNI-249), none of them
+ocp-worker-2, which carries every gateway, Authorino and maas-api.
 
 The one thing that cannot be identical is the MaaS tenant identity. A
 MaaSSubscription's name IS the identity the EPP groups on (MaaS injects it as
@@ -46,17 +49,23 @@ CANONICAL_NAMESPACE = "maas-fairness-poc"
 
 LANES = {
     "maas-fairness-poc": {"lane": 1, "suffix": "",
-                          "nodes": ["ocp-gpu-worker-0", "ocp-gpu-worker-1"]},
+                          "nodes": ["ocp-gpu-worker-0", "ocp-gpu-worker-1"],
+                          "loadgen_node": "ocp-worker-3"},
     "poc-maas-lane2": {"lane": 2, "suffix": "-l2",
-                       "nodes": ["ocp-gpu-worker-2", "ocp-gpu-worker-3"]},
+                       "nodes": ["ocp-gpu-worker-2", "ocp-gpu-worker-3"],
+                       "loadgen_node": "ocp-worker-0"},
     "poc-maas-lane3": {"lane": 3, "suffix": "-l3",
-                       "nodes": ["ocp-gpu-worker-4", "ocp-gpu-worker-5"]},
+                       "nodes": ["ocp-gpu-worker-4", "ocp-gpu-worker-5"],
+                       "loadgen_node": "ocp-worker-1"},
 }
 
 # 09-vllm-gpu.yaml pins the model servers with exactly this line; render
 # swaps the node list. Kept literal so `oc apply -f 09-vllm-gpu.yaml` alone
 # is still a correct lane-1 manifest.
 CANONICAL_NODES = "values: [ocp-gpu-worker-0, ocp-gpu-worker-1]"
+
+# 04-loadgen.yaml pins the maas-loadgen Job with exactly this line (UNI-249).
+CANONICAL_LOADGEN_NODE = "values: [ocp-worker-3]"
 
 # A lane has no CPU model; subscriptions keep only their GPU modelRef.
 LANE_MODEL = "maas-vllm-gpu"
@@ -115,6 +124,15 @@ def render_doc(doc, namespace, lane):
                      "an unpinned model server onto a shared cluster")
         doc = doc.replace(CANONICAL_NODES,
                           f"values: [{', '.join(lane['nodes'])}]")
+    if doc_kind(doc) == "Job" and \
+            re.search(r"^  name:\s*maas-loadgen\s*$", doc, re.M):
+        if CANONICAL_LOADGEN_NODE not in doc:
+            sys.exit("lanes.py: maas-loadgen has no hostname pin "
+                     f"({CANONICAL_LOADGEN_NODE!r}) to rewrite -- refusing to "
+                     "render a loadgen the scheduler could put on a shared "
+                     "node")
+        doc = doc.replace(CANONICAL_LOADGEN_NODE,
+                          f"values: [{lane['loadgen_node']}]")
     return doc
 
 
@@ -191,6 +209,7 @@ def main():
         print(f"LANE={lane['lane']}")
         print(f"LANE_SUFFIX={lane['suffix']}")
         print(f"LANE_GPU_NODES=\"{' '.join(lane['nodes'])}\"")
+        print(f"LANE_LOADGEN_NODE={lane['loadgen_node']}")
     elif a.cmd == "render":
         text = "\n---\n".join(open(f).read() for f in a.files) if a.files \
             else sys.stdin.read()

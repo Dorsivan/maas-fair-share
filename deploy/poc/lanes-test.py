@@ -65,6 +65,35 @@ class Render(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("unpinned", r.stderr)
 
+    def test_each_lane_pins_its_loadgen_to_its_own_node(self):
+        src = os.path.join(HERE, "04-loadgen.yaml")
+        seen = set()
+        for ns, node in (("maas-fairness-poc", "ocp-worker-3"),
+                         ("poc-maas-lane2", "ocp-worker-0"),
+                         ("poc-maas-lane3", "ocp-worker-1")):
+            r = run(ns, "render", src)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            pins = re.findall(r"values: \[(ocp-worker-\d)\]", r.stdout)
+            self.assertEqual(pins, [node], ns)
+            seen.add(node)
+        self.assertEqual(len(seen), 3)
+        self.assertNotIn("ocp-worker-2", seen)
+
+    def test_loadgen_anti_affinity_spans_namespaces(self):
+        r = run("poc-maas-lane2", "render", os.path.join(HERE, "04-loadgen.yaml"))
+        anti = r.stdout[r.stdout.index("podAntiAffinity:"):]
+        anti = anti[:anti.index("containers:")]
+        self.assertIn("job-name: maas-loadgen", anti)
+        self.assertIn("namespaceSelector: {}", anti)
+        self.assertIn("topologyKey: kubernetes.io/hostname", anti)
+
+    def test_unpinned_loadgen_is_refused(self):
+        src = read(os.path.join(HERE, "04-loadgen.yaml"))
+        src = src.replace("values: [ocp-worker-3]", "values: []")
+        r = run("poc-maas-lane3", "render", stdin=src)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("maas-loadgen has no hostname pin", r.stderr)
+
     def test_unknown_namespace_never_falls_back_to_lane1(self):
         for cmd in (["env"], ["render"], ["tenants"]):
             r = run("maas-fairness-poc-typo", *cmd, stdin="kind: X\n")

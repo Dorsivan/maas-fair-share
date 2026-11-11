@@ -2193,6 +2193,19 @@ for i in $(seq 1 240); do
     PHASE="done"
     break
   fi
+  # UNI-249: the loadgen is pinned to one node with cross-namespace
+  # anti-affinity, so another loadgen already on that node leaves this one
+  # Pending. Give up after ~3 min instead of polling for 40, and delete the
+  # Job so it can't start later, unmeasured.
+  UNSCHED="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="PodScheduled")].reason}{": "}{.status.conditions[?(@.type=="PodScheduled")].message}{"\n"}{end}' 2>/dev/null | grep '^Unschedulable' | head -1)"
+  if [ -n "$UNSCHED" ]; then
+    echo "[benchmark] WARNING: loadgen pod not scheduled: $UNSCHED" >&2
+    if [ "$i" -ge 18 ]; then
+      echo "[benchmark] ERROR: loadgen unschedulable for 3 min -- its node ($(NAMESPACE="$NAMESPACE" python3 -I "$(dirname "$0")/lanes.py" env | sed -n 's/^LANE_LOADGEN_NODE=//p')) is probably running another instance's loadgen; deleting the Job" >&2
+      $OC delete job "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null
+      exit 1
+    fi
+  fi
   sleep 10
 done
 if [ "$PHASE" != "done" ]; then

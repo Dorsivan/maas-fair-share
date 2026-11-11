@@ -51,11 +51,14 @@ can create llminferenceservices.serving.kserve.io -n "$NAMESPACE" \
 
 # 1. Gateway: same spec as lane 1's (03-gateway.yaml), its own Envoy pods and
 #    MetalLB address. The LLMInferenceService's HTTPRoute attaches to it.
-if $OC get gateway.gateway.networking.k8s.io maas-poc-gateway -n "$NAMESPACE" >/dev/null 2>&1; then
-  log "gateway: present"
-elif can create gateways.gateway.networking.k8s.io -n "$NAMESPACE"; then
-  render --kind Gateway "$HERE/03-gateway.yaml" | $OC create -n "$NAMESPACE" -f - >/dev/null
-  log "gateway: created"
+#    Its infra ConfigMap keeps the Envoy pods off GPU nodes; apply both every
+#    time so a Gateway from an earlier run picks up the pin.
+render --kind ConfigMap "$HERE/03-gateway.yaml" | $OC apply -n "$NAMESPACE" -f - >/dev/null
+if can patch gateways.gateway.networking.k8s.io -n "$NAMESPACE"; then
+  render --kind Gateway "$HERE/03-gateway.yaml" | $OC apply -n "$NAMESPACE" -f - >/dev/null
+  log "gateway: applied (pinned off GPU nodes)"
+elif $OC get gateway.gateway.networking.k8s.io maas-poc-gateway -n "$NAMESPACE" >/dev/null 2>&1; then
+  log "gateway: present, but this identity cannot update it -- GPU-node pin not verified"
 else
   stop "gateway maas-poc-gateway missing, and this identity cannot create it" \
     "poc-agent: NAMESPACE=$NAMESPACE python3 -I deploy/poc/lanes.py render --kind Gateway deploy/poc/03-gateway.yaml | oc create -n $NAMESPACE -f -"

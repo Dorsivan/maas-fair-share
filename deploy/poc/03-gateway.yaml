@@ -12,6 +12,27 @@
 # at all -- route straight to the Service instead and every request bypasses
 # the plugin while still returning perfectly good completions.
 ---
+# Istio merges the `deployment` key into the Deployment it generates for the
+# Gateway (infrastructure.parametersRef above). Same rule as the EPP's in
+# 09-vllm-gpu.yaml: no node with an NVIDIA PCI device.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-poc-gateway-infra
+  namespace: maas-fairness-poc
+data:
+  deployment: |
+    spec:
+      template:
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: feature.node.kubernetes.io/pci-10de.present
+                        operator: DoesNotExist
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -19,6 +40,14 @@ metadata:
   namespace: maas-fairness-poc
 spec:
   gatewayClassName: data-science-gateway-class
+  # UNI-231: keep the Envoy pods off GPU nodes. Unpinned, the scheduler put
+  # lane 2's gateway on a lane-3 GPU node and vice versa -- one lane's traffic
+  # on another lane's machine, the exact interference the A/A test hunts for.
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: ConfigMap
+      name: maas-poc-gateway-infra
   listeners:
     - name: http
       port: 80

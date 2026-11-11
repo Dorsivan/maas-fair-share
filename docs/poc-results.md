@@ -9231,8 +9231,10 @@ this document's UNI-225 pass, every discriminating run with roughly a minute or 
 contended time in this document's corpus PASSed; every one measured with contended time under 10s
 FAILed, with the sole exception of the boundary `uni164-app3-joins` row discussed above. That was a
 materially more defensible claim than "thin evidence." [UNI-227](/UNI/issues/UNI-227)'s re-run below
-adds a per-group counter-example that refines rather than overturns it -- see that section. The
-honest caveat stays attached: `contended_seconds` co-varies with scenario and offered load rather
+adds a per-group counter-example that refines rather than overturns it -- see that section.
+[UNI-245](/UNI/issues/UNI-245)'s F4 subsection (below, under the UNI-220 section) adds a second,
+cleaner counter-example: a run with every group's `contended_seconds` inside or below the FAIL band
+that still PASSed outright. The honest caveat stays attached: `contended_seconds` co-varies with scenario and offered load rather
 than being independently dialed, so this is an association across the rows measured plus one
 controlled within-scenario triplet (same weight set, same structural gap, three different
 contended-window lengths) -- not a dedicated, independently-randomized duration sweep.
@@ -9702,8 +9704,10 @@ deliberately out of scope for this ticket (see `docs/design.md`'s candidate-dire
 not evaluated here. Closing the remaining gap, if required, is follow-up work for a ticket that
 starts from this measurement rather than from the original -31.3 baseline.
 
-**Refined by [UNI-245](/UNI/issues/UNI-245):** "below 4x" is now a specific bracket -- 3x PASSes
-(8.5pt max deviation) and 4x FAILs (12.2pt) -- see that ticket's own subsection below.
+**Refined by [UNI-245](/UNI/issues/UNI-245):** "below 4x" is now a bracket -- 3x PASSes (8.5pt max
+deviation) and 4x FAILs (12.2pt), on one run each near the bar, not a repeatable boundary -- see that
+ticket's own subsection below for the duration-finding counterexample, the error-rate regime shift at
+4x, and the repeats tracked in [UNI-247](/UNI/issues/UNI-247).
 
 ### Cluster restored
 
@@ -9748,9 +9752,26 @@ the same scope boundary every other default-weight `full-contention` run carries
 Compare UNI-142's own baseline: PASS, 7.6pt max deviation (app1 -0.9, app2 +7.6, end-users -6.7).
 Same verdict, same order of magnitude, no regression.
 
+**The direct evidence is the clamp counter, not the deviation comparison above.**
+`llm_d_epp_maas_fairness_newcomer_clamps_total{fairness_id="end-users"}` is absent from
+`metrics-before.txt` and first appears as `1` in the `13:06:43Z` scrape -- run start `13:04:33Z`,
+end-users joins cold at t=120s = `13:06:33Z`, so the gate fired for the cold joiner within one 10s
+scrape of the join instant, exactly once, and never fires again for the rest of the run. That is
+`hasInFlight()` behaving precisely as designed: it suppressed nothing for a tenant that genuinely had
+no in-flight work, so UNI-162's protection fired on schedule. Contrast the pre-UNI-212 clamp storm
+this document already records (1649/1375/1751 fires in B5) -- this is the same mechanism, now firing
+once instead of thousands of times.
+
+**Saturation limb: queue, not KV, same as every other run in this series.**
+`llm_d_epp_flow_control_queue_size` peaks at 68 against the 32 threshold while
+`llm_d_epp_average_kv_cache_utilization` reads 0 for the entire run -- the KV limb never engages.
+
 **Incumbent throughput, the ask's other half:** app1+app2 together delivered 3432 requests
-(1725+1707) this run vs UNI-142's 3167 (1607+1560) -- **+8.4%, not reduced.** No evidence the
-in-flight gate costs the incumbents anything.
+(1725+1707) this run vs UNI-142's 3167 (1607+1560) -- +8.4%, not reduced. UNI-142's own baseline
+predates `queueDepthThreshold: 32` and the UNI-213 fixes (disclosed in this document's UNI-142
+setup, not repeated in its conclusion), so this delta is not attributable to the in-flight gate
+alone -- the defensible claim is **not reduced**, not **"+8.4% because of this fix."** Either way,
+there is no evidence the in-flight gate costs the incumbents anything.
 
 **No monopolisation burst at the join instant:** the first post-join window (120.0-130.0s) shows
 end-users at 38.0% of the three-way total -- below its 68.4% target, ramping up rather than
@@ -9789,6 +9810,10 @@ not run. Ledger PASSED cleanly on all three groups (within 2.8% of the 10% toler
 F3/UNI-142's staggered-join shape, this scenario runs full three-way contention the whole 240s, so
 the ledger's cost check has something to validate throughout.
 
+**Saturation limb: queue, not KV, same as every other run in this series.**
+`llm_d_epp_flow_control_queue_size` peaks at 54 against the 32 threshold while
+`llm_d_epp_average_kv_cache_utilization` reads 0 for the entire run -- the KV limb never engages.
+
 | ratio | scenario | workers (app1/app2/end-users) | max deviation | verdict |
 |---|---|---|---|---|
 | 1x | `app1-flood-light` | 32/32/64 | not re-run this fix (UNI-161's own finding, pre-fix image) | n/a |
@@ -9797,11 +9822,58 @@ the ledger's cost check has something to validate throughout.
 | 4x | `app1-flood-moderate` | 128/32/64 | 12.2 | FAIL |
 | 8x | `app1-flood` | 256/32/64 | 19.1 | FAIL |
 
-This revises UNI-220's "evidenced ceiling... below 4x" to a specific bracket: **the maximum
-over-offer-relative-to-entitlement ratio this fix reliably corrects to within the 10-point bar is
-between 3x and 4x** -- 3x clears the bar with 1.5 points to spare, 4x misses it by 2.2. The 2x point
-remains untested by design (not needed once 3x PASSed); `app1-flood-2x` is committed and ready if a
-future ticket wants to narrow the bracket further.
+**This is one run each at 3x and 4x, not a repeatable boundary.** 3x clears the bar by 1.5 points and
+4x misses it by 2.2 -- both margins sit inside the **+-13.7pt single-run swing** Zeratul's review
+measured from Khala's UNI-231 two-lane A/A (same lane, identical config, FAIL 16.5 -> PASS 4.0 on an
+unchanged re-run). "Reliably corrects" overstates what one run each shows. The defensible claim is:
+**3x scored 8.5 once and 4x scored 12.2 once, so the crossover lies between them, on unrepeated
+single runs near the bar.** Repeats (three runs each of 3x and 4x, across lanes) are filed as
+[UNI-247](/UNI/issues/UNI-247), blocked on [UNI-231](/UNI/issues/UNI-231) so they cannot collide with
+the three-lane A/A.
+
+**`app1-flood-3x` also breaks this document's duration finding, and that counterexample belongs
+here, not buried in a results directory.** The "FAIL <=66.3s, PASS >=69.0s" band (see the UNI-225
+duration-finding section above) was evidenced across the corpus as a necessary condition, not a
+guarantee. This run's `contended_seconds` are **67.5s (app1), 67.5s (app2), 64.8s (end-users)** --
+all three groups below the 69.0s PASS floor, and end-users (the group that would drive a FAIL) sits
+squarely inside the <=66.3s FAIL band -- yet the run PASSed outright. This is the first
+*discriminating* PASS to break the ordering (the earlier 39.7s exception in this document was already
+caveated as a staggered join, not a clean counterexample). It does not overturn the duration finding,
+which already carried the "necessary condition, evidenced across the corpus, not a guarantee" hedge;
+it is the second data point against the guarantee reading.
+
+**4x is also an error regime, not just a worse split.** `app1-flood-3x` returned zero HTTP 500s (12
+client `000` timeouts on app1, one 503 on end-users). `app1-flood-moderate` (4x) returned **135 app1
+/ 26 app2 / 64 end-users HTTP 500s**, and delivered **~8% fewer total tokens than 3x** (6.61M vs
+7.17M) despite offering more concurrency. A board reading "ceiling at 3x" should not assume graceful
+degradation above it: the fairness crossover measured here coincides with the onset of backend
+failures and a throughput roll-off, not a clean hand-off to a worse-but-stable split.
+
+**The lower side of the bracket remains unverified; say so rather than imply otherwise.**
+`app1-flood-light` (1x) FAILed at +12.6 (app2) pre-fix, for a different, unrelated cause (app2 itself
+over-offered ~2.5x relative to its own weight at that sizing) -- the table's "n/a" for 1x/2x is
+honest, but nothing in evidence covers the range below 3x. State the finding as **"3x and 4x bracket
+the crossover,"** not as "the fix corrects over-offer ratios up to 3x," which would imply everything
+below 3x is clean when nothing here shows that.
+
+**Why the ceiling sits here.** For app1 to land at its 30% entitlement while holding a 96/128/256
+-worker share, closed-loop arithmetic needs an app1:end-users p50 latency ratio of 3.0 / 4.0 / 8.0 at
+3x/4x/8x respectively. Measured: **2.15 / 2.58 / 4.14** (11.36s/5.31s, 14.2s/5.54s, 24.35s/5.88s) --
+achieved-over-required = **0.72 / 0.65 / 0.52**. The policy orders correctly at every ratio and runs
+out of achievable latency spread monotonically as the over-offer grows; the ceiling is a predictable,
+scenario-dependent consequence of that shortfall (the same latency-spread mechanism UNI-220's own
+"evidenced ceiling" section already named for the 8x case), not a magic threshold this fix tunes.
+
+`app1-flood-3x` also carries a **26.7-point worker-vs-weight gap** (`max_worker_vs_weight_gap_pts`,
+the UNI-225 field) -- the largest over-offer in the corpus that still PASSes, and by UNI-225's own
+accounting one of only a handful of rows able to distinguish "the split follows the weights" from
+"the split follows the workers" *and* pass. That makes it more board-quotable than the bracket alone.
+
+This revises UNI-220's "evidenced ceiling... below 4x" to a bracket observed on single runs: **the
+over-offer-relative-to-entitlement ratio at which this fix's correction crosses the 10-point bar lies
+between 3x and 4x** -- 3x clears it by 1.5 points, 4x misses by 2.2, each on one run. The 2x point
+remains untested by design; `app1-flood-2x` is committed and ready, and repeats at both 3x and 4x are
+tracked in [UNI-247](/UNI/issues/UNI-247).
 
 ### Cluster restored (UNI-245)
 

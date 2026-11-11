@@ -344,7 +344,8 @@ Say in the ticket which lane you hold.
 isolate everything. Authorino, Limitador and maas-api are single replicas
 that carry every lane's requests, and Prometheus scrapes all three lanes.
 Lanes 2 and 3 also share `ocp-worker-2` (both gateways, both EPPs and
-Authorino). Until the three-lane A/A has run, run scored rows serially.
+Authorino). **Run scored rows serially.** The three-lane A/A (UNI-231/UNI-248,
+2026-11-11) failed; see "What the three-lane A/A found" below.
 
 **Never put load on any lane while a scored run is in flight on another.**
 This includes unscored dry runs. Two-lane load used to break the shared auth
@@ -375,6 +376,32 @@ each lane alone, then both together again. Raw results are under
   `c8a088` (UNI-220's clamp fix), three solo runs of the same scenario scored
   3.7, 2.9 and 3.4, and lane 2 against lane 3 differed by under a point. That
   is three runs, not yet a repeatability result.
+
+**What the three-lane A/A found (UNI-231/UNI-248, 2026-11-11).** Same
+scenario, image `c8a088` on all three instances: all three together (T3a),
+instance 1 alone (I1), all three together again (T3b).
+
+- Two of the six per-instance runs in the together phases collapsed to
+  *uncontended*: 1 s and 28 s of contention, where the same instances alone
+  had 55-92 s. Their scores were 33.5 and 30.1, against 3.4-7.7 alone. An
+  uncontended run splits by workers, not weights, so this is a failure to
+  generate load, not a fairness result.
+- Lane 3 was steady throughout: 3.5 and 3.7 together, 2.9 and 3.4 alone.
+- **Load generators are CPU-bound.** Every loadgen pod hit its 2-core limit
+  and was CFS-throttled, solo runs included (30-64% of periods). The two
+  collapsed runs had the most-throttled loadgens (73% and 78%), and both ran
+  on `ocp-worker-2`, which also hosts every gateway, both lane EPPs and
+  Authorino. That is a correlation from two runs, not a proven mechanism.
+- **Instance 1's gateway sits at its memory limit.** It averaged 823 MiB of
+  1 GiB over 24 h, peaked at 1003 MiB with instance 1 running alone, and was
+  OOMKilled at 14:38:34 in T3b (its 15th restart). That run lost 25% of its
+  requests to connection failures. The lane gateways use about 570 MiB under
+  the same limit.
+
+Before parallel scored runs: give loadgens more CPU and put each one on a
+node that hosts none of the shared components, raise instance 1's gateway
+memory, then repeat the three-lane A/A. Until then, use lanes 2 and 3 for
+serial runs, harness work and dry runs.
 
 **Every run records concurrent load.** `15-fairness-benchmark.sh` lists every
 other instance's loadgen Jobs at the start and end of a run, and

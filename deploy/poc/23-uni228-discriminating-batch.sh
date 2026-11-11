@@ -120,14 +120,19 @@ apply_table() {
   local desc="$1" want="$2"; shift 2
   log "=== applying EPP table: $desc ==="
   local old_pod; old_pod="$(gpu_epp_pod)"
-  python3 -I "$SCRIPT_DIR/epp-groups/render.py" "$@" | $OC apply -f - | tee -a "$BATCH_LOG"
+  # UNI-231: through lanes.py so the table lands in THIS lane (suffixed
+  # match values, $NAMESPACE) -- a bare apply always wrote lane 1's ConfigMap.
+  python3 -I "$SCRIPT_DIR/epp-groups/render.py" "$@" \
+    | NAMESPACE="$NAMESPACE" python3 -I "$SCRIPT_DIR/lanes.py" render \
+    | $OC apply -n "$NAMESPACE" -f - | tee -a "$BATCH_LOG"
   wait_for_new_table "$old_pod" "$want" || exit 1
 }
 
 restore_default_table() {
   log "=== restoring default 3-group table ==="
   local old_pod; old_pod="$(gpu_epp_pod)"
-  $OC apply -f "$SCRIPT_DIR/00-config.yaml" | tee -a "$BATCH_LOG"
+  NAMESPACE="$NAMESPACE" python3 -I "$SCRIPT_DIR/lanes.py" render "$SCRIPT_DIR/00-config.yaml" \
+    | $OC apply -n "$NAMESPACE" -f - | tee -a "$BATCH_LOG"
   wait_for_new_table "$old_pod" 3 || log "WARNING: restore readiness check timed out -- verify maas-epp-config by hand"
 }
 trap restore_default_table EXIT

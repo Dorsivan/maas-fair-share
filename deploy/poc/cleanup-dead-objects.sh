@@ -18,7 +18,7 @@
 set -u
 set -o pipefail
 
-NAMESPACE="maas-fairness-poc"
+NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
 DRY_RUN=false
 for arg in "$@"; do
   case "$arg" in

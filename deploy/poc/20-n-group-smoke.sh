@@ -110,7 +110,8 @@ trap restore EXIT
 # --- point the CPU EPP at the 6-group table ---------------------------------
 python3 -I "$HERE/epp-groups/render.py" --verify >/dev/null \
   || { log "ABORT: epp-groups renders are stale vs 00-config.yaml"; exit 1; }
-$OC apply -f "$HERE/epp-groups/smoke-6-group.yaml" >/dev/null
+NAMESPACE="$NAMESPACE" python3 -I "$HERE/lanes.py" render "$HERE/epp-groups/smoke-6-group.yaml" \
+  | $OC apply -n "$NAMESPACE" -f - >/dev/null
 $OC patch llminferenceservice "$LLMISVC" -n "$NAMESPACE" --type=merge -p \
   "{\"spec\":{\"replicas\":1,\"router\":{\"scheduler\":{\"config\":{\"ref\":{\"name\":\"$SMOKE_CM\"}}}}}}" >/dev/null
 log "patched $LLMISVC -> config.ref=$SMOKE_CM replicas=1"
@@ -155,7 +156,7 @@ spec:
           command: ["/bin/bash", "/script/run.sh"]
           env:
             - {name: LOADGEN_GROUPS, value: "${lg# }"}
-            - {name: MODELPATH, value: "/maas-fairness-poc/$LLMISVC"}
+            - {name: MODELPATH, value: "/$NAMESPACE/$LLMISVC"}
             - {name: DURATION, value: "$DURATION"}
           volumeMounts:
             - {name: script, mountPath: /script}

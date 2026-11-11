@@ -1526,7 +1526,9 @@ CLIENT_RECORD_JSONL="$ARTIFACT_DIR/client-request-summary.jsonl"
 # --- Resolve manifest with this scenario's overrides -----------------------
 SRC="$(dirname "$0")/04-loadgen.yaml"
 PATCHED="$ARTIFACT_DIR/04-loadgen.patched.yaml"
-cp "$SRC" "$PATCHED"
+# UNI-231: rendered for this lane, not copied -- the manifest names
+# maas-fairness-poc, and `oc apply -n` refuses a namespace mismatch.
+NAMESPACE="$NAMESPACE" python3 -I "$(dirname "$0")/lanes.py" render "$SRC" > "$PATCHED"
 
 set_override() {
   local var="$1" val="$2"

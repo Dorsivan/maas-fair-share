@@ -299,6 +299,76 @@ run is only meaningful if they are overwhelmingly 200.
 
 ---
 
+## Pick a lane: three isolated POC instances (UNI-231)
+
+The cluster has six single-A100 GPU nodes, enough for three POC instances
+("lanes"). Each lane is the same stack under the same object names, in its
+own namespace, with its own GPU pair, EPP and `maas-epp-config`, Gateway,
+pull secret and tenant keys:
+
+| Lane | `NAMESPACE` | GPU nodes | Tenant suffix |
+|---|---|---|---|
+| 1 | `maas-fairness-poc` (the default) | `ocp-gpu-worker-0`, `-1` | none |
+| 2 | `poc-maas-lane2` | `ocp-gpu-worker-2`, `-3` | `-l2` |
+| 3 | `poc-maas-lane3` | `ocp-gpu-worker-4`, `-5` | `-l3` |
+
+**Pick a lane by setting `NAMESPACE`. Nothing else changes:**
+
+```sh
+NAMESPACE=poc-maas-lane2 OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh <scenario> [label]
+```
+
+**The rule: one lane belongs to one run for that run's whole duration.**
+Every scored run patches its lane's `maas-epp-config`, and each patch
+recreates that lane's EPP and zeroes its counters. Two runs on one lane
+overwrite each other's config and each other's metrics, and neither fails
+loudly. Before you start, check the lane is idle: no `maas-loadgen*` Job or
+pod, and no open-loop runner (`oc get job` does not show those; see UNI-227).
+Say in the ticket which lane you hold.
+
+**Parallel scored rows depend on the A/A test.** Separate namespaces do not
+isolate everything. Authorino, Limitador and maas-api are single replicas
+that carry every lane's requests, and Prometheus scrapes all three lanes.
+Until the UNI-231 A/A test passes, run scored rows serially and use the other
+lanes only for unscored work (harness development, dry runs, provisioning).
+
+How it works, so nobody "fixes" it back:
+
+- **Tenant names are the one thing that cannot be identical.** A
+  MaaSSubscription's name is the identity the EPP groups on, and every
+  subscription lives in the shared `models-as-a-service` namespace. Lane 2's
+  app1 tenant is therefore `app1-production-l2`. The board chose per-lane
+  names over editing lane 1's subscriptions (UNI-231). It is a *suffix* so
+  that `end-user-alpha-l2` still matches `prefix: [end-user-]`.
+- `deploy/poc/lanes.py` holds the lane table. `lanes.py render` rewrites a
+  manifest for `$NAMESPACE`: namespace, suffixed `exact:` match values, and
+  the model servers' node pair. For lane 1 it is the identity transform. Every
+  harness `oc apply` of a repo manifest goes through it, so an unknown
+  `NAMESPACE` fails instead of quietly configuring lane 1.
+- Keys stay canonical. `mint-loadgen-keys.sh` mints the `-l2` key but stores
+  it in the lane's `maas-loadgen-keys` under the canonical name, so the
+  loadgen and reports never need to know which lane they are on.
+- Placement: model servers are pinned to their lane's pair by
+  `kubernetes.io/hostname`. The EPP (UNI-102, now fixed) and the loadgen Job
+  stay off GPU nodes. **Lane 1's live objects predate this.** Its replicas
+  and EPP carry no pin until `09-vllm-gpu.yaml` is reapplied, which recreates
+  its pods, so do that between runs. Until then, a restarted lane-1 replica
+  can land on a lane-2/3 node.
+
+Build a new lane (lanes 2 and 3 only; the script refuses lane 1):
+
+```sh
+NAMESPACE=poc-maas-lane2 deploy/poc/25-provision-lane.sh
+```
+
+The script is idempotent. Where a permission is missing it stops and prints
+the exact command for whoever holds it: the namespace (operator), the
+Gateway (poc-agent), the pull-secret copy (secret read). It creates two
+~15 GB model downloads, so run it between instance-1 measurement runs. Run
+the offline checks with `python3 -I deploy/poc/lanes-test.py`.
+
+---
+
 ## Run the fairness benchmark (UNI-54)
 
 Before this, "delivered share" was a number a human produced by reading two

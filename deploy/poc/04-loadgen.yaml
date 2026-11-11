@@ -695,6 +695,18 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      # UNI-231: keep the client OFF the GPU nodes. Unpinned, it landed next
+      # to a vLLM replica (ocp-gpu-worker-1, 2026-11-11), and with three lanes
+      # it could land on ANOTHER lane's model server and spend that node's CPU
+      # on this lane's load -- cross-lane interference in exactly the latency
+      # the verdicts measure.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: feature.node.kubernetes.io/pci-10de.present
+                    operator: DoesNotExist
       containers:
         - name: loadgen
           image: registry.access.redhat.com/ubi9/ubi:latest

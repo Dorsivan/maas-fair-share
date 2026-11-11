@@ -2197,7 +2197,14 @@ for i in $(seq 1 240); do
   # anti-affinity, so another loadgen already on that node leaves this one
   # Pending. Give up after ~3 min instead of polling for 40, and delete the
   # Job so it can't start later, unmeasured.
-  UNSCHED="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="PodScheduled")].reason}{": "}{.status.conditions[?(@.type=="PodScheduled")].message}{"\n"}{end}' 2>/dev/null | grep '^Unschedulable' | head -1)"
+  # UNI-251: under `set -euo pipefail`, a `grep` that finds nothing exits 1,
+  # and pipefail propagates that into this assignment -- without `|| true`
+  # the script died here on every *healthy* poll (pod scheduled fine, no
+  # "Unschedulable" line to match), not after 3 min of real unschedulability.
+  # Confirmed live: all three UNI-249 solo validation runs aborted after
+  # exactly one poll iteration with no error text, while their already-created
+  # Jobs ran to completion unobserved in the background.
+  UNSCHED="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="PodScheduled")].reason}{": "}{.status.conditions[?(@.type=="PodScheduled")].message}{"\n"}{end}' 2>/dev/null | grep '^Unschedulable' | head -1 || true)"
   if [ -n "$UNSCHED" ]; then
     echo "[benchmark] WARNING: loadgen pod not scheduled: $UNSCHED" >&2
     if [ "$i" -ge 18 ]; then

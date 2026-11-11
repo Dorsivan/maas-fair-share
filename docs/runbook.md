@@ -329,17 +329,34 @@ Say in the ticket which lane you hold.
 **Parallel scored rows depend on the A/A test.** Separate namespaces do not
 isolate everything. Authorino, Limitador and maas-api are single replicas
 that carry every lane's requests, and Prometheus scrapes all three lanes.
-Until the UNI-231 A/A test passes, run scored rows serially.
+Lanes 2 and 3 also share `ocp-worker-2` (both gateways, both EPPs and
+Authorino). Until the three-lane A/A has run, run scored rows serially.
 
 **Never put load on any lane while a scored run is in flight on another.**
-This includes unscored dry runs. The A/A pre-check (UNI-231, 2026-11-11) ran
-the stock loadgen (96 workers, streaming) on lanes 2 and 3 at once. 72% of
-requests returned HTTP 500, against about 1.5% for either lane alone. The
-500s come from the gateway's auth step, which fails closed after 200ms
-(`failureMode: deny`), while Authorino and maas-api, shared by every lane,
-fall behind. Authorino's log still says `OK` for those requests because it
-answers after the gateway has given up. See UNI-240. Load-free work on a lane
-(provisioning, harness edits, `oc` reads) is fine.
+This includes unscored dry runs. Two-lane load used to break the shared auth
+path: before UNI-240, 72% of requests returned HTTP 500 (the gateway's auth
+step failed closed after 200ms while maas-api fell behind). UNI-240 fixed
+that. The rule stays for two reasons: nobody has measured three lanes plus
+instance 1 at once, and `ocp-worker-2` already peaks at 67% of its 8 cores
+with two lanes. Load-free work on a lane (provisioning, harness edits, `oc`
+reads) is fine.
+
+**What the two-lane A/A found (UNI-231, 2026-11-11).** Six runs of
+`full-contention-2x-discriminating` with enforce on: both lanes together,
+each lane alone, then both together again. Raw results are under
+`results/*-uni231-aa-*`; compare them with `deploy/poc/26-lanes-aa-compare.py`.
+
+- Auth held: no wasm denials in any phase, and 2–9 non-200s per run of about
+  5,500 requests.
+- No running-together effect stood out from run-to-run noise. Lane-vs-lane
+  gaps were 3.8–6.8 points, and lane 3 was worse in two phases and better in
+  the third.
+- **One run is not repeatable at the 10-point bar.** Lane 3 scored FAIL at
+  16.5 and then PASS at 4.0 on the same config and image, and the secondary
+  verdict flipped with it. Lane 2 moved 3.1 points. The cause is not
+  identified: contended time fits five of the six runs but not lane 3's PASS.
+  Don't read a single run within about 15 points of the bar as a verdict,
+  whether rows run serially or in parallel.
 
 How it works, so nobody "fixes" it back:
 

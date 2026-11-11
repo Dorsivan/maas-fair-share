@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """UNI-231 A/A comparison. Reads results/*-uni231-aa-<phase>-<lane>/fairness-report.json.
 
+Phase names: T* = run together with other lanes, anything else (A2, A3b, I1 ...) = alone.
+Lanes: lane2, lane3, inst1. Runs are only compared with runs on the same EPP image.
+
 Prints, as markdown:
   1. one row per run: verdict, max |dev|, per-group deviation, e2e p50, TTFT p50, errors
   2. lane vs lane within each phase (the A/A question)
@@ -15,7 +18,7 @@ ROOT = sys.argv[1] if len(sys.argv) > 1 else "results"
 GROUPS = ["app1", "app2", "end-users"]
 runs = {}
 for path in sorted(glob.glob(f"{ROOT}/*-uni231-aa-*/fairness-report.json")):
-    m = re.search(r"uni231-aa-(T1|T2|A2|A3)-(lane[23])/", path)
+    m = re.search(r"uni231-aa-([A-Za-z0-9]+)-(lane[23]|inst1)/", path)
     if not m:
         continue
     rep = json.load(open(path))
@@ -45,7 +48,7 @@ def f(v, nd=1):
 print("### Runs\n")
 print("| phase | lane | verdict | max dev | dev app1 / app2 / eu | e2e p50 s | TTFT p50 s | TTFT p95 s | prio | non-200 / req | window |")
 print("|---|---|---|---|---|---|---|---|---|---|---|")
-for (ph, ln), r in sorted(runs.items(), key=lambda kv: (["T1", "A2", "A3", "T2"].index(kv[0][0]), kv[0][1])):
+for (ph, ln), r in sorted(runs.items(), key=lambda kv: (kv[1]["start"], kv[0][1])):
     print(f"| {ph} | {ln} | {r['verdict']} | {f(r['maxdev'])} | "
           + " / ".join(f"{r['dev'].get(k, 0):+.1f}" for k in GROUPS) + " | "
           + " / ".join(f(r['p50'].get(k)) for k in GROUPS) + " | "
@@ -64,26 +67,35 @@ def cmp(a, b, label):
     ttd = max(tt, key=abs) if tt else None
     print(f"| {label} | {ddev:.1f} | {p50r_min:.2f}–{p50r:.2f} | {f(ttd, 2)} | {x['maxdev'] - y['maxdev']:+.1f} |")
 
-print("\n### Comparisons\n")
+print("\n### Comparisons (same EPP image only)\n")
 print("| comparison | max per-group deviation gap (pts) | e2e p50 ratio range | largest TTFT p50 diff (s) | max-dev diff (pts) |")
 print("|---|---|---|---|---|")
-for ph in ("T1", "T2"):
-    cmp((ph, "lane2"), (ph, "lane3"), f"{ph}: lane2 vs lane3 (together)")
-cmp(("A2", "lane2"), ("A3", "lane3"), "solo: lane2 vs lane3")
-for ph in ("T1", "T2"):
-    cmp((ph, "lane2"), ("A2", "lane2"), f"lane2: {ph} vs alone")
-    cmp((ph, "lane3"), ("A3", "lane3"), f"lane3: {ph} vs alone")
-cmp(("T1", "lane2"), ("T2", "lane2"), "lane2: T1 vs T2 (repeat)")
-cmp(("T1", "lane3"), ("T2", "lane3"), "lane3: T1 vs T2 (repeat)")
+together = lambda k: k[0].startswith("T")
+for img in sorted({r["image"] for r in runs.values()}):
+    keys = sorted((k for k, r in runs.items() if r["image"] == img), key=lambda k: runs[k]["start"])
+    print(f"| **image …{img}** | | | | |")
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            if a[0] == b[0] and together(a):
+                cmp(a, b, f"{a[0]}: {a[1]} vs {b[1]} (together)")
+            elif not together(a) and not together(b) and a[1] != b[1]:
+                cmp(a, b, f"alone: {a[1]} ({a[0]}) vs {b[1]} ({b[0]})")
+            elif a[1] == b[1] and together(a) != together(b):
+                t, al = (a, b) if together(a) else (b, a)
+                cmp(t, al, f"{t[1]}: {t[0]} vs alone ({al[0]})")
+            elif a[1] == b[1]:
+                cmp(a, b, f"{a[1]}: {a[0]} vs {b[0]} (repeat)")
 
 print("\n### Together-phase load overlap\n")
 ts = lambda s: datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").timestamp()
-for ph in ("T1", "T2"):
-    if (ph, "lane2") in runs and (ph, "lane3") in runs:
-        a, b = runs[(ph, "lane2")], runs[(ph, "lane3")]
+for ph in sorted({k[0] for k in runs if together(k)}):
+    lanes = [k for k in runs if k[0] == ph]
+    for i, ka in enumerate(lanes):
+      for kb in lanes[i + 1:]:
+        a, b = runs[ka], runs[kb]
         lo, hi = max(ts(a["start"]), ts(b["start"])), min(ts(a["end"]), ts(b["end"]))
         span = max(ts(a["end"]), ts(b["end"])) - min(ts(a["start"]), ts(b["start"]))
-        print(f"- {ph}: overlap {max(0, hi - lo):.0f}s of a {span:.0f}s combined window; start offset {ts(b['start']) - ts(a['start']):+.0f}s (lane3 minus lane2)")
+        print(f"- {ph} {ka[1]}+{kb[1]}: overlap {max(0, hi - lo):.0f}s of a {span:.0f}s combined window; start offset {ts(b['start']) - ts(a['start']):+.0f}s")
 print("\nimages:", sorted({r['image'] for r in runs.values()}))
 for k, r in sorted(runs.items()):
     print(k, r["dir"])

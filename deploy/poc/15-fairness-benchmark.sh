@@ -2155,6 +2155,21 @@ CHAOS_PID=$!
 # second, narrower trap is registered here anymore.
 
 # --- Apply the patched Job and poll to completion ---------------------------
+# UNI-231: separate namespaces still share Authorino, Limitador and
+# ocp-worker-2, and nothing stops two agents starting runs on different
+# instances at once (it happened on 2026-11-11). So every run records which
+# other instances had a loadgen Job during its own window, in
+# concurrent-runs.txt. Jobs are snapshotted before and after, because a later
+# run deletes the Job it replaces.
+other_instance_jobs() {
+  local ns
+  for ns in $(python3 -I -c 'import runpy; print(" ".join(runpy.run_path("deploy/poc/lanes.py")["LANES"]))'); do
+    [ "$ns" = "$NAMESPACE" ] && continue
+    $OC get jobs -n "$ns" -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.status.startTime}{" "}{.status.completionTime}{"\n"}{end}' 2>/dev/null \
+      || echo "# $ns: could not list jobs"
+  done
+}
+other_instance_jobs > "$ARTIFACT_DIR/other-instance-jobs-start.txt"
 $OC apply -f "$PATCHED" -n "$NAMESPACE"
 echo "[benchmark] job applied, polling for completion..."
 PHASE=""
@@ -2224,6 +2239,9 @@ echo "[benchmark] metrics snapshot: after"
 snapshot_metrics > "$METRICS_AFTER"
 RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 { echo "# ts=$RUN_END epoch=$(date +%s)"; cat "$METRICS_AFTER"; } >> "$METRICS_TS"
+other_instance_jobs > "$ARTIFACT_DIR/other-instance-jobs-end.txt"
+OWN_JOB_WINDOW="$($OC get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.startTime} {.status.completionTime}' 2>/dev/null)"
+python3 -I deploy/poc/concurrent-runs.py "$ARTIFACT_DIR" "$OWN_JOB_WINDOW" "$RUN_END" || true
 
 # UNI-143 (B4 investigation): these three reverts are called here -- AFTER
 # the after-snapshot, not before. This plugin's config has no live-reload

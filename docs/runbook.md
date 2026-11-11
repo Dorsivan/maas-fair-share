@@ -371,6 +371,18 @@ each lane alone, then both together again. Raw results are under
   identified: contended time fits five of the six runs but not lane 3's PASS.
   Don't read a single run within about 15 points of the bar as a verdict,
   whether rows run serially or in parallel.
+- That noise was measured on EPP image `617509`. After the lanes moved to
+  `c8a088` (UNI-220's clamp fix), three solo runs of the same scenario scored
+  3.7, 2.9 and 3.4, and lane 2 against lane 3 differed by under a point. That
+  is three runs, not yet a repeatability result.
+
+**Every run records concurrent load.** `15-fairness-benchmark.sh` lists every
+other instance's loadgen Jobs at the start and end of a run, and
+`deploy/poc/concurrent-runs.py` writes `concurrent-runs.txt` into the run's
+results, flagging any overlap with a WARNING line. A start-time check can't
+stop another agent starting after you; this record is how a reviewer finds
+out. On 2026-11-11 a lane-3 solo run overlapped instance 1's UNI-245 3x run by
+about 5 minutes, and nothing caught it at the time.
 
 How it works, so nobody "fixes" it back:
 

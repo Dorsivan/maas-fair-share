@@ -9613,7 +9613,7 @@ ticket's run in flight.
 | `six-group-board-case` `dominant` | 90/2/2/2/2/2 | app1 @ 181 | FAIL, -17.0 (app1) | **PASS, -3.1 max (app1)** | app2-6: 3-4 each (baseline breakdown not separately recorded) |
 | `six-group-board-case` `pow2` | 32/16/8/4/2/1 | app1 @ 58 | FAIL, -20.3 (app1) | **FAIL, -12.2 (app1)** | app1-6: 1-4 each (baseline breakdown not separately recorded) |
 | `full-contention` | 20/10/65 | 32/32/128 | PASS (must stay PASS) | **PASS**, app1 -1.4, max deviation +1.8 (end-users), NON-DISCRIMINATING per UNI-225 (worker shares already within 6.1pt of weight shares, so this PASS alone isn't evidence of weighted fairness) | app1 2, app2 1 |
-| H2 throughput A/B vs UNI-168 stock (5651 req/240s) | — | — | bar: within 5% | **PASS: 5753 gross requests (+1.8%); 5312 successful-only (-3.8%)** — both inside the 5% bar | — |
+| H2 throughput A/B vs UNI-168 stock (5651 req/240s) | — | — | bar: within 5% | **PASS: 5753 gross requests (+1.8%); 5312 successful vs stock's 5522 successful (-3.8%)** — both inside the 5% bar | — |
 
 Artifacts: `results/20261111T100257Z-uni-220-diag-clamp-off-app1-flood/`,
 `results/20261111T103042Z-uni-220-fix-app1-flood/`,
@@ -9678,11 +9678,12 @@ rather than re-litigated here.
   loadgen sizing question, not a policy one.
 - **`full-contention` stays PASS and throughput is within bar on both countings**: 5753 gross
   requests against the UNI-168 stock baseline of 5651 is +1.8%; counting only the 5312 that
-  succeeded (this run's elevated failure rate — see above — pulls the 500s out of the delivered
-  total) gives -3.8%. Both are inside the 5% bar, and well inside the noise this series has
-  already characterized for repeat runs, but the gross number alone overstates the margin by 5.6
-  points and both should be read together, per the counting convention UNI-213/UNI-214 already
-  established for totals that include failures.
+  succeeded against stock's own 5522 successful requests (this run's elevated failure rate — see
+  above — pulls the 500s out of the delivered total, and the like-for-like comparison needs
+  stock's successful count, not its gross count, as the denominator) gives -3.8%. Both are inside
+  the 5% bar, and well inside the noise this series has already characterized for repeat runs, but
+  the gross number alone overstates the margin by 5.6 points and both should be read together, per
+  the counting convention UNI-213/UNI-214 already established for totals that include failures.
 
 ### The evidenced ceiling
 

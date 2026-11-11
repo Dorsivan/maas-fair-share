@@ -273,6 +273,68 @@ func TestNewcomerClampGateImprovesBurstyShare(t *testing.T) {
 		"the legacy path must actually exercise the clamp on every burst return, or this test proves nothing")
 }
 
+// 4d. UNI-220: a group with a dispatched-but-not-yet-completed request has not
+// actually left, even on a Pick call where its own FlowQueue is momentarily
+// empty and the wall-clock idle gate alone would call the return an edge.
+// Live evidence (UNI-218's app1-flood at the settled config) found the clamp
+// firing 28 times on the starved, concurrency-limited end-users group against
+// 0 times on the continuously-flooding app1 -- almost every firing was this
+// case, not a genuine multi-second absence. hasInFlight() adds a second,
+// independent condition to the existing wall-clock gate; it does not relax it.
+func TestNewcomerClampDoesNotFireWhileInFlight(t *testing.T) {
+	t.Parallel()
+	cfg := twoGroupConfig(1, 1)
+	cfg.Enforce = true
+	cfg.NewcomerClamp = true
+	cfg.NewcomerClampIdleSeconds = 2.0
+	cfg.HalfLifeSeconds = 60
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+
+	gsA, gsB := p.states["a-group"], p.states["b-group"]
+	gsA.charge(clock.now(), 1000)
+	gsB.charge(clock.now(), 100) // b-group's earned advantage: below a-group's tab
+
+	flooder := &simFlow{id: "a-group", depth: 1, headAt: clock.now()}
+	starved := &simFlow{id: "b-group", depth: 0}
+	band := newSimBand(p, flooder, starved)
+
+	// b-group has a request dispatched a moment ago and still being served --
+	// simulated directly on groupState rather than through PreRequest, so this
+	// test exercises only the clamp gate, not the provisional-charge path.
+	gsB.addInFlight(1, 0)
+	for i := 0; i < 5; i++ {
+		_, err := p.Pick(ctx, band.accessor())
+		require.NoError(t, err)
+		clock.advance(time.Second)
+	}
+	before := gsB.normalizedService(clock.now())
+
+	// b-group returns as a candidate after a 5s absence -- ordinarily a
+	// clamp-qualifying edge (past the 2s idle gate).
+	starved.depth, starved.headAt = 1, clock.now()
+	_, err := p.Pick(ctx, band.accessor())
+	require.NoError(t, err)
+	assert.Equal(t, before, gsB.normalizedService(clock.now()),
+		"a group with an in-flight request must not be clamped on this edge -- it never left")
+
+	// Complete the in-flight request and repeat the identical absence shape
+	// with zero in-flight: this time the edge must still clamp, exactly as
+	// before UNI-220 -- the gate is additive, not a relaxation.
+	gsB.addInFlight(-1, 0)
+	starved.depth = 0
+	for i := 0; i < 5; i++ {
+		_, err := p.Pick(ctx, band.accessor())
+		require.NoError(t, err)
+		clock.advance(time.Second)
+	}
+	starved.depth, starved.headAt = 1, clock.now()
+	_, err = p.Pick(ctx, band.accessor())
+	require.NoError(t, err)
+	assert.Greater(t, gsB.normalizedService(clock.now()), before,
+		"the same absence shape with no in-flight request must still clamp")
+}
+
 // 5. Decay. The tab measures recent usage, not all-time: one half-life after a
 // charge, half of it must be gone.
 func TestDecay(t *testing.T) {

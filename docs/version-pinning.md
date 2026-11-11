@@ -121,11 +121,11 @@ carries `python:3.11-slim` in `Dockerfile.mock` and `Dockerfile.wfq`, and
 
 | File | Reference | State |
 |---|---|---|
-| `deploy/poc/02-epp.yaml:145` | `quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a7...` | **satisfies** — fixed for UNI-98, same digest UNI-29/UNI-97 landed on |
-| `deploy/poc/05-llmisvc-sim.yaml:185` | same digest | **satisfies** — fixed for UNI-98 |
-| `deploy/poc/06-rhoai34-shape.yaml:79` | same digest | **satisfies** — fixed for UNI-98 |
-| `deploy/poc/07-vllm-cpu.yaml:150` | same digest | **satisfies** — fixed for UNI-98 |
-| `deploy/llmisvc.yaml:106` | `quay.io/rh-ee-dsivan/maas-fair-share@sha256:5ddee9a7...` | **satisfies** — fixed for UNI-29; see `docs/runbook.md`'s "Publishing to Quay without a local podman" note for how this one was built |
+| `deploy/poc/02-epp.yaml:145` | `quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a08820...` | **satisfies** — current pin as of UNI-220 (`86159ee`, the newcomer-clamp in-flight-gate fix); re-pinned four times since UNI-29's original `fc27130` build (UNI-213 twice, UNI-212, UNI-220), each time a code change forced a rebuild — check `git log --oneline -- deploy/llmisvc.yaml` for the current digest before trusting this table |
+| `deploy/poc/05-llmisvc-sim.yaml:185` | same digest | **satisfies** — see note above |
+| `deploy/poc/06-rhoai34-shape.yaml:79` | same digest | **satisfies** — see note above |
+| `deploy/poc/07-vllm-cpu.yaml:150` | same digest | **satisfies** — see note above |
+| `deploy/llmisvc.yaml:106` | `quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a08820...` | **satisfies** — see note above; see `docs/runbook.md`'s "Publishing to Quay without a local podman" note for how the original UNI-29 pin was built |
 | `deploy/poc/09-vllm-gpu.yaml:111` | same digest | **satisfies** |
 | `deploy/poc/01-sim-backend.yaml:45` | `ghcr.io/llm-d/llm-d-inference-sim:v0.11.4` | version tag, not a digest — **violates**, lower risk |
 | `deploy/poc/05-llmisvc-sim.yaml:70`, `deploy/poc/06-rhoai34-shape.yaml:152` | same inference-sim tag | **violates**, lower risk |

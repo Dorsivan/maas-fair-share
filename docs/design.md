@@ -593,6 +593,101 @@ UNI-161 and UNI-160 are re-run after this fix (below, with workers **not**
 sized to the weights) to measure how much of the gap it actually closes, not
 assumed to close it outright.
 
+### UNI-220: the clamp was still firing on a tenant that never left, just because it was concurrency-limited
+
+[UNI-215](/UNI/issues/UNI-215) swept `queueDepthThreshold` across {8, 16, 32,
+64, 150} against `app1-flood` (weights 30/10/60, offered workers
+256/32/64) and found every value FAILs in a 31-39 point band — moving the
+threshold 18x moved the deviation by only 8 points, non-monotonically. This
+is the one gap in the fairness POC that touches the core claim, and it is not
+the threshold, the clamp being on vs. off as a binary, `enforce` being off, or
+a stale image (all ruled out live — see [UNI-220](/UNI/issues/UNI-220)).
+
+**Diagnosis**, built on UNI-212's fix above plus one targeted live
+experiment:
+
+- The policy is ordering correctly — per-request latency at the settled
+  config has the flooder (app1) at the *highest* p50 and the starved tenant
+  (end-users) at the *lowest*. Any design premised on "the ordering is
+  wrong" is aimed at the wrong thing; see UNI-220's addendum for the full
+  Little's-law accounting (`share_i ∝ workers_i / L_i`): the observed split
+  is fully explained by offered workers and delivered latency, with no
+  unexplained residual.
+- The newcomer-clamp counters are the tell: at the settled config, the clamp
+  fires 28 times on the starved end-users group and 0 times on the
+  continuously-flooding app1, over one 240s run. It is firing almost
+  exclusively on the group it is supposed to be protecting.
+- UNI-212's wall-clock idle gate (`newcomerClampIdleSeconds`, default 2s)
+  fixes the *millisecond*-scale false edge (a high-weight group draining its
+  own queue between bursts a few Pick calls apart) but does not fix a
+  different false edge: a tenant whose own **offered concurrency is below
+  the pool's effective capacity** does not keep its FlowQueue continuously
+  non-empty even while it has real, continuous demand — the single request
+  each of its workers has outstanding is still being served, so the queue
+  genuinely empties for longer than 2 seconds at a time, purely as a
+  function of that request's latency, not because the tenant stopped
+  wanting service. Every one of those drains, once past the 2s gate, is an
+  `isBacklogEdge` the instant its next request arrives — and each one
+  overwrites its earned (favorably low) `normalizedService` with the
+  current floor, exactly the credit-confiscation UNI-212 diagnosed, just
+  from a second root cause the wall-clock-only gate cannot see: elapsed
+  time since last candidacy does not distinguish "gone" from "still being
+  served."
+- **Live confirmation (2026-11-11), the experiment the ticket's addendum
+  specified before any code change:** `app1-flood` re-run at the live
+  settled config (`queueDepthThreshold: 32`, weights 30/10/60, image
+  `sha256:617509368126…`) with only `newcomerClamp` flipped to `false` for
+  the run. End-users' deviation closed from **-31.3 points to -12.9
+  points** — 59% of the gap, with several 10s windows mid-run landing
+  inside the 10-point bar outright (e.g. t+130-140s: 0.0pt). This rules out
+  pure work-conservation as the dominant mechanism (an admission-side fix
+  would have been required instead) and rules in the clamp: disabling it
+  outright gets most of the way to the bar on its own.
+
+**Fix:** add a second, independent condition to the clamp, alongside the
+existing wall-clock idle gate — a group with a dispatched-but-not-yet-completed
+request (`groupState.inFlight > 0`) is never treated as a returning newcomer,
+regardless of how long its FlowQueue has been empty, because it has not
+actually left the system: it is still holding capacity and still earning (or
+spending) its tab normally. `groupState.hasInFlight()`
+(`pkg/fairness/weightedlas/state.go`) exposes this; `Pick`
+(`pkg/fairness/weightedlas/plugin.go`) checks it alongside the existing edge
+test before clamping. This is additive, not a relaxation: a genuinely idle
+tenant (zero queue depth **and** zero in-flight, e.g. B1's cold join at
+t=120s or a tenant that stopped sending traffic entirely) still clamps exactly
+as before — `TestWorkConservation` and `TestReturningIdleTenant`'s
+zero-in-flight newcomer case are unaffected. New test:
+`TestNewcomerClampDoesNotFireWhileInFlight` demonstrates the gate directly —
+an edge with in-flight work present leaves `normalizedService` untouched; the
+identical absence shape with in-flight cleared still clamps.
+
+**Why not just disable the clamp, since that closed 59% of the gap on its
+own?** UNI-162 already found clamp-off shrinks the UNI-161-family failure but
+does not clear it, and costs that scenario (B5, open-loop) more than 60%
+throughput — the clamp is doing real, necessary work for a genuine cold
+start (B1's 120s-late join), which an outright disable would also break. The
+in-flight gate is the narrower fix: it stops firing on exactly the false case
+(a concurrency-limited tenant that never really left) while leaving the
+clamp fully intact for the case it exists for.
+
+**Not expected to fully close the gap on its own:** -12.9 points with the
+clamp fully *disabled* is itself still 2.9 points over the 10-point bar, so
+even a perfect version of this fix is not guaranteed to cross the line by
+itself — the remaining residual is consistent with the work-conservation
+ceiling UNI-220's addendum derives from Little's law (`share_i ∝
+workers_i / L_i`): admission-side holding can reorder and pace work that is
+already queued, but the achievable latency spread between a 256-worker
+flooder and a 64-worker starved tenant is bounded below by the starved
+tenant's own floor latency (~1.7s, measured below-capacity), and the
+required 8x spread for `app1-flood` specifically may sit above what any
+*ordering-only* mechanism can deliver without an explicit per-group
+admission cap or backpressure, both deliberately not implemented here
+pending this fix's own re-measurement — seeing how much of the residual
+in-flight gate alone removes is the point of re-running the four FAIL rows
+before deciding whether a second mechanism is needed. See
+`docs/poc-results.md` "UNI-220" for the full re-run and the final
+ceiling/ratio disclosure.
+
 **Never invoke the tokenizer.** Use `Body.TokenizedRequest.TokenCount()` *only* if the
 token-producer already ran for another plugin's benefit — opportunistic reuse, never a
 triggered cost. Three reasons: (a) after wOut calibration the cost is ~`P + 8×O`, so

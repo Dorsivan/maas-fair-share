@@ -226,6 +226,17 @@ func (gs *groupState) addInFlight(delta int64, provisional float64) {
 	}
 }
 
+// hasInFlight reports whether this group currently has any dispatched request
+// still awaiting completion. See UNI-220: a group with in-flight work has not
+// actually left the system, even on a Pick call where its own flow queue is
+// momentarily empty, and the newcomer clamp must not treat it as a returning
+// newcomer.
+func (gs *groupState) hasInFlight() bool {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	return gs.inFlight > 0
+}
+
 // snapshot is the per-group row in the debug dump and the flight-recorder log.
 type snapshot struct {
 	Name              string  `json:"name"`

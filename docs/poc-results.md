@@ -9570,3 +9570,114 @@ tickets specifically.
   `uni165-graded`'s boosted group so far -- whether this is general to every discriminating sizing in
   this document (UNI-225's six included) or specific to the equal-weight family is not established;
   re-reading UNI-225's own `ledger.rows` for the same pattern is cheap follow-up, no GPU time needed.
+
+## UNI-220: the newcomer clamp's in-flight gate closes 39-85% of the over-offer gap, full-contention and H2 stay PASS, and an 8x over-offer ratio remains an evidenced ceiling
+
+**Starting point.** [UNI-215](/UNI/issues/UNI-215)/[UNI-218](/UNI/issues/UNI-218) found the four
+FAIL rows below unmoved by `queueDepthThreshold` (swept 8-150) and not fixed by turning the
+newcomer clamp off as a binary ([UNI-162](/UNI/issues/UNI-162): clears most of the gap but costs
+B5 over 60% throughput). UNI-220's own addendum root-caused the mechanism from existing artifacts
+before any new run: the policy orders correctly (flooder gets the highest latency, starved tenant
+the lowest), the observed split is fully explained by Little's law (`share_i ∝ workers_i / L_i`),
+and the newcomer clamp's own counters show it firing 28 times on the starved end-users group
+against 0 times on the flooding app1 in one run -- see `docs/design.md` "UNI-220" for the full
+diagnosis.
+
+**The one experiment the ticket asked to run first**, `app1-flood` at the settled config
+(`queueDepthThreshold: 32`, weights 30/10/60) with `newcomerClamp` forced `false` for the run,
+confirmed the clamp as the dominant mechanism: end-users' deviation closed from -31.3 to **-12.9**
+points (59% of the gap) with no code change at all
+(`results/20261111T100257Z-uni-220-diag-clamp-off-app1-flood/`). That ruled out pure
+work-conservation as the dominant cause and ruled in a targeted fix to the clamp itself, rather
+than an admission-side mechanism.
+
+**Fix:** `groupState.hasInFlight()` gates the clamp alongside the existing wall-clock idle gate
+(`pkg/fairness/weightedlas/plugin.go`, `pkg/fairness/weightedlas/state.go`) -- a group with a
+dispatched-but-not-yet-completed request is never treated as a returning newcomer, however long
+its own FlowQueue has been empty, because it has not actually left the system. Built and pushed as
+`quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f`
+(commit `86159ee`) via the `maas-epp-quay-publish` BuildConfig and deployed live for every run
+below. `go test ./pkg/fairness/weightedlas/...` passes, including the new
+`TestNewcomerClampDoesNotFireWhileInFlight`.
+
+### Re-run: the four FAIL rows, full-contention, and H2
+
+All six rows run live, GPU backend, `queueDepthThreshold: 32`, equal 3.0/3.0 queue/prefix-cache
+scorer weights, `enforce: true` via `ENFORCE_LIVE=true` (self-reverting), one at a time, no other
+ticket's run in flight.
+
+| row | weights | offered workers | baseline (UNI-215/218) | with this fix | clamp fires with this fix |
+|---|---|---|---|---|---|
+| `app1-flood` | 30/10/60 | 256/32/64 | FAIL, -31.3 (end-users) | **FAIL, -19.1** (end-users) | app1 0, app2 1, end-users 2 (baseline's cited breakdown for this exact row: app1 0, end-users 28) |
+| `app1-flood-moderate` | 30/10/60 | 128/32/64 | FAIL, -28.6 (end-users) | **FAIL, -12.2** (end-users) | app2 1, end-users 1 (baseline breakdown not separately recorded) |
+| `six-group-board-case` `dominant` | 90/2/2/2/2/2 | app1 @ 181 | FAIL, -17.0 (app1) | **PASS, -3.1 max (app1)** | app2-6: 3-4 each (baseline breakdown not separately recorded) |
+| `six-group-board-case` `pow2` | 32/16/8/4/2/1 | app1 @ 58 | FAIL, -20.3 (app1) | **FAIL, -12.2 (app1)** | app1-6: 1-4 each (baseline breakdown not separately recorded) |
+| `full-contention` | 20/10/65 | 32/32/128 | PASS (must stay PASS) | **PASS**, -1.4 max (app1), NON-DISCRIMINATING per UNI-225 (worker shares already within 6.1pt of weight shares, so this PASS alone isn't evidence of weighted fairness) | app1 2, app2 1 |
+| H2 throughput A/B vs UNI-168 stock (5651 req/240s) | — | — | bar: within 5% | **PASS: 5753 requests, +1.8%** | — |
+
+Artifacts: `results/20261111T100257Z-uni-220-diag-clamp-off-app1-flood/`,
+`results/20261111T103042Z-uni-220-fix-app1-flood/`,
+`results/20261111T104247Z-uni-220-fix-app1-flood-moderate/`,
+`results/20261111T105512Z-uni-220-fix-dominant/`,
+`results/20261111T110758Z-uni-220-fix-pow2/`,
+`results/20261111T111904Z-uni-220-fix-full-contention/` (all force-added past `.gitignore`, same
+precedent as every settled-suite run back through UNI-214).
+
+### Reading the result: real, uneven, incomplete correction
+
+- **The clamp fix works exactly as designed.** `app1-flood`'s own clamp counters (the one row with
+  a recorded baseline breakdown) dropped from 28 fires on the starved end-users group against 0 on
+  the flooding app1, to 2 against 0 with this fix -- the false "newcomer" edge on a
+  concurrency-limited tenant is almost entirely gone. Every other re-run shows clamp fires in the
+  low single digits, spread roughly evenly across groups rather than concentrated on one starved
+  tenant, consistent with the same mechanism, though their own baseline breakdowns were not
+  separately recorded by UNI-218 to confirm the before/after delta directly.
+- **`six-group-board-case dominant` now PASSes outright** (-17.0 → -3.1). This is not really an
+  over-offer case in the same sense as the `app1-flood` family: app1 there is the *dominant-weight*
+  tenant (90%) whose own worker count (181) was already proportionate to its entitlement, so the
+  fix mostly had room to work rather than a Little's-law ceiling to fight.
+- **The two genuine over-offer rows close most, not all, of the gap, and the fraction closed
+  shrinks as the over-offer ratio grows:** `app1-flood-moderate` (app1 offering ~4x its
+  entitlement's worth of concurrency: `(128/30)/(64/60)`) closes 57% of its gap and lands within
+  2.2 points of the bar; `app1-flood` (the same ratio at ~8x) closes only 39% and lands 9.1 points
+  over. This is the Little's-law ceiling UNI-220's addendum derived analytically, now measured: an
+  8x over-offer needs an 8x latency spread between flooder and starved tenant to correct fully, the
+  policy delivers roughly a quarter to a half of that spread even with this fix, and the shortfall
+  scales with the ratio rather than disappearing at this threshold/scorer configuration.
+- **`six-group-board-case pow2`'s residual (-12.2) is a different shape**, not a flood case:
+  app1 there is *under*-offered relative to its >50% weight entitlement (58 workers against five
+  other groups at 32 each), a worker-sizing artifact UNI-165 already named ("pow2's >50%
+  entitlement breaks the linear worker-sizing fit"). The fix still measurably helps it (-20.3 →
+  -12.2) by letting app1 keep the credit it earns instead of losing it to repeated false clamps,
+  but closing it fully needs worker counts sized to express a >50% weight at all, which is a
+  loadgen sizing question, not a policy one.
+- **`full-contention` stays PASS and throughput is unaffected**: 5753 requests against the
+  UNI-168 stock baseline of 5651 is +1.8%, inside the 5% bar, and well inside the noise this
+  series has already characterized for repeat runs.
+
+### The evidenced ceiling
+
+Per the acceptance criteria's alternative to an all-four-rows PASS: **the maximum
+over-offer-relative-to-entitlement ratio this fix reliably corrects to within the 10-point bar is
+below 4x, and an 8x ratio is clearly beyond it** (-19.1 points, little changed in kind from
+baseline's -31.3 even though the mechanism that was confiscating credit is now almost entirely
+fixed). The reason is structural, not a residual bug: admission-side holding can reorder and pace
+work already queued, but the achievable latency spread between a flooder and a starved tenant is
+bounded below by the starved tenant's own floor latency (~1.7s, measured below-capacity in
+UNI-218's A6), and closing an 8x ratio at this backend's capacity would require stretching the
+flooder's own latency by roughly 8x relative to the starved tenant -- a spread this ordering-only
+mechanism does not produce, and one a purely reorder-based fix cannot be expected to produce
+without either a per-group admission cap or backpressure on the over-offering group, both
+deliberately out of scope for this ticket (see `docs/design.md`'s candidate-directions list) and
+not evaluated here. Closing the remaining gap, if required, is follow-up work for a ticket that
+starts from this measurement rather than from the original -31.3 baseline.
+
+### Cluster restored
+
+`enforce: false`, `queueDepthThreshold: 32`, weights `20/10/65/5`, `newcomerClamp: true`, equal
+3.0/3.0 scorer weights -- confirmed live after the final (`full-contention`/H2) snapshot. The GPU
+router-scheduler is running the new image
+(`sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f`); `deploy/llmisvc.yaml`,
+`deploy/poc/02-epp.yaml`, `deploy/poc/05-llmisvc-sim.yaml`, `deploy/poc/06-rhoai34-shape.yaml`,
+`deploy/poc/07-vllm-cpu.yaml` and `deploy/poc/09-vllm-gpu.yaml` all pin it, same two-manifest
+(now six-manifest) drift discipline UNI-29 established.

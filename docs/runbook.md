@@ -1779,6 +1779,149 @@ confirmed to fire before any `$OC` call.
 
 ---
 
+### Per-tenant TTFT/ITL and the SPLIT-FAIL / PRIORITY-OK secondary verdict (UNI-226)
+
+A share-split FAIL used to be reported as a bare failure with no record of
+whether the policy was nonetheless doing the right thing — see UNI-103's
+`equal-workers-control`, where app1/app2/end-users' end-to-end latencies
+(7.5s/7.4s/5.9s) showed correct prioritisation underneath a split that missed
+its target badly. This section covers the fix: per-tenant TTFT/ITL, scored as
+a second, independent verdict.
+
+**Source metrics — no client-side instrumentation needed.** The deployed
+`llm-d-router` EPP already emits both, `fairness_id`-labelled, from its own
+framework code (not this repo's): `llm_d_epp_request_ttft_seconds_bucket`
+(every request, streaming or not — non-streaming TTFT equals total duration)
+and `llm_d_epp_request_streaming_itl_seconds_bucket` (streaming requests
+only). Both were already listed in the metrics catalog table above, just
+never wired into a report or a verdict before this ticket.
+
+**GuideLLM was evaluated and rejected for this ask.** The board asked for it
+(2026-11-10) as the load generator, on the reasoning that it reports
+TTFT/ITL per customer. It does, but only for traffic it generates itself,
+and the EPP's own histograms already give the same numbers, natively
+`fairness_id`-labelled, measured at the actual enforcement point rather than
+a separate client process — no per-tenant aggregation problem to solve, no
+new air-gap dependency (GuideLLM + its dependency tree would have been a
+third blocker alongside the private Quay image and the `hf://` model URI),
+and no need to reconcile a second client-record schema against the G2
+ledger. GuideLLM may still be the right choice later for UNI-221's
+rate-based open-loop generation; it is not used anywhere in this ticket's
+implementation. The existing `deploy/poc/04-loadgen.yaml` closed-loop
+generator (per-group `STREAM_FRACTION`) is what every run in this section
+used.
+
+**Streaming fraction for scored runs: 100%, identical across every offered
+group.** TTFT is only observable on streamed requests, and a fraction that
+differs by group would make the comparison meaningless. Confirmed
+accounting-safe under UNI-186's "58x inflation" finding: that finding is in
+the framework's raw per-chunk token counters
+(`llm_d_epp_request_{input,output}_tokens_sum`), which feed the G2 ledger's
+informational raw-tokens cross-check only (already documented above as an
+expected-FAIL-under-streaming, non-gating check). The fairness plugin's own
+cost settlement is gated on `response.EndOfStream` — it books cost once,
+from the final cumulative usage block — so `contended_service_tokens_total`,
+what every share verdict in this doc is actually scored on, is unaffected by
+turning streaming on.
+
+**The secondary verdict's gate is "no rank inversion between distinctly-weighted
+groups," not raw Spearman correlation == 1.0.** The board's literal phrasing
+asked for rank correlation, but a genuine weight tie (e.g. `98/1/1`'s
+`app2 == end-users`) makes exact correlation 1.0 unreachable by construction
+even when the ordering is otherwise perfect — confirmed numerically (a
+correctly-ordered `98/1/1` run scores correlation 0.87, not 1.0, purely
+because of the tie). The report still shows raw correlation for reference,
+but the gate is: the top-weighted group's TTFT p50 and p95 are both strictly
+the lowest among distinctly-weighted groups, and no two distinctly-weighted
+groups are inverted relative to their weight order. This reduces to
+correlation == 1.0 whenever every weight in the row is distinct (every row
+in the suite except `98/1/1`-style ties), so it is a generalization, not a
+loosening.
+
+**ITL is expected to be flat, by construction.** Once a request is
+dispatched, vLLM decodes the whole resident batch in lockstep — every
+sequence advances one token per step — so the EPP has no influence after
+dispatch. Confirmed on every run in this section: ITL p50/p95 sit at
+14-16ms/35-39ms for every tenant regardless of weight, including the
+`98/1/1` row where TTFT differs by 55 seconds between app1 and the other two.
+Do not read flat ITL as a prioritisation failure; it is the predicted,
+correct result. TTFT is the metric this verdict is built on.
+
+**The noise floor is a same-run, between-tenant control, not a same-config
+repeat.** The margin the `98/1/1` row is scored against is between-tenant
+drift *within one run* — two tenants sharing a batch, a replica set and a
+scrape window have correlated errors a separate repeat run can't see, even
+with tight run-to-run reproducibility. The control actually used: the
+`98/1/1` row's own sizing (`full-contention-2x-discriminating`'s 256/256/256
+equal workers, `STREAM_FRACTION=1`, `DURATION=240`), weights patched to
+equal (1/1/1) via `deploy/poc/24-patch-all-weights.sh`, same replica pool,
+same tenant set, only the weights differ. Result
+(`results/20261110T224209Z-uni226-equal-weight-equal-load-noise-floor/`):
+
+| group | TTFT p50 | TTFT p95 |
+|---|---|---|
+| app1 | 36267ms | 54032ms |
+| app2 | 36141ms | 53563ms |
+| end-users | 36100ms | 53540ms |
+
+Max between-tenant gap: **167ms p50 / 492ms p95**. Share verdict PASS,
+correctly flagged NON-DISCRIMINATING (0.0pt worker-vs-weight gap) — this row
+is a control and is never scored on share.
+
+**`98/1/1` under equal load is a named, scored prioritisation row, not a
+skip.** The share target is genuinely unreachable (app1 can't absorb 98% of
+throughput from a third of the concurrency), but that extremity makes this
+the sharpest prioritisation test in the suite: if the policy can't produce
+an obvious ordering here, it can't anywhere. It had only ever run at
+`full-contention-2x`'s unequal 64/64/256 sizing before this ticket; the
+equal 256/256/256 sizing (`full-contention-2x-discriminating`'s own default)
+is the one used for this row, same as the noise floor. Weights patched with
+`24-patch-all-weights.sh 98 1 1`.
+
+**Result** (`results/20261110T231158Z-uni226-98-1-1-equal-load-priority-v2/`;
+`ENFORCE_LIVE=true` is required for this — see the operational note below):
+
+- Primary (share): **FAIL**, as predicted — app1 delivered 61.8% against its
+  98% target (-36.2pt), still far above its 33.3% worker share, i.e. the
+  policy visibly pulled share toward app1 without reaching the structurally
+  unreachable target. Reported, not scored as a policy defect.
+- Secondary (priority): **PRIORITY-OK**. app1 TTFT p50 14459ms / p95
+  39258ms, strictly lowest of the three; app2 and app3(end-users) both
+  ~70000ms/~118000ms (consistent with their tied weight). Separation from
+  the next distinctly-weighted group: **55381ms** — roughly 330x the noise
+  floor's p50 gap and 110x its p95 gap, not a hair's width.
+- Shedding was negligible (1/3086 requests on app1, a single transient 503;
+  app2/end-users shed zero) — the board's prediction that low-weight
+  tenants would be pushed back far enough to hit the 300s flow-control TTL
+  did not materialize at this `DURATION=240`. Not investigated further:
+  the prioritisation signal was already unambiguous without it.
+
+**Pool-level cross-check against vLLM's own `vllm:time_to_first_token_seconds`
+(2026-11-10, against live Prometheus via the Grafana anonymous-Viewer
+proxy — see "Find a run on the fairness dashboard" above for why that path
+and not a direct Thanos route):** pool EPP-side TTFT was p50 17189ms / p95
+109758ms over the same run window; vLLM's own pool-level histogram gave p50
+6.42s / p95 19.29s. The EPP number is larger in both quantiles, as expected:
+EPP TTFT measures from request arrival at the EPP (including its own
+admission-hold queueing, where the weighted-fairness policy actually acts)
+to first byte, while vLLM's own metric is engine-internal prefill time
+after dispatch. A smaller vLLM number confirms the gap is admission-hold
+time, not gateway buffering or some other unaccounted overhead — the
+client/EPP-side TTFT this verdict is built on is measuring real policy
+behaviour.
+
+**Operational note: `ENFORCE_LIVE` defaults to `false`.** The first `98/1/1`
+attempt under this ticket was run without `ENFORCE_LIVE=true` after an
+unrelated `PATH` fix, and came back with flat TTFT across all three groups
+and secondary verdict `PRIORITY-FAIL` — a dramatic-looking negative result
+that was actually just the fairness plugin never gating anything (shadow
+mode is the cluster's standing default; see "Shadow-mode control" above).
+That run is not part of the results above and was not scored. Always check
+the report's own `Enforce` metadata field before trusting a verdict run
+through a fresh invocation of `15-fairness-benchmark.sh`.
+
+---
+
 ## Load the fairness dashboard into the live Grafana
 
 `deploy/grafana-dashboard.yaml` ships the dashboard JSON as a ConfigMap

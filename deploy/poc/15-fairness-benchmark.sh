@@ -370,7 +370,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -1313,6 +1313,23 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=64)
     ;;
+  app1-flood-2x)
+    # UNI-245 (F4): bracket the over-offer ceiling from below. app1-flood
+    # (256, 8x) and app1-flood-moderate (128, 4x) both FAIL; app1-flood-light
+    # (32, 1x) is the only point below that. This scenario and
+    # app1-flood-3x fill the unexplored 1x-4x gap, holding app2/end-users and
+    # the 30/10/60 weights fixed the same way app1-flood-moderate/-light do
+    # -- app1's own sizing is the only variable.
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=64 WORKERS_APP2=32 WORKERS_END_USERS=64)
+    ;;
+  app1-flood-3x)
+    # UNI-245 (F4): see app1-flood-2x. 96 workers = 3x over-offer by the same
+    # ratio app1-flood-moderate's 128=4x and app1-flood's 256=8x use (the
+    # 32-worker unit established by app1-flood-light=1x).
+    TENANTS="app1 app2 end-users"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=96 WORKERS_APP2=32 WORKERS_END_USERS=64)
+    ;;
   app3-joins-at-saturation)
     # UNI-164: board case, 30/10/60 (end-users standing in for "app3", same
     # substitution UNI-161 used -- see that ticket's writeup and
@@ -1499,7 +1516,7 @@ case "$SCENARIO" in
     WORKERS="${WORKERS:-50}"
     ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating)" >&2
     exit 1
     ;;
 esac

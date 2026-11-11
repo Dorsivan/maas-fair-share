@@ -9702,6 +9702,9 @@ deliberately out of scope for this ticket (see `docs/design.md`'s candidate-dire
 not evaluated here. Closing the remaining gap, if required, is follow-up work for a ticket that
 starts from this measurement rather than from the original -31.3 baseline.
 
+**Refined by [UNI-245](/UNI/issues/UNI-245):** "below 4x" is now a specific bracket -- 3x PASSes
+(8.5pt max deviation) and 4x FAILs (12.2pt) -- see that ticket's own subsection below.
+
 ### Cluster restored
 
 `enforce: false`, `queueDepthThreshold: 32`, weights `20/10/65/5`, `newcomerClamp: true`, equal
@@ -9717,3 +9720,92 @@ router-scheduler is running the new image
 directly against the running pod, not just the manifest. This benchmark exercises the GPU lane
 only, so nothing here is functionally wrong, but the manifest and the live CPU pod have drifted
 and the "six manifests pin it" statement above does not mean all six are also *running* it.
+
+### UNI-245 (F3): live GPU confirmation of the cold-join (UNI-162) regression check
+
+Zeratul's UNI-220 review flagged that the committed Go tests cannot exercise the in-flight gate on
+the real dispatch path -- `harness_test.go`'s `run()` calls `PreRequest` and `ResponseBody`
+back-to-back, so `inFlight` is 0 at every simulated `Pick`, and only
+`TestNewcomerClampDoesNotFireWhileInFlight` exercises the gate at all, by poking `addInFlight`
+directly. The review closed this with an **offline simulation** (not GPU): deferring completion by
+1/5/20 cycles so a cold joiner's in-flight work persists across `Pick` calls, finding the gate
+ON/OFF byte-identical (newcomer streak 1 vs 400, incumbent picks 200/400 vs 0/400) because a cold
+joiner's queue never empties, leaving no second backlog edge for the gate to suppress. This ticket
+re-runs that confirmation live, on the real dispatch path.
+
+**Setup:** `full-contention` (32/32/128 workers, default weights 20/10/65) -- the same
+[UNI-142](/UNI/issues/UNI-142)/B1 shape, just on this fix's image and at this series' current
+`queueDepthThreshold: 32` rather than UNI-142's original config -- 240s, `END_USERS_START=120` so
+end-users (weight 65, the dominant tenant) joins cold at the halfway point exactly as B1 did.
+`enforce: true` via `ENFORCE_LIVE=true` (self-reverting), image
+`sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f` (commit `86159ee`, same
+fix UNI-220 built).
+
+**Result: PASS**, 7.8pt max deviation (app1 -7.8, app2 +2.3, end-users +5.5) --
+`results/20261111T130315Z-uni-245-f3-cold-join-confirm/`. Report flags NON-DISCRIMINATING per
+UNI-225 (the offered 32:32:128 worker ratio is itself within 6.1pt of the 20:10:65 weight ratio) --
+the same scope boundary every other default-weight `full-contention` run carries, not new here.
+Compare UNI-142's own baseline: PASS, 7.6pt max deviation (app1 -0.9, app2 +7.6, end-users -6.7).
+Same verdict, same order of magnitude, no regression.
+
+**Incumbent throughput, the ask's other half:** app1+app2 together delivered 3432 requests
+(1725+1707) this run vs UNI-142's 3167 (1607+1560) -- **+8.4%, not reduced.** No evidence the
+in-flight gate costs the incumbents anything.
+
+**No monopolisation burst at the join instant:** the first post-join window (120.0-130.0s) shows
+end-users at 38.0% of the three-way total -- below its 68.4% target, ramping up rather than
+spiking over it, the same shape UNI-142 itself found (46.0% there). The post-join phase's peak
+windowed share was 88.0% (vs UNI-142's own 98.4% peak); both are read as the same scrape-cadence
+lumpiness UNI-142's write-up diagnosed (the pre-join app1/app2-only windows, with no newcomer event
+anywhere near them, show equally large swings), not a monopolisation burst by the newcomer.
+
+**Ledger cross-check FAILs for app1 (-79.3%) and app2 (-79.8%), expected and not a new defect** --
+the same structural, contention-gated-by-design cause UNI-142's own ledger FAIL documents
+(-76.4%/-78.4% there): both tenants are offered without end-users contending against them for the
+first half of the run, and the ledger's cost check only validates contended cost.
+
+**Conclusion:** confirms Zeratul's offline simulation on the real dispatch path.
+[UNI-162](/UNI/issues/UNI-162)'s cold-join protection is preserved by the in-flight gate.
+
+### UNI-245 (F4): the over-offer ceiling, bracketed between 3x and 4x
+
+UNI-220 found `app1-flood-moderate` (4x over-offer ratio, 128 workers) FAILs by -12.2pt and
+`app1-flood` (8x, 256 workers) FAILs by -19.1pt, with nothing in evidence below 4x -- the next
+scenario down, `app1-flood-light` (1x, 32 workers), was never re-run this fix. Per Zeratul's
+2026-11-11 comment, this ticket added two new named scenarios to `15-fairness-benchmark.sh`
+(`app1-flood-2x`, 64 workers; `app1-flood-3x`, 96 workers, following the existing
+`app1-flood-moderate`/`-light` sizing pattern) and ran `app1-flood-3x` first as the run most likely
+to land a usable number; its 2x fallback was only to run if 3x also FAILed.
+
+**Setup:** same settled config as UNI-220's re-runs -- `queueDepthThreshold: 32`, weights patched
+to 30/10/60 before the run via `24-patch-all-weights.sh` (restored to 20/10/65 after, same division
+of labor every other `app1-flood*` case uses), fix image `c8a0882...`, `enforce: true` via
+`ENFORCE_LIVE=true`, 240s.
+
+**Result: `app1-flood-3x` PASSED**, 8.5pt max deviation (app1 +6.3, app2 +2.2, end-users -8.5) --
+`results/20261111T132002Z-uni-245-f4-app1-flood-3x/` (force-added past `.gitignore`, same
+precedent as every settled-suite run back through UNI-214). The 2x fallback was not needed and was
+not run. Ledger PASSED cleanly on all three groups (within 2.8% of the 10% tolerance) -- unlike
+F3/UNI-142's staggered-join shape, this scenario runs full three-way contention the whole 240s, so
+the ledger's cost check has something to validate throughout.
+
+| ratio | scenario | workers (app1/app2/end-users) | max deviation | verdict |
+|---|---|---|---|---|
+| 1x | `app1-flood-light` | 32/32/64 | not re-run this fix (UNI-161's own finding, pre-fix image) | n/a |
+| 2x | `app1-flood-2x` | 64/32/64 | not run -- 3x PASSed, fallback not needed | n/a |
+| 3x | `app1-flood-3x` | 96/32/64 | **8.5** | **PASS** |
+| 4x | `app1-flood-moderate` | 128/32/64 | 12.2 | FAIL |
+| 8x | `app1-flood` | 256/32/64 | 19.1 | FAIL |
+
+This revises UNI-220's "evidenced ceiling... below 4x" to a specific bracket: **the maximum
+over-offer-relative-to-entitlement ratio this fix reliably corrects to within the 10-point bar is
+between 3x and 4x** -- 3x clears the bar with 1.5 points to spare, 4x misses it by 2.2. The 2x point
+remains untested by design (not needed once 3x PASSed); `app1-flood-2x` is committed and ready if a
+future ticket wants to narrow the bracket further.
+
+### Cluster restored (UNI-245)
+
+`enforce: false`, `queueDepthThreshold: 32`, weights `20/10/65/5`, `newcomerClamp: true` --
+confirmed live after the final (`app1-flood-3x`) snapshot, the same baseline UNI-220 left the
+cluster at. No LLMInferenceService or scheduling-profile change this ticket; the two new scenario
+cases in `15-fairness-benchmark.sh` are the only code change.

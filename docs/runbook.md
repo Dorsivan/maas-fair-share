@@ -329,8 +329,17 @@ Say in the ticket which lane you hold.
 **Parallel scored rows depend on the A/A test.** Separate namespaces do not
 isolate everything. Authorino, Limitador and maas-api are single replicas
 that carry every lane's requests, and Prometheus scrapes all three lanes.
-Until the UNI-231 A/A test passes, run scored rows serially and use the other
-lanes only for unscored work (harness development, dry runs, provisioning).
+Until the UNI-231 A/A test passes, run scored rows serially.
+
+**Never put load on any lane while a scored run is in flight on another.**
+This includes unscored dry runs. The A/A pre-check (UNI-231, 2026-11-11) ran
+the stock loadgen (96 workers, streaming) on lanes 2 and 3 at once. 72% of
+requests returned HTTP 500, against about 1.5% for either lane alone. The
+500s come from the gateway's auth step, which fails closed after 200ms
+(`failureMode: deny`), while Authorino and maas-api, shared by every lane,
+fall behind. Authorino's log still says `OK` for those requests because it
+answers after the gateway has given up. See UNI-240. Load-free work on a lane
+(provisioning, harness edits, `oc` reads) is fine.
 
 How it works, so nobody "fixes" it back:
 

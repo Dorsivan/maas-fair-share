@@ -41,6 +41,12 @@ log() { echo "[smoke] $*" | tee -a "$OUT/smoke.log"; }
 
 log "identity: $($OC whoami)"
 
+# UNI-231: this smoke borrows the CPU model server, which only lane 1 has.
+# Refuse before the first cluster write rather than half-run on lanes 2/3.
+if [ -z "$($OC get llminferenceservice "$LLMISVC" -n "$NAMESPACE" --ignore-not-found -o name)" ]; then
+  log "ABORT: no llminferenceservice/$LLMISVC in $NAMESPACE -- this smoke runs on lane 1 (maas-fairness-poc) only"; exit 1
+fi
+
 # --- UNI-210: this script patches maas-vllm-cpu's LLMInferenceService spec
 # (config.ref, replicas below), which triggers an odh-model-controller/KServe
 # reconcile that can regenerate the Gateway-scoped maas-poc-gateway-authn

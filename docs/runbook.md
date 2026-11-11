@@ -350,10 +350,16 @@ How it works, so nobody "fixes" it back:
   loadgen and reports never need to know which lane they are on.
 - Placement: model servers are pinned to their lane's pair by
   `kubernetes.io/hostname`. The EPP (UNI-102, now fixed) and the loadgen Job
-  stay off GPU nodes. **Lane 1's live objects predate this.** Its replicas
-  and EPP carry no pin until `09-vllm-gpu.yaml` is reapplied, which recreates
-  its pods, so do that between runs. Until then, a restarted lane-1 replica
-  can land on a lane-2/3 node.
+  stay off GPU nodes. **Lane 1's live objects predate this.** Its two EPPs
+  were pinned off GPU nodes live (UNI-238, 2026-11-11). Its model-server
+  replicas still carry no pin until `09-vllm-gpu.yaml` is reapplied, which
+  recreates them, so do that between runs. Until then, a restarted lane-1
+  replica can land on a lane-2/3 node.
+- Lanes 2 and 3 have no CPU model server. `15-fairness-benchmark.sh` and
+  `24-patch-all-weights.sh` confirm a config change on both EPPs where
+  `llminferenceservice/maas-vllm-cpu` exists and on the GPU EPP alone where
+  it does not. `20-n-group-smoke.sh` borrows the CPU model server, so it is
+  lane 1 only and refuses other lanes.
 
 Build a new lane (lanes 2 and 3 only; the script refuses lane 1):
 
@@ -363,7 +369,9 @@ NAMESPACE=poc-maas-lane2 deploy/poc/25-provision-lane.sh
 
 The script is idempotent. Where a permission is missing it stops and prints
 the exact command for whoever holds it: the namespace (operator), the
-Gateway (poc-agent), the pull-secret copy (secret read). It creates two
+Gateway (poc-agent), the pull-secret copy (secret read), and the benchmark's
+`/metrics` reader binding (operator: one ClusterRoleBinding per lane, because
+a namespaced RoleBinding cannot grant a non-resource URL). It creates two
 ~15 GB model downloads, so run it between instance-1 measurement runs. Run
 the offline checks with `python3 -I deploy/poc/lanes-test.py`.
 

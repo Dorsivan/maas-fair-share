@@ -497,6 +497,7 @@ SHADOW_MODE="${SHADOW_MODE:-false}"
 ENFORCE_WAIT_TIMEOUT_SECONDS="${ENFORCE_WAIT_TIMEOUT_SECONDS:-180}"
 CONFIGMAP_NAME="maas-epp-config"
 CPU_EPP_METRICS_SVC="${CPU_EPP_METRICS_SVC:-maas-vllm-cpu-epp-service}"
+CPU_LLMISVC_NAME="${CPU_LLMISVC_NAME:-maas-vllm-cpu}"
 
 # --- UNI-174: every variable the exit trap below can reference must already
 # exist by the time the trap is registered -- `set -u` turns a reference to
@@ -517,6 +518,7 @@ SHADOW_FLIPPED="false"
 METRICS_TOKEN=""
 EPP_METRICS_SVC_IP=""
 CPU_EPP_METRICS_SVC_IP=""
+CPU_EPP_ABSENT="false"
 
 read_enforcing() {
   # $1 = EPP metrics ClusterIP. Prints 0/1, or nothing if the scrape failed
@@ -533,10 +535,18 @@ wait_for_enforcing() {
   local want="$1" gpu_val cpu_val waited=0
   while :; do
     gpu_val="$(read_enforcing "$EPP_METRICS_SVC_IP")"
-    cpu_val="$(read_enforcing "$CPU_EPP_METRICS_SVC_IP")"
-    if [ "$gpu_val" = "$want" ] && [ "$cpu_val" = "$want" ]; then
-      enforce_log "confirmed: llm_d_epp_maas_fairness_enforcing=$want on both EPPs (gpu=$gpu_val cpu=$cpu_val)"
-      return 0
+    if [ "$CPU_EPP_ABSENT" = "true" ]; then
+      cpu_val="absent"
+      if [ "$gpu_val" = "$want" ]; then
+        enforce_log "confirmed: llm_d_epp_maas_fairness_enforcing=$want on the GPU EPP, the only EPP in $NAMESPACE (gpu=$gpu_val cpu=absent)"
+        return 0
+      fi
+    else
+      cpu_val="$(read_enforcing "$CPU_EPP_METRICS_SVC_IP")"
+      if [ "$gpu_val" = "$want" ] && [ "$cpu_val" = "$want" ]; then
+        enforce_log "confirmed: llm_d_epp_maas_fairness_enforcing=$want on both EPPs (gpu=$gpu_val cpu=$cpu_val)"
+        return 0
+      fi
     fi
     if [ "$waited" -ge "$ENFORCE_WAIT_TIMEOUT_SECONDS" ]; then
       enforce_log "WARNING: timed out after ${ENFORCE_WAIT_TIMEOUT_SECONDS}s waiting for enforcing=$want (gpu=${gpu_val:-?} cpu=${cpu_val:-?})"
@@ -545,6 +555,21 @@ wait_for_enforcing() {
     sleep 2
     waited=$((waited + 2))
   done
+}
+
+resolve_cpu_epp() {
+  # UNI-231: lanes 2 and 3 run no CPU LLMInferenceService, so their
+  # maas-epp-config has one reader, not two. Keyed on the LLMISVC (the thing
+  # that actually reads the ConfigMap), not on its Service. --ignore-not-found
+  # turns only NotFound into an empty answer; Forbidden or an API error still
+  # fails under set -e, so lane 1 cannot silently lose its second
+  # confirmation.
+  if [ -z "$($OC get llminferenceservice "$CPU_LLMISVC_NAME" -n "$NAMESPACE" --ignore-not-found -o name)" ]; then
+    CPU_EPP_ABSENT="true"
+    enforce_log "no llminferenceservice/$CPU_LLMISVC_NAME in $NAMESPACE -- maas-epp-config has one reader here; confirming the GPU EPP only"
+  else
+    CPU_EPP_METRICS_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+  fi
 }
 
 patch_configmap_epp() {
@@ -1781,7 +1806,7 @@ if [ "$ENFORCE_LIVE" = "true" ]; then
   # in this branch -- an invocation that doesn't set ENFORCE_LIVE must not
   # gain a new way to fail (or a new RBAC/topology dependency) just because
   # some other environment lacks a CPU EPP Service.
-  CPU_EPP_METRICS_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+  resolve_cpu_epp
   CUR_EPP_YAML="$($OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}')"
   if printf '%s' "$CUR_EPP_YAML" | grep -qE '^[[:space:]]*enforce:[[:space:]]*true'; then
     enforce_log "enforce already true in $CONFIGMAP_NAME -- nothing to flip; this run will NOT revert it on exit (it did not cause the enabled state)"
@@ -1827,7 +1852,7 @@ if [ "$SHADOW_MODE" = "true" ]; then
   # Mutually exclusive with ENFORCE_LIVE (checked before the scenario even
   # starts, see above), so this never runs in the same invocation as that
   # block.
-  CPU_EPP_METRICS_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+  resolve_cpu_epp
   CUR_EPP_YAML="$($OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}')"
   if printf '%s' "$CUR_EPP_YAML" | grep -qE '^[[:space:]]*enforce:[[:space:]]*false'; then
     enforce_log "enforce already false in $CONFIGMAP_NAME -- nothing to flip; this run will NOT revert it on exit (it did not cause the shadow state)"

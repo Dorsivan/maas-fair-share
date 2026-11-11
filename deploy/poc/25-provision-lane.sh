@@ -19,6 +19,10 @@
 #                                           are compiled from the existing ones
 #   * get on secret/quay-maas-pull in       the private EPP image's pull
 #     maas-fairness-poc (read only)         secret, copied once per lane
+#   * a ClusterRoleBinding to ClusterRole   the benchmark's /metrics reader;
+#     maas-epp-metrics-reader               nonResourceURLs can't be granted
+#                                           by a namespaced RoleBinding
+#                                           (operator, once per lane)
 # A step whose permission is missing stops the script with the exact command
 # for whoever holds it; nothing is worked around.
 #
@@ -159,6 +163,39 @@ $OC get pods -n "$NAMESPACE" -o custom-columns=POD:.metadata.name,NODE:.spec.nod
       esac
       log "  $pod  $node  $phase  $verdict"
     done
+# 11. The benchmark's /metrics reader (deploy/rbac.yaml's shape, per lane).
+#     The EPP answers 401 without a token, and the ClusterRole grants a
+#     nonResourceURL, so the binding has to be cluster-scoped. One binding per
+#     lane, never a new subject on lane 1's maas-epp-metrics-reader binding.
+$OC apply -n "$NAMESPACE" -f - >/dev/null <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maas-epp-metrics-reader
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: maas-epp-metrics-reader-token
+  annotations:
+    kubernetes.io/service-account.name: maas-epp-metrics-reader
+type: kubernetes.io/service-account-token
+EOF
+log "metrics reader: serviceaccount + token applied"
+metrics_allowed="$($OC create -o jsonpath='{.status.allowed}' -f - <<EOF
+apiVersion: authorization.k8s.io/v1
+kind: SubjectAccessReview
+spec:
+  user: system:serviceaccount:$NAMESPACE:maas-epp-metrics-reader
+  groups: [system:serviceaccounts, "system:serviceaccounts:$NAMESPACE", system:authenticated]
+  nonResourceAttributes: {path: /metrics, verb: get}
+EOF
+)"
+[ "$metrics_allowed" = "true" ] \
+  || stop "maas-epp-metrics-reader in $NAMESPACE cannot read /metrics, so the benchmark cannot snapshot this lane's EPP" \
+    "operator: oc create clusterrolebinding maas-epp-metrics-reader-$NAMESPACE --clusterrole=maas-epp-metrics-reader --serviceaccount=$NAMESPACE:maas-epp-metrics-reader"
+log "metrics reader: bound (SubjectAccessReview allows GET /metrics)"
+
 log "done. Next: mint keys (canonical names; stored per lane):"
 echo "    NAMESPACE=$NAMESPACE MAAS_GROUP=maas-app1      deploy/maas/mint-loadgen-keys.sh app1-production"
 echo "    NAMESPACE=$NAMESPACE MAAS_GROUP=maas-app2      deploy/maas/mint-loadgen-keys.sh app2-batch"

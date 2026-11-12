@@ -2431,6 +2431,88 @@ def test_ttft_itl_integrates_into_report_and_markdown():
         assert "pool (all groups)" in md
 
 
+# --- UNI-224: saturation-limb attribution -----------------------------------
+
+def saturation_sample_block(queue_size, kv_util, pool_saturation):
+    return (
+        f'llm_d_epp_average_queue_size{{name="maas-vllm-gpu-inference-pool"}} {queue_size}\n'
+        f'llm_d_epp_average_kv_cache_utilization{{name="maas-vllm-gpu-inference-pool"}} {kv_util}\n'
+        f'llm_d_epp_flow_control_pool_saturation{{inference_pool="maas-vllm-gpu-inference-pool",'
+        f'stage="effective"}} {pool_saturation}\n'
+    )
+
+
+def test_saturation_limb_none_without_timeseries():
+    assert fairness_report.compute_saturation_limb(None, 32.0, 0.8) is None
+    assert fairness_report.compute_saturation_limb("/no/such/file", 32.0, 0.8) is None
+
+
+def test_saturation_limb_identifies_kv_cache_as_bound():
+    with tempfile.TemporaryDirectory() as tmp:
+        # Sample 0: queue-bound (16/32=0.5 vs 0.08/0.8=0.1). Sample 1: the
+        # run's peak roofline score, and it is KV-bound (0.68/0.8=0.85 vs
+        # 8/32=0.25) -- the case the saturation detector's own
+        # `max(qRatio, kvRatio)` would gate dispatch on.
+        ts = write_timeseries_raw(tmp, "ts.txt", [
+            (0, saturation_sample_block(16, 0.08, 0.5)),
+            (10, saturation_sample_block(8, 0.68, 0.85)),
+        ])
+        sat = fairness_report.compute_saturation_limb(ts, 32.0, 0.8)
+        assert sat["state"] == "ok" and sat["sample_count"] == 2
+        assert abs(sat["peak_queue_ratio"] - 0.5) < 1e-12
+        assert abs(sat["peak_kv_ratio"] - 0.85) < 1e-12
+        assert sat["bound_at_peak"] == "kv_cache"
+        assert sat["kv_binding_sample_count"] == 1
+        assert sat["samples"][0]["bound"] == "queue"
+        assert sat["samples"][1]["bound"] == "kv_cache"
+
+
+def test_saturation_limb_tie_favors_queue_and_skips_failed_scrapes():
+    with tempfile.TemporaryDirectory() as tmp:
+        lines = [
+            "# ts=2026-11-01T00:00:00Z epoch=0",
+            saturation_sample_block(0, 0, 0).rstrip("\n"),  # 0/0 tie
+            "# ts=2026-11-01T00:00:05Z epoch=5",
+            "# scrape_exit=7",  # connection-level failure -- must not count as a sample
+            "# ts=2026-11-01T00:00:10Z epoch=10",
+            saturation_sample_block(4, 0.4, 0.5).rstrip("\n"),  # kv-bound: 0.4/0.8=0.5 > 4/32=0.125
+        ]
+        ts = write(tmp, "ts.txt", "\n".join(lines) + "\n")
+        sat = fairness_report.compute_saturation_limb(ts, 32.0, 0.8)
+        assert sat["sample_count"] == 2  # the failed-scrape block is excluded
+        assert sat["samples"][0]["bound"] == "queue"  # 0/0 tie favors queue
+        assert sat["bound_at_peak"] == "kv_cache"
+
+
+def test_saturation_limb_reflects_uni224_live_finding():
+    # UNI-224's own measured numbers (2026-11-10, Prometheus, 411 samples):
+    # kv_cache peaked at 0.0017 against an 0.8 threshold (ratio 0.00213),
+    # queue peaked at 178 against a 32 threshold (ratio 5.5625) -- the queue
+    # limb wins by ~1000x, reproduced here as a regression fixture so a
+    # future change to the ratio math can't silently flip this conclusion.
+    with tempfile.TemporaryDirectory() as tmp:
+        ts = write_timeseries_raw(tmp, "ts.txt", [
+            (0, saturation_sample_block(178, 0.0017, 5.5625)),
+        ])
+        sat = fairness_report.compute_saturation_limb(ts, 32.0, 0.8)
+        assert sat["bound_at_peak"] == "queue"
+        assert sat["peak_queue_ratio"] > 1000 * sat["peak_kv_ratio"]
+
+
+def test_saturation_section_renders_markdown_and_handles_missing_timeseries():
+    with tempfile.TemporaryDirectory() as tmp:
+        report = run_build_uni181(tmp, rows=CLEAN_ROWS)
+        assert report["saturation"] is None
+        md = fairness_report.render_markdown(report)
+        assert "## Saturation limb (UNI-224)" in md
+        assert "Not evaluated" in md
+
+        ts = write_timeseries_raw(tmp, "ts2.txt", [(0, saturation_sample_block(2, 0.001, 0.0625))])
+        report2 = run_build_uni181(tmp, rows=CLEAN_ROWS, metrics_timeseries_path=ts)
+        md2 = fairness_report.render_markdown(report2)
+        assert "Bound at this run's peak roofline score: `queue`" in md2
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

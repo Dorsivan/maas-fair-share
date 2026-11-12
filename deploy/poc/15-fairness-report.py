@@ -182,6 +182,7 @@ first place.
 """
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -704,6 +705,89 @@ def compute_shed(offered_groups, loadgen_rows, weights, before_labeled, after_la
                     "non_epp_429_lower_bound": max(0.0, client_429 - epp_429)})
     return {"shed_statuses": list(SHED_STATUSES), "total_shed": shed_total,
             "rows": rows, "epp_pool_wide": epp}
+
+
+def compute_saturation_limb(metrics_timeseries_path, queue_depth_threshold, kv_cache_util_threshold):
+    """UNI-224: the utilization-detector saturation gate is a roofline over
+    TWO signals, not queue depth alone (llm-d-router@v0.11.0's
+    saturationdetector/utilization/detector.go:160):
+
+        qRatio  := average_queue_size  / queueDepthThreshold
+        kvRatio := average_kv_cache_utilization / kvCacheUtilThreshold
+        totalScore := max(qRatio, kvRatio)
+
+    Neither ratio is exposed directly -- the EPP's own
+    llm_d_epp_flow_control_pool_saturation gauge reports only the combined
+    totalScore, not which resource produced it. This reconstructs both
+    ratios from the two pool-level gauges the EPP already exports
+    (llm_d_epp_average_queue_size, llm_d_epp_average_kv_cache_utilization --
+    both already covered by snapshot_metrics()'s `average_` prefix match,
+    just never surfaced or attributed to a limb before this ticket) and
+    reports, for every timeseries sample, which limb was larger -- plus the
+    run's peak of each ratio, which is the number that matters for "did this
+    run ever threaten the gate." `pool_saturation_reported` is the detector's
+    own gauge at the same sample, kept alongside as a cross-check that this
+    reconstruction tracks the real gating value (it will not match exactly
+    when stalenessPolicy=saturated scores a stale endpoint at 1.0 -- that
+    case is surfaced via flow_control_stale_endpoints elsewhere in the report,
+    not here).
+
+    Returns None if no timeseries was captured (pre-UNI-224 shape, or a
+    caller that omitted --metrics-timeseries)."""
+    if not metrics_timeseries_path or not os.path.exists(metrics_timeseries_path):
+        return None
+    samples = []
+    for epoch, ts, series, scrape_failed in parse_timeseries(metrics_timeseries_path):
+        if scrape_failed:
+            continue
+        q = series.get("llm_d_epp_average_queue_size", {}).get(None)
+        kv = series.get("llm_d_epp_average_kv_cache_utilization", {}).get(None)
+        if q is None and kv is None:
+            continue
+        q = q or 0.0
+        kv = kv or 0.0
+        q_ratio = (q / queue_depth_threshold) if queue_depth_threshold else None
+        kv_ratio = (kv / kv_cache_util_threshold) if kv_cache_util_threshold else None
+        roofline = max(v for v in (q_ratio, kv_ratio) if v is not None) if (q_ratio is not None or kv_ratio is not None) else None
+        # Tie (including both zero) attributes to "queue" -- an explicit
+        # tie-break reads clearer than an arbitrary float comparison
+        # silently picking one, and every run on file ties at zero/zero.
+        bound = None
+        if q_ratio is not None and kv_ratio is not None:
+            bound = "kv_cache" if kv_ratio > q_ratio else "queue"
+        samples.append({
+            "epoch": epoch, "ts": ts,
+            "average_queue_size": q, "average_kv_cache_utilization": kv,
+            "queue_ratio": q_ratio, "kv_ratio": kv_ratio,
+            "roofline_score": roofline, "bound": bound,
+            "pool_saturation_reported": series.get("llm_d_epp_flow_control_pool_saturation", {}).get(None),
+        })
+    if not samples:
+        return {
+            "queue_depth_threshold": queue_depth_threshold,
+            "kv_cache_util_threshold": kv_cache_util_threshold,
+            "state": "no_samples", "samples": [],
+        }
+    peak_queue_ratio = max(s["queue_ratio"] for s in samples)
+    peak_kv_ratio = max(s["kv_ratio"] for s in samples)
+    kv_binding_samples = sum(1 for s in samples if s["bound"] == "kv_cache")
+    return {
+        "queue_depth_threshold": queue_depth_threshold,
+        "kv_cache_util_threshold": kv_cache_util_threshold,
+        "state": "ok",
+        "sample_count": len(samples),
+        "peak_queue_ratio": peak_queue_ratio,
+        "peak_kv_ratio": peak_kv_ratio,
+        "peak_average_kv_cache_utilization": max(s["average_kv_cache_utilization"] for s in samples),
+        "peak_average_queue_size": max(s["average_queue_size"] for s in samples),
+        "kv_binding_sample_count": kv_binding_samples,
+        # The limb that bound AT THIS RUN'S OWN PEAK roofline score, i.e. the
+        # one the detector actually gated dispatch on when it mattered most --
+        # not which limb won on a plurality of samples, most of which are
+        # near-idle between-request gaps.
+        "bound_at_peak": max(samples, key=lambda s: s["roofline_score"])["bound"],
+        "samples": samples,
+    }
 
 
 ALERT_RULE_LINE = re.compile(r'^\s*-\s*alert:\s*(\S+)\s*$')
@@ -1356,7 +1440,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                   cached_input_token_weight=1.0, ledger_tolerance_pct=10.0,
                   pick_latency_baseline_path=None,
                   alerts_path=None, alert_rules_path=None, alerts_step_seconds=30.0,
-                  priority_noise_floor_seconds=None):
+                  priority_noise_floor_seconds=None,
+                  queue_depth_threshold=32.0, kv_cache_util_threshold=0.8):
     before = parse_metrics(metrics_before_path)
     after = parse_metrics(metrics_after_path)
     offered_workers, loadgen_rows, logged_duration, generator = parse_loadgen_log(loadgen_log_path)
@@ -1976,6 +2061,14 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         alerts_section = compute_alerts(alerts_path, rule_names, run_start, run_end, alerts_step_seconds)
         alerts_section["rule_file"] = alert_rules_path
 
+    # UNI-224: which saturation-detector limb (queue depth vs KV cache) bound,
+    # reconstructed from the EPP's own pool-level gauges -- see
+    # compute_saturation_limb's docstring for why neither ratio is exposed
+    # directly.
+    saturation_section = compute_saturation_limb(
+        metrics_timeseries_path, queue_depth_threshold, kv_cache_util_threshold
+    )
+
     # UNI-226: per-tenant TTFT/ITL plus the SPLIT-FAIL/PRIORITY-OK secondary
     # verdict -- purely additive like ledger/shed/pick_latency above, never
     # reads or writes `verdict` itself (compute_priority_verdict only
@@ -2126,6 +2219,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         "pick_latency": pick_latency_section,
         "alerts": alerts_section,
         "ttft_itl": ttft_itl_section,
+        "saturation": saturation_section,
     }
     return report
 
@@ -2452,6 +2546,53 @@ def render_markdown(report):
     ]:
         lines.append(f"| {label} | `{r.get(key)}` |")
     lines.append("")
+    lines.append("## Saturation limb (UNI-224)")
+    lines.append("")
+    sat = report.get("saturation")
+    if sat is None:
+        lines.append(
+            "Not evaluated: no `--metrics-timeseries` was captured for this run (pre-UNI-224 "
+            "shape)."
+        )
+    elif sat["state"] == "no_samples":
+        lines.append(
+            "No usable timeseries samples (every scrape either failed or carried neither "
+            "`llm_d_epp_average_queue_size` nor `llm_d_epp_average_kv_cache_utilization`)."
+        )
+    else:
+        lines.append(
+            f"Reconstructed from `llm_d_epp_average_queue_size` / `queueDepthThreshold` "
+            f"({sat['queue_depth_threshold']:g}) and `llm_d_epp_average_kv_cache_utilization` / "
+            f"`kvCacheUtilThreshold` ({sat['kv_cache_util_threshold']:g}) across "
+            f"{sat['sample_count']} timeseries samples -- see docs/design.md's saturation-"
+            "detector section for the roofline formula this reconstructs."
+        )
+        lines.append("")
+        lines.append(
+            f"**Bound at this run's peak roofline score: `{sat['bound_at_peak']}`** "
+            f"({sat['kv_binding_sample_count']}/{sat['sample_count']} samples had the KV limb "
+            "ahead of the queue limb)."
+        )
+        lines.append("")
+        lines.append("| signal | peak value | peak ratio to threshold |")
+        lines.append("|---|---|---|")
+        lines.append(
+            f"| `average_queue_size` | {sat['peak_average_queue_size']:.2f} | "
+            f"{sat['peak_queue_ratio']:.4f} |"
+        )
+        lines.append(
+            f"| `average_kv_cache_utilization` | {sat['peak_average_kv_cache_utilization']:.4f} | "
+            f"{sat['peak_kv_ratio']:.4f} |"
+        )
+        lines.append("")
+        if sat["peak_kv_ratio"] < 0.05 and sat["peak_queue_ratio"] >= 0.05:
+            lines.append(
+                "The KV-cache limb stayed near zero this run; every verdict above was decided "
+                "on queue depth alone. See [UNI-224](/UNI/issues/UNI-224) for whether this "
+                "backend's `--max-num-seqs`/`--max-model-len` caps make the KV limb reachable "
+                "at all."
+            )
+    lines.append("")
     lines.append("## Per-group result")
     lines.append("")
     lines.append(
@@ -2703,6 +2844,18 @@ def main():
              "asserted. Omit to compute rank correlation only and leave the separation check "
              "'not_evaluated' rather than defaulting to an unjustified number.",
     )
+    p.add_argument(
+        "--queue-depth-threshold", type=float, default=32.0,
+        help="UNI-224: live EPP ConfigMap's maas-saturation queueDepthThreshold -- no metric "
+             "exposes this, so the caller must read it from maas-epp-config and pass it "
+             "through, same as --input-token-weight.",
+    )
+    p.add_argument(
+        "--kv-cache-util-threshold", type=float, default=0.8,
+        help="UNI-224: live EPP ConfigMap's maas-saturation kvCacheUtilThreshold. Defaults to "
+             "0.8 to match llm-d-router@v0.11.0's own hardcoded default for an unset key -- "
+             "this POC has never set it explicitly.",
+    )
     args = p.parse_args()
 
     report = build_report(
@@ -2734,6 +2887,8 @@ def main():
         alert_rules_path=args.alert_rules,
         alerts_step_seconds=args.alerts_step_seconds,
         priority_noise_floor_seconds=args.priority_noise_floor_seconds,
+        queue_depth_threshold=args.queue_depth_threshold,
+        kv_cache_util_threshold=args.kv_cache_util_threshold,
     )
 
     with open(args.out_json, "w") as f:

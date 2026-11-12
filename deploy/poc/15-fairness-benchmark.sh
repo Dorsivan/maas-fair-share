@@ -370,7 +370,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations kv-cache-fill shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -1247,6 +1247,54 @@ case "$SCENARIO" in
     TENANTS="app1 app2 end-users"
     PER_TENANT_OVERRIDES=(WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=48 PROMPT_WORDS_MIN_END_USERS=30 PROMPT_WORDS_MAX_END_USERS=30 MAX_TOKENS_MODE_END_USERS=longgen)
     ;;
+  kv-cache-fill)
+    # UNI-224: a capacity probe, not a fairness scenario -- single tenant,
+    # IS_CONTROL, never scored against the weighted-split threshold. Exists
+    # to answer one question: can this backend's resident KV cache ever
+    # approach the saturation detector's kvCacheUtilThreshold (default 0.8,
+    # never overridden -- deploy/poc/00-config.yaml), or does
+    # `--max-num-seqs 8` (09-vllm-gpu.yaml) cap it out of reach regardless of
+    # request shape?
+    #
+    # WORKERS_APP1=8 exactly matches --max-num-seqs 8: the whole pool's
+    # concurrent-generation budget goes to one tenant's maximal-length
+    # requests, with no HTTP-side queueing to dilute it -- a higher worker
+    # count would only grow the EPP-side waiting queue, not the engine's own
+    # resident KV, since vLLM never runs more than 8 sequences at once
+    # regardless of how many are queued ahead of it.
+    #
+    # Prompt kept SHORT (the same 30-word floor near-timeout-long-generations
+    # uses for end-users) and LONG_GEN_MAX_TOKENS pushed to 8000: output
+    # tokens, not prompt tokens, are what accumulate in KV over the length of
+    # a generation (see docs/design.md Part 3 item 9), so maximizing
+    # completion length per sequence is what actually stresses the resource
+    # this scenario exists to probe. "longgen" mode's own `min_tokens` +
+    # `ignore_eos: true` (04-loadgen.yaml, UNI-146) forces every request to
+    # generate the full 8000 tokens rather than stopping early at the
+    # model's own EOS, which is required here -- a short natural completion
+    # would never build up resident KV regardless of max_tokens.
+    # 30 (prompt, real tokenization is well under the plugin's own
+    # conservative bytes/4 estimate) + 8000 (completion) stays under this
+    # backend's real --max-model-len 8192 with ~150 tokens of margin --
+    # exceeding max-model-len gets vLLM's own 400 Bad Request, zero
+    # completions, same hazard max-tokens-skew's own comment already
+    # documents at a higher value.
+    #
+    # Global (unsuffixed) PROMPT_WORDS_MIN/MAX rather than a per-tenant
+    # _APP1 override: with only app1 offered, the two are equivalent, and
+    # only the global knobs ship a 04-loadgen.yaml placeholder for prompt
+    # length -- a per-tenant PROMPT_WORDS_MIN_APP1/MAX_APP1 override hits
+    # set_override's "override target not found" (the UNI-179 generic
+    # per-group fallback it would otherwise reach doesn't apply here: app1 is
+    # a built-in token whose WORKERS_/CACHE_SHAPE_/MAX_TOKENS_MODE_ vars are
+    # already routed through PER_TENANT_OVERRIDES, so PREEXISTING_GROUP_VARS
+    # doesn't carry a PROMPT_WORDS_MIN_APP1 entry for the fallback loop to
+    # skip into -- see six-group-board-case's own comment on this exact
+    # trap for app3-6).
+    TENANTS="app1"
+    PER_TENANT_OVERRIDES=(WORKERS_APP1=8 PROMPT_WORDS_MIN=30 PROMPT_WORDS_MAX=30 MAX_TOKENS_MODE_APP1=longgen LONG_GEN_MAX_TOKENS=8000)
+    IS_CONTROL="true"
+    ;;
   misclassified-prefix)
     # UNI-153: D2, scored run of the edge-case plan's "misclassified
     # prefix" case. UNI-129 built the `custom` pseudo-tenant mechanism and
@@ -1517,7 +1565,7 @@ case "$SCENARIO" in
     WORKERS="${WORKERS:-50}"
     ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations kv-cache-fill misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating)" >&2
     exit 1
     ;;
 esac
@@ -2309,6 +2357,18 @@ OUTPUT_TOKEN_WEIGHT="${OUTPUT_TOKEN_WEIGHT:-1.0}"
 CACHED_INPUT_TOKEN_WEIGHT="${CACHED_INPUT_TOKEN_WEIGHT:-1.0}"
 echo "[benchmark] ledger cost model (live from maas-epp-config): input=$INPUT_TOKEN_WEIGHT output=$OUTPUT_TOKEN_WEIGHT cached=$CACHED_INPUT_TOKEN_WEIGHT"
 
+# UNI-224: same live-read-not-hardcoded reasoning as the ledger weights above,
+# for the saturation detector's own two thresholds (maas-epp-config's
+# `maas-saturation` plugin instance). kvCacheUtilThreshold has never been set
+# in this repo's config -- see docs/design.md's UNI-224 section -- so it is
+# absent from the live ConfigMap entirely and falls back to 0.8, matching
+# llm-d-router@v0.11.0's own hardcoded default for an unset key exactly.
+QUEUE_DEPTH_THRESHOLD="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*queueDepthThreshold:\s*\K[0-9.]+' | head -1)"
+KV_CACHE_UTIL_THRESHOLD="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*kvCacheUtilThreshold:\s*\K[0-9.]+' | head -1)"
+QUEUE_DEPTH_THRESHOLD="${QUEUE_DEPTH_THRESHOLD:-32.0}"
+KV_CACHE_UTIL_THRESHOLD="${KV_CACHE_UTIL_THRESHOLD:-0.8}"
+echo "[benchmark] saturation detector (live from maas-epp-config): queueDepthThreshold=$QUEUE_DEPTH_THRESHOLD kvCacheUtilThreshold=$KV_CACHE_UTIL_THRESHOLD"
+
 # --- Build the report; its exit code becomes this script's exit code -------
 set +e
 REPORT_ARGS=(
@@ -2321,6 +2381,7 @@ REPORT_ARGS=(
   --client-record-jsonl "$CLIENT_RECORD_JSONL"
   --input-token-weight "$INPUT_TOKEN_WEIGHT" --output-token-weight "$OUTPUT_TOKEN_WEIGHT"
   --cached-input-token-weight "$CACHED_INPUT_TOKEN_WEIGHT" --ledger-tolerance-pct "$LEDGER_TOLERANCE_PCT"
+  --queue-depth-threshold "$QUEUE_DEPTH_THRESHOLD" --kv-cache-util-threshold "$KV_CACHE_UTIL_THRESHOLD"
   --out-json "$REPORT_JSON" --out-md "$REPORT_MD"
 )
 if [ "$IS_CONTROL" = "true" ]; then

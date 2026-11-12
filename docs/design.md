@@ -301,8 +301,8 @@ measured so far plus one controlled within-scenario comparison — not yet an in
 randomized duration sweep — but it means the right reading of a short-window FAIL is "the
 mechanism hasn't had time to converge yet," not "the mechanism doesn't hold." See
 `docs/poc-results.md`'s UNI-225 section for the full scorecard, the duration evidence, and
-what still isn't covered (the equal-weight scenarios and the saturation-limb instrumentation
-from UNI-224).
+what still isn't covered (the equal-weight scenarios, and the saturation-limb instrumentation
+and KV-cache-reachability finding — now done, Part 3 item 14 below).
 
 ## How you'll know it works in production
 
@@ -1545,6 +1545,11 @@ Things that are your call, not the implementation's:
 
    Long-context and multi-turn traffic lands in the first bucket most of the time.
 
+   **This POC's own backend never reaches either bucket.** `--max-num-seqs 8` caps
+   resident KV at a small, fixed fraction of the pool's real capacity regardless of
+   request shape — confirmed, with the exact numbers and what it would take to change,
+   in item 14 below.
+
    **Where the token proxy diverges.** A tenant's real VRAM consumption is token-
    *seconds* of residency. For one request:
 
@@ -1606,6 +1611,108 @@ Things that are your call, not the implementation's:
 13. **Metric label cardinality.** The 1000-ID cap is far above your tenant count, but
     values are admitted first-come and never evicted. Ensure anonymous traffic collapses
     to one default group and no per-session header can mint unique IDs.
+
+14. **The saturation detector's KV-cache limb has never engaged on this backend, and
+    `--max-num-seqs 8` is why — not a scenario-design gap ([UNI-224](/UNI/issues/UNI-224)).**
+
+    `flowControl.saturationDetector`'s `utilization-detector` (`llm-d-router@v0.11.0`'s
+    `saturationdetector/utilization/detector.go:160`) is a **roofline over two signals**,
+    not queue depth alone:
+
+    ```go
+    qRatio  := WaitingQueueSize / QueueDepthThreshold        // we set 32
+    kvRatio := KVCacheUsagePercent / KVCacheUtilThreshold    // never set; framework default 0.8
+    totalScore := max(qRatio, kvRatio)                       // whichever resource is closer to exhausted
+    ```
+
+    Every PASS/FAIL in this POC, and the entire `queueDepthThreshold: 32` calibration
+    (item 9's own diagnostic criteria, and [UNI-215](/UNI/issues/UNI-215)/
+    [UNI-220](/UNI/issues/UNI-220) above), was decided on the queue limb alone. Measured
+    live from Prometheus across the full ~7-hour window covering every UNI-215/UNI-218 run
+    (2026-11-10, 411 samples at 60s): `vllm:kv_cache_usage_perc` peaked at **0.0017**
+    (ratio to its 0.8 threshold: 0.002) while `vllm:num_requests_waiting` peaked at 178
+    (ratio to its 32 threshold: 5.6) — queue wins the `max()` by roughly **1000×**, in
+    every run ever scored.
+
+    **Instrumented, not just measured once.** Both ratios are now reconstructed and
+    attributed per run in `deploy/poc/15-fairness-report.py`'s `compute_saturation_limb`
+    (its own "Saturation limb" report section), from the EPP's own pool-level gauges —
+    `llm_d_epp_average_queue_size` and `llm_d_epp_average_kv_cache_utilization`. Both were
+    already covered by `snapshot_metrics()`'s `average_` prefix match and already landing
+    in every run's `metrics-before.txt`/`metrics-after.txt`/`metrics-timeseries.txt` — the
+    gap was that nothing ever divided them by their thresholds or said which one bound.
+    `15-fairness-benchmark.sh` now reads both thresholds live from `maas-epp-config` (same
+    pattern as the ledger's token weights) and passes them through
+    `--queue-depth-threshold`/`--kv-cache-util-threshold`.
+
+    **Is it reachable at all on this backend? No — confirmed, not assumed.** vLLM's own
+    engine-startup log states the real number this POC runs against:
+
+    ```
+    GPU KV cache size: 1,074,224 tokens
+    Maximum concurrency for 8,192 tokens per request: 131.13x
+    ```
+
+    With `--max-num-seqs 8` and `--max-model-len 8192` (`deploy/poc/09-vllm-gpu.yaml`), the
+    hardest possible resident-KV ceiling is `8 × 8192 = 65,536` tokens — **6.1% of the pool's
+    real capacity**, regardless of request shape, prompt length, or output length.
+    `kvCacheUtilThreshold`'s default is 0.8: this config cannot reach even a tenth of the
+    way there.
+
+    Confirmed live, not just computed: the `kv-cache-fill` scenario
+    (`deploy/poc/15-fairness-benchmark.sh`) is a dedicated capacity probe, not a fairness
+    scenario — single tenant, 8 workers (exactly `--max-num-seqs`, so no HTTP-side queueing
+    dilutes it), a 30-word prompt, and `MAX_TOKENS_MODE=longgen` forcing every request to
+    generate the full 8,000 tokens via `min_tokens`/`ignore_eos` rather than stopping at the
+    model's own EOS — the combination deliberately engineered to push KV usage as high as
+    this config structurally allows. Result (`results/20261112T084754Z-uni-224-kv-cache-fill/`,
+    24 requests, 24/24 `200`, 192,000 completion tokens, p50 90.1s/p95 94.9s):
+
+    | signal | peak |
+    |---|---|
+    | per-replica `vllm:gpu_cache_usage_perc` | 3.7% / 2.7% |
+    | pool `llm_d_epp_average_kv_cache_utilization` (EPP's own gauge) | 3.0% |
+    | `kvRatio` (peak KV ÷ 0.8 threshold) | **0.0375** |
+    | `qRatio` (queue stayed at 0 — no HTTP-side queueing at `workers == max-num-seqs`) | 0.0 |
+
+    3.0-3.7% measured against a 6.1% structural ceiling — the shortfall from theoretical
+    maximum is the two replicas' uneven split (5 vs 3 of the 8 workers) and sampling gaps
+    in a 10s-interval scrape, not evidence the ceiling is wrong. Either way, **0.0375 is
+    roughly 20× below the 1.0 gating value**, and every real contention scenario's queue
+    ratio measured so far starts above 1.0 (UNI-215/220's app1-flood: 5.6). On this
+    backend, at this config, **the queue limb will always bind first** — this is not a gap
+    in scenario design (`max-tokens-skew`/C2 and `near-timeout-long-generations`/C4 were
+    never going to show otherwise; UNI-150's own near-timeout notes already record that
+    higher concurrency than `--max-num-seqs` allows produces client-side queueing and
+    errors, not more resident KV).
+
+    **What would make it reachable.** Reaching `kvRatio = 0.8` needs ~859,000 resident
+    tokens. Options, independent of each other:
+    - Raise `--max-num-seqs` toward the engine's own reported safe concurrency (131 at
+      8,192 tokens/request) — concretely, `--max-num-seqs ~105` at the current
+      `--max-model-len 8192` gets there if all slots stay full of max-length requests.
+      This is the only one of the three that is also a *production-realistic* tuning
+      knob — it directly trades off against the queue limb's own calibration (item 9's
+      "Diagnose from vLLM's own metrics, not GPU util" guidance applies directly here:
+      watch both ratios together when changing this).
+    - Shrink the KV pool itself (`--gpu-memory-utilization` below the live 0.92) so the
+      same absolute usage is a larger fraction — cheap to try, but makes queue bind even
+      sooner, not a realistic path to isolating the KV limb.
+    - Raise `--max-model-len` — needs ~107,000 tokens/request at the current
+      `max-num-seqs 8`, technically inside Qwen2.5-7B-Instruct's YaRN-extended range but
+      impractical for a benchmark prompt corpus.
+    None of these were applied — changing the production-realistic one
+    (`--max-num-seqs`) is a scheduling-profile/capacity decision for the board, not a
+    unilateral benchmark-harness edit, per this ticket's own instructions.
+
+    **The cost-model comparison stays blocked, as the ticket that raised it already
+    expected.** `vramtime` vs. `tokens` (item 9 above) can only diverge from the token
+    proxy where KV residency diverges across tenants — at a confirmed sub-4% pool-wide
+    peak, no tenant's memory footprint is distinguishable from any other's, so running
+    the comparison now would show "no difference" for the wrong reason (nothing bound
+    memory) rather than the right one (the models agree). Unblocking it needs the
+    `--max-num-seqs` change above applied and re-validated as a real multi-tenant
+    scenario, not just this single-tenant capacity probe.
 
 ## Worth doing upstream (small, unblocks deleting local copies)
 

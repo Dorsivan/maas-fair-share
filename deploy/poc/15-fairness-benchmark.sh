@@ -2349,9 +2349,9 @@ revert_shadow_mode
 # to 1.0 (plain token sum) if a key is absent, same as the report script's
 # own CLI defaults.
 EPP_CONFIG_YAML="$($OC get configmap maas-epp-config -n "$NAMESPACE" -o jsonpath='{.data.epp}')"
-INPUT_TOKEN_WEIGHT="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*inputTokenWeight:\s*\K[0-9.]+' | head -1)"
-OUTPUT_TOKEN_WEIGHT="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*outputTokenWeight:\s*\K[0-9.]+' | head -1)"
-CACHED_INPUT_TOKEN_WEIGHT="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*cachedInputTokenWeight:\s*\K[0-9.]+' | head -1)"
+INPUT_TOKEN_WEIGHT="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*inputTokenWeight:\s*\K[0-9.]+' | head -1 || true)"
+OUTPUT_TOKEN_WEIGHT="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*outputTokenWeight:\s*\K[0-9.]+' | head -1 || true)"
+CACHED_INPUT_TOKEN_WEIGHT="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*cachedInputTokenWeight:\s*\K[0-9.]+' | head -1 || true)"
 INPUT_TOKEN_WEIGHT="${INPUT_TOKEN_WEIGHT:-1.0}"
 OUTPUT_TOKEN_WEIGHT="${OUTPUT_TOKEN_WEIGHT:-1.0}"
 CACHED_INPUT_TOKEN_WEIGHT="${CACHED_INPUT_TOKEN_WEIGHT:-1.0}"
@@ -2363,8 +2363,8 @@ echo "[benchmark] ledger cost model (live from maas-epp-config): input=$INPUT_TO
 # in this repo's config -- see docs/design.md's UNI-224 section -- so it is
 # absent from the live ConfigMap entirely and falls back to 0.8, matching
 # llm-d-router@v0.11.0's own hardcoded default for an unset key exactly.
-QUEUE_DEPTH_THRESHOLD="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*queueDepthThreshold:\s*\K[0-9.]+' | head -1)"
-KV_CACHE_UTIL_THRESHOLD="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*kvCacheUtilThreshold:\s*\K[0-9.]+' | head -1)"
+QUEUE_DEPTH_THRESHOLD="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*queueDepthThreshold:\s*\K[0-9.]+' | head -1 || true)"
+KV_CACHE_UTIL_THRESHOLD="$(printf '%s\n' "$EPP_CONFIG_YAML" | grep -oP '^\s*kvCacheUtilThreshold:\s*\K[0-9.]+' | head -1 || true)"
 QUEUE_DEPTH_THRESHOLD="${QUEUE_DEPTH_THRESHOLD:-32.0}"
 KV_CACHE_UTIL_THRESHOLD="${KV_CACHE_UTIL_THRESHOLD:-0.8}"
 echo "[benchmark] saturation detector (live from maas-epp-config): queueDepthThreshold=$QUEUE_DEPTH_THRESHOLD kvCacheUtilThreshold=$KV_CACHE_UTIL_THRESHOLD"

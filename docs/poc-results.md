@@ -9419,10 +9419,16 @@ weight-predicted even split despite one group offering 4x (`uni165-equal-discrim
 or 4x again on the doubled baseline (`uni165-equal-2x-discriminating`, 256 vs 64) the others' workers.
 But under an *equal* weight set, equal load and weight-proportional load are the same configuration
 -- so the only reason either row has a nonzero gap at all is that the load here is *not* equal, by
-this section's own 4x boost. Neither hypothesis ("split follows weight" vs "split follows worker
-count") predicts a gap under true equal load, so a gap observed only after load is made unequal
-cannot distinguish between them. These two rows do not add to the discriminating-PASS column counted
-in the scorecard above -- it stays at the 2 PASS stated there, unchanged by this ticket.
+this section's own 4x boost. That disqualifies these two rows for two separate reasons, not one.
+First, scope: the board mandated an equal-load baseline, and this batch deliberately breaks it, so a
+result obtained outside the mandated method is not scored regardless of how informative it is -- the
+same reason every row in this section is excluded from the scorecard. Second, a genuine confound: when
+the boosted tenant over-offers 4x, its own backlog throttles it (the self-queueing effect described
+below), so a split landing near the weight-predicted even split cannot be cleanly separated into
+"weights were enforced" from "the over-offering tenant self-queued into roughly that share" -- the gap
+observed here does not, by itself, establish which mechanism produced it. These two rows do not add to
+the discriminating-PASS column counted in the scorecard above -- it stays at the 2 PASS stated there,
+unchanged by this ticket.
 
 **Ledger cross-check on both PASSes and on `uni165-graded-discriminating`: the EPP's own contended
 counter under-reports the boosted group's cost relative to what the client sent, and the bias runs in
@@ -9561,6 +9567,19 @@ ordering between tenants is expected, so the TTFT spread measured there under tr
 null every other row's PRIORITY-OK claim should be judged against. A same-config repeat run measures
 run-to-run variance of the aggregate instead -- a different quantity, since tenants sharing one run's
 batch and scrape window have correlated errors a repeat run can't see.
+
+**Left open, not closed out: whether the weight table did anything at all here.** With enforcement
+live, `uni165-equal-discriminating`'s observed split (23.6%) landed 6.9pt from the weight prediction
+(16.7%) but 20.8pt from the worker prediction (44.4%) -- closer to the weight table than a pure
+worker-count model would predict. The self-queueing confound above means this batch cannot say whether
+that is the weight table asserting itself through the confound or something else; it is a real,
+unresolved result, not merely restated by the "latency tracks workers" finding (p50/p95 is a different
+measurement than observed share). [UNI-226](/UNI/issues/UNI-226)'s compliant equal-load re-run of this
+same family is where that question gets answered, not here. (For reference only, no investigation
+implied: [UNI-247](/UNI/issues/UNI-247) ran the same 4x over-offer ratio on its boosted tenant with
+enforcement live and got a stable FAIL at 14.1pt mean, against a three-tenant 30/10/60 table -- a
+different tenant count and weight table than this section's six-tenant equal split, so not a
+contradiction, just a pointer for whoever revisits this configuration.)
 
 **Result directories force-added.** All five of this ticket's `results/` directories are now committed
 past `.gitignore` (`git add -f`, same precedent as every settled-suite run back through UNI-214) -- the

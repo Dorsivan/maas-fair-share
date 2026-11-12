@@ -72,6 +72,11 @@ def send_request(gw, modelpath, token, group, arrival_t, results, lock, client_t
     start = time.time()
     code = 0
     completion_tokens = -1
+    # UNI-229: the exception class behind a code-0 row ("-" when there was an
+    # HTTP response). Collapsing every failure to code 0 hid that the ~50s
+    # failures were http.client.RemoteDisconnected -- the public Route's IBM
+    # Cloud load balancer closing a connection idle for 50s.
+    err = "-"
     try:
         with urllib.request.urlopen(req, timeout=client_timeout) as resp:
             code = resp.status
@@ -83,11 +88,15 @@ def send_request(gw, modelpath, token, group, arrival_t, results, lock, client_t
             e.read()
         except Exception:
             pass
-    except Exception:
+    except Exception as e:
         code = 0
+        err = type(e).__name__
+        # urlopen wraps socket errors in URLError; the reason is the useful part.
+        if isinstance(e, urllib.error.URLError) and isinstance(e.reason, BaseException):
+            err += ":" + type(e.reason).__name__
     latency = time.time() - start
     with lock:
-        results.append((arrival_t, start, latency, code, completion_tokens))
+        results.append((arrival_t, start, latency, code, completion_tokens, err))
 
 
 def poisson_worker(rate, token_cycle, gw, modelpath, end_time, results, lock, executor, futures, futures_lock):
@@ -113,9 +122,12 @@ def summarize(group, rows):
         return f"{group:12s} sent=0"
     lats = sorted(r[2] for r in rows)
     codes = {}
+    errs = {}
     tok_total = 0
-    for _, _, _, code, tok in rows:
+    for _, _, _, code, tok, err in rows:
         codes[code] = codes.get(code, 0) + 1
+        if err != "-":
+            errs[err] = errs.get(err, 0) + 1
         if tok and tok > 0:
             tok_total += tok
 
@@ -124,10 +136,11 @@ def summarize(group, rows):
         return lats[idx]
 
     code_str = " ".join(f"{c}={n}" for c, n in sorted(codes.items(), key=lambda kv: -kv[1]))
+    err_str = " ".join(f"{e}={n}" for e, n in sorted(errs.items(), key=lambda kv: -kv[1]))
     return (
         f"{group:12s} sent={len(rows):<6d} completion_tokens={tok_total:<8d} "
         f"p50={pct(0.50):.2f}s p95={pct(0.95):.2f}s p99={pct(0.99):.2f}s "
-        f"codes=[{code_str}]"
+        f"codes=[{code_str}]" + (f" errors=[{err_str}]" if err_str else "")
     )
 
 
@@ -236,10 +249,12 @@ def main():
 
     print("load: done.", flush=True)
     for group, rows in results.items():
-        # persist raw per-request rows for offline analysis
+        # persist raw per-request rows for offline analysis. Column 6 (UNI-229)
+        # is the exception class for code-0 rows, "-" otherwise; columns 1-5
+        # are unchanged so existing positional readers keep working.
         with open(f"{args.out}/{group}.log", "w") as f:
-            for arrival_t, start, latency, code, tok in rows:
-                f.write(f"{arrival_t:.6f} {start:.6f} {latency:.4f} {code} {tok}\n")
+            for arrival_t, start, latency, code, tok, err in rows:
+                f.write(f"{arrival_t:.6f} {start:.6f} {latency:.4f} {code} {tok} {err}\n")
         print(summarize(group, rows))
 
 

@@ -9303,6 +9303,15 @@ client-observed numbers, and the root cause is still unknown. Filed as a non-blo
 [UNI-229](/UNI/issues/UNI-229), rather than investigated further here (out of this ticket's scope,
 and the GPU-pool slot was already spent on the re-run itself).
 
+**Resolved (UNI-229, 2026-11-12):** the ~50s cut is the public Route's IBM Cloud VPC load
+balancer. Its 50s **idle** connection timeout drops any non-streaming request the EPP holds in
+queue for more than 50s; the client sees `http.client.RemoteDisconnected` at 50.03s. This is
+reproduced 3/3 on lane 2, and the same request succeeds 3/3 on the in-cluster gateway Service. It
+is also the "edge timeout ... ~50s" noted in passing in the live repro above. app1/app2 hit it
+because they were the tenants queued longest. `13-loadgen-poisson.sh` now defaults to the
+in-cluster path. The same truncation is present in UNI-137 B5, UNI-162 F2, UNI-166 G1 and
+UNI-221 B5. See `docs/runbook.md` "The public Route cuts idle requests at 50s".
+
 **Cluster state.** The run's own `revert` trap flipped `enforce` back to `false` at the run's exit
 (`16:26:48Z`) but its 180s `wait_for_enforcing` confirmation timed out (`16:29:51Z`, both EPPs still
 read `enforcing=1`) -- consistent with this project's documented no-live-reload-on-configmap-edit

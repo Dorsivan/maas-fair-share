@@ -3,7 +3,7 @@
 #
 # Wraps 13-loadgen-poisson.py: fetches the MaaS subscription keys and the EPP
 # metrics-reader token from the cluster, runs the generator against the
-# public Route (same path UNI-27 validated), and snapshots
+# in-cluster gateway Service (UNI-229; was the public Route), and snapshots
 # llm_d_epp_maas_fairness_* before and after so the run's OWN contribution
 # (dispatch_total, contended_service_tokens_total, newcomer_clamps_total
 # deltas) can be read off, not just the cumulative total.
@@ -33,7 +33,15 @@
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
-GW="${GW:-https://maas-gateway-${NAMESPACE}.apps.ocp.paladinaura.com}"
+# UNI-229: default is the in-cluster gateway Service (the same target
+# 04-loadgen.yaml's closed-loop Job uses), NOT the public Route. *.apps
+# resolves to an IBM Cloud VPC load balancer whose idle-connection timeout is
+# 50s: any non-streaming request the EPP holds in queue for >50s was cut with
+# http.client.RemoteDisconnected and logged as code 0 at ~50.0s -- measured
+# on UNI-137/162/166/221/227 runs (see docs/runbook.md "The public Route cuts
+# idle requests at 50s"). Set GW=https://maas-gateway-${NAMESPACE}.apps... to
+# deliberately test through the public Route.
+GW="${GW:-http://maas-poc-gateway-data-science-gateway-class.${NAMESPACE}.svc.cluster.local}"
 MODELPATH="${MODELPATH:-/${NAMESPACE}/maas-vllm-gpu}"
 DURATION="${DURATION:-240}"
 RATE_APP1="${RATE_APP1:-0}"

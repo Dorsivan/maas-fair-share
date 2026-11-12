@@ -2481,6 +2481,74 @@ see "UNI-157: E3, queue TTL shedding" in `docs/poc-results.md` for a worked
 run and a load-bearing caveat about this rig's Gateway connection capacity
 under the concurrency a real TTL test requires.
 
+### The public Route cuts idle requests at 50s (UNI-229)
+
+**`13-loadgen-poisson.sh` now defaults `GW` to the in-cluster gateway Service**
+(`http://maas-poc-gateway-data-science-gateway-class.<ns>.svc.cluster.local`, the
+same target `04-loadgen.yaml`'s closed-loop Job has always used). Before UNI-229
+it defaulted to the public Route, `https://maas-gateway-<ns>.apps.ocp.paladinaura.com`.
+`*.apps` resolves to an **IBM Cloud VPC load balancer**
+(`648914bb-us-east.lb.appdomain.cloud`) that closes any connection idle for 50s.
+The agent host is a pod inside the cluster, so every open-loop request went
+out to that LB and came back in. A non-streaming request the EPP holds in
+queue sends no bytes, so once its queue wait passed 50s the LB dropped it. The
+client saw `http.client.RemoteDisconnected` at ~50.03s, and the generator's
+catch-all `except Exception` logged it as code `0`.
+
+Measured on `poc-maas-lane2`, 2026-11-12:
+
+| probe | public Route (LB) | in-cluster |
+|---|---|---|
+| keep-alive connection reused after 45s / 49s idle | OK / OK | OK |
+| ... after 51s / 55s / 120s idle | EOF / EOF / EOF | OK at 55s and 120s |
+| one non-streaming 6000-token generation (~66s), 3 tries | `RemoteDisconnected` at 50.03s, 3/3 | `200`, 3/3 |
+| same generation, `stream: true` | `200` at 65.9s (bytes keep it alive) | — |
+
+So it is an **idle** timeout, not a total-request limit. Streaming requests are
+cut only if no bytes arrive for 50s, i.e. a queue wait (TTFT) over 50s. That
+still applies to streaming tools such as guidellm when they target the public URL.
+
+**Runs that carry the signature** (code `0` with latency 50.0–50.5s, from a
+scan of every `results/*/` per-request log): UNI-137 B5 above-saturation
+(3,820 of 6,010 requests), UNI-162 F2 (3,490 / 6,015), UNI-166 G1 shedding
+(22,848 / 42,797), UNI-227 E3 thr32 (4,669 / 8,601), UNI-221 B5 120% TTFT
+(589 / 6,018). In those runs the client-side latency, status counts and request
+counts for whichever tenants queued past 50s are truncated at 50s: they are
+not real client-observed numbers. The scored verdicts read the EPP's own
+`contended_service_tokens_total`, which counts dispatched work. A request cut
+while still queued was never dispatched, so it adds nothing to that counter.
+Whether these cancellations changed *which* tenant got dispatched (and so the
+verdicts themselves) has **not** been re-tested.
+
+`GW=https://maas-gateway-${NAMESPACE}.apps.ocp.paladinaura.com` still selects
+the public Route when that path is the thing under test. `12-loadgen-route.sh`
+and `16-loadgen-identity-variants.sh` still default to the public Route, by
+design (the Route is what they exist to exercise), so they inherit the 50s cap.
+
+`13-loadgen-poisson.py` per-request logs gained a **6th column**: the exception
+class for code-`0` rows (`RemoteDisconnected`, `TimeoutError`,
+`URLError:ConnectionRefusedError`, ...), and `-` otherwise. Columns 1–5 are
+unchanged. The end-of-run summary adds `errors=[...]` when there are any.
+
+**Load check on lane 2 (`enforce: false`, open-loop, 120s,
+`results/20261112T131800Z-uni-229-lane2-*` and `...134500Z-...-publicroute-r14`):**
+- in-cluster at 12/s per tenant: 4,264 `200` + 2 `503`, zero code `0`, and 1,413 requests over
+  50s that all succeeded.
+- public Route at 12/s and 14/s: zero code `0` as well, but no tenant's queue wait crossed 50s
+  (p99 47.9s / 46.7s), so these legs **did not exercise the cap**. They don't contradict it either.
+  With `enforce: false` every tenant waits about the mean. In UNI-227 the deprioritized tenants
+  waited well past it.
+- Two public-Route requests took 87–88s and still got `200`. This is unexplained. Possibly the
+  time went to connection setup before the request was sent, but it is unverified.
+
+**Caveat this exposed (separate from the 50s cap):** with the default `--max-workers 1000`, the
+"open-loop" generator caps server-side concurrency at 1,000, so steady-state client latency ≈
+1000 / throughput (lane 2: 1000/19.4 ≈ 51s in-cluster, 1000/22 ≈ 46s public; matches the
+observed p50–p99). Each row's latency is measured from when a pool thread *starts* the request,
+not from its Poisson arrival. Time spent waiting for a free thread (columns 2 − 1) averaged
+7–18s and reached 61s in these runs, and it is invisible in p50/p95. Tracked as a follow-up
+to UNI-229.
+
 ---
 
 ## Turn on the V(4) per-request tier

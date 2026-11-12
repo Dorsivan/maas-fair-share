@@ -96,9 +96,19 @@ fi
 # 15-fairness-report-test.py's 31 existing cases: all still pass, since every prior committed
 # run's snapshot simply has no flow_control_* lines to match (nothing was ever queued/evicted on
 # those runs) and the report's parser already treats an absent line as "not recorded".
+#
+# UNI-221: widened again to also pull the per-request TTFT/ITL/token histograms
+# (llm_d_epp_request_ttft_seconds_*, llm_d_epp_request_streaming_itl_seconds_*,
+# llm_d_epp_request_(input|output|cached)_tokens_*). 15-fairness-benchmark.sh's
+# closed-loop scrape (used by UNI-226) already includes this prefix; the
+# open-loop generator never did, so every open-loop report's "Per-tenant TTFT /
+# ITL and the priority verdict (UNI-226)" section reads "not recorded" and the
+# SPLIT-FAIL/PRIORITY-OK secondary verdict can never be computed for an
+# open-loop run -- see docs/poc-results.md "UNI-221" for the run this gap was
+# found on. Untested past a dry grep until the next open-loop run exercises it.
 snapshot_metrics() {
   curl -sS -m 10 -H "Authorization: Bearer $METRICS_TOKEN" "http://${EPP_METRICS_SVC_IP}:9090/metrics" \
-    | grep -E '^(llm_d_epp_maas_fairness_|llm_d_epp_flow_control_)' | grep -v '^#'
+    | grep -E '^(llm_d_epp_maas_fairness_|llm_d_epp_flow_control_|llm_d_epp_request_(ttft|streaming_itl|input_tokens|output_tokens|cached_tokens)_)' | grep -v '^#'
 }
 
 EPP_LOG_FILE="$OUT/epp-container.log"

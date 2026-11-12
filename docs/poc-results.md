@@ -9881,3 +9881,132 @@ tracked in [UNI-247](/UNI/issues/UNI-247).
 confirmed live after the final (`app1-flood-3x`) snapshot, the same baseline UNI-220 left the
 cluster at. No LLMInferenceService or scheduling-profile change this ticket; the two new scenario
 cases in `15-fairness-benchmark.sh` are the only code change.
+
+## UNI-221: `b5-openloop-120pct`'s inversion re-confirmed live -- the shed/TTL hypothesis is
+ruled out, and the real mechanism is the same duration/convergence property already documented
+for closed-loop over-offer
+
+**Starting point.** [UNI-218](/UNI/issues/UNI-218) found `b5-openloop-120pct` FAIL at the settled
+thr32 config: end-users (weight 65) deviates -33.1pt, the two low-weight groups land well above
+their targets (`results/20261110T113317Z-uni-218-b5-openloop-120pct/`, EPP digest `...617509`).
+The ticket's own hypothesis to test: the shed/timeout path selects against whichever group has the
+deepest backlog, which is the high-weight group precisely because it's served the most.
+
+**Re-run live, same parameters** (`RATE_APP1=8.4 RATE_APP2=8.4 RATE_END_USERS=8.4 DURATION=240
+SEED=1`, `enforce` hand-flipped true/false around the run -- the open-loop wrapper has no
+`ENFORCE_LIVE`, same technique as UNI-157/UNI-227), on the current EPP digest `...c8a088` (post
+UNI-220's in-flight clamp-gate fix): `results/20261112T091458Z-uni-221-b5-openloop-120pct-ttft/`.
+**Result: FAIL again**, end-users -30.6pt -- the defect reproduces unchanged by the UNI-220 fix,
+confirming it is a distinct mechanism from the closed-loop over-offer clamp bug:
+
+| group | weight | expected % | observed % | deviation (pts) | contended_seconds | p50 / p95 latency | shed (429/503) |
+|---|---|---|---|---|---|---|---|
+| app1 | 20.0 | 21.1% | 37.3% | +16.2 | 28.8s | 5.8s / 10.6s | 1 (503) |
+| app2 | 10.0 | 10.5% | 24.9% | +14.4 | 29.8s | 33.2s / 50.0s | 1 (503) |
+| end-users | 65.0 | 68.4% | 37.8% | -30.6 | 28.8s | 5.0s / 25.0s | 0 |
+
+**Ask 1's hypothesis is rejected.** Two independent, direct pieces of evidence:
+
+1. **TTL eviction cannot be firing at all.** This run's own EPP startup log (`epp-container.log`)
+   prints `FlowControlConfig:{Controller:{DefaultRequestTTL:5m0s ... EnableEviction:false ...}}` --
+   `EnableEviction` is a hard-coded `false` in this build, independent of the 300s
+   `defaultRequestTTL` value in the YAML. This matches [UNI-227](/UNI/issues/UNI-227)'s finding on
+   the prior digest; now confirmed again on the current one. The "shed/timeout path" the ticket
+   asks about is not armed, so it cannot be selecting against anyone.
+2. **The only shed that happens is tiny and not weight-correlated.** Both runs show 0-2 total
+   429/503s across the whole scenario (1 each for app1/app2, 0 for end-users here; 1 for end-users
+   in the Nov-10 run) -- nowhere near enough magnitude to move a 30-45 point gap, and not
+   consistently landing on one weight tier.
+3. **The EPP's scored metric is not mis-reporting a total that didn't happen.** Cross-checking the
+   Nov-10 run's EPP-side `contended_service_tokens_total` share (36.1/28.6/35.3%) against the
+   loadgen's own client-observed `completion_tokens` (ground truth, every request, not just
+   contended ones: 123488/101626/122151 -> 35.6/29.3/35.2%) -- the two agree to within 1 point. The
+   scored split is a real description of what was delivered, not an artifact of the contended-only
+   accounting window.
+
+**The real mechanism is the duration/convergence property this document already established for
+closed-loop over-offer ([UNI-220](/UNI/issues/UNI-220)), not a new open-loop-specific one.** Three
+lines of evidence, all pointing the same way:
+
+- **The scheduler orders correctly on the one lever it has.** Per-request latency is
+  weight-ordered in both runs: end-users fastest (p50 11.9s / 5.0s), app1 middle, app2 slowest
+  (p50 28.6s / 33.2s) -- a ~3-6x spread in the right direction. The loadgen's own live progress log
+  (`uni221-work/run.log`) shows the same thing mid-run, before any drain: at the 240s arrival-window
+  close, end-users had *completed* the most requests (1999), app1 next (1879), app2 fewest (1591) --
+  correct rank order, modest magnitude.
+- **Nothing is ever denied, only delayed, and the run waits out nearly the whole backlog.** The
+  generator's `--drain-timeout` (100s default, not overridden) blocks after the 240s arrival window
+  until essentially every in-flight request finishes before the EPP is re-scraped for
+  `metrics-after.txt`. In-flight count grew from 59 (t=15s) to a 633 peak (t=195s) -- real, sustained
+  overload, not a transient blip -- but with `EnableEviction:false` and a generous client timeout,
+  almost the entire backlog still drains to completion (app1 1985/1985 sent, end-users 2033/2033;
+  only app2 -- the lowest-weight group, correctly -- loses a meaningful fraction, 589-610 of ~2000,
+  to timeout before the drain window closes, the known UNI-229 ~50s-cutoff anomaly). With equal
+  Poisson arrival rate per group and nearly complete eventual delivery, final **total** throughput
+  share is mathematically pulled toward equal thirds regardless of weight -- weighted LAS only
+  controls queueing order/latency, and a terminal-count metric is blind to order once the queue has
+  had time to empty.
+- **`contended_seconds` for all three groups (28.8-29.8s both groups, 51-55s in the Nov-10 run) sit
+  well under the ~69.0s point this document's duration finding (UNI-225 section) established as the
+  empirical PASS floor across the corpus.** Short contended windows elsewhere in this project track
+  worker/offer-share, not weight-share, for exactly this reason (the LAS tab needs sustained
+  backlog, on the order of multiple `halfLifeSeconds: 60` windows, to compound a latency-ordering
+  advantage into a throughput-share advantage) -- `b5-openloop-120pct` fits that pattern, it isn't a
+  structural exception to it.
+
+**Distinguishing "the split really inverts" from "the accounting mis-reports an inversion that
+isn't there" (the acceptance criterion):** it is neither cleanly. The measured terminal split is
+real and accurately reported (point 3 above) -- not a counting bug. But reading it as "the
+highest-weight tenant is being actively starved" overstates a directional, adversarial mechanism
+that the evidence does not support: the scheduler demonstrably orders by weight on the lever it
+controls (latency, and mid-run completion count), and the only groups any shed-like loss falls on
+are the low-weight ones (correctly). The FAIL is a **measurement-methodology bound**: a benchmark
+that (a) offers equal arrival rate per group, (b) disables TTL eviction, (c) uses a generous client
+timeout, and (d) waits out a full drain before scoring, cannot discriminate "weights decided the
+split" from "no scheduling happened at all" for open-loop traffic below the corpus's ~69s
+contended-duration convergence floor -- because under those four conditions, total delivered work
+converges toward the offered-rate split (here, equal) independent of any internal reordering. This
+is not fixable inside `pkg/fairness/weightedlas` -- there is no code defect to patch; the policy is
+doing what it can with the one knob (order) it has, and the metric being read (terminal throughs-put
+share) isn't sensitive to that knob under this traffic shape.
+
+**What would make the split discriminating for open-loop traffic:** either (a) score during
+sustained overload rather than after a full drain (e.g. at the 240s arrival-window boundary, before
+the drain phase lets low-priority stragglers catch up), which the current harness does not do, or
+(b) score on TTFT/latency ordering directly -- the [UNI-226](/UNI/issues/UNI-226)
+SPLIT-FAIL/PRIORITY-OK secondary verdict already built for exactly this situation (a share FAIL
+alongside correct priority ordering). (b) could not be computed for either run above: the open-loop
+generator's own metrics scrape (`13-loadgen-poisson.sh`'s `snapshot_metrics()`) only ever pulled
+`llm_d_epp_maas_fairness_*` and `llm_d_epp_flow_control_*` metric families -- it never picked up
+`llm_d_epp_request_ttft_seconds`/`llm_d_epp_request_streaming_itl_seconds`, so every open-loop
+report's TTFT section reads "not recorded" even though `15-fairness-report.py` has supported the
+verdict since UNI-226 landed on the closed-loop path. **Fixed in this ticket** (one-line regex
+widen in `snapshot_metrics()`, `deploy/poc/13-loadgen-poisson.sh`) -- verified against the full
+90/90 `15-fairness-report-test.py` suite, but **not yet exercised live**: doing so needs a third
+open-loop GPU run, which this ticket's one-run-at-a-time rule put out of scope once the first
+live re-run had already answered ask 1 and 2. The saturation-limb capture ([UNI-224](/UNI/issues/UNI-224))
+has the same gap for a different reason -- `compute_saturation_limb()` needs `--metrics-timeseries`
+(periodic scrapes through the run), which the open-loop generator has never captured (only one
+before/one after snapshot); qualitatively, given UNI-224's live finding that `--max-num-seqs 8` caps
+KV at ~6% of this backend's real capacity regardless of scenario shape, plus this run's own
+sustained queue growth (in-flight 59->633) at a flat per-request service rate, the queue limb is
+almost certainly what bound here too -- consistent with every other run in this project -- but that
+is inference from adjacent evidence, not a direct measurement, and is flagged as such rather than
+asserted.
+
+**Follow-up filed:** [UNI-260](/UNI/issues/UNI-260) -- wire periodic `--metrics-timeseries`
+capture into the open-loop generator (closes both the saturation-limb gap and lets a future
+open-loop run validate the TTFT scrape-filter fix end-to-end). Backlog, not blocking.
+
+**Acceptance:** `b5-openloop-120pct` stays FAIL; documented root cause above, with evidence
+(EnableEviction:false confirmed live, negligible/non-correlated shed counts, client-side token
+cross-check, weight-ordered latency, sub-floor contended duration) distinguishing a real-but-
+mischaracterized convergence property from an accounting bug or an adversarial shed mechanism.
+70%/100% points were not re-run (no scheduler or scoring-logic change was made -- only an
+unrelated metrics-scrape addition -- so UNI-218's UNCONTENDED verdict for both stands unmodified).
+
+**Cluster restored.** `enforce: false` (hand-reverted, confirmed `llm_d_epp_maas_fairness_enforcing
+0` on both GPU and CPU EPPs after the final snapshot), `queueDepthThreshold: 32`, weights
+`20/10/65/5`, `newcomerClamp: true`, scorer weights `queue-scorer 3.0` / `prefix-cache-scorer 3.0`
+/ `kv-cache-utilization-scorer 2.0` -- unchanged throughout, the same baseline UNI-220 and UNI-224
+left the cluster at. The only code change is the `13-loadgen-poisson.sh` scrape-filter widen.

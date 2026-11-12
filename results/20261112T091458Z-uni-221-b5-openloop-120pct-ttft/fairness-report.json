@@ -1,0 +1,309 @@
+{
+  "schema": "uni54.fairness_benchmark_report.v1",
+  "run": {
+    "scenario": "uni-221-b5-openloop-120pct-ttft",
+    "label": "uni-221-b5-openloop-120pct-ttft",
+    "control": false,
+    "generator": "open-loop",
+    "namespace": "maas-fairness-poc",
+    "enforce": true,
+    "duration_seconds": 240,
+    "backend": "vllm-gpu (real)",
+    "epp_image_digest": "quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f",
+    "epp_pod": "maas-vllm-gpu-kserve-router-scheduler-5fbdd988df-8vpkd",
+    "run_start": "2026-11-12T09:14:59Z",
+    "run_end": "2026-11-12T09:19:38Z"
+  },
+  "groups": [
+    {
+      "group": "app1",
+      "configured_weight": 20.0,
+      "offered": true,
+      "offered_workers": 8.4,
+      "requests_total": 1985,
+      "status_tally": {
+        "200": 1984,
+        "503": 1
+      },
+      "p50_sec": 5.79,
+      "p95_sec": 10.62,
+      "delivered_tokens": 2373404.0,
+      "expected_share_pct": 21.05263157894737,
+      "observed_share_pct": 37.252504502343854,
+      "deviation_pts": 16.199872923396484,
+      "request_share_pct": 32.98438019275507,
+      "request_share_deviation_pts": 11.931748613807699,
+      "worker_share_pct": 33.33333333333333,
+      "worker_vs_weight_gap_pts": 12.280701754385959,
+      "contended_seconds": 28.843138579000005,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 1985.0
+    },
+    {
+      "group": "app2",
+      "configured_weight": 10.0,
+      "offered": true,
+      "offered_workers": 8.4,
+      "requests_total": 2000,
+      "status_tally": {
+        "200": 1410,
+        "0": 589,
+        "503": 1
+      },
+      "p50_sec": 33.18,
+      "p95_sec": 50.01,
+      "delivered_tokens": 1587820.0,
+      "expected_share_pct": 10.526315789473685,
+      "observed_share_pct": 24.92212522558807,
+      "deviation_pts": 14.395809436114384,
+      "request_share_pct": 33.23363243602526,
+      "request_share_deviation_pts": 22.707316646551575,
+      "worker_share_pct": 33.33333333333333,
+      "worker_vs_weight_gap_pts": 22.807017543859644,
+      "contended_seconds": 29.77393545600001,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 2000.0
+    },
+    {
+      "group": "end-users",
+      "configured_weight": 65.0,
+      "offered": true,
+      "offered_workers": 8.4,
+      "requests_total": 2033,
+      "status_tally": {
+        "200": 2033
+      },
+      "p50_sec": 5.03,
+      "p95_sec": 25.01,
+      "delivered_tokens": 2409902.0,
+      "expected_share_pct": 68.42105263157895,
+      "observed_share_pct": 37.82537027206808,
+      "deviation_pts": -30.595682359510867,
+      "request_share_pct": 33.78198737121967,
+      "request_share_deviation_pts": -34.639065260359274,
+      "worker_share_pct": 33.33333333333333,
+      "worker_vs_weight_gap_pts": -35.08771929824562,
+      "contended_seconds": 28.826258306000003,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 2033.0
+    },
+    {
+      "group": "unclassified",
+      "configured_weight": 5.0,
+      "offered": false,
+      "offered_workers": 0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": null,
+      "expected_share_pct": null,
+      "observed_share_pct": null,
+      "deviation_pts": null,
+      "request_share_pct": null,
+      "request_share_deviation_pts": null,
+      "worker_share_pct": null,
+      "worker_vs_weight_gap_pts": null,
+      "contended_seconds": null,
+      "prompt_tokens_cached_ratio": null,
+      "dispatch_total": null
+    }
+  ],
+  "verdict": {
+    "result": "FAIL",
+    "threshold_points": 10.0,
+    "max_abs_deviation_points": 30.595682359510867,
+    "reasons": [
+      "end-users deviated -30.6 points from its contention-adjusted expected share, exceeding the 10-point threshold"
+    ],
+    "epp_restarted_mid_run": false,
+    "epp_restarted_in_windows_but_not_snapshot_pair": false,
+    "scrape_gap_in_windows": false,
+    "solo_group": null,
+    "capped_groups": [],
+    "uncontended_threshold_seconds": 1.0,
+    "max_worker_vs_weight_gap_points": 35.08771929824562,
+    "discriminating": true
+  },
+  "sources": {
+    "delivered_tokens_and_observed_share": "llm_d_epp_maas_fairness_contended_service_tokens_total, scraped directly from the EPP's /metrics immediately before and after the run (same mechanism as deploy/poc/13-loadgen-poisson.sh). This is the EPP's own accounting -- the generator cannot see token usage. Reused unmodified from the SLI deploy/grafana-dashboard.yaml (UNI-50) already defines; this report does not invent a second definition of delivered share.",
+    "offered_and_delivered_requests": "deploy/poc/13-loadgen-poisson.py's own stdout (UNI-137/B5): the 'load: open-loop Poisson arrivals rate ...' line for each offered group's Poisson arrival rate in req/s -- NOT a worker count, this generator is open-loop -- and each group's own 'sent=... completion_tokens=... p50=...s p95=...s p99=...s codes=[...]' summary line for delivered requests, status tally, and latency.",
+    "expected_share": "each offered group's configured_weight divided by the sum of configured_weight over OFFERED groups only (excludes the never-offered 'unclassified' catch-all and any group this scenario left idle), so a work-conserving policy absorbing an idle group's share is not scored as a deviation. Also excludes any 'capped_groups' entry (UNI-134's app2-trickle): a group offered but structurally unable to reach a weight-proportional share at its own worker count is scored on a dedicated 'did it get served' check instead, not folded into the other groups' expected-share denominator.",
+    "request_share_pct": "UNI-146 (C1): the SAME expected_share target above, scored against requests_total (plain request count, from the loadgen log) instead of delivered weighted tokens -- informational only, never part of the verdict. Equal to observed_share_pct when every offered group's requests are uniform cost (every scenario before this ticket); expected to diverge when request cost is asymmetric across groups."
+  },
+  "timeline": null,
+  "ledger": null,
+  "shed": {
+    "shed_statuses": [
+      "429",
+      "503"
+    ],
+    "total_shed": 2,
+    "rows": [
+      {
+        "group": "app1",
+        "state": "shed",
+        "requests_total": 1985,
+        "status_429": 0,
+        "status_503": 1,
+        "shed": 1,
+        "shed_rate_pct": 0.05037783375314862,
+        "weight_share_pct": 21.05263157894737,
+        "shed_share_pct": 50.0,
+        "shed_share_vs_weight_share": 2.375
+      },
+      {
+        "group": "app2",
+        "state": "shed",
+        "requests_total": 2000,
+        "status_429": 0,
+        "status_503": 1,
+        "shed": 1,
+        "shed_rate_pct": 0.05,
+        "weight_share_pct": 10.526315789473685,
+        "shed_share_pct": 50.0,
+        "shed_share_vs_weight_share": 4.75
+      },
+      {
+        "group": "end-users",
+        "state": "never_shed",
+        "requests_total": 2033,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 68.42105263157895,
+        "shed_share_pct": 0.0,
+        "shed_share_vs_weight_share": 0.0
+      }
+    ],
+    "epp_pool_wide": {
+      "state": "ok",
+      "outcome_deltas": {
+        "Dispatched": 6018.0
+      },
+      "epp_shed_total": 0.0,
+      "epp_429_upper_bound": 0.0,
+      "client_429_total": 0,
+      "non_epp_429_lower_bound": 0.0,
+      "epp_restarted": false
+    }
+  },
+  "pick_latency": {
+    "histograms": {
+      "scheduler_e2e": {
+        "metric": "llm_d_epp_scheduler_e2e_duration_seconds",
+        "state": "not_recorded",
+        "observations": null,
+        "p50_seconds": null,
+        "p99_seconds": null,
+        "p50_bucket": null,
+        "p99_bucket": null,
+        "p99_at_histogram_ceiling": null,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      },
+      "flow_control_dispatch_cycle": {
+        "metric": "llm_d_epp_flow_control_dispatch_cycle_duration_seconds",
+        "state": "ok",
+        "observations": 261418.0,
+        "p50_seconds": 5.004268841287161e-05,
+        "p99_seconds": 9.90845230574858e-05,
+        "p50_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_at_histogram_ceiling": false,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      }
+    },
+    "epp_restarted": false,
+    "baseline_report": null,
+    "baseline_has_pick_latency": null
+  },
+  "alerts": null,
+  "ttft_itl": {
+    "window_seconds": 10.0,
+    "groups": {
+      "app1": {
+        "ttft": {
+          "state": "not_recorded",
+          "observations": null,
+          "p50_seconds": null,
+          "p95_seconds": null
+        },
+        "itl": {
+          "state": "not_recorded",
+          "observations": null,
+          "p50_seconds": null,
+          "p95_seconds": null
+        }
+      },
+      "app2": {
+        "ttft": {
+          "state": "not_recorded",
+          "observations": null,
+          "p50_seconds": null,
+          "p95_seconds": null
+        },
+        "itl": {
+          "state": "not_recorded",
+          "observations": null,
+          "p50_seconds": null,
+          "p95_seconds": null
+        }
+      },
+      "end-users": {
+        "ttft": {
+          "state": "not_recorded",
+          "observations": null,
+          "p50_seconds": null,
+          "p95_seconds": null
+        },
+        "itl": {
+          "state": "not_recorded",
+          "observations": null,
+          "p50_seconds": null,
+          "p95_seconds": null
+        }
+      }
+    },
+    "pool": {
+      "ttft": {
+        "state": "not_recorded",
+        "observations": null,
+        "p50_seconds": null,
+        "p95_seconds": null
+      },
+      "itl": {
+        "state": "not_recorded",
+        "observations": null,
+        "p50_seconds": null,
+        "p95_seconds": null
+      }
+    },
+    "windows": null,
+    "epp_restarted_during_windows": false,
+    "scrape_gap_in_windows": false,
+    "priority_verdict": {
+      "applicable": true,
+      "result": "not_evaluated",
+      "reason": "TTFT not available (state != ok) for: app1, app2, end-users",
+      "groups": [
+        "app1",
+        "app2",
+        "end-users"
+      ]
+    }
+  },
+  "saturation": null
+}

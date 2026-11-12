@@ -48,8 +48,28 @@ back to a request-success-rate bar instead (see SOLO_SUCCESS_THRESHOLD
 below): "receives ~100% of the pool" is judged by HTTP status, not by a
 token-share metric that cannot move in a single-tenant run.
 
-UNI-127 adds a second, purely additive layer on top of the above -- it never
-changes `verdict`, only adds a `timeline` section:
+UNI-222 (B4, "long idle return"): the "expected share" above is still a flat
+ratio applied uniformly across the run's *entire* duration, which silently
+assumes every offered group was present the whole time. For a group with a
+declared join/leave offset or duty cycle (--timeline-config, below), that
+assumption is wrong for whatever fraction of the run it was absent --
+scoring the group's whole-run average against a target it was never even
+offered for double-penalizes an idle-then-return scenario for the idle
+period itself, on top of whatever its actual return behaviour earns or
+loses it. When --metrics-timeseries is also given,
+schedule_aware_whole_run_shares replaces the flat ratio for exactly the
+groups affected by a non-trivial schedule with a time-weighted entitlement
+built from the same per-window renormalization UNI-127's `timeline` section
+below already computes (see docs/design.md "Whole-run scoring with a
+declared schedule" for the full writeup and a worked example). A scenario
+with no declared schedule, or where every offered group is active for the
+whole run, is completely unaffected -- the two formulas are mathematically
+identical in that case.
+
+UNI-127 adds a second layer on top of the above -- mostly additive (it never
+changes `verdict` on its own), but see the UNI-222 paragraph just above for
+the one way `windows` now feeds back into it. It always adds a `timeline`
+section:
 
   --metrics-timeseries  periodic /metrics scrapes taken throughout the run
       (deploy/poc/15-fairness-benchmark.sh's timeseries_loop), not just
@@ -1034,6 +1054,92 @@ def compute_windows(timeseries, schedule, weights):
     return windows, any_restart, any_scrape_gap
 
 
+def schedule_has_partial_offering(schedule, run_duration):
+    """True if any group in `schedule` is not simply "active for the whole
+    run" -- a join/leave offset inside [0, run_duration) or a duty cycle.
+    UNI-222's whole-run expected-share gate below only has work to do when
+    this is true; when every group's schedule is the default full-run entry,
+    schedule_aware_whole_run_shares collapses to the exact same answer as the
+    flat weight-ratio formula anyway (see its own docstring), so callers skip
+    it there to keep every non-idle/non-join scenario's output byte-identical
+    to before this existed."""
+    for entry in schedule.values():
+        if entry.get("duty_on"):
+            return True
+        if (entry.get("start") or 0.0) > 0.0:
+            return True
+        stop = entry.get("stop")
+        if stop is not None and stop < run_duration:
+            return True
+    return False
+
+
+def schedule_aware_whole_run_shares(windows, offered_groups):
+    """UNI-222 (B4, "long idle return"): the flat whole-run `expected_share_pct`
+    (each offered group's weight over the sum of every OFFERED group's weight,
+    applied uniformly for the run's entire duration) silently assumes every
+    offered group was contending the whole time. For a group with a declared
+    join/leave or duty-cycle schedule, that assumption is simply false for
+    whatever fraction of the run it was absent -- and the project's own
+    intentional, documented behaviour during an absence is work conservation:
+    an idle group's weight is given to whoever is still asking (see this
+    module's "Expected share" docstring above), not held in reserve. Scoring
+    that correct behaviour against a target that still expects the absent
+    group's full-time share double-penalizes it for being away at all,
+    on top of (not instead of) whatever its own return behaviour earns or
+    loses it -- exactly what UNI-143/UNI-144 found and flagged in prose
+    ("the naive whole-run expected-% assumes full-time offering it never had
+    -- not the right number to judge this case by") without ever fixing the
+    number itself. docs/design.md "Whole-run scoring with a declared
+    schedule" has the full writeup and the worked long-idle example.
+
+    This reuses the exact per-window expected/observed shares
+    compute_windows already computes (same renormalization-among-currently-
+    active-groups definition, just not fed back into the whole-run verdict
+    until now) and aggregates them token-weighted across the run: each
+    window's contribution to both the expected and observed numerator, and
+    to the shared denominator, is scaled by that window's own total
+    delivered tokens among the groups active *in that window* -- so a
+    quiet window (little volume) cannot swamp a busy one, and a window
+    where every candidate group is between its stop time and the run's
+    tail (every group inactive, e.g. draining in-flight requests after a
+    shared "stop" offset) contributes to no group's numerator or the
+    denominator at all, rather than counting as "zero credit, but still
+    judged against a positive target" the way a naive include-everything
+    sum would.
+
+    Returns {group: {"expected_share_pct": ..., "observed_share_pct": ...}}
+    for every group that accumulated a nonzero denominator; a group entirely
+    absent from every window's active set (never actually contended) is
+    omitted, same as the flat path leaves it at None via offered_tokens_total
+    <= 0. Returns {} if there is nothing to aggregate (no windows, or every
+    window's active set is empty/zero-volume) -- callers fall back to the
+    flat formula in that case."""
+    offered = set(offered_groups)
+    exp_num = {}
+    obs_num = {}
+    denom = 0.0
+    for w in windows:
+        active_entries = [e for e in w["groups"] if e.get("active") and e["group"] in offered]
+        window_active_total = sum((e.get("delivered_tokens") or 0.0) for e in active_entries)
+        if window_active_total <= 0:
+            continue
+        denom += window_active_total
+        for e in active_entries:
+            gid = e["group"]
+            obs_num[gid] = obs_num.get(gid, 0.0) + (e.get("delivered_tokens") or 0.0)
+            exp_num[gid] = exp_num.get(gid, 0.0) + (e.get("expected_share_pct") or 0.0) / 100.0 * window_active_total
+    if denom <= 0:
+        return {}
+    return {
+        gid: {
+            "expected_share_pct": 100.0 * exp_num.get(gid, 0.0) / denom,
+            "observed_share_pct": 100.0 * obs_num.get(gid, 0.0) / denom,
+        }
+        for gid in exp_num
+    }
+
+
 # UNI-164: per-group, per-window queue-wait distribution from the upstream
 # llm-d-router Flow Control layer's own histogram (fairness_id-labelled since
 # v0.11.0, llm-d-router docs/metrics.md "Flow control") -- already scraped by
@@ -1606,6 +1712,36 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         if g not in capped_groups
     )
 
+    # UNI-222: resolve the schedule -- and, when timeseries is available, the
+    # per-window data -- before the whole-run expected/observed share
+    # computation below, so a group with a declared join/leave or duty-cycle
+    # schedule can be scored against its own time-weighted entitlement
+    # instead of the flat weight ratio applied uniformly for the run's whole
+    # duration. See schedule_aware_whole_run_shares above and
+    # docs/design.md "Whole-run scoring with a declared schedule". windows/
+    # timeseries are computed whenever timeseries is available at all --
+    # the UNI-127 timeline section further below wants them regardless of
+    # whether the schedule is actually non-trivial; only the whole-run
+    # correction itself is gated on schedule_has_partial_offering, so a
+    # plain full-run scenario's expected_share_pct/deviation_pts/verdict
+    # stay byte-identical to before this existed.
+    run_duration = duration_seconds if duration_seconds is not None else (logged_duration or 0)
+    timeline_cfg = {}
+    if timeline_config_path:
+        with open(timeline_config_path) as f:
+            timeline_cfg = json.load(f)
+    schedule = resolve_schedule(timeline_cfg.get("tenants"), set(offered_groups), run_duration)
+    chaos_events = timeline_cfg.get("chaos_events", [])
+    windows, windows_epp_restarted, windows_scrape_gap = [], False, False
+    schedule_aware_shares = {}
+    if metrics_timeseries_path:
+        timeline_weights = {g: (weight_after.get(g) if weight_after.get(g) is not None else weight_before.get(g)) or 0.0
+                             for g in schedule}
+        timeseries = parse_timeseries(metrics_timeseries_path)
+        windows, windows_epp_restarted, windows_scrape_gap = compute_windows(timeseries, schedule, timeline_weights)
+        if schedule_has_partial_offering(schedule, run_duration):
+            schedule_aware_shares = schedule_aware_whole_run_shares(windows, offered_groups)
+
     rows = []
     deviations_for_verdict = []
     worker_vs_weight_gaps = []
@@ -1624,20 +1760,36 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
         if is_offered and gid != solo and gid not in capped_groups:
             if offered_weight_total > 0 and weight is not None:
                 expected_pct = 100.0 * weight / offered_weight_total
+            # UNI-225's worker-vs-weight question ("does this scenario's
+            # worker sizing alone predict the split") and UNI-146 (C1)'s
+            # request-count share below are both about the configured
+            # whole-run sizing, not about how long a group was actually
+            # present -- they keep this flat definition even for a group
+            # UNI-222's schedule-aware correction below overrides
+            # expected_pct/deviation_pts for.
+            flat_expected_pct = expected_pct
             delivered_tokens_for_pct = deltas.get(gid)
             if offered_tokens_total > 0 and delivered_tokens_for_pct is not None:
                 observed_pct = 100.0 * delivered_tokens_for_pct / offered_tokens_total
             else:
                 observed_pct = 0.0
+            # UNI-222: a group with a declared join/leave or duty-cycle
+            # schedule is scored against its time-weighted entitlement
+            # instead of the flat one above, whenever the timeline data
+            # needed to compute it is available -- see
+            # schedule_aware_whole_run_shares.
+            if gid in schedule_aware_shares:
+                expected_pct = schedule_aware_shares[gid]["expected_share_pct"]
+                observed_pct = schedule_aware_shares[gid]["observed_share_pct"]
             if expected_pct is not None and observed_pct is not None:
                 deviation_pts = observed_pct - expected_pct
                 deviations_for_verdict.append((gid, deviation_pts))
             if offered_workers_total > 0:
                 worker_share_pct = 100.0 * (offered_workers.get(gid, 0) or 0.0) / offered_workers_total
-            if expected_pct is not None and worker_share_pct is not None:
-                worker_vs_weight_gap_pts = worker_share_pct - expected_pct
+            if flat_expected_pct is not None and worker_share_pct is not None:
+                worker_vs_weight_gap_pts = worker_share_pct - flat_expected_pct
                 worker_vs_weight_gaps.append((gid, worker_vs_weight_gap_pts))
-            # UNI-146 (C1): same expected_pct target, but against this
+            # UNI-146 (C1): same flat_expected_pct target, but against this
             # group's share of total REQUEST COUNT rather than weighted
             # tokens -- informational only, never fed into
             # deviations_for_verdict/the scored verdict below. A scenario
@@ -1650,8 +1802,8 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                 request_share_pct = 100.0 * requests_for_pct / offered_requests_total
             else:
                 request_share_pct = 0.0
-            if expected_pct is not None:
-                request_share_deviation_pts = request_share_pct - expected_pct
+            if flat_expected_pct is not None:
+                request_share_deviation_pts = request_share_pct - flat_expected_pct
 
         delivered_tokens = deltas.get(gid)
         gen_row = loadgen_rows.get(gid, {"total": 0, "p50_sec": None, "p95_sec": None, "statuses": {}})
@@ -1884,24 +2036,16 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
                 "weighted fairness specifically"
             )
 
-    # UNI-127: purely additive. Never reads or writes `verdict` above -- a run
-    # with no timeseries/timeline-config, or one that doesn't use any of the
-    # timeline/chaos knobs, gets timeline=None or an empty-schedule timeline,
-    # and the verdict this report's "done when" is graded on is identical
-    # either way.
+    # UNI-127: additive -- except that, as of UNI-222, `schedule`/`windows`
+    # computed above already fed the whole-run expected/observed shares (and
+    # therefore `verdict`) above when schedule_has_partial_offering was true.
+    # What's purely additive here is everything specific to this section:
+    # phase_edges, convergence, and the queue-wait windows. A run with no
+    # timeseries/timeline-config, or a schedule with nothing non-trivial in
+    # it, leaves timeline=None or an empty-schedule timeline with `verdict`
+    # computed exactly as before UNI-222 either way.
     timeline_section = None
     if metrics_timeseries_path:
-        run_duration = duration_seconds if duration_seconds is not None else (logged_duration or 0)
-        timeline_cfg = {}
-        if timeline_config_path:
-            with open(timeline_config_path) as f:
-                timeline_cfg = json.load(f)
-        schedule = resolve_schedule(timeline_cfg.get("tenants"), set(offered_groups), run_duration)
-        chaos_events = timeline_cfg.get("chaos_events", [])
-        weights = {g: (weight_after.get(g) if weight_after.get(g) is not None else weight_before.get(g)) or 0.0
-                   for g in schedule}
-        timeseries = parse_timeseries(metrics_timeseries_path)
-        windows, windows_epp_restarted, windows_scrape_gap = compute_windows(timeseries, schedule, weights)
         phase_edges = compute_phase_edges(schedule, chaos_events, run_duration)
         convergence = compute_convergence(windows, phase_edges, threshold_points)
         # UNI-164: same metrics-timeseries.txt file, parsed a second time with
@@ -2172,6 +2316,15 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
             # UNI-225: see the module docstring's UNI-225 paragraph.
             "max_worker_vs_weight_gap_points": max_worker_vs_weight_gap,
             "discriminating": is_discriminating,
+            # UNI-222: which offered groups' expected_share_pct/observed_share_pct/
+            # deviation_pts above (in `groups`) used the time-weighted,
+            # declared-schedule-aware definition instead of the flat
+            # whole-run weight ratio -- see schedule_aware_whole_run_shares
+            # and docs/design.md "Whole-run scoring with a declared
+            # schedule". Empty for the overwhelming majority of scenarios
+            # (no declared schedule, or every offered group active for the
+            # whole run), which get the exact pre-UNI-222 numbers.
+            "schedule_aware_groups": sorted(schedule_aware_shares.keys()),
         },
         "sources": {
             "delivered_tokens_and_observed_share": (
@@ -2500,6 +2653,13 @@ def render_markdown(report):
                 if v.get("discriminating") is False
                 else ""
             )
+        )
+    if v.get("schedule_aware_groups"):
+        lines.append(
+            f"Schedule-aware expected share (UNI-222): {', '.join(v['schedule_aware_groups'])} "
+            "scored against a time-weighted entitlement from the declared join/leave or "
+            "duty-cycle schedule, not the flat whole-run weight ratio -- see "
+            "docs/design.md \"Whole-run scoring with a declared schedule\"."
         )
     if v["reasons"]:
         lines.append("")

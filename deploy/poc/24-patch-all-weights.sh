@@ -50,7 +50,18 @@ W_END_USERS="${3:?usage: $0 <app1-weight> <app2-weight> <end-users-weight>}"
 
 log() { echo "[patch-all-weights] $(date -u +%H:%M:%S) $*" >&2; }
 
-SCRATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/patch-all-weights.XXXXXX")"
+# UNI-222: NOT $TMPDIR -- a background run's $TMPDIR is scoped to the
+# launching session and can vanish out from under a backgrounded batch
+# driver (nohup+disown) well before this script's own invocation runs,
+# making `mktemp -d "$TMPDIR/..."` fail outright and silently skip the
+# weight restore it was called to do (live on UNI-247's 4x-rep3 batch,
+# 2026-11-12: "mktemp: failed to create directory ... No such file or
+# directory", cluster left at 30/10/60). `results/` is already gitignored
+# and lives in the repo working tree, which does not get torn down with
+# any one session -- the same fix this project's standing run-hygiene rule
+# already requires of every benchmark run's own scratch output.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRATCH_DIR="$(mktemp -d "$REPO_ROOT/results/.patch-all-weights.XXXXXX")"
 trap 'rm -rf "$SCRATCH_DIR"' EXIT
 
 $OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}' > "$SCRATCH_DIR/before.yaml"

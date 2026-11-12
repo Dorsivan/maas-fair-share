@@ -1210,6 +1210,140 @@ def test_build_report_timeline_section_populated_with_timeseries_and_config():
         assert cli_report["timeline"] is not None
 
 
+# --- UNI-222: schedule-aware whole-run expected/observed share --------------
+
+def _window(groups):
+    """groups: {gid: (active, delivered_tokens, expected_share_pct)}."""
+    return {
+        "start_s": 0.0, "end_s": 10.0,
+        "groups": [
+            {"group": g, "active": a, "delivered_tokens": tok, "expected_share_pct": exp,
+             "observed_share_pct": None, "deviation_pts": None}
+            for g, (a, tok, exp) in groups.items()
+        ],
+    }
+
+
+def test_schedule_has_partial_offering_true_only_for_non_default_entries():
+    trivial = {"app1": fairness_report.default_schedule_entry(240), "app2": fairness_report.default_schedule_entry(240)}
+    assert fairness_report.schedule_has_partial_offering(trivial, 240) is False
+
+    joins_late = dict(trivial, **{"app2": {"start": 120.0, "stop": 240.0, "duty_on": None, "duty_off": None}})
+    assert fairness_report.schedule_has_partial_offering(joins_late, 240) is True
+
+    leaves_early = dict(trivial, **{"app2": {"start": 0.0, "stop": 180.0, "duty_on": None, "duty_off": None}})
+    assert fairness_report.schedule_has_partial_offering(leaves_early, 240) is True
+
+    duty_cycles = dict(trivial, **{"app1": {"start": 0.0, "stop": 240.0, "duty_on": 30.0, "duty_off": 30.0}})
+    assert fairness_report.schedule_has_partial_offering(duty_cycles, 240) is True
+
+
+def test_schedule_aware_whole_run_shares_matches_flat_formula_when_trivial():
+    # Every group active every window (the common case) -- the time-weighted
+    # average of a constant is that constant, so this must reproduce exactly
+    # what offered_weight_total/offered_tokens_total would have given.
+    windows = [
+        _window({"app1": (True, 200.0, 21.05), "app2": (True, 100.0, 10.53), "end-users": (True, 650.0, 68.42)}),
+        _window({"app1": (True, 200.0, 21.05), "app2": (True, 100.0, 10.53), "end-users": (True, 650.0, 68.42)}),
+    ]
+    shares = fairness_report.schedule_aware_whole_run_shares(windows, ["app1", "app2", "end-users"])
+    assert abs(shares["app1"]["expected_share_pct"] - 21.05) < 0.01
+    assert abs(shares["app1"]["observed_share_pct"] - 21.05) < 0.01
+
+
+def test_schedule_aware_whole_run_shares_excludes_windows_with_no_group_active():
+    # UNI-245/UNI-222 live finding: once every scheduled group's `stop` offset
+    # has passed, a window can still show real delivered tokens (in-flight
+    # requests draining) with every group marked inactive. That volume must
+    # not inflate the denominator for a target nobody was scored against --
+    # the degenerate case of the general "a window's pool only counts toward
+    # the groups eligible to contend for it" rule schedule_aware_whole_run_shares
+    # implements.
+    windows = [
+        _window({"app1": (True, 100.0, 50.0), "app2": (True, 100.0, 50.0)}),
+        _window({"app1": (False, 999.0, None), "app2": (False, 999.0, None)}),  # drain tail
+    ]
+    shares = fairness_report.schedule_aware_whole_run_shares(windows, ["app1", "app2"])
+    assert abs(shares["app1"]["expected_share_pct"] - 50.0) < 0.01
+    assert abs(shares["app1"]["observed_share_pct"] - 50.0) < 0.01
+
+
+def test_schedule_aware_whole_run_shares_returns_empty_with_no_contended_windows():
+    windows = [_window({"app1": (False, 0.0, None), "app2": (False, 0.0, None)})]
+    assert fairness_report.schedule_aware_whole_run_shares(windows, ["app1", "app2"]) == {}
+    assert fairness_report.schedule_aware_whole_run_shares([], ["app1", "app2"]) == {}
+
+
+def test_build_report_long_idle_return_whole_run_fail_becomes_pass_schedule_aware():
+    # UNI-222 (B4): app1 is active 0-30s then idle for the rest of a 150s
+    # run (never returns within this run -- the shape that originally FAILed
+    # UNI-143/UNI-218 at -15.5/-15.6pt). While active, app1/app2/end-users
+    # split exactly on weight (20/10/65); while idle, app2/end-users correctly
+    # absorb app1's share (work conservation) and also split exactly on
+    # their own renormalized weight (10/65 -> 13.33/86.67). A flat whole-run
+    # ratio scores this "perfect policy" run as a severe FAIL anyway, purely
+    # because app1 is 0% for 80% of the run against a flat 21.05% target;
+    # the schedule-aware correction must read it as the PASS it actually is.
+    with tempfile.TemporaryDirectory() as tmp:
+        # app1: 3 active windows x 200 tokens = 600 total, then silent.
+        # app2/end-users: 100/650 per active window (3x), then 100/650 per
+        # idle window (12x) -- same per-window volume throughout, just
+        # renormalized among whoever is still active.
+        app1_cum, app2_cum, eu_cum = [0.0], [0.0], [0.0]
+        for i in range(3):
+            app1_cum.append(app1_cum[-1] + 200.0)
+            app2_cum.append(app2_cum[-1] + 100.0)
+            eu_cum.append(eu_cum[-1] + 650.0)
+        for i in range(12):
+            app1_cum.append(app1_cum[-1])
+            app2_cum.append(app2_cum[-1] + 100.0)
+            eu_cum.append(eu_cum[-1] + 650.0)
+        snapshots = [
+            (t * 10, {"app1": app1_cum[t], "app2": app2_cum[t], "end-users": eu_cum[t]})
+            for t in range(16)
+        ]
+        before = write(tmp, "before.txt", CONFIGURED_WEIGHT + ENFORCING_ON + metrics_block({"app1": 0.0, "app2": 0.0, "end-users": 0.0}))
+        after = write(tmp, "after.txt", CONFIGURED_WEIGHT + ENFORCING_ON + metrics_block(
+            {"app1": app1_cum[-1], "app2": app2_cum[-1], "end-users": eu_cum[-1]}
+        ))
+        log = write(tmp, "loadgen.log", loadgen_log("app1 app2 end-users", 32, 32, 128, 150, [
+            ("app1", 100, "1.00", "2.00", "200=100"),
+            ("app2", 400, "1.00", "2.00", "200=400"),
+            ("end-users", 2000, "1.00", "2.00", "200=2000"),
+        ]))
+        ts = write_timeseries(tmp, "ts.txt", snapshots)
+        cfg = write_timeline_config(tmp, "timeline.json", tenants={"app1": {"duty_on": 30, "duty_off": 120}})
+
+        # Sanity check: without the schedule, this exact data is the FAIL
+        # UNI-143/UNI-218 actually hit (app1's flat whole-run share crushed
+        # by its own idle time).
+        flat = fairness_report.build_report(
+            scenario="b4-long-idle", enforce=True, duration_seconds=150, backend="vllm-gpu",
+            epp_image_digest="sha256:deadbeef", namespace="maas-fairness-poc", epp_pod="test-pod",
+            run_start="2026-11-01T00:00:00Z", run_end="2026-11-01T00:02:30Z", threshold_points=10.0,
+            metrics_before_path=before, metrics_after_path=after, loadgen_log_path=log,
+        )
+        assert flat["verdict"]["result"] == "FAIL", flat["verdict"]
+        flat_app1 = next(g for g in flat["groups"] if g["group"] == "app1")
+        assert flat_app1["deviation_pts"] < -10.0
+
+        # With the schedule + timeseries, the same run reads PASS.
+        report = fairness_report.build_report(
+            scenario="b4-long-idle", enforce=True, duration_seconds=150, backend="vllm-gpu",
+            epp_image_digest="sha256:deadbeef", namespace="maas-fairness-poc", epp_pod="test-pod",
+            run_start="2026-11-01T00:00:00Z", run_end="2026-11-01T00:02:30Z", threshold_points=10.0,
+            metrics_before_path=before, metrics_after_path=after, loadgen_log_path=log,
+            metrics_timeseries_path=ts, timeline_config_path=cfg, window_seconds=10.0,
+        )
+        assert report["verdict"]["result"] == "PASS", report["verdict"]
+        assert sorted(report["verdict"]["schedule_aware_groups"]) == ["app1", "app2", "end-users"]
+        for g in report["groups"]:
+            if g["group"] in ("app1", "app2", "end-users"):
+                assert abs(g["deviation_pts"]) < 1.0, g
+        md = fairness_report.render_markdown(report)
+        assert "Schedule-aware expected share (UNI-222)" in md
+
+
 def test_mid_run_restart_invisible_to_snapshot_pair_is_flagged_from_windows():
     # UNI-163 (F6): found live on a run that patched maas-epp-config mid-run
     # (any edit recreates the EPP pod -- no live-reload path -- so its

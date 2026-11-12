@@ -777,6 +777,136 @@ a per-tenant counter.
   near 5–10, invest in the estimator (`max_tokens`, then per-tenant observed history)
   before tuning anything else.
 
+### UNI-222: B4's "long idle return" FAIL is a scoring artifact, not a policy defect
+
+[UNI-143](/UNI/issues/UNI-143)'s original B4 case (`full-contention`, app1
+duty-cycling 150s on / 600s off / 140s on, 890s total) and its exact
+reproduction at `queueDepthThreshold: 32` ([UNI-218](/UNI/issues/UNI-218))
+both FAILed the same way: app1's **whole-run** delivered share came in at
+5.5%, 15.5–15.6 points under its flat 21.1% target, while app2 and
+end-users came in correspondingly over (+4.8/+10.7pt). Taken at face value
+this reads as "a tenant returning after a long idle does not land on its
+entitled share" — [UNI-222](/UNI/issues/UNI-222) was opened to find out
+whether that is a real defect in the returning-from-idle clamp
+(`### Returning-from-idle clamp` / UNI-212 / UNI-220, above) or a problem
+with how the number itself is computed.
+
+**It is the number.** The flat formula (`deploy/poc/15-fairness-report.py`'s
+"Expected share" — each offered group's weight over the sum of every offered
+group's weight) is applied uniformly across the run's *entire* duration,
+which is only correct when every offered group is actually contending for
+the whole run. B4 violates that by construction: app1 is idle for 600 of
+890 seconds (67% of the run) by design, and work conservation — the
+intentional, already-documented behaviour this project scores as *correct*
+for `end-users-idle`/`app1-alone` (see "Expected share" at the top of
+`15-fairness-report.py`) — correctly gives app1's unclaimed weight to app2
+and end-users for that entire window. The flat formula has no way to tell
+"app1 is being starved while contending" apart from "app1 wasn't
+contending for most of the run and the other two correctly absorbed its
+share while it wasn't" — it scores both as the same kind of deviation from
+a target app1 was never actually entitled to for the idle 67% of the run.
+[UNI-143](/UNI/issues/UNI-143) and [UNI-144](/UNI/issues/UNI-144) (B2/B3)
+both already named this in prose ("the naive whole-run expected-% assumes
+full-time offering it never had ... not the right number to judge this
+case by") without ever fixing the number itself; UNI-143's own windowed,
+post-return-only analysis (settling to within ±10pt noise in ~131s, a
+similar noise band to the short-idle run) was already the better signal,
+it just never fed back into the scored `verdict`.
+
+**The fix: `schedule_aware_whole_run_shares`.** When a scenario provides
+both `--timeline-config` (the declared per-tenant join/leave/duty-cycle
+schedule) and `--metrics-timeseries`, and that schedule is non-trivial for
+at least one offered group (`schedule_has_partial_offering`), the whole-run
+`expected_share_pct`/`observed_share_pct`/`deviation_pts` fed into `verdict`
+are recomputed as a token-volume-weighted aggregate of the same per-window
+values UNI-127's `timeline.windows` already compute (the ones that already
+correctly renormalize each window's expected share among only the groups
+active *in that window*):
+
+```
+for each window:
+    active_total = sum(delivered_tokens for groups active in this window)
+    if active_total <= 0: skip (nothing to attribute -- including a window
+                                 where every scheduled group is between its
+                                 own stop time and the run's tail, draining
+                                 in-flight requests with nobody left
+                                 "eligible" to be scored against)
+    denominator += active_total
+    for each active group g:
+        observed_numerator[g] += delivered_tokens[g]
+        expected_numerator[g] += (expected_share_pct[g] / 100) * active_total
+expected_share_pct[g] = 100 * expected_numerator[g] / denominator
+observed_share_pct[g] = 100 * observed_numerator[g]   / denominator
+```
+
+A scenario with no declared schedule, or where every offered group is
+active for the entire run, is completely unaffected: every window's active
+set is then "everyone," so the per-window expected share equals the flat
+global ratio in every window, and the volume-weighted average of a constant
+is that same constant — mathematically identical to the pre-UNI-222
+formula, confirmed byte-for-byte on a real `full-contention` run with no
+`--timeline-config` tenants declared. `worker_share_pct`/
+`worker_vs_weight_gap_pts` (UNI-225) and `request_share_pct`/
+`request_share_deviation_pts` (UNI-146/C1) deliberately keep the flat
+definition — both are about the scenario's *configured* sizing, not about
+how long a group happened to be present, so a schedule change should not
+move them.
+
+**Re-run under the corrected formula, same raw artifacts** (re-fed through
+the fixed report generator, not re-executed against the cluster — the
+underlying EPP behaviour is unchanged, only how it is scored):
+
+| case | flat whole-run (pre-UNI-222) | schedule-aware (UNI-222) |
+|---|---|---|
+| B4 long idle return (UNI-143 run) | **FAIL**, app1 −15.5pt | **PASS**, max 3.0pt (app2) |
+| B4 long idle return (UNI-218 thr32 run) | **FAIL**, app1 −15.6pt | **PASS** (re-run live under UNI-222, see docs/poc-results.md) |
+| B4 short idle return (UNI-143 run) | PASS, app1 −5.3pt | PASS, max 4.2pt (app2) — tighter, same verdict |
+| B1 cold join (UNI-245 thr32 confirm — the named regression control) | PASS, app1 −7.8pt | PASS, max 8.2pt (end-users) — same verdict, closer to the bar |
+| `full-contention` (no declared schedule — the other named regression control) | PASS, 4.0pt | **identical**, 4.0pt, `schedule_aware_groups: []` |
+
+B1 cold-join is the interesting near-miss: end-users joins at t=120 of a
+~240s run, and because essentially none of that run's volume was
+*contended* before the join (app1/app2 alone never backed up the queue —
+the same `A1 app2-alone`/`A6 below-capacity` pattern), excluding the
+pre-join window from the denominator barely moves the number (7.8→8.2pt).
+It stays a clear PASS, but it is close enough to the 10-point bar that a
+scenario shaped like "a late joiner that's already somewhat over-served
+once it does arrive" could flip under this formula where it would not have
+under the flat one — a real, intended consequence of scoring entitlement
+against actual presence, not a bug to work around.
+
+**Verdict for UNI-222: test-expectation problem, not a defect in the
+clamp/decay mechanism.** The returning tenant's post-return behaviour was
+already measured as converging (UNI-143's windowed analysis); the whole-run
+FAIL was entirely an artifact of blending a correctly-zero-demand idle
+period into a uniform-weight average. No change to
+`pkg/fairness/weightedlas` was needed or made for this ticket — the
+clamp/decay mechanism (`### Returning-from-idle clamp`, UNI-212, UNI-220,
+above) is unchanged. **Correct behaviour on return, stated plainly:** a
+tenant idle long enough for its decayed tab to reach the newcomer-clamp
+floor returns on equal footing with whoever it finds already contending
+(by design — see `### Returning-from-idle clamp` above), is low-latency for
+its first dispatch, and converges back toward its configured weight share
+within roughly one settling period (~110–132s measured across
+UNI-141/142/143/144) once it is actually contending again; it earns no
+credit for having been away, and is not expected to make up the
+tokens/share it would have received had it been contending the whole time
+it chose to be idle. A scoring methodology that expects the latter (the
+pre-UNI-222 flat whole-run ratio, for any case with a declared idle/join
+schedule) is checking the wrong thing.
+
+**Known, deliberate side effect, flagged for the reviewer rather than
+silently absorbed:** the same correction applies to every other scenario in
+this repo with a declared `--timeline-config` schedule that isn't trivial —
+notably B2 (`tenant-leaves-mid-run`, UNI-141), B3 (`on/off duty cycle`,
+UNI-144), and `app3-joins-at-saturation` (UNI-164) — whose own whole-run
+`verdict` fields will also change on their next re-run (B2/B3 both already
+carry the same "not the right number" caveat in prose; UNI-164's own
+whole-run ratio is similarly distorted by its staggered join, per
+[UNI-201](/UNI/issues/UNI-201)). Retroactively re-scoring their *historical*
+docs/poc-results.md rows is out of scope for this ticket — filed as a
+follow-up so it is tracked rather than silently left stale.
+
 ### Two vLLM flags are hard prerequisites
 
 Both default to **off**, both fail silently, and both go on the **vLLM container**

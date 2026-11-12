@@ -340,21 +340,42 @@ loudly. Before you start, check the lane is idle: no `maas-loadgen*` Job or
 pod, and no open-loop runner (`oc get job` does not show those; see UNI-227).
 Say in the ticket which lane you hold.
 
-**Parallel scored rows depend on the A/A test.** Separate namespaces do not
-isolate everything. Authorino, Limitador and maas-api are single replicas
-that carry every lane's requests, and Prometheus scrapes all three lanes.
-Lanes 2 and 3 also share `ocp-worker-2` (both gateways, both EPPs and
-Authorino). **Run scored rows serially.** The three-lane A/A (UNI-231/UNI-248,
-2026-11-11) failed; see "What the three-lane A/A found" below.
+**Lanes 2 and 3 may run unrelated scored tickets in parallel (UNI-261,
+2026-11-12), with each other and with instance 1. Instance-1 scored runs stay
+solo** until [UNI-259](/UNI/issues/UNI-259) (instance 1 specifically scoring
+4-7 pts worse, one FAIL at -11.6, under three-way load) is understood. This
+narrows the blanket "run scored rows serially" rule this section used to
+state after the first three-lane A/A ([UNI-231](/UNI/issues/UNI-231)/[UNI-248](/UNI/issues/UNI-248))
+collapsed on loadgen CPU and gateway OOM -- both fixed
+([UNI-249](/UNI/issues/UNI-249), [UNI-250](/UNI/issues/UNI-250)), and the
+repeat A/A ([UNI-252](/UNI/issues/UNI-252)) found lanes 2 and 3 hold up under
+parallel load while instance 1 is the one lane with a measured penalty. See
+"What the three-lane A/A found" below for the original failure, and
+[UNI-259](/UNI/issues/UNI-259) plus `docs/poc-results.md`'s UNI-247 section
+(which discusses the UNI-252 repeat inline) for the repeat.
 
-**Never put load on any lane while a scored run is in flight on another.**
-This includes unscored dry runs. Two-lane load used to break the shared auth
-path: before UNI-240, 72% of requests returned HTTP 500 (the gateway's auth
-step failed closed after 200ms while maas-api fell behind). UNI-240 fixed
-that. The rule stays for two reasons: nobody has measured three lanes plus
-instance 1 at once, and `ocp-worker-2` already peaks at 67% of its 8 cores
-with two lanes. Load-free work on a lane (provisioning, harness edits, `oc`
-reads) is fine.
+Two more conditions apply to a parallel result:
+
+- **A result within ~5 pts of the 10-pt bar gets a solo or repeat run before
+  it is quoted.** A single near-bar run, run serially or in parallel, is not
+  a verdict (UNI-231's own two-lane A/A swung 13.7 pts on an unchanged
+  re-run).
+- Each lane's `maas-epp-config` must still be patched and verified
+  independently before use -- the patch recreates that lane's EPP and zeroes
+  its counters, so two tickets cannot share one lane. See "The rule: one lane
+  belongs to one run" above.
+
+**Never put load on any lane while a scored run is in flight on instance 1,
+unless that run is instance 1's own.** This includes unscored dry runs.
+Two-lane load used to break the shared auth path: before UNI-240, 72% of
+requests returned HTTP 500 (the gateway's auth step failed closed after
+200ms while maas-api fell behind). UNI-240 fixed that. The remaining
+exposure is instance 1's own unresolved three-way penalty (UNI-259) and
+`ocp-worker-2`, which every lane's gateway, EPP and Authorino share and which
+already peaks at 67% of its 8 cores with two lanes loaded. Load-free work on
+a lane (provisioning, harness edits, `oc` reads) is always fine. Every run
+records concurrent load in `concurrent-runs.txt` (below) -- check it, and the
+ticket thread, before trusting a lane was actually idle.
 
 **What the two-lane A/A found (UNI-231, 2026-11-11).** Six runs of
 `full-contention-2x-discriminating` with enforce on: both lanes together,
@@ -398,10 +419,16 @@ instance 1 alone (I1), all three together again (T3b).
   requests to connection failures. The lane gateways use about 570 MiB under
   the same limit.
 
-Before parallel scored runs: give loadgens more CPU and put each one on a
-node that hosts none of the shared components, raise instance 1's gateway
-memory, then repeat the three-lane A/A. Until then, use lanes 2 and 3 for
-serial runs, harness work and dry runs.
+**Resolved (UNI-249, UNI-250, UNI-252).** Loadgens now get more CPU and a
+node of their own, instance 1's gateway memory was raised, and the repeat
+three-lane A/A confirmed both fixes hold: no uncontended-collapse runs and
+zero gateway restarts across all three instances. Lanes 2 and 3 matched
+their solo baselines to within ~2.5 pts in both three-way phases. Instance 1
+still scored 4-7 pts worse under three-way load, with one FAIL at -11.6 --
+see [UNI-259](/UNI/issues/UNI-259) and the UNI-252 repeat discussed inline in
+`docs/poc-results.md`'s UNI-247 section. That is the evidence behind the
+narrower rule stated above: lanes 2
+and 3 are cleared for parallel scored work, instance 1 is not, yet.
 
 **Loadgen sizing and placement (UNI-249).** The loadgen now requests 1 core
 with a 4-core limit, up from 100m and 2 cores. Each instance's loadgen is

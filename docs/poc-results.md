@@ -9709,6 +9709,11 @@ deviation) and 4x FAILs (12.2pt), on one run each near the bar, not a repeatable
 ticket's own subsection below for the duration-finding counterexample, the error-rate regime shift at
 4x, and the repeats tracked in [UNI-247](/UNI/issues/UNI-247).
 
+**Superseded by [UNI-247](/UNI/issues/UNI-247)'s three repeats per point:** 2x is a stable PASS
+(8.0/9.3/9.0), 3x is **not stable** (9.7 PASS / 10.5 FAIL / 8.8 PASS, mean 9.7 on the bar), and 4x
+is a stable FAIL (14.3/14.6/13.6). The evidenced statement is now "reliable to 2x, fails at 4x,
+borderline at 3x". See that subsection under UNI-245 below.
+
 ### Cluster restored
 
 `enforce: false`, `queueDepthThreshold: 32`, weights `20/10/65/5`, `newcomerClamp: true`, equal
@@ -9848,6 +9853,9 @@ client `000` timeouts on app1, one 503 on end-users). `app1-flood-moderate` (4x)
 7.17M) despite offering more concurrency. A board reading "ceiling at 3x" should not assume graceful
 degradation above it: the fairness crossover measured here coincides with the onset of backend
 failures and a throughput roll-off, not a clean hand-off to a worse-but-stable split.
+**Did not reproduce ([UNI-247](/UNI/issues/UNI-247)):** three 4x repeats returned zero HTTP 500s,
+and their tokens were only about 1-2% below 3x. The 500s above came from one run (UNI-220's 4x) and
+are not a property of 4x. At 4x the split is worse but stable.
 
 **The lower side of the bracket remains unverified; say so rather than imply otherwise.**
 `app1-flood-light` (1x) FAILed at +12.6 (app2) pre-fix, for a different, unrelated cause (app2 itself
@@ -9881,6 +9889,115 @@ tracked in [UNI-247](/UNI/issues/UNI-247).
 confirmed live after the final (`app1-flood-3x`) snapshot, the same baseline UNI-220 left the
 cluster at. No LLMInferenceService or scheduling-profile change this ticket; the two new scenario
 cases in `15-fairness-benchmark.sh` are the only code change.
+
+### UNI-247: three repeats per point — 2x stable PASS, 3x not stable, 4x stable FAIL
+
+[UNI-245](/UNI/issues/UNI-245)'s bracket rested on one run per point, each within 2.2 points of the
+bar. This ticket repeated each point three times. Because the 3x repeats came out mixed, it also
+added `app1-flood-2x`, which the ticket names as the fallback for exactly that case.
+
+**Setup:** the same settled config as UNI-245. Weights were patched to 30/10/60 with
+`24-patch-all-weights.sh`, which aborts on patch failure and confirmed the new weights on both EPPs
+before each batch. The other settings were `queueDepthThreshold: 32`, `enforce: true` via
+`ENFORCE_LIVE=true`, 240s per run, and image
+`sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f`. Every run checked its own
+`metrics-before.txt` rather than trusting the manifest, and every run read `configured_weight`
+30/10/60/5 and `llm_d_epp_maas_fairness_enforcing 1`. All nine ran **one at a time on instance 1
+alone**, not across lanes, for two reasons. UNI-231's three-lane A/A verdict was negative. The
+repeat A/A ([UNI-252](/UNI/issues/UNI-252)) found instance 1 specifically 4-7 points worse under
+three-way load ([UNI-259](/UNI/issues/UNI-259)), and UNI-245's baseline came from instance 1. To
+check for overlap, I looked up the last loadgen Job on `poc-maas-lane2`/`poc-maas-lane3`. Both
+finished at 2026-11-11T23:04Z, ten hours before the first repeat started (09:35Z), and neither lane
+ran anything during the batch. Driver scripts, logs and summary helpers are in `deploy/poc/uni247/`.
+
+| ratio | scenario | rep 1 | rep 2 | rep 3 | mean | spread | sd | verdict across repeats |
+|---|---|---|---|---|---|---|---|---|
+| 2x | `app1-flood-2x` (64/32/64) | 8.0 PASS | 9.3 PASS | 9.0 PASS | 8.8 | 1.3 | 0.7 | **stable PASS** (worst rep 0.7 under the bar) |
+| 3x | `app1-flood-3x` (96/32/64) | 9.7 PASS | 10.5 FAIL | 8.8 PASS | 9.7 | 1.7 | 0.9 | **not stable**: 2 PASS / 1 FAIL |
+| 4x | `app1-flood-moderate` (128/32/64) | 14.3 FAIL | 14.6 FAIL | 13.6 FAIL | 14.1 | 1.0 | 0.5 | **stable FAIL** (best rep 3.6 over the bar) |
+
+In every run the max deviation is end-users running poor (-8.0 to -14.6), with app1 running rich
+(+5.7 to +10.9). Every run is `discriminating` under UNI-225's definition. Run dirs are
+`results/20261112T{093554,094545,095239}Z-uni-247-3x-rep{1,2,3}/`,
+`results/20261112T{100244,101311,102427}Z-uni-247-4x-rep{1,2,3}/` and
+`results/20261112T{112138,113246,114340}Z-uni-247-2x-rep{1,2,3}/`, force-added past `.gitignore`
+following the same precedent as UNI-245.
+
+**3x's verdict is not stable.** Its three repeats straddle the bar, and their mean (9.7) is 0.3
+points from it. That is the result, not a gap in the experiment: at this config, 3x sits on the
+10-point line. UNI-245's single 8.5 was a draw from the low end of the same distribution.
+
+**The noise here is small, and it is not UNI-231's ±13.7.** The run-to-run spread at every point is
+1.0-1.7 points, with an sd of 0.5-0.9. The ±13.7-point swing UNI-245 cited came from a *two-lane*
+A/A, with lanes loaded concurrently. Serial runs on one instance are roughly ten times tighter, and
+that is the noise level these verdicts carry.
+
+**Which points are separable at this noise level:**
+- **4x is separable from both 2x and 3x.** Its best repeat (13.6) is 3.1 points above 3x's worst
+  (10.5) and 4.3 above 2x's worst (9.3).
+- **2x and 3x are not separable from each other.** Their ranges overlap (8.0-9.3 vs 8.8-10.5), and
+  their means differ by 0.9 points, about one sd. Deviation barely moves from 2x to 3x, then jumps
+  by 4.4 points from 3x to 4x.
+
+**The latency-spread mechanism shows the same shape.** The p50 app1:end-users latency ratio app1
+needs in order to land on its 30% entitlement is 2.0 at 2x, 3.0 at 3x and 4.0 at 4x. The mean
+measured ratios are 1.43 (2x), 2.18 (3x) and 2.61 (4x). Achieved over required is therefore **0.71,
+0.73 and 0.65**. The policy delivers about the same fraction of the needed spread at 2x and 3x, then
+falls further behind at 4x. That matches the deviation table: flat from 2x to 3x, then a step.
+
+**Saturation limb: queue in all nine runs, KV never engaged.** `llm_d_epp_flow_control_queue_size`
+peaked between 68.5 and 99.5 against the 32 threshold, and
+`llm_d_epp_average_kv_cache_utilization` read 0 throughout every run. There were no EPP restarts,
+and the ledger cross-check PASSed in all nine.
+
+**UNI-245's "4x is also an error regime" did not reproduce.** That claim rested on a single run,
+UNI-220's `20261111T104247Z-uni-220-fix-app1-flood-moderate`. That run had the same weights and
+`enforcing 1`, and it returned 135/26/64 HTTP 500s. Its 6.61M tokens were about 8% below 3x. Across
+the three 4x repeats here, the 500 count is **zero**, with only 1-7 client `000` timeouts per group,
+the same level as 2x and 3x. Delivered tokens were 6.96-7.13M at 4x, 7.09-7.15M at 3x and
+7.18-7.20M at 2x, a roll-off of about 1-2% from 3x to 4x rather than 8%. The 4x fairness FAIL is
+real and repeatable. The error burst seen once on UNI-220's run is not, and its cause was not
+determined: the loadgen log records status tallies only, not bodies. Treat 4x as a worse but
+stable split, not as the onset of backend failures.
+
+**Four more counterexamples to the duration finding's PASS floor.** The UNI-225 band reads "FAIL
+<=66.3s, PASS >=69.0s" contended. In this batch, four PASSes have end-users contended time below the
+69.0s floor: 2x rep 1 (58.9s), 2x rep 2 (49.7s), 2x rep 3 (66.9s) and 3x rep 3 (68.6s). 2x rep 2
+PASSes 16.6s inside the FAIL band. The FAILs all sit at or below 67.9s, so the FAIL side holds. For
+the `app1-flood*` family, though, short contended time does not predict a FAIL. Together with
+UNI-245's 3x run, that makes five discriminating PASSes below the floor. The duration finding should
+be read as describing the corpus it was fit on, not as a necessary condition.
+
+**Harness defect found and fixed along the way.** 3x reps 1-3 and 4x reps 1-2 exited 1 *before*
+writing a report. That was a crash, not a FAIL verdict. UNI-224's (`6630bb7`) new
+`kvCacheUtilThreshold` ConfigMap read runs under `set -euo pipefail`, and because that key has never
+been set live, grep's no-match killed the script. This affected every scored run on `main` from
+`6630bb7` until the fix in `73c599e` (`|| true` on that read and its four siblings). Those five
+reports were rebuilt offline from each run's own artifacts with
+`deploy/poc/uni247/rebuild-report.sh`, using the arguments the script would have passed. Nothing was
+re-run. 4x rep 3 and the three 2x reps ran on the fixed script and wrote their own reports.
+
+#### The evidenced ceiling, with spread
+
+**At 30/10/60 and `queueDepthThreshold: 32`, on instance 1 run solo, this fix reliably corrects a
+2x over-offer to within the 10-point bar** (3/3 PASS, mean 8.8, spread 1.3), **and reliably does not
+correct 4x** (3/3 FAIL, mean 14.1, spread 1.0). **3x is the crossover itself** (2/3 PASS, mean 9.7,
+spread 1.7): it cannot be quoted as either side of the bar. The board-quotable statement is
+**"reliable to 2x, fails at 4x, borderline at 3x."** Two caveats apply. First, 2x's margin is thin:
+its worst repeat is 0.7 points under the bar, and 2x and 3x are not separable at this noise level.
+Second, the result holds for this scenario shape (end-users at 64 workers, app2 at 32) and this
+backend. The crossover follows from the latency-spread shortfall above, which depends on the
+scenario, so it is not a universal constant.
+
+#### Cluster restored (UNI-247)
+
+`enforce: false` was confirmed live (`llm_d_epp_maas_fairness_enforcing 0` on both EPPs, 11:54:38Z)
+after the final repeat's snapshot. Weights were back at `20/10/65/5` and confirmed on both EPPs at
+11:55:54Z. `queueDepthThreshold: 32` and `newcomerClamp: true` were unchanged throughout. One gap:
+the first batch's own weight restore (10:35Z) failed on the session-scoped-`$TMPDIR` bug that
+`6d7ce9c` fixed in `24-patch-all-weights.sh`, so the cluster sat at 30/10/60 between the two batches
+until the 2x batch re-patched and then restored. No scored run from another ticket ran in that window.
+[UNI-222](/UNI/issues/UNI-222)'s queued batch started at 11:56Z and re-verifies the baseline itself.
 
 ## UNI-221: `b5-openloop-120pct`'s inversion re-confirmed live -- the shed/TTL hypothesis is
 ruled out, and the real mechanism is the same duration/convergence property already documented

@@ -1,0 +1,3756 @@
+{
+  "schema": "uni54.fairness_benchmark_report.v1",
+  "run": {
+    "scenario": "app1-flood-3x",
+    "label": "uni-247-3x-rep2",
+    "control": false,
+    "generator": "closed-loop",
+    "namespace": "maas-fairness-poc",
+    "enforce": true,
+    "duration_seconds": 240,
+    "backend": "vllm-gpu (real)",
+    "epp_image_digest": "quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f",
+    "epp_pod": "maas-vllm-gpu-kserve-router-scheduler-6988b67749-dfcwc",
+    "run_start": "2026-11-12T09:47:01Z",
+    "run_end": "2026-11-12T09:51:25Z"
+  },
+  "groups": [
+    {
+      "group": "app1",
+      "configured_weight": 30.0,
+      "offered": true,
+      "offered_workers": 96,
+      "requests_total": 2047,
+      "status_tally": {
+        "200": 2047
+      },
+      "p50_sec": 11.82,
+      "p95_sec": 14.25,
+      "delivered_tokens": 2684160.0,
+      "expected_share_pct": 30.0,
+      "observed_share_pct": 37.8666063244749,
+      "deviation_pts": 7.866606324474901,
+      "request_share_pct": 38.0624767571588,
+      "request_share_deviation_pts": 8.062476757158798,
+      "worker_share_pct": 50.0,
+      "worker_vs_weight_gap_pts": 20.0,
+      "contended_seconds": 66.39338896499999,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 2047.0
+    },
+    {
+      "group": "app2",
+      "configured_weight": 10.0,
+      "offered": true,
+      "offered_workers": 32,
+      "requests_total": 684,
+      "status_tally": {
+        "200": 684
+      },
+      "p50_sec": 11.76,
+      "p95_sec": 14.11,
+      "delivered_tokens": 895338.0,
+      "expected_share_pct": 10.0,
+      "observed_share_pct": 12.630920501513586,
+      "deviation_pts": 2.630920501513586,
+      "request_share_pct": 12.718482707326144,
+      "request_share_deviation_pts": 2.718482707326144,
+      "worker_share_pct": 16.666666666666668,
+      "worker_vs_weight_gap_pts": 6.666666666666668,
+      "contended_seconds": 66.393643785,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 684.0
+    },
+    {
+      "group": "end-users",
+      "configured_weight": 60.0,
+      "offered": true,
+      "offered_workers": 64,
+      "requests_total": 2647,
+      "status_tally": {
+        "200": 2647
+      },
+      "p50_sec": 5.55,
+      "p95_sec": 9.09,
+      "delivered_tokens": 3508964.0,
+      "expected_share_pct": 60.0,
+      "observed_share_pct": 49.50247317401151,
+      "deviation_pts": -10.497526825988487,
+      "request_share_pct": 49.21904053551506,
+      "request_share_deviation_pts": -10.780959464484937,
+      "worker_share_pct": 33.333333333333336,
+      "worker_vs_weight_gap_pts": -26.666666666666664,
+      "contended_seconds": 62.854003663,
+      "prompt_tokens_cached_ratio": 0.9886178861788618,
+      "dispatch_total": 2647.0
+    },
+    {
+      "group": "unclassified",
+      "configured_weight": 5.0,
+      "offered": false,
+      "offered_workers": 0,
+      "requests_total": 0,
+      "status_tally": {},
+      "p50_sec": null,
+      "p95_sec": null,
+      "delivered_tokens": null,
+      "expected_share_pct": null,
+      "observed_share_pct": null,
+      "deviation_pts": null,
+      "request_share_pct": null,
+      "request_share_deviation_pts": null,
+      "worker_share_pct": null,
+      "worker_vs_weight_gap_pts": null,
+      "contended_seconds": null,
+      "prompt_tokens_cached_ratio": null,
+      "dispatch_total": null
+    }
+  ],
+  "verdict": {
+    "result": "FAIL",
+    "threshold_points": 10.0,
+    "max_abs_deviation_points": 10.497526825988487,
+    "reasons": [
+      "end-users deviated -10.5 points from its contention-adjusted expected share, exceeding the 10-point threshold"
+    ],
+    "epp_restarted_mid_run": false,
+    "epp_restarted_in_windows_but_not_snapshot_pair": false,
+    "scrape_gap_in_windows": false,
+    "solo_group": null,
+    "capped_groups": [],
+    "uncontended_threshold_seconds": 1.0,
+    "max_worker_vs_weight_gap_points": 26.666666666666664,
+    "discriminating": true
+  },
+  "sources": {
+    "delivered_tokens_and_observed_share": "llm_d_epp_maas_fairness_contended_service_tokens_total, scraped directly from the EPP's /metrics immediately before and after the run (same mechanism as deploy/poc/13-loadgen-poisson.sh). This is the EPP's own accounting -- the generator cannot see token usage. Reused unmodified from the SLI deploy/grafana-dashboard.yaml (UNI-50) already defines; this report does not invent a second definition of delivered share.",
+    "offered_and_delivered_requests": "deploy/poc/04-loadgen.yaml's own run.sh: the 'load: tenants=...' line for offered worker counts, and the TENANT/TOTAL/P50_SEC/P95_SEC/STATUSES table for delivered requests, status tally, and latency.",
+    "expected_share": "each offered group's configured_weight divided by the sum of configured_weight over OFFERED groups only (excludes the never-offered 'unclassified' catch-all and any group this scenario left idle), so a work-conserving policy absorbing an idle group's share is not scored as a deviation. Also excludes any 'capped_groups' entry (UNI-134's app2-trickle): a group offered but structurally unable to reach a weight-proportional share at its own worker count is scored on a dedicated 'did it get served' check instead, not folded into the other groups' expected-share denominator.",
+    "request_share_pct": "UNI-146 (C1): the SAME expected_share target above, scored against requests_total (plain request count, from the loadgen log) instead of delivered weighted tokens -- informational only, never part of the verdict. Equal to observed_share_pct when every offered group's requests are uniform cost (every scenario before this ticket); expected to diverge when request cost is asymmetric across groups."
+  },
+  "timeline": {
+    "window_seconds": 10.0,
+    "schedule": {
+      "app1": {
+        "start": 0.0,
+        "stop": 240.0,
+        "duty_on": null,
+        "duty_off": null
+      },
+      "app2": {
+        "start": 0.0,
+        "stop": 240.0,
+        "duty_on": null,
+        "duty_off": null
+      },
+      "end-users": {
+        "start": 0.0,
+        "stop": 240.0,
+        "duty_on": null,
+        "duty_off": null
+      }
+    },
+    "chaos_events": [],
+    "phase_edges": [
+      0.0,
+      240.0
+    ],
+    "windows": [
+      {
+        "start_s": 0.0,
+        "end_s": 10.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -30.0
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 0.0,
+            "deviation_pts": -10.0
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 22976.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 100.0,
+            "deviation_pts": 40.0
+          }
+        ]
+      },
+      {
+        "start_s": 10.0,
+        "end_s": 20.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 90702.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 32.72361243397697,
+            "deviation_pts": 2.7236124339769674
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 29748.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 10.732530955061044,
+            "deviation_pts": 0.7325309550610442
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 156726.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 56.54385661096199,
+            "deviation_pts": -3.4561433890380115
+          }
+        ]
+      },
+      {
+        "start_s": 20.0,
+        "end_s": 30.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 93318.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 36.70642100791416,
+            "deviation_pts": 6.706421007914159
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 29774.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 11.711534528061426,
+            "deviation_pts": 1.711534528061426
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 131136.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 51.58204446402442,
+            "deviation_pts": -8.41795553597558
+          }
+        ]
+      },
+      {
+        "start_s": 30.0,
+        "end_s": 40.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 118992.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 38.09572594845526,
+            "deviation_pts": 8.09572594845526
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 40600.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 12.998239154794302,
+            "deviation_pts": 2.9982391547943017
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 152758.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 48.90603489675044,
+            "deviation_pts": -11.093965103249559
+          }
+        ]
+      },
+      {
+        "start_s": 40.0,
+        "end_s": 50.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 101302.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 36.21239418897277,
+            "deviation_pts": 6.212394188972773
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 35196.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 12.581503088538092,
+            "deviation_pts": 2.581503088538092
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 143246.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 51.206102722489135,
+            "deviation_pts": -8.793897277510865
+          }
+        ]
+      },
+      {
+        "start_s": 50.0,
+        "end_s": 60.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 112220.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 36.70054812082205,
+            "deviation_pts": 6.700548120822049
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 37926.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 12.40335936580197,
+            "deviation_pts": 2.40335936580197
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 155626.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 50.89609251337598,
+            "deviation_pts": -9.103907486624017
+          }
+        ]
+      },
+      {
+        "start_s": 60.0,
+        "end_s": 70.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 87892.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 32.01474487863158,
+            "deviation_pts": 2.014744878631582
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 28400.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 10.34472710318501,
+            "deviation_pts": 0.34472710318500965
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 158244.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 57.64052801818341,
+            "deviation_pts": -2.35947198181659
+          }
+        ]
+      },
+      {
+        "start_s": 70.0,
+        "end_s": 81.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 110840.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 40.5671495392093,
+            "deviation_pts": 10.567149539209296
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 35208.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 12.88603573598413,
+            "deviation_pts": 2.88603573598413
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 127178.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 46.54681472480657,
+            "deviation_pts": -13.453185275193427
+          }
+        ]
+      },
+      {
+        "start_s": 81.0,
+        "end_s": 91.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 91938.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 29.693242815525828,
+            "deviation_pts": -0.3067571844741721
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 33768.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 10.906060860522048,
+            "deviation_pts": 0.9060608605220484
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 183920.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 59.400696323952126,
+            "deviation_pts": -0.5993036760478745
+          }
+        ]
+      },
+      {
+        "start_s": 91.0,
+        "end_s": 101.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 115044.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 37.802882435283216,
+            "deviation_pts": 7.802882435283216
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 36524.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 12.001603543568411,
+            "deviation_pts": 2.001603543568411
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 152758.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 50.19551402114838,
+            "deviation_pts": -9.804485978851623
+          }
+        ]
+      },
+      {
+        "start_s": 101.0,
+        "end_s": 111.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 120564.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 39.429378752796204,
+            "deviation_pts": 9.429378752796204
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 40502.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 13.245817144800702,
+            "deviation_pts": 3.245817144800702
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 144706.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 47.3248041024031,
+            "deviation_pts": -12.6751958975969
+          }
+        ]
+      },
+      {
+        "start_s": 111.0,
+        "end_s": 121.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 95968.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 31.401291808728544,
+            "deviation_pts": 1.4012918087285442
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 31106.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 10.178065428083425,
+            "deviation_pts": 0.17806542808342485
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 178544.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 58.420642763188035,
+            "deviation_pts": -1.5793572368119655
+          }
+        ]
+      },
+      {
+        "start_s": 121.0,
+        "end_s": 131.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 97136.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 35.58799176393865,
+            "deviation_pts": 5.587991763938653
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 33760.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 12.368746931627502,
+            "deviation_pts": 2.368746931627502
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 142050.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 52.04326130443384,
+            "deviation_pts": -7.956738695566159
+          }
+        ]
+      },
+      {
+        "start_s": 131.0,
+        "end_s": 141.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 113670.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 38.206862244212,
+            "deviation_pts": 8.206862244211997
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 36454.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 12.252951141466562,
+            "deviation_pts": 2.2529511414665624
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 147388.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 49.54018661432144,
+            "deviation_pts": -10.459813385678558
+          }
+        ]
+      },
+      {
+        "start_s": 141.0,
+        "end_s": 151.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 161046.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 53.62730015384308,
+            "deviation_pts": 23.62730015384308
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 52734.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 17.560088709516293,
+            "deviation_pts": 7.560088709516293
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 86526.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 28.812611136640626,
+            "deviation_pts": -31.187388863359374
+          }
+        ]
+      },
+      {
+        "start_s": 151.0,
+        "end_s": 161.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 109542.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 37.86319173205212,
+            "deviation_pts": 7.8631917320521225
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 37778.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 13.057965504130518,
+            "deviation_pts": 3.057965504130518
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 141990.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 49.078842763817356,
+            "deviation_pts": -10.921157236182644
+          }
+        ]
+      },
+      {
+        "start_s": 161.0,
+        "end_s": 171.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 108252.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 36.513643876277534,
+            "deviation_pts": 6.513643876277534
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 36554.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 12.329746686005329,
+            "deviation_pts": 2.329746686005329
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 151664.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 51.15660943771714,
+            "deviation_pts": -8.843390562282863
+          }
+        ]
+      },
+      {
+        "start_s": 171.0,
+        "end_s": 181.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 87936.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 28.263971921163265,
+            "deviation_pts": -1.7360280788367355
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 31160.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 10.015299366169115,
+            "deviation_pts": 0.015299366169115203
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 192028.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 61.720728712667615,
+            "deviation_pts": 1.720728712667615
+          }
+        ]
+      },
+      {
+        "start_s": 181.0,
+        "end_s": 191.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 198538.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 65.02023920248372,
+            "deviation_pts": 35.02023920248372
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 59512.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 19.48989349856557,
+            "deviation_pts": 9.489893498565571
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 47298.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 15.489867298950706,
+            "deviation_pts": -44.510132701049294
+          }
+        ]
+      },
+      {
+        "start_s": 191.0,
+        "end_s": 201.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 89210.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 30.27680486546659,
+            "deviation_pts": 0.2768048654665911
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 33830.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 11.481496565393282,
+            "deviation_pts": 1.4814965653932823
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 171608.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 58.24169856914013,
+            "deviation_pts": -1.7583014308598734
+          }
+        ]
+      },
+      {
+        "start_s": 201.0,
+        "end_s": 211.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 125804.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 40.473831186379606,
+            "deviation_pts": 10.473831186379606
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 41858.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 13.46661175955834,
+            "deviation_pts": 3.46661175955834
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 143166.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 46.059557054062054,
+            "deviation_pts": -13.940442945937946
+          }
+        ]
+      },
+      {
+        "start_s": 211.0,
+        "end_s": 221.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 117560.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 38.46783112896998,
+            "deviation_pts": 8.467831128969983
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 40646.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 13.300131541919988,
+            "deviation_pts": 3.3001315419199884
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 147400.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 48.23203732911003,
+            "deviation_pts": -11.767962670889972
+          }
+        ]
+      },
+      {
+        "start_s": 221.0,
+        "end_s": 231.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 105514.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 34.83459887751733,
+            "deviation_pts": 4.83459887751733
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 35120.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 11.59458567183889,
+            "deviation_pts": 1.5945856718388907
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 162266.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 53.57081545064378,
+            "deviation_pts": -6.429184549356222
+          }
+        ]
+      },
+      {
+        "start_s": 231.0,
+        "end_s": 241.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": true,
+            "delivered_tokens": 90498.0,
+            "expected_share_pct": 30.0,
+            "observed_share_pct": 30.011540604356245,
+            "deviation_pts": 0.011540604356245154
+          },
+          {
+            "group": "app2",
+            "active": true,
+            "delivered_tokens": 29784.0,
+            "expected_share_pct": 10.0,
+            "observed_share_pct": 9.877165521449607,
+            "deviation_pts": -0.1228344785503932
+          },
+          {
+            "group": "end-users",
+            "active": true,
+            "delivered_tokens": 181262.0,
+            "expected_share_pct": 60.0,
+            "observed_share_pct": 60.111293874194146,
+            "deviation_pts": 0.11129387419414627
+          }
+        ]
+      },
+      {
+        "start_s": 241.0,
+        "end_s": 251.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 140674.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 47396.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 86500.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 251.0,
+        "end_s": 261.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      },
+      {
+        "start_s": 261.0,
+        "end_s": 264.0,
+        "groups": [
+          {
+            "group": "app1",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "app2",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          },
+          {
+            "group": "end-users",
+            "active": false,
+            "delivered_tokens": 0.0,
+            "expected_share_pct": null,
+            "observed_share_pct": null,
+            "deviation_pts": null
+          }
+        ]
+      }
+    ],
+    "convergence": [
+      {
+        "phase_edge_s": 0.0,
+        "converged_at_s": 221.0,
+        "seconds_to_converge": 221.0
+      },
+      {
+        "phase_edge_s": 240.0,
+        "converged_at_s": null,
+        "seconds_to_converge": null
+      }
+    ],
+    "epp_restarted_during_windows": false,
+    "windows_scrape_gap": false,
+    "queue_wait_windows": [
+      {
+        "start_s": 0.0,
+        "end_s": 10.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 0.0001,
+            "p90_seconds": 4.109375000000001,
+            "p99_seconds": 4.9109375
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 39.0,
+            "p50_seconds": 9.750000000000001e-05,
+            "p90_seconds": 4.113636363636364,
+            "p99_seconds": 4.911363636363636
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 117.0,
+            "p50_seconds": 0.34558823529411764,
+            "p90_seconds": 1.9611111111111108,
+            "p99_seconds": 3.537499999999998
+          }
+        ]
+      },
+      {
+        "start_s": 10.0,
+        "end_s": 20.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 48.0,
+            "p50_seconds": 7.5,
+            "p90_seconds": 9.5,
+            "p99_seconds": 9.95
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 15.0,
+            "p50_seconds": 7.5,
+            "p90_seconds": 9.5,
+            "p99_seconds": 9.95
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 100.0,
+            "p50_seconds": 1.4811320754716981,
+            "p90_seconds": 3.2142857142857144,
+            "p99_seconds": 4.821428571428571
+          }
+        ]
+      },
+      {
+        "start_s": 20.0,
+        "end_s": 30.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 107.0,
+            "p50_seconds": 3.8719512195121952,
+            "p90_seconds": 8.471428571428572,
+            "p99_seconds": 9.847142857142856
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 36.0,
+            "p50_seconds": 3.666666666666667,
+            "p90_seconds": 8.2,
+            "p99_seconds": 9.82
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 97.0,
+            "p50_seconds": 2.5657894736842106,
+            "p90_seconds": 8.383333333333333,
+            "p99_seconds": 9.838333333333335
+          }
+        ]
+      },
+      {
+        "start_s": 30.0,
+        "end_s": 40.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 96.0,
+            "p50_seconds": 4.2073170731707314,
+            "p90_seconds": 8.62857142857143,
+            "p99_seconds": 9.862857142857141
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 4.230769230769231,
+            "p90_seconds": 8.666666666666666,
+            "p99_seconds": 9.866666666666667
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 122.0,
+            "p50_seconds": 1.6634615384615383,
+            "p90_seconds": 4.046875,
+            "p99_seconds": 4.9046875
+          }
+        ]
+      },
+      {
+        "start_s": 40.0,
+        "end_s": 50.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 52.0,
+            "p50_seconds": 3.5,
+            "p90_seconds": 8.142857142857144,
+            "p99_seconds": 9.814285714285713
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 17.0,
+            "p50_seconds": 3.392857142857143,
+            "p90_seconds": 7.875000000000001,
+            "p99_seconds": 9.787499999999998
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 3.1818181818181817,
+            "p90_seconds": 4.90909090909091,
+            "p99_seconds": 9.366666666666667
+          }
+        ]
+      },
+      {
+        "start_s": 50.0,
+        "end_s": 60.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 87.0,
+            "p50_seconds": 6.25,
+            "p90_seconds": 9.25,
+            "p99_seconds": 9.925
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 29.0,
+            "p50_seconds": 6.184210526315789,
+            "p90_seconds": 9.236842105263158,
+            "p99_seconds": 9.923684210526316
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 100.0,
+            "p50_seconds": 1.3125,
+            "p90_seconds": 2.9166666666666665,
+            "p99_seconds": 4.791666666666666
+          }
+        ]
+      },
+      {
+        "start_s": 60.0,
+        "end_s": 70.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 64.0,
+            "p50_seconds": 5.0,
+            "p90_seconds": 9.0,
+            "p99_seconds": 9.9
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 22.0,
+            "p50_seconds": 4.642857142857142,
+            "p90_seconds": 8.9,
+            "p99_seconds": 9.89
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 89.0,
+            "p50_seconds": 1.7010869565217392,
+            "p90_seconds": 3.887500000000001,
+            "p99_seconds": 4.88875
+          }
+        ]
+      },
+      {
+        "start_s": 70.0,
+        "end_s": 81.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 68.0,
+            "p50_seconds": 6.222222222222222,
+            "p90_seconds": 9.244444444444444,
+            "p99_seconds": 9.924444444444443
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 22.0,
+            "p50_seconds": 6.764705882352941,
+            "p90_seconds": 9.352941176470587,
+            "p99_seconds": 9.935294117647059
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 137.0,
+            "p50_seconds": 2.632978723404255,
+            "p90_seconds": 7.145833333333332,
+            "p99_seconds": 9.714583333333334
+          }
+        ]
+      },
+      {
+        "start_s": 81.0,
+        "end_s": 91.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 73.0,
+            "p50_seconds": 7.3161764705882355,
+            "p90_seconds": 9.463235294117647,
+            "p99_seconds": 9.946323529411764
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 25.0,
+            "p50_seconds": 7.395833333333334,
+            "p90_seconds": 9.479166666666668,
+            "p99_seconds": 9.947916666666668
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 142.0,
+            "p50_seconds": 1.274390243902439,
+            "p90_seconds": 2.3134146341463415,
+            "p99_seconds": 4.112500000000008
+          }
+        ]
+      },
+      {
+        "start_s": 91.0,
+        "end_s": 101.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 101.0,
+            "p50_seconds": 7.097701149425287,
+            "p90_seconds": 9.419540229885058,
+            "p99_seconds": 9.941954022988504
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 33.0,
+            "p50_seconds": 7.155172413793103,
+            "p90_seconds": 9.431034482758621,
+            "p99_seconds": 9.943103448275863
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 114.0,
+            "p50_seconds": 1.2686567164179103,
+            "p90_seconds": 2.28955223880597,
+            "p99_seconds": 3.5749999999999993
+          }
+        ]
+      },
+      {
+        "start_s": 101.0,
+        "end_s": 111.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 57.0,
+            "p50_seconds": 7.361111111111111,
+            "p90_seconds": 9.472222222222221,
+            "p99_seconds": 9.947222222222223
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 18.0,
+            "p50_seconds": 7.352941176470589,
+            "p90_seconds": 9.470588235294118,
+            "p99_seconds": 9.94705882352941
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 102.0,
+            "p50_seconds": 1.5795454545454546,
+            "p90_seconds": 3.9375,
+            "p99_seconds": 4.893750000000001
+          }
+        ]
+      },
+      {
+        "start_s": 111.0,
+        "end_s": 121.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 91.0,
+            "p50_seconds": 5.7075471698113205,
+            "p90_seconds": 9.141509433962264,
+            "p99_seconds": 9.914150943396226
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 6.0,
+            "p90_seconds": 9.2,
+            "p99_seconds": 9.92
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 106.0,
+            "p50_seconds": 1.0,
+            "p90_seconds": 2.2470588235294118,
+            "p99_seconds": 3.674999999999997
+          }
+        ]
+      },
+      {
+        "start_s": 121.0,
+        "end_s": 131.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 84.0,
+            "p50_seconds": 4.534883720930233,
+            "p90_seconds": 8.764705882352942,
+            "p99_seconds": 9.876470588235293
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 28.0,
+            "p50_seconds": 4.464285714285714,
+            "p90_seconds": 8.727272727272727,
+            "p99_seconds": 9.872727272727271
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 141.0,
+            "p50_seconds": 2.14375,
+            "p90_seconds": 4.712264150943397,
+            "p99_seconds": 9.118750000000002
+          }
+        ]
+      },
+      {
+        "start_s": 131.0,
+        "end_s": 141.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 92.0,
+            "p50_seconds": 2.685185185185185,
+            "p90_seconds": 7.809523809523808,
+            "p99_seconds": 9.780952380952382
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 31.0,
+            "p50_seconds": 2.4318181818181817,
+            "p90_seconds": 7.785714285714287,
+            "p99_seconds": 9.778571428571428
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 52.0,
+            "p50_seconds": 2.0588235294117645,
+            "p90_seconds": 4.694444444444445,
+            "p99_seconds": 9.13333333333333
+          }
+        ]
+      },
+      {
+        "start_s": 141.0,
+        "end_s": 151.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 97.0,
+            "p50_seconds": 3.3653846153846154,
+            "p90_seconds": 4.857692307692307,
+            "p99_seconds": 9.191666666666666
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 32.0,
+            "p50_seconds": 3.2894736842105265,
+            "p90_seconds": 4.973684210526316,
+            "p99_seconds": 9.466666666666665
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 83.0,
+            "p50_seconds": 6.422413793103448,
+            "p90_seconds": 9.28448275862069,
+            "p99_seconds": 9.92844827586207
+          }
+        ]
+      },
+      {
+        "start_s": 151.0,
+        "end_s": 161.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 79.0,
+            "p50_seconds": 4.439655172413794,
+            "p90_seconds": 8.803030303030305,
+            "p99_seconds": 9.880303030303029
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 27.0,
+            "p50_seconds": 4.0625,
+            "p90_seconds": 8.5,
+            "p99_seconds": 9.850000000000001
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 144.0,
+            "p50_seconds": 2.0588235294117645,
+            "p90_seconds": 4.368421052631579,
+            "p99_seconds": 4.936842105263159
+          }
+        ]
+      },
+      {
+        "start_s": 161.0,
+        "end_s": 171.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 72.0,
+            "p50_seconds": 6.7272727272727275,
+            "p90_seconds": 9.345454545454546,
+            "p99_seconds": 9.934545454545454
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 25.0,
+            "p50_seconds": 6.323529411764706,
+            "p90_seconds": 9.264705882352942,
+            "p99_seconds": 9.926470588235293
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 90.0,
+            "p50_seconds": 1.6160714285714286,
+            "p90_seconds": 3.125,
+            "p99_seconds": 4.812499999999998
+          }
+        ]
+      },
+      {
+        "start_s": 171.0,
+        "end_s": 181.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 100.0,
+            "p50_seconds": 5.283018867924528,
+            "p90_seconds": 9.056603773584905,
+            "p99_seconds": 9.90566037735849
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 31.0,
+            "p50_seconds": 5.4411764705882355,
+            "p90_seconds": 9.088235294117649,
+            "p99_seconds": 9.908823529411766
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 101.0,
+            "p50_seconds": 1.4342105263157894,
+            "p90_seconds": 2.4973684210526317,
+            "p99_seconds": 4.747499999999999
+          }
+        ]
+      },
+      {
+        "start_s": 181.0,
+        "end_s": 191.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 134.0,
+            "p50_seconds": 2.08,
+            "p90_seconds": 4.367924528301887,
+            "p99_seconds": 4.936792452830188
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 46.0,
+            "p50_seconds": 1.9782608695652173,
+            "p90_seconds": 4.233333333333333,
+            "p99_seconds": 4.923333333333333
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 76.0,
+            "p50_seconds": 5.476190476190476,
+            "p90_seconds": 9.095238095238095,
+            "p99_seconds": 9.909523809523808
+          }
+        ]
+      },
+      {
+        "start_s": 191.0,
+        "end_s": 201.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 55.0,
+            "p50_seconds": 7.010869565217391,
+            "p90_seconds": 9.402173913043478,
+            "p99_seconds": 9.940217391304348
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 18.0,
+            "p50_seconds": 6.538461538461538,
+            "p90_seconds": 9.307692307692307,
+            "p99_seconds": 9.93076923076923
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 128.0,
+            "p50_seconds": 1.6764705882352942,
+            "p90_seconds": 4.111111111111112,
+            "p99_seconds": 4.911111111111111
+          }
+        ]
+      },
+      {
+        "start_s": 201.0,
+        "end_s": 211.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 79.0,
+            "p50_seconds": 6.273584905660377,
+            "p90_seconds": 9.254716981132077,
+            "p99_seconds": 9.925471698113206
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 26.0,
+            "p50_seconds": 6.176470588235294,
+            "p90_seconds": 9.23529411764706,
+            "p99_seconds": 9.923529411764704
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 101.0,
+            "p50_seconds": 1.4961538461538462,
+            "p90_seconds": 2.428461538461539,
+            "p99_seconds": 4.6392857142857125
+          }
+        ]
+      },
+      {
+        "start_s": 211.0,
+        "end_s": 221.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 99.0,
+            "p50_seconds": 6.360294117647059,
+            "p90_seconds": 9.272058823529413,
+            "p99_seconds": 9.927205882352942
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 34.0,
+            "p50_seconds": 6.136363636363637,
+            "p90_seconds": 9.227272727272727,
+            "p99_seconds": 9.922727272727272
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 129.0,
+            "p50_seconds": 1.5809859154929577,
+            "p90_seconds": 3.4642857142857153,
+            "p99_seconds": 4.846428571428571
+          }
+        ]
+      },
+      {
+        "start_s": 221.0,
+        "end_s": 231.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 64.0,
+            "p50_seconds": 7.090909090909091,
+            "p90_seconds": 9.418181818181818,
+            "p99_seconds": 9.941818181818181
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 22.0,
+            "p50_seconds": 7.25,
+            "p90_seconds": 9.45,
+            "p99_seconds": 9.945
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 128.0,
+            "p50_seconds": 1.3888888888888888,
+            "p90_seconds": 2.337037037037037,
+            "p99_seconds": 4.199999999999999
+          }
+        ]
+      },
+      {
+        "start_s": 231.0,
+        "end_s": 241.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 90.0,
+            "p50_seconds": 6.120689655172414,
+            "p90_seconds": 9.224137931034484,
+            "p99_seconds": 9.922413793103448
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 29.0,
+            "p50_seconds": 5.972222222222222,
+            "p90_seconds": 9.194444444444445,
+            "p99_seconds": 9.919444444444444
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 71.0,
+            "p50_seconds": 1.703125,
+            "p90_seconds": 4.342592592592593,
+            "p99_seconds": 4.93425925925926
+          }
+        ]
+      },
+      {
+        "start_s": 241.0,
+        "end_s": 251.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "ok",
+            "observations": 44.0,
+            "p50_seconds": 4.396551724137931,
+            "p90_seconds": 8.533333333333333,
+            "p99_seconds": 9.853333333333335
+          },
+          {
+            "group": "app2",
+            "state": "ok",
+            "observations": 15.0,
+            "p50_seconds": 4.583333333333334,
+            "p90_seconds": 8.75,
+            "p99_seconds": 9.875
+          },
+          {
+            "group": "end-users",
+            "state": "ok",
+            "observations": 63.0,
+            "p50_seconds": 2.9276315789473686,
+            "p90_seconds": 4.585526315789474,
+            "p99_seconds": 4.958552631578947
+          }
+        ]
+      },
+      {
+        "start_s": 251.0,
+        "end_s": 261.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      },
+      {
+        "start_s": 261.0,
+        "end_s": 264.0,
+        "groups": [
+          {
+            "group": "app1",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "app2",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          },
+          {
+            "group": "end-users",
+            "state": "no_observations",
+            "observations": 0.0,
+            "p50_seconds": null,
+            "p90_seconds": null,
+            "p99_seconds": null
+          }
+        ]
+      }
+    ],
+    "queue_wait_epp_restarted": false,
+    "queue_wait_scrape_gap": false
+  },
+  "ledger": {
+    "tolerance_pct": 10.0,
+    "cost_model": {
+      "input_token_weight": 1.0,
+      "output_token_weight": 2.0,
+      "cached_input_token_weight": 1.0
+    },
+    "rows": [
+      {
+        "group": "app1",
+        "client_prompt_tokens": 2517810,
+        "client_completion_tokens": 125014,
+        "client_requests_sent": 2047,
+        "client_aborts": 0,
+        "client_errors": 0,
+        "epp_total_input_tokens_delta": 2517810.0,
+        "epp_total_output_tokens_delta": 125014.0,
+        "epp_total_cached_tokens_delta": 2489152.0,
+        "epp_total_raw_tokens_delta": 2642824.0,
+        "raw_tokens_pct_diff": 0.0,
+        "epp_contended_cost_delta": 2684160.0,
+        "expected_cost_from_client": 2767838.0,
+        "cost_pct_diff": -3.0232260703119187,
+        "within_tolerance": true
+      },
+      {
+        "group": "app2",
+        "client_prompt_tokens": 841320,
+        "client_completion_tokens": 41909,
+        "client_requests_sent": 684,
+        "client_aborts": 0,
+        "client_errors": 0,
+        "epp_total_input_tokens_delta": 841320.0,
+        "epp_total_output_tokens_delta": 41909.0,
+        "epp_total_cached_tokens_delta": 831744.0,
+        "epp_total_raw_tokens_delta": 883229.0,
+        "raw_tokens_pct_diff": 0.0,
+        "epp_contended_cost_delta": 895338.0,
+        "expected_cost_from_client": 925138.0,
+        "cost_pct_diff": -3.221141062198288,
+        "within_tolerance": true
+      },
+      {
+        "group": "end-users",
+        "client_prompt_tokens": 3255810,
+        "client_completion_tokens": 161732,
+        "client_requests_sent": 2647,
+        "client_aborts": 0,
+        "client_errors": 0,
+        "epp_total_input_tokens_delta": 3255810.0,
+        "epp_total_output_tokens_delta": 161732.0,
+        "epp_total_cached_tokens_delta": 3218752.0,
+        "epp_total_raw_tokens_delta": 3417542.0,
+        "raw_tokens_pct_diff": 0.0,
+        "epp_contended_cost_delta": 3508964.0,
+        "expected_cost_from_client": 3579274.0,
+        "cost_pct_diff": -1.964364840467648,
+        "within_tolerance": true
+      }
+    ],
+    "verdict": {
+      "result": "PASS",
+      "reasons": []
+    }
+  },
+  "shed": {
+    "shed_statuses": [
+      "429",
+      "503"
+    ],
+    "total_shed": 0,
+    "rows": [
+      {
+        "group": "app1",
+        "state": "never_shed",
+        "requests_total": 2047,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 30.0,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      },
+      {
+        "group": "app2",
+        "state": "never_shed",
+        "requests_total": 684,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 10.0,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      },
+      {
+        "group": "end-users",
+        "state": "never_shed",
+        "requests_total": 2647,
+        "status_429": 0,
+        "status_503": 0,
+        "shed": 0,
+        "shed_rate_pct": 0.0,
+        "weight_share_pct": 60.0,
+        "shed_share_pct": null,
+        "shed_share_vs_weight_share": null
+      }
+    ],
+    "epp_pool_wide": {
+      "state": "ok",
+      "outcome_deltas": {
+        "Dispatched": 5378.0
+      },
+      "epp_shed_total": 0.0,
+      "epp_429_upper_bound": 0.0,
+      "client_429_total": 0,
+      "non_epp_429_lower_bound": 0.0,
+      "epp_restarted": false
+    }
+  },
+  "pick_latency": {
+    "histograms": {
+      "scheduler_e2e": {
+        "metric": "llm_d_epp_scheduler_e2e_duration_seconds",
+        "state": "ok",
+        "observations": 5378.0,
+        "p50_seconds": 5.1741389263036374e-05,
+        "p99_seconds": 0.0001780490797546014,
+        "p50_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_bucket": [
+          0.0001,
+          0.0002
+        ],
+        "p99_at_histogram_ceiling": false,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      },
+      "flow_control_dispatch_cycle": {
+        "metric": "llm_d_epp_flow_control_dispatch_cycle_duration_seconds",
+        "state": "ok",
+        "observations": 250072.0,
+        "p50_seconds": 5.00450275568648e-05,
+        "p99_seconds": 9.908915456259231e-05,
+        "p50_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_bucket": [
+          0.0,
+          0.0001
+        ],
+        "p99_at_histogram_ceiling": false,
+        "baseline_p50_seconds": null,
+        "baseline_p99_seconds": null,
+        "p50_vs_baseline": null,
+        "p99_vs_baseline": null
+      }
+    },
+    "epp_restarted": false,
+    "baseline_report": null,
+    "baseline_has_pick_latency": null
+  },
+  "alerts": null,
+  "ttft_itl": {
+    "window_seconds": 10.0,
+    "groups": {
+      "app1": {
+        "ttft": {
+          "state": "ok",
+          "observations": 2047.0,
+          "p50_seconds": 11.982398568019093,
+          "p95_seconds": 14.730459427207638
+        },
+        "itl": {
+          "state": "not_recorded",
+          "observations": null,
+          "p50_seconds": null,
+          "p95_seconds": null
+        }
+      },
+      "app2": {
+        "ttft": {
+          "state": "ok",
+          "observations": 684.0,
+          "p50_seconds": 12.005347593582888,
+          "p95_seconds": 14.74866310160428
+        },
+        "itl": {
+          "state": "not_recorded",
+          "observations": null,
+          "p50_seconds": null,
+          "p95_seconds": null
+        }
+      },
+      "end-users": {
+        "ttft": {
+          "state": "ok",
+          "observations": 2647.0,
+          "p50_seconds": 5.511098779134295,
+          "p95_seconds": 8.941379310344834
+        },
+        "itl": {
+          "state": "not_recorded",
+          "observations": null,
+          "p50_seconds": null,
+          "p95_seconds": null
+        }
+      }
+    },
+    "pool": {
+      "ttft": {
+        "state": "ok",
+        "observations": 5378.0,
+        "p50_seconds": 7.747919143876338,
+        "p95_seconds": 14.467077315208154
+      },
+      "itl": {
+        "state": "not_recorded",
+        "observations": null,
+        "p50_seconds": null,
+        "p95_seconds": null
+      }
+    },
+    "windows": [
+      {
+        "start_s": 0.0,
+        "end_s": 10.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 51.0,
+              "p50_seconds": 2.236842105263158,
+              "p95_seconds": 4.149999999999999
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 14.0,
+              "p50_seconds": 1.75,
+              "p95_seconds": 3.299999999999999
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 58.0,
+              "p50_seconds": 3.1904761904761907,
+              "p95_seconds": 4.758333333333333
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 10.0,
+        "end_s": 20.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 76.0,
+              "p50_seconds": 9.764705882352942,
+              "p95_seconds": 14.472222222222221
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 29.0,
+              "p50_seconds": 9.0,
+              "p95_seconds": 14.34090909090909
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 123.0,
+              "p50_seconds": 4.9296875,
+              "p95_seconds": 5.924545454545455
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 20.0,
+        "end_s": 30.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 69.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 22.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 97.0,
+              "p50_seconds": 5.5638297872340425,
+              "p95_seconds": 8.383333333333331
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 30.0,
+        "end_s": 40.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 88.0,
+              "p50_seconds": 12.471264367816092,
+              "p95_seconds": 14.74712643678161
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 30.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 113.0,
+              "p50_seconds": 5.911290322580645,
+              "p95_seconds": 7.9297872340425535
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 40.0,
+        "end_s": 50.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 75.0,
+              "p50_seconds": 12.466216216216216,
+              "p95_seconds": 14.746621621621621
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 26.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 107.0,
+              "p50_seconds": 6.160714285714286,
+              "p95_seconds": 7.880357142857143
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 50.0,
+        "end_s": 60.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 83.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 28.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 115.0,
+              "p50_seconds": 5.256756756756757,
+              "p95_seconds": 7.616666666666667
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 60.0,
+        "end_s": 70.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 65.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 21.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 117.0,
+              "p50_seconds": 5.2421875,
+              "p95_seconds": 6.829999999999998
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 70.0,
+        "end_s": 81.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 82.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 26.0,
+              "p50_seconds": 12.6,
+              "p95_seconds": 14.940000000000001
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 95.0,
+              "p50_seconds": 6.776315789473684,
+              "p95_seconds": 7.901315789473684
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 81.0,
+        "end_s": 91.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 68.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 25.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 136.0,
+              "p50_seconds": 5.24,
+              "p95_seconds": 7.546666666666666
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 91.0,
+        "end_s": 101.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 85.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 27.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 112.0,
+              "p50_seconds": 5.517857142857143,
+              "p95_seconds": 7.671428571428571
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 101.0,
+        "end_s": 111.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 89.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 30.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 108.0,
+              "p50_seconds": 4.9818181818181815,
+              "p95_seconds": 6.2399999999999975
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 111.0,
+        "end_s": 121.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 71.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 23.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 132.0,
+              "p50_seconds": 4.953846153846154,
+              "p95_seconds": 7.633333333333333
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 121.0,
+        "end_s": 131.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 72.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 25.0,
+              "p50_seconds": 12.604166666666666,
+              "p95_seconds": 14.947916666666668
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 105.0,
+              "p50_seconds": 5.6688311688311686,
+              "p95_seconds": 7.673076923076923
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 131.0,
+        "end_s": 141.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 84.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 27.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 109.0,
+              "p50_seconds": 5.2073170731707314,
+              "p95_seconds": 7.504545454545454
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 141.0,
+        "end_s": 151.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 120.0,
+              "p50_seconds": 7.157894736842105,
+              "p95_seconds": 14.25
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 39.0,
+              "p50_seconds": 7.0,
+              "p95_seconds": 14.303571428571427
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 64.0,
+              "p50_seconds": 12.09090909090909,
+              "p95_seconds": 14.709090909090909
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 151.0,
+        "end_s": 161.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 81.0,
+              "p50_seconds": 12.065217391304348,
+              "p95_seconds": 14.706521739130434
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 28.0,
+              "p50_seconds": 12.2,
+              "p95_seconds": 14.719999999999999
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 106.0,
+              "p50_seconds": 5.481481481481482,
+              "p95_seconds": 7.969999999999999
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 161.0,
+        "end_s": 171.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 80.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 27.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 112.0,
+              "p50_seconds": 5.568181818181818,
+              "p95_seconds": 7.697297297297297
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 171.0,
+        "end_s": 181.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 65.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 23.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 142.0,
+              "p50_seconds": 5.24,
+              "p95_seconds": 7.726923076923077
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 181.0,
+        "end_s": 191.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 148.0,
+              "p50_seconds": 10.066666666666666,
+              "p95_seconds": 14.506666666666668
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 45.0,
+              "p50_seconds": 10.3125,
+              "p95_seconds": 14.53125
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 35.0,
+              "p50_seconds": 11.75925925925926,
+              "p95_seconds": 14.675925925925926
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 191.0,
+        "end_s": 201.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 66.0,
+              "p50_seconds": 9.84,
+              "p95_seconds": 14.46774193548387
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 25.0,
+              "p50_seconds": 9.90909090909091,
+              "p95_seconds": 14.479166666666668
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 128.0,
+              "p50_seconds": 5.573529411764706,
+              "p95_seconds": 13.89655172413793
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 201.0,
+        "end_s": 211.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 93.0,
+              "p50_seconds": 12.703488372093023,
+              "p95_seconds": 16.678571428571423
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 31.0,
+              "p50_seconds": 12.589285714285715,
+              "p95_seconds": 16.125
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 106.0,
+              "p50_seconds": 5.555555555555555,
+              "p95_seconds": 7.783673469387755
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 211.0,
+        "end_s": 221.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 87.0,
+              "p50_seconds": 11.10576923076923,
+              "p95_seconds": 14.870192307692307
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 30.0,
+              "p50_seconds": 11.38888888888889,
+              "p95_seconds": 16.25
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 109.0,
+              "p50_seconds": 5.717391304347826,
+              "p95_seconds": 7.81063829787234
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 221.0,
+        "end_s": 231.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 78.0,
+              "p50_seconds": 12.465753424657535,
+              "p95_seconds": 14.86986301369863
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 26.0,
+              "p50_seconds": 12.291666666666666,
+              "p95_seconds": 14.729166666666668
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 120.0,
+              "p50_seconds": 6.181818181818182,
+              "p95_seconds": 7.818181818181818
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 231.0,
+        "end_s": 241.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 67.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 22.0,
+              "p50_seconds": 12.5,
+              "p95_seconds": 14.75
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 134.0,
+              "p50_seconds": 4.882352941176471,
+              "p95_seconds": 6.51111111111111
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 241.0,
+        "end_s": 251.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "ok",
+              "observations": 104.0,
+              "p50_seconds": 11.438356164383562,
+              "p95_seconds": 14.643835616438356
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "ok",
+              "observations": 35.0,
+              "p50_seconds": 11.5,
+              "p95_seconds": 14.65
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "ok",
+              "observations": 64.0,
+              "p50_seconds": 6.967741935483871,
+              "p95_seconds": 7.896774193548387
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 251.0,
+        "end_s": 261.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "no_observations",
+              "observations": 0.0,
+              "p50_seconds": null,
+              "p95_seconds": null
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "no_observations",
+              "observations": 0.0,
+              "p50_seconds": null,
+              "p95_seconds": null
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "no_observations",
+              "observations": 0.0,
+              "p50_seconds": null,
+              "p95_seconds": null
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      },
+      {
+        "start_s": 261.0,
+        "end_s": 264.0,
+        "groups": [
+          {
+            "group": "app1",
+            "ttft": {
+              "state": "no_observations",
+              "observations": 0.0,
+              "p50_seconds": null,
+              "p95_seconds": null
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "app2",
+            "ttft": {
+              "state": "no_observations",
+              "observations": 0.0,
+              "p50_seconds": null,
+              "p95_seconds": null
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          },
+          {
+            "group": "end-users",
+            "ttft": {
+              "state": "no_observations",
+              "observations": 0.0,
+              "p50_seconds": null,
+              "p95_seconds": null
+            },
+            "itl": {
+              "state": "not_recorded",
+              "observations": null,
+              "p50_seconds": null,
+              "p95_seconds": null
+            }
+          }
+        ]
+      }
+    ],
+    "epp_restarted_during_windows": false,
+    "scrape_gap_in_windows": false,
+    "priority_verdict": {
+      "applicable": true,
+      "result": "PRIORITY-OK",
+      "top_weighted_group": "end-users",
+      "top_group_ttft_p50_seconds": 5.511098779134295,
+      "top_group_ttft_p95_seconds": 8.941379310344834,
+      "top_group_strictly_lowest_p50": true,
+      "top_group_strictly_lowest_p95": true,
+      "no_inversions_among_distinct_weights": true,
+      "rank_correlation": 1.0,
+      "separation_from_next_seconds": 6.471299788884798,
+      "noise_floor_seconds": null,
+      "separation_state": "not_evaluated",
+      "groups": [
+        "app1",
+        "app2",
+        "end-users"
+      ],
+      "weights": {
+        "app1": 30.0,
+        "app2": 10.0,
+        "end-users": 60.0
+      }
+    }
+  },
+  "saturation": {
+    "queue_depth_threshold": 32.0,
+    "kv_cache_util_threshold": 0.8,
+    "state": "ok",
+    "sample_count": 28,
+    "peak_queue_ratio": 2.4375,
+    "peak_kv_ratio": 0.0,
+    "peak_average_kv_cache_utilization": 0.0,
+    "peak_average_queue_size": 78.0,
+    "kv_binding_sample_count": 0,
+    "bound_at_peak": "queue",
+    "samples": [
+      {
+        "epoch": 1794476821.0,
+        "ts": "2026-11-12T09:47:01Z",
+        "average_queue_size": 0.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 0.0,
+        "kv_ratio": 0.0,
+        "roofline_score": 0.0,
+        "bound": "queue",
+        "pool_saturation_reported": 0.0
+      },
+      {
+        "epoch": 1794476831.0,
+        "ts": "2026-11-12T09:47:11Z",
+        "average_queue_size": 45.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.40625,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.40625,
+        "bound": "queue",
+        "pool_saturation_reported": 2.046875
+      },
+      {
+        "epoch": 1794476841.0,
+        "ts": "2026-11-12T09:47:21Z",
+        "average_queue_size": 34.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.0625,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.0625,
+        "bound": "queue",
+        "pool_saturation_reported": 1.046875
+      },
+      {
+        "epoch": 1794476851.0,
+        "ts": "2026-11-12T09:47:31Z",
+        "average_queue_size": 40.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.265625,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.265625,
+        "bound": "queue",
+        "pool_saturation_reported": 1.84375
+      },
+      {
+        "epoch": 1794476861.0,
+        "ts": "2026-11-12T09:47:41Z",
+        "average_queue_size": 36.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.125,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.125,
+        "bound": "queue",
+        "pool_saturation_reported": 2.15625
+      },
+      {
+        "epoch": 1794476871.0,
+        "ts": "2026-11-12T09:47:51Z",
+        "average_queue_size": 72.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 2.265625,
+        "kv_ratio": 0.0,
+        "roofline_score": 2.265625,
+        "bound": "queue",
+        "pool_saturation_reported": 1.765625
+      },
+      {
+        "epoch": 1794476881.0,
+        "ts": "2026-11-12T09:48:01Z",
+        "average_queue_size": 56.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.765625,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.765625,
+        "bound": "queue",
+        "pool_saturation_reported": 1.625
+      },
+      {
+        "epoch": 1794476891.0,
+        "ts": "2026-11-12T09:48:11Z",
+        "average_queue_size": 78.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 2.4375,
+        "kv_ratio": 0.0,
+        "roofline_score": 2.4375,
+        "bound": "queue",
+        "pool_saturation_reported": 1.28125
+      },
+      {
+        "epoch": 1794476902.0,
+        "ts": "2026-11-12T09:48:22Z",
+        "average_queue_size": 42.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.3125,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.3125,
+        "bound": "queue",
+        "pool_saturation_reported": 1.546875
+      },
+      {
+        "epoch": 1794476912.0,
+        "ts": "2026-11-12T09:48:32Z",
+        "average_queue_size": 46.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.4375,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.4375,
+        "bound": "queue",
+        "pool_saturation_reported": 1.71875
+      },
+      {
+        "epoch": 1794476922.0,
+        "ts": "2026-11-12T09:48:42Z",
+        "average_queue_size": 54.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.703125,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.703125,
+        "bound": "queue",
+        "pool_saturation_reported": 2.09375
+      },
+      {
+        "epoch": 1794476932.0,
+        "ts": "2026-11-12T09:48:52Z",
+        "average_queue_size": 42.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.328125,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.328125,
+        "bound": "queue",
+        "pool_saturation_reported": 1.3125
+      },
+      {
+        "epoch": 1794476942.0,
+        "ts": "2026-11-12T09:49:02Z",
+        "average_queue_size": 43.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.34375,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.34375,
+        "bound": "queue",
+        "pool_saturation_reported": 1.3915373000387263
+      },
+      {
+        "epoch": 1794476952.0,
+        "ts": "2026-11-12T09:49:12Z",
+        "average_queue_size": 54.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.703125,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.703125,
+        "bound": "queue",
+        "pool_saturation_reported": 1.484375
+      },
+      {
+        "epoch": 1794476962.0,
+        "ts": "2026-11-12T09:49:22Z",
+        "average_queue_size": 75.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 2.359375,
+        "kv_ratio": 0.0,
+        "roofline_score": 2.359375,
+        "bound": "queue",
+        "pool_saturation_reported": 1.453125
+      },
+      {
+        "epoch": 1794476972.0,
+        "ts": "2026-11-12T09:49:32Z",
+        "average_queue_size": 55.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.71875,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.71875,
+        "bound": "queue",
+        "pool_saturation_reported": 1.28125
+      },
+      {
+        "epoch": 1794476982.0,
+        "ts": "2026-11-12T09:49:42Z",
+        "average_queue_size": 49.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.53125,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.53125,
+        "bound": "queue",
+        "pool_saturation_reported": 1.1875
+      },
+      {
+        "epoch": 1794476992.0,
+        "ts": "2026-11-12T09:49:52Z",
+        "average_queue_size": 37.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.171875,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.171875,
+        "bound": "queue",
+        "pool_saturation_reported": 1.234375
+      },
+      {
+        "epoch": 1794477002.0,
+        "ts": "2026-11-12T09:50:02Z",
+        "average_queue_size": 44.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.375,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.375,
+        "bound": "queue",
+        "pool_saturation_reported": 1.359375
+      },
+      {
+        "epoch": 1794477012.0,
+        "ts": "2026-11-12T09:50:12Z",
+        "average_queue_size": 59.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.859375,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.859375,
+        "bound": "queue",
+        "pool_saturation_reported": 1.796875
+      },
+      {
+        "epoch": 1794477022.0,
+        "ts": "2026-11-12T09:50:22Z",
+        "average_queue_size": 49.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.546875,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.546875,
+        "bound": "queue",
+        "pool_saturation_reported": 1.515625
+      },
+      {
+        "epoch": 1794477032.0,
+        "ts": "2026-11-12T09:50:32Z",
+        "average_queue_size": 38.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.203125,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.203125,
+        "bound": "queue",
+        "pool_saturation_reported": 1.125
+      },
+      {
+        "epoch": 1794477042.0,
+        "ts": "2026-11-12T09:50:42Z",
+        "average_queue_size": 57.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.78125,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.78125,
+        "bound": "queue",
+        "pool_saturation_reported": 1.6875
+      },
+      {
+        "epoch": 1794477052.0,
+        "ts": "2026-11-12T09:50:52Z",
+        "average_queue_size": 51.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.59375,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.59375,
+        "bound": "queue",
+        "pool_saturation_reported": 1.53125
+      },
+      {
+        "epoch": 1794477062.0,
+        "ts": "2026-11-12T09:51:02Z",
+        "average_queue_size": 34.5,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 1.078125,
+        "kv_ratio": 0.0,
+        "roofline_score": 1.078125,
+        "bound": "queue",
+        "pool_saturation_reported": 1.046875
+      },
+      {
+        "epoch": 1794477072.0,
+        "ts": "2026-11-12T09:51:12Z",
+        "average_queue_size": 0.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 0.0,
+        "kv_ratio": 0.0,
+        "roofline_score": 0.0,
+        "bound": "queue",
+        "pool_saturation_reported": 0.0
+      },
+      {
+        "epoch": 1794477082.0,
+        "ts": "2026-11-12T09:51:22Z",
+        "average_queue_size": 0.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 0.0,
+        "kv_ratio": 0.0,
+        "roofline_score": 0.0,
+        "bound": "queue",
+        "pool_saturation_reported": 0.0
+      },
+      {
+        "epoch": 1794477085.0,
+        "ts": "2026-11-12T09:51:25Z",
+        "average_queue_size": 0.0,
+        "average_kv_cache_utilization": 0.0,
+        "queue_ratio": 0.0,
+        "kv_ratio": 0.0,
+        "roofline_score": 0.0,
+        "bound": "queue",
+        "pool_saturation_reported": 0.0
+      }
+    ]
+  }
+}

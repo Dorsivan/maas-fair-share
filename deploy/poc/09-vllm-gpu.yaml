@@ -49,6 +49,20 @@ spec:
   replicas: 2
 
   template:
+    # UNI-231: pin the model servers to THIS lane's dedicated pair of GPU
+    # nodes. Three lanes share the cluster and every verdict is latency-based,
+    # so a replica that drifts onto another lane's node (it would take that
+    # lane's only A100 and leave its replica Pending) invalidates both lanes.
+    # This literal list is lane 1's pair; deploy/poc/lanes.py render rewrites
+    # it for lanes 2 and 3 -- see the lane table there.
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: kubernetes.io/hostname
+                  operator: In
+                  values: [ocp-gpu-worker-0, ocp-gpu-worker-1]
     containers:
       - name: main
         args:
@@ -91,6 +105,16 @@ spec:
       # so an EPP stuck in ImagePullBackOff means Envoy silently bypasses the
       # fairness policy and every request is served unmanaged. A load run in
       # that state looks completely healthy and measures nothing.
+      #
+      # UNI-102: this used to be TWO `template:` keys under `scheduler:`, one
+      # holding the affinity and one the container. YAML keeps the last
+      # duplicate, so the affinity was silently dropped and the live EPP was
+      # never pinned (confirmed 2026-11-11: no affinity on the live object,
+      # EPP running on ocp-gpu-worker-1). One key, both halves.
+      config:
+        ref:
+          name: maas-epp-config
+          key: epp
       template:
         affinity:
           nodeAffinity:
@@ -99,11 +123,6 @@ spec:
                 - matchExpressions:
                     - key: feature.node.kubernetes.io/pci-10de.present
                       operator: DoesNotExist
-      config:
-        ref:
-          name: maas-epp-config
-          key: epp
-      template:
         containers:
           - name: main
             # built from commit 86159ee (UNI-220); quay.io/rh-ee-dsivan/maas-fair-share:86159ee

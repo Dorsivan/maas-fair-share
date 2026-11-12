@@ -497,6 +497,7 @@ SHADOW_MODE="${SHADOW_MODE:-false}"
 ENFORCE_WAIT_TIMEOUT_SECONDS="${ENFORCE_WAIT_TIMEOUT_SECONDS:-180}"
 CONFIGMAP_NAME="maas-epp-config"
 CPU_EPP_METRICS_SVC="${CPU_EPP_METRICS_SVC:-maas-vllm-cpu-epp-service}"
+CPU_LLMISVC_NAME="${CPU_LLMISVC_NAME:-maas-vllm-cpu}"
 
 # --- UNI-174: every variable the exit trap below can reference must already
 # exist by the time the trap is registered -- `set -u` turns a reference to
@@ -518,6 +519,7 @@ SHADOW_FLIPPED="false"
 METRICS_TOKEN=""
 EPP_METRICS_SVC_IP=""
 CPU_EPP_METRICS_SVC_IP=""
+CPU_EPP_ABSENT="false"
 
 read_enforcing() {
   # $1 = EPP metrics ClusterIP. Prints 0/1, or nothing if the scrape failed
@@ -534,10 +536,18 @@ wait_for_enforcing() {
   local want="$1" gpu_val cpu_val waited=0
   while :; do
     gpu_val="$(read_enforcing "$EPP_METRICS_SVC_IP")"
-    cpu_val="$(read_enforcing "$CPU_EPP_METRICS_SVC_IP")"
-    if [ "$gpu_val" = "$want" ] && [ "$cpu_val" = "$want" ]; then
-      enforce_log "confirmed: llm_d_epp_maas_fairness_enforcing=$want on both EPPs (gpu=$gpu_val cpu=$cpu_val)"
-      return 0
+    if [ "$CPU_EPP_ABSENT" = "true" ]; then
+      cpu_val="absent"
+      if [ "$gpu_val" = "$want" ]; then
+        enforce_log "confirmed: llm_d_epp_maas_fairness_enforcing=$want on the GPU EPP, the only EPP in $NAMESPACE (gpu=$gpu_val cpu=absent)"
+        return 0
+      fi
+    else
+      cpu_val="$(read_enforcing "$CPU_EPP_METRICS_SVC_IP")"
+      if [ "$gpu_val" = "$want" ] && [ "$cpu_val" = "$want" ]; then
+        enforce_log "confirmed: llm_d_epp_maas_fairness_enforcing=$want on both EPPs (gpu=$gpu_val cpu=$cpu_val)"
+        return 0
+      fi
     fi
     if [ "$waited" -ge "$ENFORCE_WAIT_TIMEOUT_SECONDS" ]; then
       enforce_log "WARNING: timed out after ${ENFORCE_WAIT_TIMEOUT_SECONDS}s waiting for enforcing=$want (gpu=${gpu_val:-?} cpu=${cpu_val:-?})"
@@ -546,6 +556,21 @@ wait_for_enforcing() {
     sleep 2
     waited=$((waited + 2))
   done
+}
+
+resolve_cpu_epp() {
+  # UNI-231: lanes 2 and 3 run no CPU LLMInferenceService, so their
+  # maas-epp-config has one reader, not two. Keyed on the LLMISVC (the thing
+  # that actually reads the ConfigMap), not on its Service. --ignore-not-found
+  # turns only NotFound into an empty answer; Forbidden or an API error still
+  # fails under set -e, so lane 1 cannot silently lose its second
+  # confirmation.
+  if [ -z "$($OC get llminferenceservice "$CPU_LLMISVC_NAME" -n "$NAMESPACE" --ignore-not-found -o name)" ]; then
+    CPU_EPP_ABSENT="true"
+    enforce_log "no llminferenceservice/$CPU_LLMISVC_NAME in $NAMESPACE -- maas-epp-config has one reader here; confirming the GPU EPP only"
+  else
+    CPU_EPP_METRICS_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+  fi
 }
 
 patch_configmap_epp() {
@@ -1592,7 +1617,9 @@ CLIENT_RECORD_JSONL="$ARTIFACT_DIR/client-request-summary.jsonl"
 # --- Resolve manifest with this scenario's overrides -----------------------
 SRC="$(dirname "$0")/04-loadgen.yaml"
 PATCHED="$ARTIFACT_DIR/04-loadgen.patched.yaml"
-cp "$SRC" "$PATCHED"
+# UNI-231: rendered for this lane, not copied -- the manifest names
+# maas-fairness-poc, and `oc apply -n` refuses a namespace mismatch.
+NAMESPACE="$NAMESPACE" python3 -I "$(dirname "$0")/lanes.py" render "$SRC" > "$PATCHED"
 
 set_override() {
   local var="$1" val="$2"
@@ -1845,7 +1872,7 @@ if [ "$ENFORCE_LIVE" = "true" ]; then
   # in this branch -- an invocation that doesn't set ENFORCE_LIVE must not
   # gain a new way to fail (or a new RBAC/topology dependency) just because
   # some other environment lacks a CPU EPP Service.
-  CPU_EPP_METRICS_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+  resolve_cpu_epp
   CUR_EPP_YAML="$($OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}')"
   if printf '%s' "$CUR_EPP_YAML" | grep -qE '^[[:space:]]*enforce:[[:space:]]*true'; then
     enforce_log "enforce already true in $CONFIGMAP_NAME -- nothing to flip; this run will NOT revert it on exit (it did not cause the enabled state)"
@@ -1891,7 +1918,7 @@ if [ "$SHADOW_MODE" = "true" ]; then
   # Mutually exclusive with ENFORCE_LIVE (checked before the scenario even
   # starts, see above), so this never runs in the same invocation as that
   # block.
-  CPU_EPP_METRICS_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+  resolve_cpu_epp
   CUR_EPP_YAML="$($OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}')"
   if printf '%s' "$CUR_EPP_YAML" | grep -qE '^[[:space:]]*enforce:[[:space:]]*false'; then
     enforce_log "enforce already false in $CONFIGMAP_NAME -- nothing to flip; this run will NOT revert it on exit (it did not cause the shadow state)"
@@ -2224,6 +2251,21 @@ CHAOS_PID=$!
 # second, narrower trap is registered here anymore.
 
 # --- Apply the patched Job and poll to completion ---------------------------
+# UNI-231: separate namespaces still share Authorino, Limitador and
+# ocp-worker-2, and nothing stops two agents starting runs on different
+# instances at once (it happened on 2026-11-11). So every run records which
+# other instances had a loadgen Job during its own window, in
+# concurrent-runs.txt. Jobs are snapshotted before and after, because a later
+# run deletes the Job it replaces.
+other_instance_jobs() {
+  local ns
+  for ns in $(python3 -I -c 'import runpy; print(" ".join(runpy.run_path("deploy/poc/lanes.py")["LANES"]))'); do
+    [ "$ns" = "$NAMESPACE" ] && continue
+    $OC get jobs -n "$ns" -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{.status.startTime}{" "}{.status.completionTime}{"\n"}{end}' 2>/dev/null \
+      || echo "# $ns: could not list jobs"
+  done
+}
+other_instance_jobs > "$ARTIFACT_DIR/other-instance-jobs-start.txt"
 $OC apply -f "$PATCHED" -n "$NAMESPACE"
 echo "[benchmark] job applied, polling for completion..."
 PHASE=""
@@ -2246,6 +2288,26 @@ for i in $(seq 1 240); do
   if [ "${SUCCEEDED:-0}" = "1" ] || [ "${FAILED:-0}" -ge 1 ] 2>/dev/null; then
     PHASE="done"
     break
+  fi
+  # UNI-249: the loadgen is pinned to one node with cross-namespace
+  # anti-affinity, so another loadgen already on that node leaves this one
+  # Pending. Give up after ~3 min instead of polling for 40, and delete the
+  # Job so it can't start later, unmeasured.
+  # UNI-251: under `set -euo pipefail`, a `grep` that finds nothing exits 1,
+  # and pipefail propagates that into this assignment -- without `|| true`
+  # the script died here on every *healthy* poll (pod scheduled fine, no
+  # "Unschedulable" line to match), not after 3 min of real unschedulability.
+  # Confirmed live: all three UNI-249 solo validation runs aborted after
+  # exactly one poll iteration with no error text, while their already-created
+  # Jobs ran to completion unobserved in the background.
+  UNSCHED="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="PodScheduled")].reason}{": "}{.status.conditions[?(@.type=="PodScheduled")].message}{"\n"}{end}' 2>/dev/null | grep '^Unschedulable' | head -1 || true)"
+  if [ -n "$UNSCHED" ]; then
+    echo "[benchmark] WARNING: loadgen pod not scheduled: $UNSCHED" >&2
+    if [ "$i" -ge 18 ]; then
+      echo "[benchmark] ERROR: loadgen unschedulable for 3 min -- its node ($(NAMESPACE="$NAMESPACE" python3 -I "$(dirname "$0")/lanes.py" env | sed -n 's/^LANE_LOADGEN_NODE=//p')) is probably running another instance's loadgen; deleting the Job" >&2
+      $OC delete job "$JOB_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null
+      exit 1
+    fi
   fi
   sleep 10
 done
@@ -2293,6 +2355,9 @@ echo "[benchmark] metrics snapshot: after"
 snapshot_metrics > "$METRICS_AFTER"
 RUN_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 { echo "# ts=$RUN_END epoch=$(date +%s)"; cat "$METRICS_AFTER"; } >> "$METRICS_TS"
+other_instance_jobs > "$ARTIFACT_DIR/other-instance-jobs-end.txt"
+OWN_JOB_WINDOW="$($OC get job "$JOB_NAME" -n "$NAMESPACE" -o jsonpath='{.status.startTime} {.status.completionTime}' 2>/dev/null)"
+python3 -I deploy/poc/concurrent-runs.py "$ARTIFACT_DIR" "$OWN_JOB_WINDOW" "$RUN_END" || true
 
 # UNI-143 (B4 investigation): these three reverts are called here -- AFTER
 # the after-snapshot, not before. This plugin's config has no live-reload

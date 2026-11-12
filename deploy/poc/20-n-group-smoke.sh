@@ -41,6 +41,12 @@ log() { echo "[smoke] $*" | tee -a "$OUT/smoke.log"; }
 
 log "identity: $($OC whoami)"
 
+# UNI-231: this smoke borrows the CPU model server, which only lane 1 has.
+# Refuse before the first cluster write rather than half-run on lanes 2/3.
+if [ -z "$($OC get llminferenceservice "$LLMISVC" -n "$NAMESPACE" --ignore-not-found -o name)" ]; then
+  log "ABORT: no llminferenceservice/$LLMISVC in $NAMESPACE -- this smoke runs on lane 1 (maas-fairness-poc) only"; exit 1
+fi
+
 # --- UNI-210: this script patches maas-vllm-cpu's LLMInferenceService spec
 # (config.ref, replicas below), which triggers an odh-model-controller/KServe
 # reconcile that can regenerate the Gateway-scoped maas-poc-gateway-authn
@@ -110,7 +116,8 @@ trap restore EXIT
 # --- point the CPU EPP at the 6-group table ---------------------------------
 python3 -I "$HERE/epp-groups/render.py" --verify >/dev/null \
   || { log "ABORT: epp-groups renders are stale vs 00-config.yaml"; exit 1; }
-$OC apply -f "$HERE/epp-groups/smoke-6-group.yaml" >/dev/null
+NAMESPACE="$NAMESPACE" python3 -I "$HERE/lanes.py" render "$HERE/epp-groups/smoke-6-group.yaml" \
+  | $OC apply -n "$NAMESPACE" -f - >/dev/null
 $OC patch llminferenceservice "$LLMISVC" -n "$NAMESPACE" --type=merge -p \
   "{\"spec\":{\"replicas\":1,\"router\":{\"scheduler\":{\"config\":{\"ref\":{\"name\":\"$SMOKE_CM\"}}}}}}" >/dev/null
 log "patched $LLMISVC -> config.ref=$SMOKE_CM replicas=1"
@@ -155,7 +162,7 @@ spec:
           command: ["/bin/bash", "/script/run.sh"]
           env:
             - {name: LOADGEN_GROUPS, value: "${lg# }"}
-            - {name: MODELPATH, value: "/maas-fairness-poc/$LLMISVC"}
+            - {name: MODELPATH, value: "/$NAMESPACE/$LLMISVC"}
             - {name: DURATION, value: "$DURATION"}
           volumeMounts:
             - {name: script, mountPath: /script}

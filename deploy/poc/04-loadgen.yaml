@@ -695,6 +695,45 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      # UNI-231: keep the client OFF the GPU nodes. Unpinned, it landed next
+      # to a vLLM replica (ocp-gpu-worker-1, 2026-11-11), and with three lanes
+      # it could land on ANOTHER lane's model server and spend that node's CPU
+      # on this lane's load -- cross-lane interference in exactly the latency
+      # the verdicts measure.
+      #
+      # UNI-249: and pin it to ONE named node per instance, chosen to host none
+      # of the request-path components another instance uses. Unpinned, the
+      # scheduler only ever picked ocp-worker-2/3 (0/1 are more CPU-requested,
+      # though barely used), and in the three-lane A/A both runs that
+      # collapsed to uncontended had their loadgen on ocp-worker-2, the node
+      # with every gateway, both lane EPPs, Authorino and maas-api. Instance 1
+      # gets ocp-worker-3 because that node's only per-instance component is
+      # instance 1's own GPU EPP (plus Limitador, which every lane shares
+      # wherever it runs); lanes 2/3 get ocp-worker-0/1. lanes.py rewrites the
+      # hostname line per lane -- keep it literal.
+      #
+      # The pod anti-affinity matches every harness loadgen in every namespace
+      # (the Job controller labels them all job-name=maas-loadgen), so even an
+      # older, unpinned loadgen can't share a node with a pinned one. A
+      # collision leaves the newer pod Pending, which the poll loop reports,
+      # instead of a run that silently shares a node.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: feature.node.kubernetes.io/pci-10de.present
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: [ocp-worker-3]
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  job-name: maas-loadgen
+              namespaceSelector: {}
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: loadgen
           image: registry.access.redhat.com/ubi9/ubi:latest
@@ -870,11 +909,13 @@ spec:
               mountPath: /keys
               readOnly: true
           resources:
-            # Deliberately small. This cluster has two Ready workers at ~98%
-            # CPU requested, so anything larger simply never schedules. It is
-            # enough: the simulator's latency is sleeps rather than compute, so
-            # a CPU-starved generator slows all three tenants equally and the
-            # RATIO -- the thing under test -- is unaffected.
+            # UNI-249: 1 core requested, 4 allowed. The old 100m/2-core sizing
+            # assumed a CPU-starved generator slows every tenant equally and
+            # leaves the ratio alone. The three-lane A/A disproved that: every
+            # loadgen hit its 2-core limit and was CFS-throttled in 30-64% of
+            # periods even solo, and the two most-throttled ones collapsed to
+            # uncontended runs. The generator is part of the instrument, so
+            # results from before this change are not directly comparable.
             #
             # UNI-167: the memory LIMIT (not the request, which stays tiny and
             # doesn't affect scheduling) needs headroom for high-group-count
@@ -882,10 +923,10 @@ spec:
             # request, and at ~1000 concurrent workers that blew through 2Gi
             # with "fork: Cannot allocate memory" after ~55s.
             requests:
-              cpu: 100m
+              cpu: "1"
               memory: 256Mi
             limits:
-              cpu: "2"
+              cpu: "4"
               memory: 6Gi
           securityContext:
             allowPrivilegeEscalation: false

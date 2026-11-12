@@ -26,7 +26,7 @@ set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
 GW="${GW:-https://maas-gateway-${NAMESPACE}.apps.ocp.paladinaura.com}"
-MODELPATH="${MODELPATH:-/maas-fairness-poc/maas-vllm-gpu}"
+MODELPATH="${MODELPATH:-/${NAMESPACE}/maas-vllm-gpu}"
 DURATION="${DURATION:-240}"
 WORKERS="${WORKERS:-32}"
 OUT="${OUT:-/tmp/route-codes}"

@@ -313,6 +313,166 @@ run is only meaningful if they are overwhelmingly 200.
 
 ---
 
+## Pick a lane: three isolated POC instances (UNI-231)
+
+The cluster has six single-A100 GPU nodes, enough for three POC instances
+("lanes"). Each lane is the same stack under the same object names, in its
+own namespace, with its own GPU pair, EPP and `maas-epp-config`, Gateway,
+pull secret and tenant keys:
+
+| Lane | `NAMESPACE` | GPU nodes | Tenant suffix |
+|---|---|---|---|
+| 1 | `maas-fairness-poc` (the default) | `ocp-gpu-worker-0`, `-1` | none |
+| 2 | `poc-maas-lane2` | `ocp-gpu-worker-2`, `-3` | `-l2` |
+| 3 | `poc-maas-lane3` | `ocp-gpu-worker-4`, `-5` | `-l3` |
+
+**Pick a lane by setting `NAMESPACE`. Nothing else changes:**
+
+```sh
+NAMESPACE=poc-maas-lane2 OPENSHIFT_TOKEN=... ./deploy/poc/15-fairness-benchmark.sh <scenario> [label]
+```
+
+**The rule: one lane belongs to one run for that run's whole duration.**
+Every scored run patches its lane's `maas-epp-config`, and each patch
+recreates that lane's EPP and zeroes its counters. Two runs on one lane
+overwrite each other's config and each other's metrics, and neither fails
+loudly. Before you start, check the lane is idle: no `maas-loadgen*` Job or
+pod, and no open-loop runner (`oc get job` does not show those; see UNI-227).
+Say in the ticket which lane you hold.
+
+**Parallel scored rows depend on the A/A test.** Separate namespaces do not
+isolate everything. Authorino, Limitador and maas-api are single replicas
+that carry every lane's requests, and Prometheus scrapes all three lanes.
+Lanes 2 and 3 also share `ocp-worker-2` (both gateways, both EPPs and
+Authorino). **Run scored rows serially.** The three-lane A/A (UNI-231/UNI-248,
+2026-11-11) failed; see "What the three-lane A/A found" below.
+
+**Never put load on any lane while a scored run is in flight on another.**
+This includes unscored dry runs. Two-lane load used to break the shared auth
+path: before UNI-240, 72% of requests returned HTTP 500 (the gateway's auth
+step failed closed after 200ms while maas-api fell behind). UNI-240 fixed
+that. The rule stays for two reasons: nobody has measured three lanes plus
+instance 1 at once, and `ocp-worker-2` already peaks at 67% of its 8 cores
+with two lanes. Load-free work on a lane (provisioning, harness edits, `oc`
+reads) is fine.
+
+**What the two-lane A/A found (UNI-231, 2026-11-11).** Six runs of
+`full-contention-2x-discriminating` with enforce on: both lanes together,
+each lane alone, then both together again. Raw results are under
+`results/*-uni231-aa-*`; compare them with `deploy/poc/26-lanes-aa-compare.py`.
+
+- Auth held: no wasm denials in any phase, and 2–9 non-200s per run of about
+  5,500 requests.
+- No running-together effect stood out from run-to-run noise. Lane-vs-lane
+  gaps were 3.8–6.8 points, and lane 3 was worse in two phases and better in
+  the third.
+- **One run is not repeatable at the 10-point bar.** Lane 3 scored FAIL at
+  16.5 and then PASS at 4.0 on the same config and image, and the secondary
+  verdict flipped with it. Lane 2 moved 3.1 points. The cause is not
+  identified: contended time fits five of the six runs but not lane 3's PASS.
+  Don't read a single run within about 15 points of the bar as a verdict,
+  whether rows run serially or in parallel.
+- That noise was measured on EPP image `617509`. After the lanes moved to
+  `c8a088` (UNI-220's clamp fix), three solo runs of the same scenario scored
+  3.7, 2.9 and 3.4, and lane 2 against lane 3 differed by under a point. That
+  is three runs, not yet a repeatability result.
+
+**What the three-lane A/A found (UNI-231/UNI-248, 2026-11-11).** Same
+scenario, image `c8a088` on all three instances: all three together (T3a),
+instance 1 alone (I1), all three together again (T3b).
+
+- Two of the six per-instance runs in the together phases collapsed to
+  *uncontended*: 1 s and 28 s of contention, where the same instances alone
+  had 55-92 s. Their scores were 33.5 and 30.1, against 3.4-7.7 alone. An
+  uncontended run splits by workers, not weights, so this is a failure to
+  generate load, not a fairness result.
+- Lane 3 was steady throughout: 3.5 and 3.7 together, 2.9 and 3.4 alone.
+- **Load generators are CPU-bound.** Every loadgen pod hit its 2-core limit
+  and was CFS-throttled, solo runs included (30-64% of periods). The two
+  collapsed runs had the most-throttled loadgens (73% and 78%), and both ran
+  on `ocp-worker-2`, which also hosts every gateway, both lane EPPs and
+  Authorino. That is a correlation from two runs, not a proven mechanism.
+- **Instance 1's gateway sits at its memory limit.** It averaged 823 MiB of
+  1 GiB over 24 h, peaked at 1003 MiB with instance 1 running alone, and was
+  OOMKilled at 14:38:34 in T3b (its 15th restart). That run lost 25% of its
+  requests to connection failures. The lane gateways use about 570 MiB under
+  the same limit.
+
+Before parallel scored runs: give loadgens more CPU and put each one on a
+node that hosts none of the shared components, raise instance 1's gateway
+memory, then repeat the three-lane A/A. Until then, use lanes 2 and 3 for
+serial runs, harness work and dry runs.
+
+**Loadgen sizing and placement (UNI-249).** The loadgen now requests 1 core
+with a 4-core limit, up from 100m and 2 cores. Each instance's loadgen is
+pinned to its own CPU node: instance 1 on `ocp-worker-3`, lane 2 on
+`ocp-worker-0`, lane 3 on `ocp-worker-1`. None goes on `ocp-worker-2`
+(gateways, lane EPPs, Authorino, maas-api). `ocp-worker-3` is not clean. It
+also runs instance 1's own GPU EPP, Limitador (which every lane shares
+wherever it runs) and paperclip-server. Instance 1 goes there because that is
+the only placement where no lane's loadgen shares a node with another
+instance's EPP. A required anti-affinity on `job-name=maas-loadgen` across
+all namespaces keeps two loadgens off one node. If a loadgen finds its node
+taken, it stays Pending, and `15-fairness-benchmark.sh` gives up after 3
+minutes. Unpinned, the scheduler only ever chose workers 2 and 3. Workers 0
+and 1 are more CPU-*requested*, though barely used. **This changes the
+instrument**, so serial results from before and after it may not be directly
+comparable. Open-loop runs (`17-…-openloop.sh`) are a local process, not a
+Job, and this change does not affect them.
+
+**Every run records concurrent load.** `15-fairness-benchmark.sh` lists every
+other instance's loadgen Jobs at the start and end of a run, and
+`deploy/poc/concurrent-runs.py` writes `concurrent-runs.txt` into the run's
+results, flagging any overlap with a WARNING line. A start-time check can't
+stop another agent starting after you; this record is how a reviewer finds
+out. On 2026-11-11 a lane-3 solo run overlapped instance 1's UNI-245 3x run by
+about 5 minutes, and nothing caught it at the time.
+
+How it works, so nobody "fixes" it back:
+
+- **Tenant names are the one thing that cannot be identical.** A
+  MaaSSubscription's name is the identity the EPP groups on, and every
+  subscription lives in the shared `models-as-a-service` namespace. Lane 2's
+  app1 tenant is therefore `app1-production-l2`. The board chose per-lane
+  names over editing lane 1's subscriptions (UNI-231). It is a *suffix* so
+  that `end-user-alpha-l2` still matches `prefix: [end-user-]`.
+- `deploy/poc/lanes.py` holds the lane table. `lanes.py render` rewrites a
+  manifest for `$NAMESPACE`: namespace, suffixed `exact:` match values, and
+  the model servers' node pair. For lane 1 it is the identity transform. Every
+  harness `oc apply` of a repo manifest goes through it, so an unknown
+  `NAMESPACE` fails instead of quietly configuring lane 1.
+- Keys stay canonical. `mint-loadgen-keys.sh` mints the `-l2` key but stores
+  it in the lane's `maas-loadgen-keys` under the canonical name, so the
+  loadgen and reports never need to know which lane they are on.
+- Placement: model servers are pinned to their lane's pair by
+  `kubernetes.io/hostname`. The EPP (UNI-102, now fixed) and the loadgen Job
+  stay off GPU nodes. **Lane 1's live objects predate this.** Its two EPPs
+  were pinned off GPU nodes live (UNI-238, 2026-11-11). Its model-server
+  replicas still carry no pin until `09-vllm-gpu.yaml` is reapplied, which
+  recreates them, so do that between runs. Until then, a restarted lane-1
+  replica can land on a lane-2/3 node.
+- Lanes 2 and 3 have no CPU model server. `15-fairness-benchmark.sh` and
+  `24-patch-all-weights.sh` confirm a config change on both EPPs where
+  `llminferenceservice/maas-vllm-cpu` exists and on the GPU EPP alone where
+  it does not. `20-n-group-smoke.sh` borrows the CPU model server, so it is
+  lane 1 only and refuses other lanes.
+
+Build a new lane (lanes 2 and 3 only; the script refuses lane 1):
+
+```sh
+NAMESPACE=poc-maas-lane2 deploy/poc/25-provision-lane.sh
+```
+
+The script is idempotent. Where a permission is missing it stops and prints
+the exact command for whoever holds it: the namespace (operator), the
+Gateway (poc-agent), the pull-secret copy (secret read), and the benchmark's
+`/metrics` reader binding (operator: one ClusterRoleBinding per lane, because
+a namespaced RoleBinding cannot grant a non-resource URL). It creates two
+~15 GB model downloads, so run it between instance-1 measurement runs. Run
+the offline checks with `python3 -I deploy/poc/lanes-test.py`.
+
+---
+
 ## Run the fairness benchmark (UNI-54)
 
 Before this, "delivered share" was a number a human produced by reading two

@@ -34,7 +34,7 @@ set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
 GW="${GW:-https://maas-gateway-${NAMESPACE}.apps.ocp.paladinaura.com}"
-MODELPATH="${MODELPATH:-/maas-fairness-poc/maas-vllm-gpu}"
+MODELPATH="${MODELPATH:-/${NAMESPACE}/maas-vllm-gpu}"
 DURATION="${DURATION:-240}"
 RATE_APP1="${RATE_APP1:-0}"
 RATE_APP2="${RATE_APP2:-0}"

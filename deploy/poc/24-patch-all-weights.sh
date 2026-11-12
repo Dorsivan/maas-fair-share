@@ -41,6 +41,7 @@ NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
 CONFIGMAP_NAME="maas-epp-config"
 EPP_SELECTOR="${EPP_SELECTOR:-app.kubernetes.io/component=llminferenceservice-router-scheduler,app.kubernetes.io/name=maas-vllm-gpu}"
 CPU_EPP_METRICS_SVC="${CPU_EPP_METRICS_SVC:-maas-vllm-cpu-epp-service}"
+CPU_LLMISVC_NAME="${CPU_LLMISVC_NAME:-maas-vllm-cpu}"
 WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-180}"
 OC="${OC:-oc}"
 
@@ -99,7 +100,15 @@ print(json.dumps({'data': {'epp': open('$SCRATCH_DIR/after.yaml').read()}}))
 # is actually being served" signal, not a proxy for it.
 METRICS_TOKEN="$($OC get secret maas-epp-metrics-reader-token -n "$NAMESPACE" -o jsonpath='{.data.token}' | base64 -d)"
 GPU_SVC_IP="$($OC get svc maas-vllm-gpu-epp-service -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
-CPU_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+# UNI-231: lanes 2 and 3 run no CPU LLMInferenceService, so the ConfigMap has
+# one reader there. Only NotFound means absent (--ignore-not-found); Forbidden
+# still fails under set -e, so lane 1 keeps its second confirmation.
+CPU_SVC_IP=""
+if [ -n "$($OC get llminferenceservice "$CPU_LLMISVC_NAME" -n "$NAMESPACE" --ignore-not-found -o name)" ]; then
+  CPU_SVC_IP="$($OC get svc "$CPU_EPP_METRICS_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')"
+else
+  log "no llminferenceservice/$CPU_LLMISVC_NAME in $NAMESPACE -- confirming the GPU EPP only"
+fi
 
 read_weight() {
   # $1 = metrics ClusterIP, $2 = fairness_id. Prints the live gauge value,
@@ -131,11 +140,13 @@ wait_for_weights() {
 
 rc=0
 wait_for_weights "$GPU_SVC_IP" "GPU EPP" || rc=1
-wait_for_weights "$CPU_SVC_IP" "CPU EPP" || rc=1
+if [ -n "$CPU_SVC_IP" ]; then
+  wait_for_weights "$CPU_SVC_IP" "CPU EPP" || rc=1
+fi
 
 if [ "$rc" -ne 0 ]; then
   log "FATAL: one or both EPPs did not confirm the new weights within ${WAIT_TIMEOUT_SECONDS}s -- not safe to start a scored run against this config"
   exit 1
 fi
 
-log "done: both EPPs confirmed app1=$W_APP1 app2=$W_APP2 end-users=$W_END_USERS"
+log "done: $([ -n "$CPU_SVC_IP" ] && echo "both EPPs" || echo "the GPU EPP (no CPU EPP in $NAMESPACE)") confirmed app1=$W_APP1 app2=$W_APP2 end-users=$W_END_USERS"

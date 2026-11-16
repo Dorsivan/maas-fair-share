@@ -522,7 +522,7 @@ reasoning there is load-bearing.
 |---|---|---|
 | `full-contention` | `TENANTS="app1 app2 end-users"`, per-tenant `WORKERS_APP1=32 WORKERS_APP2=32 WORKERS_END_USERS=128` | the headline weight split: 20/10/65 delivered under genuine three-way contention, with every tenant over-offering relative to its entitlement |
 | `end-users-idle` | `TENANTS="app1 app2"`, per-tenant `WORKERS_APP1=64 WORKERS_APP2=32` (UNI-104; was `128/32` under UNI-103) | end-users' 65% is **absorbed** by app1/app2, not reserved while idle, with app1 over-offering relative to app2 to express their 2:1 (66.7/33.3 renormalized) ratio |
-| `equal-workers-control` | `TENANTS="app1 app2 end-users"`, equal `WORKERS` (the **original** full-contention shape) | **negative control, not scored.** Kept to show what an under-offered load looks like on this backend — expected to compress toward equal thirds, not 20/10/65. See "Per-tenant worker sizing and the saturation check" below |
+| `equal-workers-control` | `TENANTS="app1 app2 end-users"`, equal `WORKERS` (the **original** full-contention shape) | **negative control, not scored.** Kept to show what an under-offered load looks like on this backend. This row's "expected to compress toward equal thirds" prediction was recorded before the thr32/UNI-211/UNI-214 fixes and the board's equal-load-baseline ruling, and has since been re-evidenced *against*, not confirmed -- see below |
 | `app1-alone` | `TENANTS="app1"` | a single tenant receives ~100% of the pool, not capped near its 20% weight |
 | `app2-alone` | `TENANTS="app2"` (UNI-131) | mirror of `app1-alone` for the lowest-weight tenant: a single tenant receives ~100% of the pool regardless of which weight it carries |
 | `app2-idle` | `TENANTS="app1 end-users"`, per-tenant `WORKERS_APP1=32 WORKERS_END_USERS=104` (UNI-132) | promotes the by-hand "S3" check (`docs/poc-results.md`) into the benchmark: app2 excluded entirely (not just idle-but-offered), pair target renormalizes to 23.5/76.5 (20:65), worker ratio sized to match that ratio directly per the UNI-104 lesson |
@@ -538,6 +538,28 @@ weighted split once the weights differ (see below), so UNI-103 resized both
 to per-tenant worker counts and kept the original equal-worker shape alive
 under a new name, `equal-workers-control`, as a deliberate, documented
 negative control rather than deleting the evidence of the failure mode.
+
+**The "compress toward equal thirds" prediction above does not hold at thr32 (UNI-225 board
+addendum, item 2: re-evidence or delete).** The board's equal-load-baseline ruling asked for this
+claim to be checked against the settled config rather than carried forward unverified. It can be
+checked with data this project already collected, no new GPU time required:
+`full-contention-discriminating` and `full-contention-2x-discriminating`
+(`docs/poc-results.md`'s UNI-225 section) are exactly this scenario's equal-worker-offer shape --
+equal workers across all three tenants, unequal 20/10/65 weights -- re-run at the settled
+`queueDepthThreshold: 32` config, just scored (not carved out as `IS_CONTROL`) and at 128 and 256
+workers/tenant rather than the original 32. Neither compresses toward equal thirds: at 128
+workers/tenant the observed split is 33.4/19.6/47.0 (end-users already well past an equal third,
+not stuck at it); at 256 workers/tenant it is 26.9/15.5/57.6 -- *closer* to the 21.1/10.5/68.4
+weight target than to equal thirds, and closer than the 128-worker run was. The claim this table
+carried since UNI-103 was true for the pre-thr32, lower-threshold config it was measured under,
+but is false at the settled config: equal-worker offers at thr32 don't erase the weighted split,
+they just approach it more slowly than a worker ratio that already matches the weights, and more
+offered load narrows the gap further rather than holding it at equal thirds. `equal-workers-control`
+itself (the literally-named scenario, 32 workers/tenant) has not been re-run at thr32 under this
+correction -- promoting it to a formally scored row, rather than inferring its behavior from its
+`-discriminating` cousins' larger worker counts, is the remaining, GPU-needing piece of this
+addendum item, filed as [UNI-269](/UNI/issues/UNI-269) rather than done here (see
+`docs/poc-results.md`'s UNI-225 section for the disposition of the addendum's other three items).
 
 ### What it produces
 

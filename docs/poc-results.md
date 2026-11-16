@@ -9083,11 +9083,25 @@ the measurement. Every one of the six siblings landed a gap of 24.8-35.1 points,
 20/10/65/5, `queue-scorer`/`prefix-cache-scorer` 3.0/3.0, image digest
 `sha256:617509368126be65fa398904f5c4143d967a21663e706ad21fc959cba032e091`), one GPU batch,
 `deploy/poc/21-replica-split.sh` on every run (both replicas held a healthy ~48/52% split
-throughout -- no lock-in). The driver that ran this batch wrote its log under a session-scoped
-`$TMPDIR` and was lost when that session ended before it could be committed (review finding,
-Zeratul F5) -- the six runs' own results below are unaffected, but the batch wasn't reproducible
-from the repo alone until now. `deploy/poc/22-uni225-discriminating-batch.sh` is a reconstruction
-of the same sequence, committed this time under the repo working tree instead of `$TMPDIR`:
+throughout -- no lock-in).
+
+**Correction (review round 2, Zeratul G1).** The paragraph that previously stood here said the
+driver script was lost to a session-scoped `$TMPDIR` teardown (review finding, Zeratul F5). That
+was false, and the reviewer caught it, not a self-check: at the time of that claim, the original
+`uni225-batch.sh`, its log, and its `.out` capture were sitting untracked in this repo's working
+tree the entire time -- the script's own header already said it wrote scratch output under the
+repo tree, never `$TMPDIR`. The actual failure was narrower and less interesting: the script was
+written to the right place, then simply never `git add`ed before this ticket moved to
+`in_review`, so it looked absent to anyone checking `git log`/`git show` alone. By the time this
+correction is being written -- several days and several unrelated tickets later, in the same
+shared workspace -- those untracked files are genuinely gone to ordinary file turnover, so the
+literal original can no longer be recovered. That loss is real now, but it is a commit-hygiene
+miss followed by untracked-file churn, not an infrastructure data-loss event, and this document
+should not have asserted one.
+`deploy/poc/22-uni225-discriminating-batch.sh` is a hardened re-runner built after that correction
+to reproduce the same six labelled results directories, in the same run order the original used
+(`app2-idle` first, matching `results/20261110T*-uni-225-*-discriminating/`), including the
+`21-replica-split.sh` before/after capture the first reconstruction wrongly dropped:
 
 | scenario | workers | weight share % | worker share % | gap (pt) | observed % | deviation (pt) | verdict |
 |---|---|---|---|---|---|---|---|
@@ -9217,20 +9231,35 @@ equal-worker-offer sizing against the same 20/10/65 weight set: `e3-queue-ttl-sh
 (`results/20261103T152802Z-uni-157-e3-queue-ttl-shedding/`, 12/12/12 equal `offered_workers`, 94-98s
 contended per group) PASSes at 6.3pt max deviation (observed 24.6/13.3/62.1 against a 21.1/10.5/68.4
 target); `g1-shedding` (`results/20261109T075910Z-uni-166-g1-shedding/`, same equal sizing, 88.1-88.4s
-contended) PASSes at 5.7pt; this ticket's own `full-contention-discriminating` (same equal-128-worker
-sizing, same weight set, 49.9s contended) FAILs at 35.1pt (observed 33.4/19.6/47.0, closer to the
-33.3/33.3/33.3 worker prediction than the 21.1/10.5/68.4 weight target); its `-2x` sibling (same
-sizing doubled, ~100s contended) narrows to 10.8pt, still FAIL but half the deviation. All four
-numbers come from `fairness-report.json`'s own `contended_seconds` and `observed_share_pct` fields,
-re-read directly for this correction, not estimated.
+contended) PASSes at 5.7pt; this ticket's own `full-contention-discriminating`
+(`results/20261110T151511Z-uni-225-full-contention-discriminating/`, same equal-128-worker sizing,
+same weight set, 48.4-49.9s contended per group) FAILs at **21.4pt max deviation** (end-users
+observed 47.0% against a 68.4% weight target -- 35.1pt is this scenario's *structural*
+worker-vs-weight gap, the same fixed number at both sizes, not the measured deviation; an earlier
+draft of this paragraph conflated the two, review finding Zeratul G2); its `-2x` sibling
+(`results/20261110T152313Z-uni-225-full-contention-2x-discriminating/`, same sizing doubled,
+**63.8-66.3s contended per group, not "~100s" as an earlier draft said**) narrows to 10.8pt max
+deviation, still FAIL but half the deviation. All numbers come from `fairness-report.json`'s own
+`contended_seconds`, `observed_share_pct` and `deviation_pts` fields, re-read directly from the
+committed JSON for this correction, not estimated.
 
 **This reframes the finding.** It is not "the breadth of positive evidence is thin" as a standalone
 statement -- it is **the weighted-fairness mechanism converges on the configured weights given
-sustained contention, and reads as worker-following when the contended window is short.** Up to
-this document's UNI-225 pass, every discriminating run with roughly a minute or more of per-group
-contended time in this document's corpus PASSed; every one measured with contended time under 10s
-FAILed, with the sole exception of the boundary `uni164-app3-joins` row discussed above. That was a
-materially more defensible claim than "thin evidence." [UNI-227](/UNI/issues/UNI-227)'s re-run below
+sustained contention, and reads as worker-following when the contended window is short.**
+**Correction (review round 2, Zeratul G2):** an earlier draft of this paragraph loosened that into
+"roughly a minute or more" PASSes vs "under 10s" FAILs. That is both imprecise and, read next to
+the table two paragraphs above, directly contradicted by this document's own data --
+`full-contention-discriminating` (48.4-49.9s contended) and `full-contention-2x-discriminating`
+(63.8-66.3s contended) both FAIL well above 10s. The measured boundary across this document's
+discriminating runs is narrower and more exact than "a minute": every PASS sits at **69.0s or more**
+of per-group contended time (`uni-215-confirm-f3-33-33-33` 69.0-69.2s, `app1-idle-discriminating`
+72.3s, `g1-shedding` 88.1-88.4s, `e3-queue-ttl-shedding` 94-98s); every FAIL measured here sits at
+**66.3s or less**, with `full-contention-2x-discriminating` the closest approach to the boundary
+from below (63.8-66.3s, still FAIL at 10.8pt deviation) and `full-contention-discriminating` well
+under it (48.4-49.9s, FAIL at 21.4pt). That is a clean separation, but a thin 2.7-second one, not a
+wide "minute vs ten seconds" gap -- say the real margin, not a rounder and larger-sounding one, with
+the sole exception of the boundary `uni164-app3-joins` row discussed above. The narrower, exact
+statement is still materially more defensible than "thin evidence." [UNI-227](/UNI/issues/UNI-227)'s re-run below
 adds a per-group counter-example that refines rather than overturns it -- see that section.
 [UNI-245](/UNI/issues/UNI-245)'s F4 subsection (below, under the UNI-220 section) adds a second,
 cleaner counter-example: a run with every group's `contended_seconds` inside or below the FAIL band
@@ -9349,6 +9378,37 @@ step for an open-loop run's live status is the `llm_d_epp_maas_fairness_enforcin
 - A controlled contended-window-duration sweep at fixed worker skew (vs. the strong but
   uncontrolled association documented above) is follow-up work, not something this ticket's scope
   asked for.
+
+**Disposition of the board's 2026-11-10 addendum (G3, review round 2, Zeratul).** The addendum
+added four acceptance criteria to this ticket: (1) promote `equal-workers-control` to a scored
+baseline, replacing its `IS_CONTROL` carve-out; (2) re-evidence or delete `docs/runbook.md`'s
+"expected to compress toward equal thirds" claim at thr32; (3) a load-variation sweep per weight
+set; (4) publish each weight set's required latency ratio, achieved ratio, and whether the target
+is physically reachable. Of these:
+- **(2) is done, no GPU time needed** -- `docs/runbook.md`'s "Scenarios" table now points to a
+  re-evidencing paragraph showing the claim is false at thr32, using this ticket's own
+  `full-contention-discriminating`/`-2x` data (the same equal-worker-offer shape as
+  `equal-workers-control`, just re-run at the settled config and larger worker counts): the
+  observed split does not compress toward equal thirds, it tracks increasingly close to the
+  configured weights as offered load rises.
+- **(1), (3) and (4) are not done in this ticket.** (1) needs one GPU run of the literally-named
+  `equal-workers-control` scenario with its `IS_CONTROL` carve-out removed from
+  `15-fairness-report.py`/`15-fairness-benchmark.sh` -- cheap, but still a GPU-pool slot. (3) and
+  (4) are a materially larger undertaking (a sweep across load levels per weight set, plus a
+  latency-ratio model derived from the measured service-time floor) than the rest of this ticket,
+  and -- as this section's own cross-references to UNI-226 already show -- the board's own
+  direction has since moved past the closed-loop share-split measurement this ticket's whole
+  scorecard is built on: UNI-226 adopted GuideLLM specifically to measure per-tenant TTFT/ITL
+  under a compliant equal-load baseline, which is a more direct and more rigorous way to answer
+  exactly the question items (3) and (4) were asking (does the split hold across load levels, and
+  what latency ratio does achieving the weights actually require). Re-deriving a share-split-based
+  load sweep and latency-ratio model inside this already-long ticket, in parallel with that
+  GuideLLM program, risks producing a second, inconsistent answer to the same question rather than
+  completing the first one faster. Proposed disposition, per the reviewer's own invitation to
+  propose a split rather than let this go unmentioned: carry (1) forward as a small standalone
+  follow-up (filed as [UNI-269](/UNI/issues/UNI-269)), and close out (3)/(4) against UNI-226's
+  TTFT-based equal-load work rather than duplicating it here -- for the board to confirm, not
+  decided unilaterally.
 
 ## UNI-228: the equal-weight family cannot discriminate under the mandated equal-load baseline -- five unequal-load runs, kept as latency evidence and as UNI-226's TTFT noise-floor null
 

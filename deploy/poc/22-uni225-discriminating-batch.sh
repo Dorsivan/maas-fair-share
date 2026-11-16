@@ -1,24 +1,29 @@
 #!/bin/bash
-# UNI-225 (F5, Zeratul review): drives the six `-discriminating` sibling
+# UNI-225 (F5/G1, Zeratul review): drives the six `-discriminating` sibling
 # scenarios 15-fairness-benchmark.sh's own usage line already understands
-# (app1-idle-discriminating, app2-idle-discriminating, app2-trickle-
+# (app2-idle-discriminating, app1-idle-discriminating, app2-trickle-
 # discriminating, end-users-idle-discriminating, full-contention-
-# discriminating, full-contention-2x-discriminating) back-to-back, one GPU
-# batch, restoring `enforce` to its steady-state `false` between runs and
-# waiting for any in-flight `maas-loadgen` Job before starting the next so
-# this never overlaps another ticket's use of the shared GPU pool.
+# discriminating, full-contention-2x-discriminating, in that order) back-to-
+# back, one GPU batch, restoring `enforce` to its steady-state `false`
+# between runs and waiting for any in-flight `maas-loadgen` Job before
+# starting the next so this never overlaps another ticket's use of the
+# shared GPU pool.
 #
 # This is a reconstruction, not the literal script the original UNI-225 run
-# used. That script wrote its log under a session-scoped $TMPDIR, which was
-# torn down when the launching session ended before the script could be
-# committed -- the exact "$TMPDIR can vanish when the launching session
-# ends" hazard docs/poc-results.md's UNI-218 section already documents for a
-# different run in this same series. The six runs' own results (reported in
-# docs/poc-results.md's UNI-225 section) are unaffected -- only the driver
-# script itself was lost. This version fixes that by living in the repo
-# working tree from the start, per this chain's standing run-hygiene
-# instruction ("write scratch files under the repo working tree, never
-# $TMPDIR").
+# used -- that original was never actually lost to a $TMPDIR teardown (an
+# earlier version of this header and of docs/poc-results.md both wrongly
+# claimed it was; corrected per the reviewer's G1 finding). It was sitting
+# untracked in this repo's working tree the whole time, its header already
+# saying it wrote scratch output under the repo tree, not $TMPDIR. The real
+# failure was narrower: it was never `git add`ed before the ticket moved to
+# `in_review`, so by the time anyone went back to commit it -- several days
+# and several unrelated tickets later, in this same shared workspace -- the
+# untracked copy was gone to ordinary file turnover, not infrastructure
+# data loss. This version is a hardened re-runner built to reproduce the
+# same six labelled results directories (`uni-225-<scenario>`, matching
+# `results/20261110T*-uni-225-*-discriminating/`) in the same order the
+# original ran, including the `21-replica-split.sh` before/after capture
+# the original took and the first reconstruction (wrongly) dropped.
 #
 # Usage:
 #   OPENSHIFT_TOKEN=... ./22-uni225-discriminating-batch.sh
@@ -45,7 +50,7 @@ LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/../../results}"
 mkdir -p "$LOG_DIR"
 BATCH_LOG="$LOG_DIR/uni225-batch-$(date -u +%Y%m%dT%H%M%SZ).log"
 
-SCENARIOS="${SCENARIOS:-app1-idle-discriminating:app1-idle-discriminating app2-idle-discriminating:app2-idle-discriminating app2-trickle-discriminating:app2-trickle-discriminating end-users-idle-discriminating:end-users-idle-discriminating full-contention-discriminating:full-contention-discriminating full-contention-2x-discriminating:full-contention-2x-discriminating}"
+SCENARIOS="${SCENARIOS:-app2-idle-discriminating:uni-225-app2-idle-discriminating app1-idle-discriminating:uni-225-app1-idle-discriminating app2-trickle-discriminating:uni-225-app2-trickle-discriminating end-users-idle-discriminating:uni-225-end-users-idle-discriminating full-contention-discriminating:uni-225-full-contention-discriminating full-contention-2x-discriminating:uni-225-full-contention-2x-discriminating}"
 
 log() {
   echo "[uni225-batch] $(date -u +%H:%M:%S) $*" | tee -a "$BATCH_LOG"
@@ -78,6 +83,7 @@ for pair in $SCENARIOS; do
   label="${pair##*:}"
   log "=== $label ==="
   wait_for_no_active_job
+  "$SCRIPT_DIR/21-replica-split.sh" snapshot "$LOG_DIR/.uni225-rs-before.txt" >>"$BATCH_LOG" 2>&1 || true
   if ! DURATION="$DURATION" ENFORCE_LIVE=true NAMESPACE="$NAMESPACE" \
       "$SCRIPT_DIR/15-fairness-benchmark.sh" "$scenario" "$label" 2>&1 | tee -a "$BATCH_LOG"; then
     log "FAIL: $label did not complete -- checking cluster state before stopping (does not re-run automatically)"
@@ -85,6 +91,16 @@ for pair in $SCENARIOS; do
     exit 1
   fi
   confirm_enforce_false
+  "$SCRIPT_DIR/21-replica-split.sh" snapshot "$LOG_DIR/.uni225-rs-after.txt" >>"$BATCH_LOG" 2>&1 || true
+  dir="$(ls -dt "$LOG_DIR"/*-"${label}" 2>/dev/null | head -1)"
+  if [ -n "$dir" ]; then
+    cp "$LOG_DIR/.uni225-rs-before.txt" "$dir/replica-counters-before.txt" 2>/dev/null || true
+    cp "$LOG_DIR/.uni225-rs-after.txt" "$dir/replica-counters-after.txt" 2>/dev/null || true
+    "$SCRIPT_DIR/21-replica-split.sh" diff "$LOG_DIR/.uni225-rs-before.txt" "$LOG_DIR/.uni225-rs-after.txt" \
+      > "$dir/replica-split.md" 2>>"$BATCH_LOG" || true
+  else
+    log "WARNING: no results dir found for label $label -- replica-split not captured"
+  fi
   log "=== $label done ==="
 done
 

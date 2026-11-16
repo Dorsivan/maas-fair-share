@@ -284,16 +284,20 @@ configured weight. When offered workers already track weights 1:1, a PASS on tha
 cannot distinguish "the split follows the weights" from "the split follows the workers" —
 both predict the same number. Restricting the check to rows where the worker ratio is
 deliberately different from the weight ratio — the only rows that can actually tell the
-two apart — currently stands at 2 PASS, 9 FAIL out of 11 across this project's settled
-config. Treat that, not the suite's overall PASS/FAIL tally, as the headline evidence count
-for weighted fairness specifically; the tally overstates support because most of its rows
-can't distinguish the claim from the alternative at all.
+two apart — currently stands at 2 PASS, 10 FAIL out of 12 across this project's settled
+config (updated by [UNI-227](/UNI/issues/UNI-227)'s re-run, which added one more FAIL to this
+count after this section was first written). Treat that, not the suite's overall PASS/FAIL
+tally, as the headline evidence count for weighted fairness specifically; the tally overstates
+support because most of its rows can't distinguish the claim from the alternative at all.
 
 **That FAIL majority has a cause, and it is the one thing in this list worth leading
 with: contended-window duration, not worker-ratio mismatch on its own, is what decides the
-outcome.** Every discriminating row with roughly a minute or more of per-group contended
-time converges on the configured weights; every one measured under ten seconds tracks the
-offered worker ratio instead. The cleanest evidence holds the scenario, the weight set, and
+outcome.** Every discriminating row measured at 69.0s or more of per-group contended time
+converges on the configured weights; every one at 66.3s or less tracks the offered worker
+ratio instead — a clean but thin 2.7-second boundary (an earlier draft of this section said
+"roughly a minute" versus "under ten seconds," which understates how close several FAILs sit
+to the boundary; see `docs/poc-results.md`'s UNI-225 section for the corrected figures). The
+cleanest evidence holds the scenario, the weight set, and
 the gap size fixed and varies only the contended window: the same `33/33/33` weight set
 with the same ~33-point worker-vs-weight gap lands on the weights at 69s of contention and
 on the worker ratio at 8-9s. This is a strong association across every discriminating row

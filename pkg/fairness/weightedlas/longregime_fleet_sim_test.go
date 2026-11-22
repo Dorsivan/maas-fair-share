@@ -431,3 +431,35 @@ func TestUNI283MultiEPP(t *testing.T) {
 		}
 	}
 }
+
+// TestUNI283CritSlots: at what EFFECTIVE concurrency does the dispatch-gap
+// bias (low weights over-served when H < the low-weight dispatch gap) return?
+func TestUNI283CritSlots(t *testing.T) {
+	skipUnlessSim(t)
+	fmt.Println("| effective slots | H (s) | app2 dispatch gap S̄/(w_min·slots) (s) | gap / H | mean split | mean max-dev | seeds within 5 pts | seeds within 10 pts |")
+	fmt.Println("|---|---|---|---|---|---|---|---|")
+	for _, h := range []float64{60, 300} {
+		for _, slots := range []int{16, 24, 32, 48, 64, 96, 128, 200, 400} {
+			const seeds = 10
+			share := map[string]float64{}
+			var dev float64
+			p5, p10 := 0, 0
+			for s := 0; s < seeds; s++ {
+				r := runFleet(t, flParams{slots: slots, epps: 1, halfLife: h, warmup: 4 * 3600, window: 3600,
+					seed: int64(5000 + s), tenants: boardFleetTenants(60, 720)})
+				for k, v := range r.share {
+					share[k] += v / seeds
+				}
+				dev += r.maxDev / seeds
+				if r.maxDev <= 5 {
+					p5++
+				}
+				if r.maxDev <= 10 {
+					p10++
+				}
+			}
+			gap := 187.8 / (0.1053 * float64(slots))
+			fmt.Printf("| %d | %.0f | %.1f | %.2f | %s | %.1f | %d/%d | %d/%d |\n", slots, h, gap, gap/h, fmtShares(share), dev, p5, seeds, p10, seeds)
+		}
+	}
+}

@@ -86,6 +86,13 @@ type epParams struct {
 	tenants     []epTenant
 	trackJoin   string
 	noClamp     bool
+	// kvThr is the detector's kvCacheUtilThreshold (0 = library default 0.8).
+	kvThr float64
+	// preempt models vLLM's KV exhaustion: a start needs free KV for its
+	// context, and when an endpoint's KV exceeds capacity the most recently
+	// started sequence is preempted and later re-prefilled (recompute).
+	preempt          bool
+	prefillTokPerSec float64
 }
 
 type epEndpoint struct {
@@ -98,14 +105,16 @@ type epEndpoint struct {
 }
 
 type epReq struct {
-	tenant  string
-	prefix  int
-	req     *fwksched.InferenceRequest
-	service float64
-	output  int
-	enqAt   float64
-	startAt float64
-	endAt   float64
+	tenant   string
+	prefix   int
+	req      *fwksched.InferenceRequest
+	service  float64
+	output   int
+	enqAt    float64
+	startAt  float64
+	endAt    float64
+	genBase  float64 // tokens generated before the current run (preemption)
+	decodeAt float64 // when decoding (re)starts after any recompute
 }
 
 type epResult struct {
@@ -125,6 +134,11 @@ type epResult struct {
 	firstStart     float64
 	firstPick      float64 // seconds from trackJoin's join to its first dispatch
 	toNinety       float64 // minutes until trackJoin holds 90% of entitlement (1-min buckets)
+	meanRunning    float64 // effective concurrency: mean running sequences, pool-wide
+	preemptions    map[string]float64
+	dispatches     map[string]float64
+	recomputeS     map[string]float64 // slot-seconds spent re-prefilling preempted work
+	slotS          map[string]float64
 }
 
 func runEndpoints(t *testing.T, prm epParams) epResult {
@@ -144,6 +158,10 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 	p, clock := newTestPlugin(t, cfg)
 	state := p.NewState(ctx)
 	rng := rand.New(rand.NewSource(prm.seed))
+	kvThr := prm.kvThr
+	if kvThr == 0 {
+		kvThr = 0.8
+	}
 	sigma := math.Log(prm.p95/prm.median) / 1.6449
 
 	eps := make([]*epEndpoint, prm.endpoints)
@@ -178,7 +196,7 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 	kvOf := func(e *epEndpoint, now float64) float64 {
 		var used float64
 		for _, r := range e.running {
-			used += prm.promptToks + math.Min(now-r.startAt, r.service)*prm.tokPerSec
+			used += prm.promptToks + r.genBase + math.Max(0, math.Min(now, r.endAt)-r.decodeAt)*prm.tokPerSec
 		}
 		return used / prm.kvCapacity
 	}
@@ -217,6 +235,7 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 	const snapEvery = 50 // ms
 	occ := map[string]float64{}
 	var res epResult
+	res.preemptions, res.dispatches, res.recomputeS, res.slotS = map[string]float64{}, map[string]float64{}, map[string]float64{}, map[string]float64{}
 	res.firstStart = -1
 	res.firstPick = -1
 	var joinAt float64
@@ -254,15 +273,46 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 			e.running = keep
 			for len(e.running) < prm.maxSeqs && len(e.waiting) > 0 {
 				r := e.waiting[0]
+				if prm.preempt && kvOf(e, now)+(prm.promptToks+r.genBase)/prm.kvCapacity > 1.0 {
+					break
+				}
 				e.waiting = e.waiting[1:]
 				r.startAt = now
-				r.endAt = now + r.service
+				recompute := 0.0
+				if r.genBase > 0 {
+					recompute = (prm.promptToks + r.genBase) / prm.prefillTokPerSec
+					if inWin {
+						res.recomputeS[r.tenant] += recompute
+					}
+				}
+				r.decodeAt = now + recompute
+				r.endAt = r.decodeAt + r.service - r.genBase/prm.tokPerSec
 				e.running = append(e.running, r)
 				if inWin {
 					fifoWaits = append(fifoWaits, now-r.enqAt)
 				}
 				if r.tenant == prm.trackJoin && res.firstStart < 0 && now >= joinAt {
 					res.firstStart = now - joinAt
+				}
+			}
+		}
+		// vLLM KV exhaustion: preempt the most recently started sequence
+		if prm.preempt && step%snapEvery == 0 {
+			for _, e := range eps {
+				for len(e.running) > 1 && kvOf(e, now) > 1.0 {
+					vi := 0
+					for i, r := range e.running {
+						if r.startAt > e.running[vi].startAt {
+							vi = i
+						}
+					}
+					v := e.running[vi]
+					v.genBase += math.Max(0, now-v.decodeAt) * prm.tokPerSec
+					e.running = append(e.running[:vi], e.running[vi+1:]...)
+					e.waiting = append([]*epReq{v}, e.waiting...)
+					if inWin {
+						res.preemptions[v.tenant]++
+					}
 				}
 			}
 		}
@@ -279,9 +329,9 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 					mx = w
 				}
 				qsum += w / prm.thr
-				kvsum += e.snapKV / 0.8
-				if inWin && e.snapKV/0.8 > res.peakKVRatio {
-					res.peakKVRatio = e.snapKV / 0.8
+				kvsum += e.snapKV / kvThr
+				if inWin && e.snapKV/kvThr > res.peakKVRatio {
+					res.peakKVRatio = e.snapKV / kvThr
 				}
 				if inWin && step%(snapEvery*20) == 0 {
 					waitSamples = append(waitSamples, w)
@@ -300,7 +350,7 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 		// saturation from the snapshot
 		var sat float64
 		for _, e := range eps {
-			sat += math.Max(float64(e.snapWaiting)/prm.thr, e.snapKV/0.8)
+			sat += math.Max(float64(e.snapWaiting)/prm.thr, e.snapKV/kvThr)
 		}
 		sat /= float64(len(eps))
 		if inWin && step%snapEvery == 0 && sat < 1 {
@@ -321,7 +371,7 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 				px := prefixID(tn)
 				// filter
 				qLimit := prm.thr * (1 + prm.headroom)
-				kvLimit := 0.8 * (1 + prm.headroom)
+				kvLimit := kvThr * (1 + prm.headroom)
 				var cands []*epEndpoint
 				for _, e := range eps {
 					if float64(e.snapWaiting) < qLimit && e.snapKV < kvLimit {
@@ -366,6 +416,9 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 				if err := p.PreRequest(ctx, ir, nil); err != nil {
 					t.Fatal(err)
 				}
+				if now >= prm.warmup {
+					res.dispatches[id]++
+				}
 				e.waiting = append(e.waiting, &epReq{tenant: id, prefix: px, req: ir, service: s,
 					output: int(s * prm.tokPerSec), enqAt: now})
 			}
@@ -383,7 +436,9 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 				for i, e := range eps {
 					for _, r := range e.running {
 						occ[r.tenant] += 0.1
+						res.slotS[r.tenant] += 0.1
 					}
+					res.meanRunning += float64(len(e.running))
 					epBusy[i] += float64(len(e.running))
 					idle := float64(prm.maxSeqs - len(e.running))
 					slotTotal += float64(prm.maxSeqs)
@@ -419,6 +474,7 @@ func runEndpoints(t *testing.T, prm epParams) epResult {
 			res.maxDev = d
 		}
 	}
+	res.meanRunning /= prm.window * 10
 	if snaps > 0 {
 		res.gateOpenFrac = float64(gateOpenSnaps) / float64(snaps)
 		res.meanStd /= float64(snaps)
@@ -538,6 +594,34 @@ func TestUNI283EndpointNewcomer(t *testing.T) {
 			}
 			fmt.Printf("| %s | %.2f | %v | %.0f | %.0f | %.0f | %.0f |\n", sh.name, 32/float64(sh.maxSeqs), clamp,
 				medianOf(picks), medianOf(starts), medianOf(ninetys), medianOf(fifo))
+		}
+	}
+}
+
+// TestUNI283Preemption: KV-bound endpoints with vLLM-style preemption, across
+// kvCacheUtilThreshold values. Token usage blocks never report recompute, so
+// the plugin's charge is blind to it; this measures who pays it in GPU time.
+func TestUNI283Preemption(t *testing.T) {
+	skipUnlessSim(t)
+	fmt.Println("| shape | kvCacheUtilThreshold | effective concurrency (configured) | split app1/app2/end-users | max-dev | kvRatio mean / peak | preemptions per 100 dispatches app1/app2/end-users | recompute share of slot-time app1/app2/end-users |")
+	fmt.Println("|---|---|---|---|---|---|---|---|")
+	for _, sh := range []epShape{epShapes[1], epShapes[2]} {
+		for _, kt := range []float64{0.8, 0.6, 0.5} {
+			prm := epBase(sh)
+			prm.preempt, prm.prefillTokPerSec, prm.kvThr = true, 5000, kt
+			prm.warmup, prm.window = 3600, 1800
+			r := runEndpoints(t, prm)
+			pp, rc := "", ""
+			for i, id := range []string{"app1", "app2", "end-users"} {
+				if i > 0 {
+					pp += "/"
+					rc += "/"
+				}
+				pp += fmt.Sprintf("%.1f", 100*r.preemptions[id]/math.Max(1, r.dispatches[id]))
+				rc += fmt.Sprintf("%.2f%%", 100*r.recomputeS[id]/math.Max(1e-9, r.slotS[id]))
+			}
+			fmt.Printf("| %s | %.1f | %.0f (%d) | %s | %.1f | %.2f / %.2f | %s | %s |\n", sh.name, kt, r.meanRunning, sh.endpoints*sh.maxSeqs,
+				fmtShares(r.share), r.maxDev, r.meanKVRatio, r.peakKVRatio, pp, rc)
 		}
 	}
 }

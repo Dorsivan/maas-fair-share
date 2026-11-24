@@ -69,6 +69,25 @@ type clParams struct {
 	vllmPriority bool                  // vLLM waiting queue ordered by a priority stamped at dispatch (normalized service), not FCFS
 	serviceMul   map[string]float64    // per-tenant multiplier on slot-hold time and output tokens (default 1)
 	idle         map[string][2]float64 // tenant stops submitting during [from,to), then returns with its full worker count
+
+	// UNI-290 round 2: the saturation detector decides only whether the cap
+	// is active; it never blocks dispatch by itself (threshold still can).
+	detector                string           // "pool" or "endpoint"; "" keeps the round-1 paths
+	capThr                  float64          // queue limb: waiting per endpoint at which an endpoint counts as saturated
+	kvThr                   float64          // KV limb: kv utilisation at which an endpoint counts as saturated (0 = limb off)
+	kvCaps                  []float64        // per-endpoint KV capacity in tokens (0 = unlimited); vLLM admits only what fits
+	affinity                map[string][]int // tenant -> home endpoints (prefix-cache affinity)
+	affSlack                float64          // extra waiting a non-home endpoint must save to win
+	capUnit                 string           // "" / "count": requests; "oracle": true output tokens; "ewma": min(max_tokens, per-tenant output EWMA 1/64)
+	gamer                   string           // tenant sending 3 short (0.05x) requests per long (gamerLong x) one
+	gamerLong               float64
+	staleOnly               bool   // detector reads only the 50 ms snapshot, no EPP-local count of dispatches since
+	prioStamp               string // "" = tenant's normalized service at dispatch; "sfq" = start-time fair queueing tag (monotone per tenant)
+	sfqCost                 string // SFQ tag increment: "" = 1/w per request; "oracle" = true tokens/w; "ewma" = dispatch estimate/w
+	sfqVFrom                string // SFQ virtual time advances on "" = request start (needs a first-token signal); "complete" = completion
+	underCapIgnoresAffinity bool   // route a request from a tenant under its cap share by queue depth alone
+	gamerTightMax           bool   // the gamer's short requests carry max_tokens = their true output (UNI-283's vector)
+	sfqTrueUp               bool   // at completion, move the tenant's SFQ tag by (true cost - estimate)/w, undecayed
 }
 
 type clDecision struct {
@@ -126,6 +145,11 @@ type clReq struct {
 	released float64 // when the EPP forwarded it
 	started  float64 // when it got a slot
 	prio     float64 // vLLM priority stamp (lower is served first)
+	mul      float64 // slot-hold and output-token multiplier for this request
+	est      float64 // cap load charged while in flight
+	kv       float64 // KV tokens held while running
+	maxTok   float64 // max_tokens the client sent
+	inc      float64 // SFQ tag increment charged at dispatch
 }
 
 var armAWeights = map[string]float64{"app1": 20, "app2": 10, "end-users": 65}
@@ -202,14 +226,30 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 	waiting := make([][]*clReq, prm.endpoints)
 	running := make([][]*clReq, prm.endpoints)
 	seq := 0
+	nthReq := map[string]int{}
 	newReq := func(tenant string) *clReq {
 		seq++
+		nthReq[tenant]++
+		m := 1.0
+		if v, ok := prm.serviceMul[tenant]; ok {
+			m = v
+		}
+		if tenant == prm.gamer {
+			m = 0.05
+			if nthReq[tenant]%4 == 0 {
+				m = prm.gamerLong
+			}
+		}
 		mt := prm.maxTokens
 		body := &fwkrh.InferenceRequestBody{}
 		if mt > 0 {
 			body.MaxOutputTokens = &mt
 		}
-		return &clReq{tenant: tenant, arrived: tsec(), enqueued: clock.now(),
+		maxTok := float64(prm.maxTokens)
+		if tenant == prm.gamer && prm.gamerTightMax && m < 1 {
+			maxTok = math.Ceil(float64(prm.outToks) * m)
+		}
+		return &clReq{tenant: tenant, arrived: tsec(), enqueued: clock.now(), mul: m, maxTok: maxTok,
 			req: &fwksched.InferenceRequest{RequestID: fmt.Sprintf("%s-%d", tenant, seq), FairnessID: tenant,
 				Body: body, RequestSizeBytes: prm.promptToks * 4}}
 	}
@@ -264,12 +304,33 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 	eppWaitSum, vllmWaitSum := map[string]float64{}, map[string]float64{}
 	lats := map[string][]float64{}
 	slotSec := map[string]float64{}
-	mul := func(tn string) float64 {
-		if m, ok := prm.serviceMul[tn]; ok {
-			return m
+	kvUsed := make([]float64, prm.endpoints)
+	kvCap := func(e int) float64 {
+		if e < len(prm.kvCaps) && prm.kvCaps[e] > 0 {
+			return prm.kvCaps[e]
 		}
-		return 1
+		return math.Inf(1)
 	}
+	fits := func(e int, r *clReq) bool { return len(running[e]) < prm.seqs && kvUsed[e]+r.kv <= kvCap(e) }
+	releasedLoad := map[string]float64{}
+	ewma := map[string]float64{}
+	for _, tn := range armATenants {
+		ewma[tn] = float64(prm.outToks)
+	}
+	snapW, snapKV, since := make([]float64, prm.endpoints), make([]float64, prm.endpoints), make([]float64, prm.endpoints)
+	snapFree := make([]float64, prm.endpoints)
+	// estWaiting: the EPP's view of an endpoint's waiting queue: the last
+	// scrape, plus what it dispatched there since, less the slots that
+	// scrape showed free (num_requests_running). It cannot see KV room.
+	estWaiting := func(e int) float64 {
+		if prm.staleOnly {
+			return snapW[e]
+		}
+		return math.Max(0, snapW[e]+since[e]-snapFree[e])
+	}
+	typical := float64(prm.promptToks + prm.outToks)
+	wEst := 0.0 // EWMA of vLLM queue wait, seconds (what an EPP can measure as TTFT minus prefill)
+	sfqLast, sfqV := map[string]float64{}, 0.0
 	var waitingSum, runningSum, dipN float64
 	var win *clWindow
 	var winN float64
@@ -289,14 +350,24 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 				}
 				p.ResponseBody(ctx, r.req, &fwkrc.Response{
 					EndOfStream: true, TerminationCause: fwkrc.TerminationCauseNatural,
-					Usage: fwkrh.Usage{PromptTokens: prm.promptToks, CompletionTokens: int(float64(prm.outToks) * mul(r.tenant)),
-						TotalTokens:        prm.promptToks + int(float64(prm.outToks)*mul(r.tenant)),
+					Usage: fwkrh.Usage{PromptTokens: prm.promptToks, CompletionTokens: int(float64(prm.outToks) * r.mul),
+						TotalTokens:        prm.promptToks + int(float64(prm.outToks)*r.mul),
 						PromptTokenDetails: &fwkrh.PromptTokenDetails{}},
 				}, nil)
 				latSum[r.tenant] += now - r.arrived
 				latN[r.tenant]++
 				completed++
 				released[r.tenant]--
+				releasedLoad[r.tenant] -= r.est
+				kvUsed[e] -= r.kv
+				ewma[r.tenant] += (float64(prm.outToks)*r.mul - ewma[r.tenant]) / 64
+				wEst += (r.started - r.released - wEst) / 64
+				if prm.sfqVFrom == "complete" {
+					sfqV = math.Max(sfqV, r.prio)
+				}
+				if prm.sfqTrueUp {
+					sfqLast[r.tenant] += (r.mul - r.inc) / armAWeights[r.tenant]
+				}
 				slotSec[r.tenant] += r.service
 				lats[r.tenant] = append(lats[r.tenant], now-r.arrived)
 				res.completedBy[r.tenant]++
@@ -310,7 +381,7 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 				}
 			}
 			running[e] = keep
-			for len(running[e]) < prm.seqs && len(waiting[e]) > 0 {
+			for len(waiting[e]) > 0 {
 				i := 0
 				if prm.vllmPriority {
 					for j, w := range waiting[e] {
@@ -320,9 +391,16 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 					}
 				}
 				r := waiting[e][i]
+				if !fits(e, r) {
+					break // vLLM stops admitting at the first request that does not fit
+				}
 				waiting[e] = append(waiting[e][:i], waiting[e][i+1:]...)
+				kvUsed[e] += r.kv
 				r.endAt = now + r.service
 				r.started = now
+				if prm.sfqVFrom == "" {
+					sfqV = math.Max(sfqV, r.prio)
+				}
 				running[e] = append(running[e], r)
 			}
 		}
@@ -342,19 +420,170 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 			}
 			gateMean = float64(tot) / float64(prm.endpoints)
 			nextRefresh = now + prm.staleness
+			for e := range waiting {
+				snapW[e], since[e] = float64(len(waiting[e])), 0
+				snapFree[e] = float64(prm.seqs - len(running[e]))
+				snapKV[e] = 0
+				if c := kvCap(e); !math.IsInf(c, 1) {
+					snapKV[e] = kvUsed[e] / c
+				}
+			}
+		}
+		if prm.detector != "" {
+			satOf := func(e int) float64 {
+				s := estWaiting(e) / prm.capThr
+				if prm.kvThr > 0 {
+					s = math.Max(s, snapKV[e]/prm.kvThr)
+				}
+				return s
+			}
+			for n := 0; gateMean < prm.threshold && float64(n) < prm.tick/0.001; n++ {
+				var cands []int
+				capActive := false
+				if prm.detector == "endpoint" {
+					for e := range waiting {
+						if satOf(e) < 1 {
+							cands = append(cands, e)
+						}
+					}
+					capActive = len(cands) == 0
+				} else {
+					// pool-wide mean of each limb, as the current detector reads it
+					var mw, mk float64
+					for e := range waiting {
+						mw += estWaiting(e) / float64(prm.endpoints)
+						mk += snapKV[e] / float64(prm.endpoints)
+					}
+					pool := mw / prm.capThr
+					if prm.kvThr > 0 {
+						pool = math.Max(pool, mk/prm.kvThr)
+					}
+					capActive = pool >= 1
+				}
+				if len(cands) == 0 {
+					for e := range waiting {
+						cands = append(cands, e)
+					}
+				}
+				var eligible map[string]bool
+				if capActive {
+					load := map[string]float64{}
+					for _, tn := range armATenants {
+						load[tn] = float64(released[tn])
+						if prm.capUnit != "" && prm.capUnit != "count" {
+							load[tn] = releasedLoad[tn]
+						}
+					}
+					eligible = compEligible("comp", 0, eppQ, released, load)
+				}
+				norm := map[string]float64{}
+				queued := 0
+				for _, tn := range armATenants {
+					if len(eppQ[tn]) > 0 && (eligible == nil || eligible[tn]) {
+						norm[tn] = p.stateFor(tn).normalizedService(clock.now())
+						queued++
+					}
+				}
+				if queued == 0 {
+					break
+				}
+				q, err := p.Pick(ctx, accessor(eligible))
+				if err != nil || q == nil {
+					t.Fatalf("pick: %v %v", q, err)
+				}
+				id := q.FlowKey().ID
+				r := eppQ[id][0]
+				if infinite[id] {
+					eppQ[id][0] = newReq(id)
+				} else {
+					eppQ[id] = eppQ[id][1:]
+				}
+				r.prio = norm[id]
+				if prm.prioStamp == "sfq" {
+					inc := 1.0
+					switch prm.sfqCost {
+					case "oracle":
+						inc = r.mul
+					case "ewma":
+						inc = math.Min(r.maxTok, ewma[id]) / float64(prm.outToks)
+					}
+					r.inc = inc
+					r.prio = math.Max(sfqLast[id], sfqV)
+					sfqLast[id] = r.prio + inc/armAWeights[id]
+				}
+				if err := p.PreRequest(ctx, r.req, nil); err != nil {
+					t.Fatal(err)
+				}
+				res.dispatch[id]++
+				released[id]++
+				r.released = now
+				tok := float64(prm.outToks) * r.mul
+				r.kv = float64(prm.promptToks) + tok
+				switch prm.capUnit {
+				case "oracle":
+					r.est = tok
+				case "ewma":
+					r.est = math.Min(r.maxTok, ewma[id])
+				case "sojourn": // expected time in vLLM: queue wait + oracle service
+					r.est = wEst + prm.service*r.mul
+				case "sojourn-ewma":
+					r.est = wEst + prm.service*math.Min(float64(prm.maxTokens), ewma[id])/float64(prm.outToks)
+				default:
+					r.est = 1
+				}
+				releasedLoad[id] += r.est
+				home := map[int]bool{}
+				for _, e := range prm.affinity[id] {
+					home[e] = true
+				}
+				if prm.underCapIgnoresAffinity {
+					load := map[string]float64{}
+					for _, tn := range armATenants {
+						load[tn] = float64(released[tn])
+					}
+					if compEligible("comp", 0, eppQ, released, load)[id] || len(eppQ[id]) == 0 {
+						home = nil
+					}
+				}
+				score := func(e int) float64 {
+					v := estWaiting(e)
+					if len(home) > 0 && !home[e] {
+						v += prm.affSlack
+					}
+					return v + 0.01*float64(len(running[e]))/float64(prm.seqs)
+				}
+				best := cands[0]
+				for _, e := range cands[1:] {
+					if score(e) < score(best) {
+						best = e
+					}
+				}
+				since[best]++
+				r.service = r.mul * prm.service * math.Exp(0.15*rng.NormFloat64()-0.5*0.15*0.15)
+				if len(waiting[best]) == 0 && fits(best, r) {
+					kvUsed[best] += r.kv
+					r.endAt = now + r.service
+					r.started = now
+					running[best] = append(running[best], r)
+				} else {
+					waiting[best] = append(waiting[best], r)
+				}
+			}
 		}
 		// EPP dispatch while the (possibly stale) saturation gate is open.
 		// Each dispatch in the same staleness window bumps the local estimate
 		// by nothing: that is exactly the overshoot a 50ms scrape produces.
 		// The dispatch loop runs on a ~1ms cadence, so at most tick/1ms Picks.
-		for n := 0; gateMean < prm.threshold && float64(n) < prm.tick/0.001; n++ {
+		for n := 0; prm.detector == "" && gateMean < prm.threshold && float64(n) < prm.tick/0.001; n++ {
 			var eligible map[string]bool
 			if prm.admission != "" {
 				load := map[string]float64{}
 				for _, tn := range armATenants {
 					load[tn] = float64(released[tn])
 					if prm.admission == "comp-cost" {
-						load[tn] *= mul(tn)
+						if m, ok := prm.serviceMul[tn]; ok {
+							load[tn] *= m
+						}
 					}
 				}
 				eligible = compEligible(prm.admission, prm.compFloor, eppQ, released, load)
@@ -416,8 +645,10 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 					best = e
 				}
 			}
-			r.service = mul(id) * prm.service * math.Exp(0.15*rng.NormFloat64()-0.5*0.15*0.15)
-			if len(running[best]) < prm.seqs {
+			r.kv = float64(prm.promptToks) + float64(prm.outToks)*r.mul
+			r.service = r.mul * prm.service * math.Exp(0.15*rng.NormFloat64()-0.5*0.15*0.15)
+			if len(waiting[best]) == 0 && fits(best, r) {
+				kvUsed[best] += r.kv
 				r.endAt = now + r.service
 				r.started = now
 				running[best] = append(running[best], r)
@@ -453,8 +684,15 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 			}
 			waitingSum += float64(nw)
 			runningSum += float64(nr)
-			if nr < prm.endpoints*prm.seqs && held > 0 {
-				dipN++
+			// idle capacity: an endpoint with nothing waiting and room for a
+			// typical request while the EPP is holding work
+			if held > 0 {
+				for e := range waiting {
+					if len(waiting[e]) == 0 && len(running[e]) < prm.seqs && kvUsed[e]+typical <= kvCap(e) {
+						dipN++
+						break
+					}
+				}
 			}
 			samples++
 		}

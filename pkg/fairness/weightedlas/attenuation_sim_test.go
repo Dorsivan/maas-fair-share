@@ -81,6 +81,8 @@ type clResult struct {
 	lastThird   map[string]float64
 	latency     map[string]float64 // mean e2e seconds
 	meanEPPHeld float64
+	heldBy      map[string]float64 // time-averaged EPP flow-queue depth per tenant
+	zeroFrac    map[string]float64 // fraction of samples with that tenant's queue empty
 	meanBackend float64
 	throughput  float64
 	decisions   []clDecision
@@ -180,6 +182,8 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 	latSum := map[string]float64{}
 	latN := map[string]float64{}
 	var heldSum, backendSum, samples float64
+	heldBy := map[string]float64{}
+	zeroN := map[string]float64{}
 	nextRefresh := 0.0
 	gateMean := 0.0
 	completed := 0
@@ -300,6 +304,10 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 			for _, tn := range armATenants {
 				if !infinite[tn] {
 					heldSum += float64(len(eppQ[tn]))
+					heldBy[tn] += float64(len(eppQ[tn]))
+					if len(eppQ[tn]) == 0 {
+						zeroN[tn]++
+					}
 				}
 			}
 			for e := range waiting {
@@ -333,6 +341,11 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 	res.firstThird = pct(third[0])
 	res.lastThird = pct(third[2])
 	res.meanEPPHeld = heldSum / samples
+	res.heldBy, res.zeroFrac = map[string]float64{}, map[string]float64{}
+	for _, tn := range armATenants {
+		res.heldBy[tn] = heldBy[tn] / samples
+		res.zeroFrac[tn] = 100 * zeroN[tn] / samples
+	}
 	res.meanBackend = backendSum / samples
 	res.throughput = float64(completed) / prm.duration
 	return res
@@ -419,6 +432,7 @@ func TestUNI288Decisions(t *testing.T) {
 		w := winsWhenQueued[tn]
 		fmt.Printf("  %s: queued at %d contended decisions, won %d\n", tn, w[1], w[0])
 	}
+	fmt.Printf("time-averaged EPP-held per tenant %s (total %.1f), queue empty %% of time %s\n", fmt3(r.heldBy), r.meanEPPHeld, fmt3(r.zeroFrac))
 	fmt.Printf("warm-up cut: first third %s, last third %s, whole %s\n", fmt3(r.firstThird), fmt3(r.lastThird), fmt3(r.share))
 }
 

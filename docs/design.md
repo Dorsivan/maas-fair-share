@@ -1034,6 +1034,12 @@ plugins:
       # Turning it off re-couples fairness to idleness and breaks work conservation.
       newcomerClamp: true
       provisionalCharge: true
+      # UNI-293, off by default. An under-estimate's true-up lands at full weight
+      # on completion rather than decayed by 2^(-inflight/H). That closes the
+      # tight-max_tokens vector, where tiny requests drag the output EWMA down
+      # and long ones under-pay. Over-estimates are still refunded decayed. See
+      # "UNI-293: SFQ priority stamp" below.
+      undecayedTrueUp: false
       # Fallback only. The real output estimate is min(max_tokens, per-group EWMA
       # of observed output tokens); this applies when neither is available.
       defaultEstimatedOutputTokens: 512

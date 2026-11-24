@@ -700,11 +700,20 @@ func (p *Plugin) ResponseBody(
 
 	delta := actual - charge.cost
 	inflight := now.Sub(charge.at).Seconds()
-	// The correction is decayed by the time the hold has already spent decaying,
-	// which makes the tab exactly what it would have been had the true value
-	// been charged at dispatch. Adding the raw delta instead would leave the
-	// accumulated tab dependent on estimator quality rather than on consumption.
-	gs.chargeInflight(now, delta, inflight)
+	if p.cfg.UndecayedTrueUp && delta > 0 {
+		// UNI-293: an under-estimate lands at full weight, as of now. See
+		// Config.UndecayedTrueUp. That makes the final tab depend on when the
+		// cost became known, not only on the cost. That is the intent: the
+		// decayed form below lets a long request's real cost evaporate before
+		// it is ever charged.
+		gs.charge(now, delta)
+	} else {
+		// The correction is decayed by the time the hold has already spent decaying,
+		// which makes the tab exactly what it would have been had the true value
+		// been charged at dispatch. Adding the raw delta instead would leave the
+		// accumulated tab dependent on estimator quality rather than on consumption.
+		gs.chargeInflight(now, delta, inflight)
+	}
 	truingError.WithLabelValues(boundID(id)).Observe(delta)
 	if v4, ok := p.v4Logger(ctx, now); ok {
 		fields := append([]any{"plugin", p.name, "group", id,
@@ -833,6 +842,7 @@ func (p *Plugin) fairnessIDFor(request *fwksched.InferenceRequest) string {
 
 type dumpState struct {
 	Enforcing       bool       `json:"enforcing"`
+	UndecayedTrueUp bool       `json:"undecayedTrueUp"`
 	HalfLifeSeconds float64    `json:"halfLifeSeconds"`
 	CostModel       string     `json:"costModel"`
 	Groups          []snapshot `json:"groups"`
@@ -854,6 +864,7 @@ func (p *Plugin) dump() dumpState {
 	now := p.now()
 	d := dumpState{
 		Enforcing:       p.cfg.Enforce,
+		UndecayedTrueUp: p.cfg.UndecayedTrueUp,
 		HalfLifeSeconds: p.cfg.HalfLifeSeconds,
 		CostModel:       p.cfg.CostModel,
 		Groups:          make([]snapshot, 0, len(p.states)),

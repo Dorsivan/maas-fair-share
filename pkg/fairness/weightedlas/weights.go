@@ -117,6 +117,20 @@ type Config struct {
 	DefaultEstimatedOutputTokens float64 `json:"defaultEstimatedOutputTokens,omitempty"`
 	EstimatedBytesPerToken       float64 `json:"estimatedBytesPerToken,omitempty"`
 
+	// UndecayedTrueUp lands an under-estimate's correction at full weight when
+	// the request completes, instead of decaying it by 2^(-inflight/H) as if it
+	// had been charged at dispatch. UNI-293: the decayed form is gameable. A
+	// tenant that interleaves tiny tight-max_tokens requests drags its own
+	// output EWMA down, so its long requests are estimated low. By the time a
+	// long request completes, the decay has already wiped out most of the
+	// correction, so the tenant under-pays exactly where the cost is largest.
+	// Over-estimates are still refunded decayed, i.e. never more than what is
+	// left of the hold. Refunding them at full weight would take back charges
+	// that belong to other requests. The flag is separate from
+	// sfqPriorityStamp so the two can be reviewed and shipped on their own.
+	// Off by default.
+	UndecayedTrueUp bool `json:"undecayedTrueUp"`
+
 	// AgingTokensPerSecond subtracts head-of-line wait from the score in raw
 	// units. 0 is pure proportional ordering.
 	AgingTokensPerSecond float64 `json:"agingTokensPerSecond,omitempty"`

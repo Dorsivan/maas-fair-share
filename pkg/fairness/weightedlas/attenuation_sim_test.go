@@ -62,6 +62,13 @@ type clParams struct {
 	promptToks int
 	outToks    int
 	maxTokens  int64
+
+	// UNI-290 extensions; zero values reproduce UNI-288 exactly.
+	admission    string                // "" depth gate only; "comp-epp" / "comp" / "comp-cost": weighted in-flight cap (see compEligible)
+	compFloor    int                   // "comp", "comp-cost": release regardless while total released < compFloor (GPU-level work conservation)
+	vllmPriority bool                  // vLLM waiting queue ordered by a priority stamped at dispatch (normalized service), not FCFS
+	serviceMul   map[string]float64    // per-tenant multiplier on slot-hold time and output tokens (default 1)
+	idle         map[string][2]float64 // tenant stops submitting during [from,to), then returns with its full worker count
 }
 
 type clDecision struct {
@@ -86,6 +93,27 @@ type clResult struct {
 	meanBackend float64
 	throughput  float64
 	decisions   []clDecision
+
+	completedBy map[string]int
+	compShare   map[string]float64 // share of completions (what the tenants were actually served)
+	eppWait     map[string]float64 // mean seconds held at the EPP
+	vllmWait    map[string]float64 // mean seconds in vLLM's waiting queue
+	meanWaiting float64            // time-averaged vLLM waiting, summed over endpoints
+	meanRunning float64            // time-averaged running, summed over endpoints
+	slotDipFrac float64            // % of samples with a free slot while the EPP held requests
+	slotShare   map[string]float64 // share of slot-seconds served (GPU-time composition)
+	p99Lat      map[string]float64 // e2e seconds
+	maxLat      map[string]float64
+	series      []clWindow
+}
+
+// clWindow is one 1-second sample of the time series.
+type clWindow struct {
+	at        float64
+	completed map[string]int
+	waiting   float64 // mean over the window
+	running   float64
+	held      map[string]float64
 }
 
 type clReq struct {
@@ -95,6 +123,50 @@ type clReq struct {
 	enqueued time.Time
 	service  float64
 	endAt    float64
+	released float64 // when the EPP forwarded it
+	started  float64 // when it got a slot
+	prio     float64 // vLLM priority stamp (lower is served first)
+}
+
+var armAWeights = map[string]float64{"app1": 20, "app2": 10, "end-users": 65}
+
+// compEligible implements UNI-290's weighted in-flight admission. A tenant
+// with queued requests may be released while released_i/Σreleased <= w_i,
+// with w normalized over tenants that have demand (queued or in flight).
+// If no queued tenant qualifies, "comp-epp" releases anyway (work
+// conservation at the EPP queue: bind only while an under-cap tenant is
+// waiting); "comp" releases anyway only while Σreleased < floor (work
+// conservation at the GPU: bind while the backend has enough work).
+//
+// load is what the cap counts per tenant: released requests, or (comp-cost)
+// their expected slot-time.
+func compEligible(mode string, floor int, eppQ map[string][]*clReq, released map[string]int, load map[string]float64) map[string]bool {
+	var wsum, ltot float64
+	tot := 0
+	for _, tn := range armATenants {
+		ltot += load[tn]
+		if len(eppQ[tn]) > 0 || released[tn] > 0 {
+			wsum += armAWeights[tn]
+		}
+		tot += released[tn]
+	}
+	out := map[string]bool{}
+	for _, tn := range armATenants {
+		if len(eppQ[tn]) > 0 && (tot == 0 || load[tn] <= armAWeights[tn]/wsum*ltot) {
+			out[tn] = true
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	if mode == "comp-epp" || tot < floor {
+		for _, tn := range armATenants {
+			if len(eppQ[tn]) > 0 {
+				out[tn] = true
+			}
+		}
+	}
+	return out
 }
 
 var armATenants = []string{"app1", "app2", "end-users"}
@@ -153,10 +225,10 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 		}
 	}
 
-	accessor := func() flowcontrol.PriorityBandAccessor {
+	accessor := func(eligible map[string]bool) flowcontrol.PriorityBandAccessor {
 		var active []flowcontrol.FlowQueueAccessor
 		for _, tn := range armATenants {
-			if len(eppQ[tn]) == 0 {
+			if len(eppQ[tn]) == 0 || (eligible != nil && !eligible[tn]) {
 				continue
 			}
 			active = append(active, &fwkfcmocks.MockFlowQueueAccessor{
@@ -187,6 +259,24 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 	nextRefresh := 0.0
 	gateMean := 0.0
 	completed := 0
+	released := map[string]int{}
+	res.completedBy = map[string]int{}
+	eppWaitSum, vllmWaitSum := map[string]float64{}, map[string]float64{}
+	lats := map[string][]float64{}
+	slotSec := map[string]float64{}
+	mul := func(tn string) float64 {
+		if m, ok := prm.serviceMul[tn]; ok {
+			return m
+		}
+		return 1
+	}
+	var waitingSum, runningSum, dipN float64
+	var win *clWindow
+	var winN float64
+	active := func(tn string, now float64) bool {
+		w, ok := prm.idle[tn]
+		return !ok || now < w[0] || now >= w[1]
+	}
 
 	for now := 0.0; now < prm.duration; now = tsec() {
 		// completions, then resubmission by the same closed-loop worker
@@ -199,23 +289,50 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 				}
 				p.ResponseBody(ctx, r.req, &fwkrc.Response{
 					EndOfStream: true, TerminationCause: fwkrc.TerminationCauseNatural,
-					Usage: fwkrh.Usage{PromptTokens: prm.promptToks, CompletionTokens: prm.outToks,
-						TotalTokens:        prm.promptToks + prm.outToks,
+					Usage: fwkrh.Usage{PromptTokens: prm.promptToks, CompletionTokens: int(float64(prm.outToks) * mul(r.tenant)),
+						TotalTokens:        prm.promptToks + int(float64(prm.outToks)*mul(r.tenant)),
 						PromptTokenDetails: &fwkrh.PromptTokenDetails{}},
 				}, nil)
 				latSum[r.tenant] += now - r.arrived
 				latN[r.tenant]++
 				completed++
-				if !infinite[r.tenant] {
+				released[r.tenant]--
+				slotSec[r.tenant] += r.service
+				lats[r.tenant] = append(lats[r.tenant], now-r.arrived)
+				res.completedBy[r.tenant]++
+				eppWaitSum[r.tenant] += r.released - r.arrived
+				vllmWaitSum[r.tenant] += r.started - r.released
+				if win != nil {
+					win.completed[r.tenant]++
+				}
+				if !infinite[r.tenant] && active(r.tenant, now) {
 					eppQ[r.tenant] = append(eppQ[r.tenant], newReq(r.tenant))
 				}
 			}
 			running[e] = keep
 			for len(running[e]) < prm.seqs && len(waiting[e]) > 0 {
-				r := waiting[e][0]
-				waiting[e] = waiting[e][1:]
+				i := 0
+				if prm.vllmPriority {
+					for j, w := range waiting[e] {
+						if w.prio < waiting[e][i].prio {
+							i = j
+						}
+					}
+				}
+				r := waiting[e][i]
+				waiting[e] = append(waiting[e][:i], waiting[e][i+1:]...)
 				r.endAt = now + r.service
+				r.started = now
 				running[e] = append(running[e], r)
+			}
+		}
+		// a tenant returning from idle comes back with its full worker count
+		for tn := range prm.idle {
+			if infinite[tn] || !active(tn, now) {
+				continue
+			}
+			for n := len(eppQ[tn]) + released[tn]; n < prm.workers[tn]; n++ {
+				eppQ[tn] = append(eppQ[tn], newReq(tn))
 			}
 		}
 		if now >= nextRefresh {
@@ -231,11 +348,22 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 		// by nothing: that is exactly the overshoot a 50ms scrape produces.
 		// The dispatch loop runs on a ~1ms cadence, so at most tick/1ms Picks.
 		for n := 0; gateMean < prm.threshold && float64(n) < prm.tick/0.001; n++ {
-			acc := accessor()
+			var eligible map[string]bool
+			if prm.admission != "" {
+				load := map[string]float64{}
+				for _, tn := range armATenants {
+					load[tn] = float64(released[tn])
+					if prm.admission == "comp-cost" {
+						load[tn] *= mul(tn)
+					}
+				}
+				eligible = compEligible(prm.admission, prm.compFloor, eppQ, released, load)
+			}
+			acc := accessor(eligible)
 			norm := map[string]float64{}
 			queued := 0
 			for _, tn := range armATenants {
-				if len(eppQ[tn]) > 0 {
+				if len(eppQ[tn]) > 0 && (eligible == nil || eligible[tn]) {
 					norm[tn] = p.stateFor(tn).normalizedService(clock.now())
 					queued++
 				}
@@ -254,10 +382,13 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 			} else {
 				eppQ[id] = eppQ[id][1:]
 			}
+			r.prio = norm[id]
 			if err := p.PreRequest(ctx, r.req, nil); err != nil {
 				t.Fatal(err)
 			}
 			res.dispatch[id]++
+			released[id]++
+			r.released = now
 			if b := int(3 * now / prm.duration); b == 0 || b == 2 {
 				third[b][id]++
 			}
@@ -285,9 +416,10 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 					best = e
 				}
 			}
-			r.service = prm.service * math.Exp(0.15*rng.NormFloat64()-0.5*0.15*0.15)
+			r.service = mul(id) * prm.service * math.Exp(0.15*rng.NormFloat64()-0.5*0.15*0.15)
 			if len(running[best]) < prm.seqs {
 				r.endAt = now + r.service
+				r.started = now
 				running[best] = append(running[best], r)
 			} else {
 				waiting[best] = append(waiting[best], r)
@@ -310,11 +442,43 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 					}
 				}
 			}
+			held, nw, nr := 0, 0, 0
+			for _, tn := range armATenants {
+				held += len(eppQ[tn])
+			}
 			for e := range waiting {
 				backendSum += float64(len(waiting[e]) + len(running[e]))
+				nw += len(waiting[e])
+				nr += len(running[e])
+			}
+			waitingSum += float64(nw)
+			runningSum += float64(nr)
+			if nr < prm.endpoints*prm.seqs && held > 0 {
+				dipN++
 			}
 			samples++
 		}
+		// 1-second time series from t=0 (includes warm-up, for convergence)
+		if win == nil || now >= win.at+1 {
+			if win != nil {
+				win.waiting /= winN
+				win.running /= winN
+				for tn := range win.held {
+					win.held[tn] /= winN
+				}
+				res.series = append(res.series, *win)
+			}
+			win = &clWindow{at: math.Floor(now), completed: map[string]int{}, held: map[string]float64{}}
+			winN = 0
+		}
+		for e := range waiting {
+			win.waiting += float64(len(waiting[e]))
+			win.running += float64(len(running[e]))
+		}
+		for _, tn := range armATenants {
+			win.held[tn] += float64(len(eppQ[tn]))
+		}
+		winN++
 		clock.advance(time.Duration(prm.tick * float64(time.Second)))
 	}
 	total := 0
@@ -347,6 +511,20 @@ func runClosedLoop(t *testing.T, prm clParams) clResult {
 		res.zeroFrac[tn] = 100 * zeroN[tn] / samples
 	}
 	res.meanBackend = backendSum / samples
+	res.meanWaiting, res.meanRunning, res.slotDipFrac = waitingSum/samples, runningSum/samples, 100*dipN/samples
+	res.compShare, res.eppWait, res.vllmWait = map[string]float64{}, map[string]float64{}, map[string]float64{}
+	res.p99Lat, res.maxLat = map[string]float64{}, map[string]float64{}
+	res.slotShare = pctOf(slotSec)
+	for _, tn := range armATenants {
+		if l := lats[tn]; len(l) > 0 {
+			sort.Float64s(l)
+			res.p99Lat[tn], res.maxLat[tn] = l[int(0.99*float64(len(l)-1))], l[len(l)-1]
+		}
+		res.compShare[tn] = 100 * float64(res.completedBy[tn]) / float64(completed)
+		if c := float64(res.completedBy[tn]); c > 0 {
+			res.eppWait[tn], res.vllmWait[tn] = eppWaitSum[tn]/c, vllmWaitSum[tn]/c
+		}
+	}
 	res.throughput = float64(completed) / prm.duration
 	return res
 }
@@ -467,4 +645,16 @@ func TestUNI288Levers(t *testing.T) {
 		prm.threshold = thr
 		row(fmt.Sprintf("queueDepthThreshold %.0f", thr), prm)
 	}
+}
+
+func pctOf(m map[string]float64) map[string]float64 {
+	var s float64
+	for _, v := range m {
+		s += v
+	}
+	out := map[string]float64{}
+	for k, v := range m {
+		out[k] = 100 * v / s
+	}
+	return out
 }

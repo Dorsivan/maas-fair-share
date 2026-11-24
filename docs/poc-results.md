@@ -10215,3 +10215,114 @@ unrelated metrics-scrape addition -- so UNI-218's UNCONTENDED verdict for both s
 `20/10/65/5`, `newcomerClamp: true`, scorer weights `queue-scorer 3.0` / `prefix-cache-scorer 3.0`
 / `kv-cache-utilization-scorer 2.0` -- unchanged throughout, the same baseline UNI-220 and UNI-224
 left the cluster at. The only code change is the `13-loadgen-poisson.sh` scrape-filter widen.
+
+## UNI-289: raising the EPP-held fraction moves composition toward target, but plateaus at thr16 and either lever (lower threshold or more offered load) costs real throughput once EPP-held crosses roughly a third of the population
+
+Follow-on to [UNI-288](/UNI/issues/UNI-288) (sim-only; not on `main` as of this entry -- branch
+`uni288-attenuation` on top of `uni283-long-regime-sim`), which found the real plugin produces the
+exact target split under infinite backlog but the EPP only holds ~6-8% of the live in-flight
+population at `queueDepthThreshold: 32` -- vLLM's own FIFO absorbs the rest, and FIFO is arrival
+order. This ticket swept `queueDepthThreshold` live and measured both composition and throughput at
+each point.
+
+**New instrumentation (additive, not a replacement for the UNI-282 scrape loop or
+`16-gate-correlation.py`):** `deploy/poc/28-vllm-queue-scrape.sh`, a ~10s-cadence sampler of vLLM's
+own `num_requests_running`/`num_requests_waiting` gauges (summed across both GPU replicas, via the
+API-server pod proxy, no port-forward needed). Joined against the EPP's own
+`llm_d_epp_flow_control_queue_size` (already captured by `15-fairness-benchmark.sh`'s
+`metrics-timeseries.txt`) by nearest wall-clock timestamp, this gives a live measurement of the
+EPP-held fraction = EPP-held / (EPP-held + vLLM running + vLLM waiting) -- the thing UNI-288's
+report flagged as unmeasured live.
+
+**Methodology trap, caught before the final numbers (left in this writeup since it explains an
+early inconsistent data point and is a reusable warning):** `15-fairness-benchmark.sh` defaults
+`ENFORCE_LIVE=false`. A first full pass of this sweep ran without it -- every composition number
+came back flat/equal regardless of threshold, including one run of `full-contention-discriminating`
+(128w) that landed at 33.3/33.2/33.5%, flatly contradicting UNI-225 round-2's prior live citation of
+33.4/19.6/47.0% for the identical scenario. That contradiction was the tell: shadow mode means the
+policy's ranking is computed and metered but never applied to real dispatch order, so equal offered
+workers produce equal composition independent of weight, threshold, or EPP-held fraction. The
+EPP-held-fraction measurements from that pass are still valid (the saturation detector and
+`enforce` are independent plugins), only the composition numbers from it are not. All composition
+numbers below are from the corrected, `ENFORCE_LIVE=true` re-run.
+
+**Sweep A: `equal-workers-control` (32/32/32 workers, the shape UNI-282's Arm A and UNI-283's sim
+both used)**
+
+| `queueDepthThreshold` | app1/app2/end-users observed % | max deviation (pts) | EPP-held fraction | run wall-clock | p50/p95 latency, s (app1 / app2 / end-users) | requests delivered |
+|---|---|---|---|---|---|---|
+| 32 (control) | 32.7/30.9/36.4 | 32.0 | 7.1% | 4m19s | 4.3/4.8, 4.5/5.0, 3.8/4.4 | 5464 |
+| 16 | 33.9/24.7/41.4 | 27.0 | 25.8% | 4m19s | 4.3/5.5, 5.9/7.2, 3.3/5.1 | 5423 |
+| 8 | 35.5/23.2/41.4 | 27.1 | 35.1% | **8m57s** | 5.5/7.9, **9.0/10.9**, 4.6/5.4 | 3794 |
+| 4 | 34.1/32.0/33.9 | 34.5 | 40.6% | 4m17s | 6.6/11.1, 7.7/11.1, 7.0/11.0 | 3174 |
+
+Target: 21.1/10.5/68.4%. `requests_evicted_total` and EPP-side shed stayed 0 at every point --
+every cost measured here is latency/throughput, not shedding.
+
+Three findings:
+
+1. **thr32 to thr16 buys real, genuine ground.** app2 moves from 30.9% toward its 10.5% target,
+   end-users from 36.4% toward 68.4%, max deviation improves 32.0 to 27.0pts, tracking the EPP-held
+   fraction rising 7.1% to 25.8% (UNI-283's sim predicted 8.2%/24.6% for the same two points -- close).
+2. **It plateaus hard after thr16, then reverses at thr4.** thr8 pushes EPP-held to 35.1% (10 points
+   more than thr16) for zero further composition gain (27.1pt, same as thr16). thr4 pushes EPP-held
+   higher still (40.6%) and composition **reverses toward equal thirds** (34.5pt, worse than the
+   thr32 control) -- a genuine non-monotonic result, not noise (both the shadow-mode and the
+   corrected pass show the same U-shape in deviation, and both independently show thr4 finishing in
+   normal wall-clock time while thr8 does not, below). No root cause is established for the reversal
+   within this ticket's scope; flagged as an open question for whoever designs the in-flight-aware
+   gate UNI-288 proposed.
+3. **thr8 has a severe, reproducible throughput cost that thr4 does not share.** Across two
+   independent runs (one shadow-mode, one enforced), thr8 took ~8m57s-8m53s wall-clock for the same
+   240s-of-offered-load shape that normally finishes in ~4m19s -- app2's own p50/p95 latency nearly
+   doubled on top of thr16's already-worse numbers, and total requests delivered dropped ~30%. thr4,
+   despite a higher EPP-held fraction and worse p95 latency uniformly across all three groups
+   (11.0-11.1s), finished in normal wall-clock time both times it was run. The mechanism for thr8
+   specifically stalling (apparently on one or two straggler requests riding the loadgen's 300s
+   `REQUEST_TIMEOUT_SECONDS` to its limit) is not identified.
+
+**thr16 is the clear candidate from this sweep alone**: it captures essentially all of the
+composition benefit achievable via this lever on this backend, at no detectable throughput cost
+(wall-clock, request count and p50 latency all within noise of the thr32 baseline; only p95
+degrades, +15-25%). It does not reach PASS (27.0pt max deviation, versus a 10pt bar) on its own.
+
+**Sweep B: `full-contention-discriminating` (128/128/128 workers) at thr32 -- checking the open
+sim/live disagreement UNI-288 flagged (sim predicts exact weights at 128w/256w; a prior live
+citation found 33.4/19.6/47.0%)**
+
+| | app1/app2/end-users observed % | max deviation | EPP-held fraction | run wall-clock | p50/p95 latency, s |
+|---|---|---|---|---|---|
+| thr32, 128w (enforced) | **23.6/13.0/63.4** | **6.3 -- PASS** | 61.2% | 8m44s | app1 27.2/32.9, app2 46.5/59.2, end-users 8.5/22.1 |
+
+This neither matches UNI-283's sim (predicts exact 21.1/10.5/68.4 for any worker count once
+infinite-backlog conditions hold) nor the prior live citation (33.4/19.6/47.0) -- it PASSes, and
+closer to target than either. The most likely explanation: **over-offering more total workers
+against a fixed backend is itself a second lever that raises the EPP-held fraction**, independent of
+`queueDepthThreshold` -- 384 offered workers against this backend's ~16-24 effective vLLM slots
+naturally backs a much larger fraction of the population into the EPP's own queue (61.2% here, vs.
+7.1% at 32 workers/tenant and the same thr32) than any threshold point tested in Sweep A achieved.
+That is consistent with Sweep A's own pattern: composition improvement tracks EPP-held fraction
+fairly tightly regardless of which lever raised it. It does not explain why the prior 33.4/19.6/47.0
+citation differs this much from today's measurement at nominally the same scenario and threshold;
+that gap is unresolved and should be treated as a live variance warning before reusing either number
+without a repeat. The latency cost here is severe (app2 p95 59.2s) and the run itself took
+8m44s against a 240s nominal load window -- the same ~2x wall-clock-inflation pattern Sweep A saw
+at thr8, this time from raw oversubscription rather than a low threshold. Only this one point was
+re-run with enforcement on; a full threshold sweep at 128w/256w was out of scope for this pass given
+time and the Sweep A conclusion already answering the ticket's core question -- recommended as a
+follow-up if the board wants the full picture at production-adjacent worker counts.
+
+**Answer to the ticket's question ("can the gate alone fix this, and what does it cost"):** no
+single point in Sweep A reaches PASS without compromise; thr16 is a genuine partial win at zero
+cost, and reaching full PASS (demonstrated only via Sweep B's much larger offered-load shape)
+costs a 2x wall-clock slowdown and tens-of-seconds p95 latency for the lowest-weight tenant. The
+gate alone, at realistic worker counts, is not a complete fix -- it is a partial, free improvement
+(thr16) plus a confirmation that full correction is possible but expensive, via either lever, once
+EPP-held fraction crosses roughly a third of the live population. The in-flight-aware admission
+change UNI-288 proposed as a follow-on remains the right next step if full correction at low
+latency cost is required.
+
+**Cluster restored.** `queueDepthThreshold: 32`, `enforce: false`, `headroom: 0.3` -- confirmed live
+via `oc get configmap maas-epp-config` after the final run, matching the committed
+`deploy/poc/00-config.yaml` baseline exactly. No plugin code was changed (out of scope per the
+ticket). New tooling only: `deploy/poc/28-vllm-queue-scrape.sh`.

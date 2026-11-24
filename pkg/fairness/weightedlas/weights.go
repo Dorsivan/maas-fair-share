@@ -131,6 +131,36 @@ type Config struct {
 	// Off by default.
 	UndecayedTrueUp bool `json:"undecayedTrueUp"`
 
+	// SFQPriorityStamp writes a start-time-fair-queueing tag into every
+	// request's `priority` field, so a vLLM pool running --scheduling-policy
+	// priority orders its own waiting queue by weighted share. See sfq.go and
+	// docs/design.md "UNI-293: SFQ priority stamp". Independent of Enforce:
+	// that switch governs the EPP's own pick, this one governs vLLM's.
+	//
+	// When on: any client-supplied `priority` is overwritten on every path;
+	// a request whose body cannot be rewritten is rejected rather than
+	// forwarded with a client priority intact; and the EPP refuses to start
+	// if requestHandler.propagatePriority is on. Off by default. When off,
+	// a client-supplied `priority` is still stripped (see stampPriority).
+	SFQPriorityStamp bool `json:"sfqPriorityStamp"`
+
+	// SFQEndpointStaleSeconds is how long an endpoint with work outstanding
+	// may go without a request visibly starting before it stops holding the
+	// virtual clock back. See sfqState.serving. This bounds how long a wedged
+	// endpoint, or one whose responses never reach the EPP, can freeze V.
+	SFQEndpointStaleSeconds float64 `json:"sfqEndpointStaleSeconds,omitempty"`
+
+	// SFQSettleTimeoutSeconds is how long after dispatch a request with no
+	// observed completion is presumed lost and charged its worst-case cost
+	// on the finish tag. See sfqState.reap. Set it above the pool's longest
+	// legitimate request. A request that outlives it is charged worst-case
+	// meanwhile and trued down to the measured actual if it completes.
+	SFQSettleTimeoutSeconds float64 `json:"sfqSettleTimeoutSeconds,omitempty"`
+
+	// SFQUnboundedOutputTokens is the output length assumed for a lost
+	// request that sent no max_tokens, when pricing its worst case.
+	SFQUnboundedOutputTokens float64 `json:"sfqUnboundedOutputTokens,omitempty"`
+
 	// AgingTokensPerSecond subtracts head-of-line wait from the score in raw
 	// units. 0 is pure proportional ordering.
 	AgingTokensPerSecond float64 `json:"agingTokensPerSecond,omitempty"`
@@ -186,6 +216,9 @@ func DefaultConfig() Config {
 		EstimatedBytesPerToken:       4,
 		AgingTokensPerSecond:         0,
 		EmitAttributionHeaders:       true,
+		SFQEndpointStaleSeconds:      60,
+		SFQSettleTimeoutSeconds:      900,
+		SFQUnboundedOutputTokens:     4096,
 	}
 }
 
@@ -261,6 +294,17 @@ func (c *Config) validate() error {
 	}
 	if c.AgingTokensPerSecond < 0 {
 		return fmt.Errorf("agingTokensPerSecond must be >= 0, got %v", c.AgingTokensPerSecond)
+	}
+	if c.SFQPriorityStamp {
+		if c.SFQEndpointStaleSeconds <= 0 {
+			return fmt.Errorf("sfqEndpointStaleSeconds must be > 0, got %v", c.SFQEndpointStaleSeconds)
+		}
+		if c.SFQSettleTimeoutSeconds <= 0 {
+			return fmt.Errorf("sfqSettleTimeoutSeconds must be > 0, got %v", c.SFQSettleTimeoutSeconds)
+		}
+		if c.SFQUnboundedOutputTokens < 0 {
+			return fmt.Errorf("sfqUnboundedOutputTokens must be >= 0, got %v", c.SFQUnboundedOutputTokens)
+		}
 	}
 	if c.RequestTierV4TimeBoxSeconds < 0 {
 		return fmt.Errorf("requestTierV4TimeBoxSeconds must be >= 0, got %v", c.RequestTierV4TimeBoxSeconds)

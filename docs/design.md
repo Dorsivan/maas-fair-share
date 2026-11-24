@@ -911,6 +911,116 @@ whole-run ratio is similarly distorted by its staggered join, per
 docs/poc-results.md rows is out of scope for this ticket — filed as a
 follow-up so it is tracked rather than silently left stale.
 
+### UNI-293: SFQ priority stamp
+
+**Why.** UNI-288 found that under closed-loop load the EPP holds ~8 requests
+and vLLM's FIFO waiting queue holds ~88, so FIFO, not this policy, orders
+most dispatches. UNI-290 round 2 showed that stamping a start-time fair
+queueing (SFQ) tag as vLLM's `priority` composes Arm A exactly, with nothing
+held at the EPP. UNI-291 confirmed the stamp path exists (`PreRequest` ->
+`MutatePayloadMap` -> the director's `repackage`) and that vLLM 0.24 reorders
+its waiting queue on the tag without preempting on it.
+
+**The tag.** A group g with weight w dispatching a request with estimated
+cost c gets start tag `S = max(F_g, V)`, then `F_g = S + c/w`. At completion,
+`F_g += (actual - charged)/w`. A tag never decays, so the true-up is
+undecayed by construction. The estimate is the same `min(max_tokens, EWMA)`
+the tab uses, which is exactly what the UNI-283 tight-`max_tokens` vector
+drives low. Without the true-up the gamer takes 50.1% against a 21.1% target.
+With it, 21.1%. The `sfq_sim_test.go` case `TestSFQSimGamingVector`
+measures this in CI.
+
+**The tab's version of the same fix: `undecayedTrueUp`.** The vector is
+also live on the tab in today's build, with or without the stamp. The tab
+decays, and the existing true-up decays its correction by
+`2^(-inflight/H)`, so by the time a long request completes most of its
+under-estimate has gone. With `undecayedTrueUp: true`, an under-estimate
+lands at full weight on completion. Over-estimates are still refunded
+decayed, so a refund can never exceed what is left of the hold. It has its
+own flag, so it can be reviewed and shipped without the stamp.
+
+**V.** The virtual clock is the **minimum, over serving endpoints, of the
+newest start tag each one has begun serving**, not the max. With uneven
+endpoint speeds, the max definition's error grows ~1.5 pt per doubling of N
+(5.3 at N=8, 9.3 at N=64). The min definition measured 0.0 at every N
+(UNI-291). "Begun serving" means the first response byte reached the EPP:
+the first token for a stream, the completion for a non-streaming request.
+UNI-290 found the "V from completions" variant equally robust.
+
+**What "serving" means, and why idle endpoints are excluded.** An endpoint
+counts toward the min only while it has a request in flight **and** has been
+seen to start one within `sfqEndpointStaleSeconds`. Otherwise V freezes: an
+endpoint that starts nothing pins the min at its last start, every new tag
+collapses to its own group's F_g, and a group returning from idle restarts
+at its old F_g and takes every queue slot until it catches up. The two cases
+that trip this are an endpoint with no traffic (idle) and one whose
+responses never come back (stale). Stale is an expected mode on this
+cluster: PreStop fails every time, and UNI-193 lost ~80% of dispatch
+accounting on one path. An endpoint that goes idle forgets its last start,
+so on return it rejoins the min only once it starts something new. V is
+monotone, so excluding an endpoint can never move it back. A stale window
+set too short drops slow but healthy endpoints between starts and drifts
+toward the max definition's error. Set too long, it lets a wedged endpoint
+hold V for that long. Either way the freeze is bounded.
+
+**When completion is never observed.** Any ticket with no completion after
+`sfqSettleTimeoutSeconds` is presumed lost. It is charged its **worst-case**
+cost (prompt plus all of `max_tokens`, or `sfqUnboundedOutputTokens` with no
+`max_tokens`) and taken off its endpoint's in-flight count. A group whose
+completions are lost therefore pays at least as much as any completion
+could have cost. Keeping the low estimate would be the failure the gaming
+vector exploits. If the completion turns up later, it is trued down to the
+measured cost. Reaping runs on dispatch, so it costs nothing while the pool
+is idle. `maas_fairness_sfq_unsettled_total` counts how often the ledger runs
+on presumption. A completion **without** a usage block (error status, reset,
+cancel) keeps its tag charge. That deliberately differs from the tab's
+UNI-213 refund: refunding the tag would let a client read most of a stream,
+disconnect, and get its queue position back.
+
+**The three non-negotiables.**
+
+1. *The `priority` field is always the plugin's.* With
+   `propagatePriority` off, nothing else in the EPP touches it, so a client's
+   own value reaches vLLM unchanged. Under fcfs it is ignored. Under priority
+   scheduling it is a queue jump: the same class as the client-controlled
+   fairness ID flagged on upstream PR #3471. With the stamp on, it is
+   overwritten on every path, including provisional charging off, unknown
+   groups and an empty fairness ID. A body the plugin cannot rewrite (raw or
+   proto payload) is **rejected** (400), not forwarded. With the stamp off, a
+   client `priority` is deleted, which is a no-op under today's fcfs.
+   `maas_fairness_client_priority_overwritten_total` counts both.
+2. *Integer tags only.* vLLM answers `3.5` with 400 `int_from_float`. Tags
+   are stamped as `int64` milli-cost-units (`round(S * 1000)`), clamped to
+   `[0, 2^53]`. `TestStampedPriorityIsNeverFractional` checks the
+   marshalled bytes.
+3. *`propagatePriority` must be off.* It runs after `PreRequest` and
+   overwrites the tag with the objective's static priority, which would
+   disable fairness silently. The plugin `Handle` does not expose it, so
+   `Factory` re-reads the EPP's own `--config-file` / `--config-text` from the
+   already-parsed flag set. It refuses to start if the setting is on, **or if
+   it cannot find the config to check**.
+
+**Observability.** Metrics `maas_fairness_sfq_enabled`, `_sfq_virtual_time`,
+`_sfq_serving_endpoints`, `_sfq_finish_tag{fairness_id}`,
+`_sfq_lag{fairness_id}` (F - V), `_sfq_stamped_priority{fairness_id}`,
+`_sfq_unsettled_total`, `_sfq_unstampable_total`. Response header
+`x-maas-fairness-priority` (when `emitAttributionHeaders`). Flight-recorder
+fields `sfqVirtualTime` and `sfqFinishTag`. V(4) fields `sfqPriority` and
+`sfqStartTag`. A `sfq` section in the `StateDumper` output with every
+endpoint's in-flight count, newest start and serving flag.
+
+**Limits, stated plainly.**
+- One EPP replica is one clock. Two replicas would stamp tags that cannot
+  be compared. The EPP is `replicas: 1` today.
+- An EPP restart resets every tag to 0. For as long as the old high-tag
+  requests stay queued in vLLM, new requests jump them. The impact is one
+  queue drain, not lasting.
+- Nothing here changes vLLM. The stamp does nothing until the pool runs
+  `--scheduling-policy priority`. Whether the shipped RH image exposes that
+  flag is UNI-292.
+- The CI sim (`sfq_sim_test.go`) drives the real plugin's stamp into a
+  model of vLLM's priority queue. It is a model, not a live run.
+
 ### Two vLLM flags are hard prerequisites
 
 Both default to **off**, both fail silently, and both go on the **vLLM container**
@@ -1038,8 +1148,18 @@ plugins:
       # on completion rather than decayed by 2^(-inflight/H). That closes the
       # tight-max_tokens vector, where tiny requests drag the output EWMA down
       # and long ones under-pay. Over-estimates are still refunded decayed. See
-      # "UNI-293: SFQ priority stamp" below.
+      # "UNI-293: SFQ priority stamp" above.
       undecayedTrueUp: false
+      # UNI-293, off by default. Stamps every request's vLLM `priority` with its
+      # SFQ start tag. That only does anything on a pool running
+      # --scheduling-policy priority. Independent of `enforce`. When on, the EPP
+      # refuses to start if requestHandler.propagatePriority is on. Even when
+      # off, a client-supplied `priority` is stripped. See "UNI-293: SFQ
+      # priority stamp" above for the three tuning knobs.
+      sfqPriorityStamp: false
+      sfqEndpointStaleSeconds: 60     # bounds how long a wedged endpoint can freeze V
+      sfqSettleTimeoutSeconds: 900    # no completion by then = lost, charged worst case
+      sfqUnboundedOutputTokens: 4096  # worst-case length for a lost request with no max_tokens
       # Fallback only. The real output estimate is min(max_tokens, per-group EWMA
       # of observed output tokens); this applies when neither is available.
       defaultEstimatedOutputTokens: 512

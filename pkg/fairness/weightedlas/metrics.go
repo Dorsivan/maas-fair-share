@@ -159,6 +159,76 @@ var (
 			Name:      metricPrefix + "enforcing",
 			Help:      help("1 when the policy's pick is honoured, 0 in shadow mode."),
 		})
+
+	// UNI-293 SFQ priority stamp. UNI-282 lost a day because the enforce
+	// state could not be seen in the output. Every input to the stamp is
+	// exported here so a live run can be debugged without a rebuild.
+	sfqEnabledGauge = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_enabled",
+			Help:      help("1 when every request's vLLM priority is stamped with its SFQ start tag."),
+		})
+
+	sfqVirtualTime = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_virtual_time",
+			Help:      help("SFQ virtual time V in tag units (cost/weight): min over serving endpoints of the newest start tag. A flat line under load means V froze."),
+		})
+
+	sfqServingEndpoints = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_serving_endpoints",
+			Help:      help("Endpoints currently taking part in V: work in flight and a start observed within sfqEndpointStaleSeconds."),
+		})
+
+	sfqFinishTag = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_finish_tag",
+			Help:      help("The group's SFQ finish tag F, in tag units. Its next request starts at max(F, V)."),
+		}, []string{"fairness_id"})
+
+	sfqLag = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_lag",
+			Help:      help("Finish tag minus virtual time: how far ahead of the clock the group has been served. Negative means its next request starts at V."),
+		}, []string{"fairness_id"})
+
+	sfqStampedPriority = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_stamped_priority",
+			Help:      help("The integer priority most recently written into a request body for the group (start tag x 1000)."),
+		}, []string{"fairness_id"})
+
+	// Lost completions, charged at worst case. On a cluster where PreStop
+	// always fails, this measures how much of the ledger runs on presumption.
+	sfqUnsettled = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_unsettled_total",
+			Help:      help("Requests with no completion observed within sfqSettleTimeoutSeconds, charged their worst-case cost on the finish tag."),
+		}, []string{"fairness_id"})
+
+	sfqUnstampable = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_unstampable_total",
+			Help:      help("Requests rejected because their body could not be rewritten to carry the priority stamp."),
+		}, []string{"fairness_id"})
+
+	// Non-zero means a client is setting `priority` itself, whether out of
+	// ignorance or as an attempt. Either way it was removed or overwritten.
+	clientPriorityOverwritten = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "client_priority_overwritten_total",
+			Help:      help("Requests that arrived with a client-supplied priority field, which was stripped or overwritten."),
+		}, []string{"fairness_id"})
 )
 
 func collectors() []prometheus.Collector {
@@ -176,6 +246,15 @@ func collectors() []prometheus.Collector {
 		provisionalChargesExempted,
 		cachedRatio,
 		enforcingGauge,
+		sfqEnabledGauge,
+		sfqVirtualTime,
+		sfqServingEndpoints,
+		sfqFinishTag,
+		sfqLag,
+		sfqStampedPriority,
+		sfqUnsettled,
+		sfqUnstampable,
+		clientPriorityOverwritten,
 	}
 }
 

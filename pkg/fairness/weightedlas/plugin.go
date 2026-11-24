@@ -51,7 +51,10 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
+	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
+
+	errcommon "github.com/llm-d/llm-d-router/pkg/common/error"
 )
 
 // PluginType is the `type` to name in the EndpointPickerConfig plugins list.
@@ -196,6 +199,9 @@ type Plugin struct {
 	// around the same time. It is a recency marker, not an exact interval
 	// membership test -- a request can settle between two ticks.
 	flightRecorderTick atomic.Uint64
+
+	// sfq is the SFQ priority-stamp ledger, nil unless cfg.SFQPriorityStamp.
+	sfq *sfqState
 }
 
 // Factory builds the plugin from its `parameters` block.
@@ -209,6 +215,19 @@ func Factory(name string, parameters *json.Decoder, handle fwkplugin.Handle) (fw
 	p, err := newPlugin(name, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("%s plugin %q: %w", PluginType, name, err)
+	}
+	if cfg.SFQPriorityStamp {
+		source, err := checkPropagatePriorityOff()
+		if err != nil {
+			return nil, fmt.Errorf("%s plugin %q: %w", PluginType, name, err)
+		}
+		ctx := context.Background()
+		if handle != nil {
+			ctx = handle.Context()
+		}
+		log.FromContext(ctx).Info("SFQ priority stamp enabled; requestHandler.propagatePriority verified off",
+			"plugin", name, "config", source,
+			"endpointStaleSeconds", cfg.SFQEndpointStaleSeconds, "settleTimeoutSeconds", cfg.SFQSettleTimeoutSeconds)
 	}
 
 	if handle != nil {
@@ -250,6 +269,9 @@ func newPlugin(name string, cfg Config) (*Plugin, error) {
 	for _, gname := range table.names() {
 		p.states[gname] = newGroupState(gname, table.weight(gname), cfg.HalfLifeSeconds, cfg.ObservedHalfLivesSeconds)
 	}
+	if cfg.SFQPriorityStamp {
+		p.sfq = newSFQState(&cfg)
+	}
 	return p, nil
 }
 
@@ -261,6 +283,11 @@ func (p *Plugin) publishStaticMetrics() {
 		enforcingGauge.Set(1)
 	} else {
 		enforcingGauge.Set(0)
+	}
+	if p.cfg.SFQPriorityStamp {
+		sfqEnabledGauge.Set(1)
+	} else {
+		sfqEnabledGauge.Set(0)
 	}
 }
 
@@ -560,13 +587,18 @@ func (p *Plugin) publishNormalized(now time.Time, candidates []candidate) {
 // real token count only arrives 10-40s later, while scheduling decisions happen
 // every millisecond, so a group would dispatch thousands of requests before any
 // of them landed on its tab. The estimate is a hold, settled by ResponseBody.
-func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceRequest, _ *fwksched.SchedulingResult) error {
+func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceRequest, result *fwksched.SchedulingResult) error {
 	if request == nil {
 		return nil
 	}
 	now := p.now()
 	id := p.fairnessIDFor(request)
 	gs := p.stateFor(id)
+	// First, before any path below can return early. UNI-293: the priority
+	// field is a security boundary, not a tuning knob.
+	if err := p.stampPriority(request, result, id, gs, now); err != nil {
+		return err
+	}
 	dispatchTotal.WithLabelValues(boundID(id)).Inc()
 	p.recordQueueWait(request, now)
 
@@ -585,6 +617,89 @@ func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceReques
 	// subtracting it out again when the real cost turns out lower, and a
 	// Prometheus counter cannot move backwards.
 	return nil
+}
+
+// stampPriority owns the outbound request's `priority` field. UNI-293.
+//
+// vLLM reads `priority` straight from the request body, and with
+// requestHandler.propagatePriority off (it must be; see
+// checkPropagatePriorityOff) nothing else in the EPP touches it. So a
+// client's own `priority` passes through to vLLM unchanged. Under today's
+// --scheduling-policy fcfs vLLM accepts and ignores it. The day a pool flips
+// to priority scheduling, it becomes a direct queue jump for anyone who
+// guesses the field name. That is the same class of defect as the
+// client-controlled fairness ID flagged on upstream PR #3471, and the reason
+// RequestHeader overwrites FairnessID unconditionally.
+//
+// So the field is always this plugin's, flag or no flag:
+//   - stamp off: a client-supplied priority is deleted. Under fcfs that
+//     changes nothing vLLM does. It just stops the spoof from going live when
+//     the pool's policy changes.
+//   - stamp on: the field is overwritten with the request's SFQ start tag.
+//     A body this plugin cannot rewrite (a raw or proto payload) is rejected,
+//     not forwarded, because forwarding it would pass through whatever
+//     priority it carries.
+func (p *Plugin) stampPriority(request *fwksched.InferenceRequest, result *fwksched.SchedulingResult,
+	id string, gs *groupState, now time.Time,
+) error {
+	body := request.Body
+	if body == nil {
+		// Nothing is forwarded from here that could carry a priority.
+		return nil
+	}
+	m, isMap := body.Payload.(fwkrh.PayloadMap)
+	if isMap {
+		if _, had := m["priority"]; had {
+			clientPriorityOverwritten.WithLabelValues(boundID(id)).Inc()
+		}
+	}
+	if p.sfq == nil {
+		if isMap {
+			if _, had := m["priority"]; had {
+				body.MutatePayloadMap(func(m fwkrh.PayloadMap) { delete(m, "priority") })
+			}
+		}
+		return nil
+	}
+	if !isMap {
+		sfqUnstampable.WithLabelValues(boundID(id)).Inc()
+		return errcommon.Error{Code: errcommon.BadRequest,
+			Msg: "maas-weighted-fairness: request body cannot carry a priority stamp"}
+	}
+
+	est := p.estimateCost(request, gs)
+	worstOut := p.cfg.SFQUnboundedOutputTokens
+	if body.MaxOutputTokens != nil && *body.MaxOutputTokens >= 0 {
+		worstOut = float64(*body.MaxOutputTokens)
+	}
+	worst := p.cost(p.estimatePromptTokens(request), 0, int(worstOut))
+	ticket, reaped := p.sfq.dispatch(now, gs.name, targetEndpoint(result), gs.weight, est, worst)
+	body.MutatePayloadMap(func(m fwkrh.PayloadMap) { m["priority"] = ticket.priority })
+	request.PutAttribute(sfqTicketKey, ticket)
+
+	for _, g := range reaped {
+		sfqUnsettled.WithLabelValues(boundID(g)).Inc()
+	}
+	sfqStampedPriority.WithLabelValues(boundID(gs.name)).Set(float64(ticket.priority))
+	p.publishSFQ(now)
+	return nil
+}
+
+// publishSFQ refreshes the virtual-time and finish-tag gauges.
+func (p *Plugin) publishSFQ(now time.Time) {
+	v := p.sfq.view(now)
+	sfqVirtualTime.Set(v.VirtualTime)
+	serving := 0
+	for _, ep := range v.Endpoints {
+		if ep.Serving {
+			serving++
+		}
+	}
+	sfqServingEndpoints.Set(float64(serving))
+	for g, f := range v.FinishTags {
+		sfqFinishTag.WithLabelValues(boundID(g)).Set(f)
+		sfqLag.WithLabelValues(boundID(g)).Set(f - v.VirtualTime)
+	}
 }
 
 // recordQueueWait finishes the correlation attribute RequestHeader started,
@@ -615,12 +730,32 @@ func (p *Plugin) ResponseBody(
 	response *fwkrc.Response,
 	_ *datalayer.EndpointMetadata,
 ) {
-	if request == nil || response == nil || !response.EndOfStream {
+	if request == nil || response == nil {
+		return
+	}
+	ticket, haveTicket := fwksched.ReadRequestAttribute[*sfqTicket](request, sfqTicketKey)
+	haveTicket = haveTicket && ticket != nil && p.sfq != nil
+	if haveTicket && !response.EndOfStream {
+		// The first response byte is the EPP's view of vLLM starting this
+		// request -- the signal V advances on.
+		p.sfq.observeStart(ticket, p.now())
+	}
+	if !response.EndOfStream {
 		return
 	}
 	id := p.fairnessIDFor(request)
 	gs := p.stateFor(id)
 	now := p.now()
+	// Every exit below settles the ticket. Only the usage branch sets an
+	// actual; every other branch leaves the charge standing (see settle).
+	var sfqActual float64
+	sfqHaveActual := false
+	if haveTicket {
+		defer func() {
+			p.sfq.settle(ticket, now, sfqActual, sfqHaveActual)
+			p.publishSFQ(now)
+		}()
+	}
 	corr, haveCorr := fwksched.ReadRequestAttribute[correlation](request, correlationKey)
 	if !haveCorr {
 		corr = resolveCorrelation(request, now, p.genID)
@@ -685,6 +820,7 @@ func (p *Plugin) ResponseBody(
 	}
 
 	actual := p.cost(prompt, cached, completion)
+	sfqActual, sfqHaveActual = actual, true
 	gs.recordCompletion(completion, prompt, cached)
 	if r, has := gs.cachedRatio(); has {
 		cachedRatio.WithLabelValues(boundID(id)).Set(r)
@@ -720,6 +856,9 @@ func (p *Plugin) ResponseBody(
 			"band", request.Objectives.Priority, "enforcing", p.cfg.Enforce,
 			"estimateCharged", charge.cost, "trueUpDelta", delta,
 			"recorderTick", p.flightRecorderTick.Load()}, corr.logFields()...)
+		if haveTicket {
+			fields = append(fields, "sfqPriority", ticket.priority, "sfqStartTag", ticket.start)
+		}
 		v4.Info("per-request fairness tier", fields...)
 	}
 	// Book the full real cost, not the delta, under the gate decided at dispatch
@@ -797,6 +936,9 @@ func (p *Plugin) ResponseHeader(
 	if corr.haveQueueMs {
 		response.Headers[fairnessQueueMsHeader] = strconv.FormatFloat(corr.queueMs, 'f', 1, 64)
 	}
+	if t, ok := fwksched.ReadRequestAttribute[*sfqTicket](request, sfqTicketKey); ok && t != nil {
+		response.Headers[fairnessPriorityHeader] = strconv.FormatInt(t.priority, 10)
+	}
 }
 
 // recordContendedService books a one-shot charge against the SLI numerator --
@@ -843,6 +985,7 @@ func (p *Plugin) fairnessIDFor(request *fwksched.InferenceRequest) string {
 type dumpState struct {
 	Enforcing       bool       `json:"enforcing"`
 	UndecayedTrueUp bool       `json:"undecayedTrueUp"`
+	SFQ             *sfqView   `json:"sfq,omitempty"`
 	HalfLifeSeconds float64    `json:"halfLifeSeconds"`
 	CostModel       string     `json:"costModel"`
 	Groups          []snapshot `json:"groups"`
@@ -873,6 +1016,10 @@ func (p *Plugin) dump() dumpState {
 		if gs, ok := p.states[name]; ok {
 			d.Groups = append(d.Groups, gs.snapshot(now))
 		}
+	}
+	if p.sfq != nil {
+		v := p.sfq.view(now)
+		d.SFQ = &v
 	}
 	p.unmatchedMu.Lock()
 	d.UnmatchedTotal = p.unmatchedCount
@@ -989,13 +1136,23 @@ func (p *Plugin) logFlightRecorderTick(ctx context.Context) {
 	now := p.now()
 	tick := p.flightRecorderTick.Add(1)
 	logger := log.FromContext(ctx)
+	var sfqv sfqView
+	if p.sfq != nil {
+		sfqv = p.sfq.view(now)
+	}
 	for _, name := range p.groups.names() {
 		gs, ok := p.states[name]
 		if !ok {
 			continue
 		}
 		s := gs.snapshot(now)
-		logger.Info("fairness state",
+		var sfqFields []any
+		if p.sfq != nil {
+			// UNI-293: the clock and this group's place on it, so a live run
+			// can be debugged from the log without a rebuild.
+			sfqFields = []any{"sfqVirtualTime", sfqv.VirtualTime, "sfqFinishTag", sfqv.FinishTags[name]}
+		}
+		logger.Info("fairness state", append([]any{
 			"plugin", p.name,
 			"tick", tick,
 			"group", s.Name,
@@ -1007,6 +1164,6 @@ func (p *Plugin) logFlightRecorderTick(ctx context.Context) {
 			"provisionalCharge", s.ProvisionalCharge,
 			"ewmaOutputTokens", s.EWMAOutputTokens,
 			"ewmaWarm", s.EWMAWarm,
-		)
+		}, sfqFields...)...)
 	}
 }

@@ -33,6 +33,9 @@ const (
 	traceparentHeader     = "traceparent"
 	fairnessGroupHeader   = "x-maas-fairness-group"
 	fairnessQueueMsHeader = "x-maas-fairness-queue-ms"
+	// fairnessPriorityHeader is the SFQ priority stamped on this request
+	// (UNI-293), set only while sfqPriorityStamp is on.
+	fairnessPriorityHeader = "x-maas-fairness-priority"
 )
 
 // correlationKey holds the correlation{} attribute RequestHeader resolves once

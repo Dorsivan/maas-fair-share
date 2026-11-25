@@ -29,12 +29,15 @@ of manual cluster patches that were never written back.
    confirmed the `resources:` block survived on both). Both pods came up `1/1`, zero
    restarts, config loaded with no flag-parse errors, `PropagatePriority:false` confirmed in
    the EPP's own logged effective config.
-5. **Settled UNI-292** ("does the shipped RH vLLM image expose `--scheduling-policy
-   priority`"): scaled the CPU vLLM workload (`maas-vllm-cpu`, which runs the same
-   `vllm==0.24.0+rhaiv.9` family as the GPU path) from 0 to 1 replica with
-   `--scheduling-policy priority` added to its args. vLLM logged it as an accepted
-   non-default arg (`'scheduling_policy': 'priority'`), the model loaded, and the pod
-   reached `1/1 Ready` serving `/health` and `/metrics`. **Yes, this build accepts the flag.**
+5. **Independently confirmed UNI-292's finding at runtime** (UNI-292 itself was already
+   resolved 2026-11-24 via a read-only grep of the GPU image's own vLLM source showing
+   `SchedulerPolicy`/`PriorityRequestQueue` present -- this check did not re-decide that
+   question, it corroborated it a different way): scaled the CPU vLLM workload
+   (`maas-vllm-cpu`, which runs the same `vllm==0.24.0+rhaiv.9` family as the GPU path)
+   from 0 to 1 replica with `--scheduling-policy priority` added to its args. vLLM logged
+   it as an accepted non-default arg (`'scheduling_policy': 'priority'`), the model
+   loaded, and the pod reached `1/1 Ready` serving `/health` and `/metrics`. **Yes, this
+   build accepts the flag at runtime, matching the static finding.**
    Not tested: the GPU vLLM workload directly (see below), and whether vLLM actually
    *reorders* its queue by a stamped priority under contention (that needs
    `sfqPriorityStamp: true` and real contended traffic, out of scope for this check).

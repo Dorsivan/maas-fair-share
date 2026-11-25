@@ -1188,11 +1188,15 @@ endpoint's in-flight count, newest start and serving flag.
   drain" estimate here. The idle reset bounds it to the current busy
   period, but does not remove it.
 - Nothing here changes vLLM. The stamp does nothing until the pool runs
-  `--scheduling-policy priority`. **UNI-292, resolved 2026-11-25 (UNI-303):** the
-  shipped RH vLLM build (`0.24.0+rhaiv.9`) accepts the flag as a non-default arg and
-  boots healthy -- confirmed on the CPU vLLM path
+  `--scheduling-policy priority`. **UNI-292** (resolved 2026-11-24, a read-only grep of
+  the shipped RH vLLM image's own `arg_utils.py`/`scheduler.py`/`request_queue.py`)
+  found `SchedulerPolicy` and a `PriorityRequestQueue` branch present. **UNI-303**
+  (2026-11-25) independently confirmed this at runtime: the shipped RH vLLM build
+  (`0.24.0+rhaiv.9`) accepts `--scheduling-policy priority` as a non-default arg and
+  boots healthy -- on the CPU vLLM path
   (`results/20261125T231600Z-uni303-image-rebuild-and-sched-policy-check/`). Not yet
-  confirmed on the GPU path specifically (same vLLM version, different container).
+  confirmed at runtime on the GPU path specifically (same vLLM version, different
+  container).
 - The CI sim (`sfq_sim_test.go`) drives the real plugin's stamp into a
   model of vLLM's priority queue. It is a model, not a live run.
 

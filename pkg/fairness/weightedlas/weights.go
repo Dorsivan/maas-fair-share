@@ -168,6 +168,19 @@ type Config struct {
 	// request that sent no max_tokens, when pricing its worst case.
 	SFQUnboundedOutputTokens float64 `json:"sfqUnboundedOutputTokens,omitempty"`
 
+	// SFQDecisionLog makes the stamp explain itself in the log. UNI-302.
+	//   - "off" (the default, also ""): nothing new is logged.
+	//   - "info": one "sfq priority" line per dispatched request: group,
+	//     weight, stamped priority, its tag, its rank among the groups' next
+	//     tags, and V. Cheap enough to leave on.
+	//   - "debug": the info line plus one "sfq decision" record per dispatch,
+	//     with every group's finish tag and every endpoint's state, and one
+	//     "sfq settle" record per completion's true-up.
+	// Gated by this field alone, emitted at the process's default verbosity:
+	// unlike the V(4) tier it needs no -v flag, which the KServe-managed
+	// scheduler cannot be given. See docs/log-field-contract.md §3.4.
+	SFQDecisionLog string `json:"sfqDecisionLog,omitempty"`
+
 	// AgingTokensPerSecond subtracts head-of-line wait from the score in raw
 	// units. 0 is pure proportional ordering.
 	AgingTokensPerSecond float64 `json:"agingTokensPerSecond,omitempty"`
@@ -199,6 +212,13 @@ type Config struct {
 	// RequestTierV4SampleEvery is set.
 	RequestTierV4TimeBoxSeconds float64 `json:"requestTierV4TimeBoxSeconds,omitempty"`
 }
+
+// SFQDecisionLog values.
+const (
+	SFQDecisionLogOff   = "off"
+	SFQDecisionLogInfo  = "info"
+	SFQDecisionLogDebug = "debug"
+)
 
 // DefaultIdentityHeader is the header the MaaS AuthPolicy actually injects.
 // It was "x-maas-subscription-id" until UNI-306: the deployed ConfigMaps had
@@ -325,6 +345,11 @@ func (c *Config) validate() error {
 		if c.SFQUnboundedOutputTokens < 0 {
 			return fmt.Errorf("sfqUnboundedOutputTokens must be >= 0, got %v", c.SFQUnboundedOutputTokens)
 		}
+	}
+	switch c.SFQDecisionLog {
+	case "", SFQDecisionLogOff, SFQDecisionLogInfo, SFQDecisionLogDebug:
+	default:
+		return fmt.Errorf("sfqDecisionLog must be one of off, info, debug, got %q", c.SFQDecisionLog)
 	}
 	if c.RequestTierV4TimeBoxSeconds < 0 {
 		return fmt.Errorf("requestTierV4TimeBoxSeconds must be >= 0, got %v", c.RequestTierV4TimeBoxSeconds)

@@ -134,6 +134,7 @@ func addSaturating(a, b int64) int64 {
 
 // sfqTicket is one dispatched request's entry in the SFQ ledger.
 type sfqTicket struct {
+	id       string // the request's correlation id, for the decision log
 	group    string
 	endpoint string
 	weight   float64
@@ -179,9 +180,12 @@ type sfqEndpoint struct {
 // cannot be compared. That is recorded as a limitation in docs/design.md, not
 // handled here.
 type sfqState struct {
-	mu        sync.Mutex
-	v         float64
-	nServing  int // endpoints in the min as of the last advanceV, for the gauge
+	mu       sync.Mutex
+	v        float64
+	nServing int // endpoints in the min as of the last advanceV, for the gauge
+	// vFrom is the endpoint that supplied the min at the last advanceV, ""
+	// when none was serving. UNI-302: the decision log names it.
+	vFrom     string
 	finish    map[string]float64
 	endpoints map[string]*sfqEndpoint
 	// pending is every unreaped ticket in dispatch order. Tickets are
@@ -221,6 +225,10 @@ type sfqState struct {
 	// Tests only, for the same reason as noTrueUp.
 	noIdleReset bool
 	naiveRebase bool
+
+	// debug makes dispatch and settle snapshot the whole ledger into their
+	// records. Off, nothing beyond a few scalars is copied. UNI-302.
+	debug bool
 }
 
 func newSFQState(cfg *Config) *sfqState {
@@ -230,6 +238,7 @@ func newSFQState(cfg *Config) *sfqState {
 		rebaseAt:      sfqRebaseThreshold,
 		settleTimeout: time.Duration(cfg.SFQSettleTimeoutSeconds * float64(time.Second)),
 		staleAfter:    time.Duration(cfg.SFQEndpointStaleSeconds * float64(time.Second)),
+		debug:         cfg.SFQDecisionLog == SFQDecisionLogDebug,
 	}
 }
 
@@ -280,8 +289,8 @@ func (s *sfqState) serving(ep *sfqEndpoint, now time.Time) bool {
 // advanceV moves V up to the min over serving endpoints, if any serve. Caller
 // holds s.mu.
 func (s *sfqState) advanceV(now time.Time) {
-	lo, n := math.Inf(1), 0
-	for _, ep := range s.endpoints {
+	lo, n, from := math.Inf(1), 0, ""
+	for name, ep := range s.endpoints {
 		serving := s.serving(ep, now)
 		if ep.wasServing && !serving {
 			// Still has work in flight (release deletes an idle endpoint),
@@ -292,15 +301,13 @@ func (s *sfqState) advanceV(now time.Time) {
 		}
 		ep.wasServing = serving
 		if serving {
-			if s.vMax && n > 0 {
-				lo = math.Max(lo, ep.newestStart)
-			} else {
-				lo = math.Min(lo, ep.newestStart)
+			if n == 0 || (s.vMax && ep.newestStart > lo) || (!s.vMax && ep.newestStart < lo) {
+				lo, from = ep.newestStart, name
 			}
 			n++
 		}
 	}
-	s.nServing = n
+	s.nServing, s.vFrom = n, from
 	if n > 0 && lo > s.v {
 		s.v = lo
 	}
@@ -318,31 +325,49 @@ func (s *sfqState) advanceV(now time.Time) {
 // completion could have. If the completion turns up after all, settle trues
 // it down to the measured actual.
 //
-// Returns the groups charged, for the metric.
-func (s *sfqState) reap(now time.Time) []string {
-	var reaped []string
+// Returns the tickets charged, for the metric and the decision log, and how
+// many already-settled tickets were dropped from the front.
+func (s *sfqState) reap(now time.Time) (reaped []sfqReaped, dropped int) {
 	i := 0
 	for ; i < len(s.pending); i++ {
 		t := s.pending[i]
 		if t.settled {
+			dropped++
 			continue
 		}
 		if now.Sub(t.at) < s.settleTimeout {
 			break
 		}
+		r := sfqReaped{RequestID: t.id, Group: t.group, Endpoint: t.endpoint,
+			AgeSeconds: now.Sub(t.at).Seconds(), Charged: t.charged, Worst: t.worst}
 		if extra := t.worst - t.charged; extra > 0 {
 			s.finish[t.group] += extra / t.weight
 			t.charged = t.worst
+			r.FinishCorrection = extra / t.weight
 		}
 		t.reaped = true
 		s.release(t)
-		reaped = append(reaped, t.group)
+		sfqChargedCost.WithLabelValues(boundID(t.group)).Add(t.charged)
+		reaped = append(reaped, r)
 		s.lostUntil = now.Add(s.settleTimeout)
 	}
 	if i > 0 {
 		s.pending = s.pending[i:]
 	}
-	return reaped
+	return reaped, dropped
+}
+
+// sfqReaped is one ticket the reaper charged worst-case. Its reason is always
+// the settle timeout: a ticket that completed normally is dropped without
+// being charged, and only counted (sfqDispatchRecord.SettledDropped).
+type sfqReaped struct {
+	RequestID        string  `json:"requestID"`
+	Group            string  `json:"group"`
+	Endpoint         string  `json:"endpoint"`
+	AgeSeconds       float64 `json:"ageSeconds"`
+	Charged          float64 `json:"charged"` // before the reap
+	Worst            float64 `json:"worst"`
+	FinishCorrection float64 `json:"finishCorrection"` // added to the group's F
 }
 
 // rebase subtracts the integer part of V from V, from every finish tag and
@@ -431,30 +456,112 @@ func (s *sfqState) release(t *sfqTicket) {
 }
 
 // dispatch tags a request. est is the dispatch cost estimate and worst its
-// bound.
-func (s *sfqState) dispatch(now time.Time, group, endpoint string, weight, est, worst float64) (*sfqTicket, []string) {
+// bound. The record carries what the metrics and the decision log need; the
+// caller formats it after the lock is released.
+func (s *sfqState) dispatch(now time.Time, id, group, endpoint string, weight, est, worst float64) (*sfqTicket, sfqDispatchRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	reaped := s.reap(now)
+	rec := sfqDispatchRecord{VBefore: s.v, epochBefore: s.epoch}
+	rec.Reaped, rec.SettledDropped = s.reap(now)
 	s.resetIfIdle(now)
 	s.advanceV(now)
 	if s.v >= s.rebaseAt {
 		s.rebase()
+		rec.Rebased = true
 	}
-	start := math.Max(s.finish[group], s.v)
+	rec.FinishBefore = s.finish[group]
+	start := math.Max(rec.FinishBefore, s.v)
 	s.finish[group] = start + est/weight
-	priority := addSaturating(s.wireBase, quantiseTag(start))
+	tag := quantiseTag(start)
+	priority := addSaturating(s.wireBase, tag)
 	if s.naiveRebase {
-		priority = quantiseTag(start)
+		priority = tag
 	}
 	t := &sfqTicket{
-		group: group, endpoint: endpoint, weight: weight,
+		id: id, group: group, endpoint: endpoint, weight: weight,
 		start: start, priority: priority, at: now,
 		charged: est, worst: math.Max(worst, est), epoch: s.epoch, base: s.wireBase,
 	}
 	s.endpoint(endpoint).inFlight++
 	s.pending = append(s.pending, t)
-	return t, reaped
+
+	rec.V, rec.VFrom, rec.Serving = s.v, s.vFrom, s.nServing
+	rec.Epoch, rec.WireBase, rec.Tag = s.epoch, s.wireBase, tag
+	rec.FinishAfter = s.finish[group]
+	rec.Rank, rec.Groups = s.rankLocked(group, start)
+	if s.debug {
+		rec.FinishTags = make(map[string]float64, len(s.finish))
+		for g, f := range s.finish {
+			rec.FinishTags[g] = f
+		}
+		rec.Endpoints = s.endpointsLocked(now)
+	}
+	return t, rec
+}
+
+// rankLocked is where a request tagged start sits against every other group
+// the ledger knows this epoch: 1 plus the number of groups whose next request
+// would be tagged strictly lower, max(F_h, V). Lower is served first, so rank
+// 1 means no other group can currently place a request ahead of this one.
+// Ties go to this request, which under contention is most of the time at V.
+// A group that has not dispatched since the last idle reset is not counted:
+// its next tag would be V. Caller holds s.mu. O(groups), no allocation.
+func (s *sfqState) rankLocked(group string, start float64) (rank, groups int) {
+	rank = 1
+	for g, f := range s.finish {
+		if g != group && math.Max(f, s.v) < start {
+			rank++
+		}
+	}
+	return rank, len(s.finish)
+}
+
+func (s *sfqState) endpointsLocked(now time.Time) map[string]sfqEndpointLog {
+	out := make(map[string]sfqEndpointLog, len(s.endpoints))
+	for name, ep := range s.endpoints {
+		age := -1.0
+		if ep.haveStart {
+			age = now.Sub(ep.lastStartAt).Seconds()
+		}
+		out[name] = sfqEndpointLog{InFlight: ep.inFlight, NewestStart: ep.newestStart,
+			LastStartAgeSeconds: age, Serving: s.serving(ep, now)}
+	}
+	return out
+}
+
+// sfqDispatchRecord is one dispatch decision, as the decision log and the
+// metrics see it. Tag units (cost/weight) throughout, on the internal clock;
+// the stamp is WireBase + Tag. FinishTags and Endpoints are filled only with
+// the debug log on.
+type sfqDispatchRecord struct {
+	VBefore        float64 // V on entry, before reap, idle reset and advanceV
+	V              float64 // V the request was tagged against
+	VFrom          string  // the endpoint that supplied the min; "" if none serving
+	Serving        int
+	Rebased        bool
+	Epoch          uint64
+	WireBase       int64
+	FinishBefore   float64 // F_g before this request
+	FinishAfter    float64 // start + est/weight
+	Tag            int64   // quantised start, before WireBase is added
+	Rank, Groups   int
+	Reaped         []sfqReaped
+	SettledDropped int
+
+	FinishTags map[string]float64
+	Endpoints  map[string]sfqEndpointLog
+
+	epochBefore uint64
+}
+
+// IdleReset reports whether this dispatch started a new epoch.
+func (r *sfqDispatchRecord) IdleReset() bool { return r.Epoch != r.epochBefore }
+
+type sfqEndpointLog struct {
+	InFlight            int     `json:"inFlight"`
+	NewestStart         float64 `json:"newestStart"`
+	LastStartAgeSeconds float64 `json:"lastStartAgeSeconds"` // -1: no start seen since going busy
+	Serving             bool    `json:"serving"`
 }
 
 // nextStarts returns, for each group, the start tag its next dispatch would
@@ -518,13 +625,15 @@ func (s *sfqState) observeStartLocked(t *sfqTicket, now time.Time) {
 // whatever was charged stands. That is deliberately not the tab's UNI-213
 // refund. A client that disconnects after receiving most of a stream must
 // not get the tag back.
-func (s *sfqState) settle(t *sfqTicket, now time.Time, actual float64, haveActual bool) {
+func (s *sfqState) settle(t *sfqTicket, now time.Time, actual float64, haveActual bool) (rec sfqSettleRecord, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if t.settled {
-		return
+		return rec, false
 	}
 	s.observeStartLocked(t, now)
+	rec = sfqSettleRecord{Charged: t.charged, Actual: actual, HaveActual: haveActual,
+		Reaped: t.reaped, StaleEpoch: t.epoch != s.epoch, FinishBefore: s.finish[t.group]}
 	if t.reaped && haveActual {
 		// Presumed lost, then completed. UNI-300: with
 		// sfqSettleTimeoutSeconds short for the pool's dispatch-to-
@@ -533,14 +642,35 @@ func (s *sfqState) settle(t *sfqTicket, now time.Time, actual float64, haveActua
 		sfqLateCompletions.WithLabelValues(boundID(t.group)).Inc()
 	}
 	if haveActual && !s.noTrueUp && t.epoch == s.epoch {
-		s.finish[t.group] += (actual - t.charged) / t.weight
+		rec.FinishCorrection = (actual - t.charged) / t.weight
+		s.finish[t.group] += rec.FinishCorrection
 		t.charged = actual
 	}
 	t.settled = true
 	if !t.reaped {
 		s.release(t)
+		// A reaped ticket was booked at its worst case by reap. A late
+		// actual corrects the finish tag but cannot take a counter back.
+		sfqChargedCost.WithLabelValues(boundID(t.group)).Add(t.charged)
 	}
 	s.advanceV(now)
+	rec.FinishAfter, rec.V = s.finish[t.group], s.v
+	return rec, true
+}
+
+// sfqSettleRecord is one completion's true-up, for the decision log.
+// FinishCorrection is 0 when no true-up ran: no usage block, a ticket from
+// before an idle reset, or noTrueUp.
+type sfqSettleRecord struct {
+	Charged          float64 // booked before this completion: the estimate, or worst if reaped
+	Actual           float64
+	HaveActual       bool
+	Reaped           bool
+	StaleEpoch       bool
+	FinishBefore     float64
+	FinishCorrection float64
+	FinishAfter      float64
+	V                float64
 }
 
 // gauges reads what the per-request metric refresh needs, without building a

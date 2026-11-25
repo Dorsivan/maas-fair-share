@@ -1598,6 +1598,8 @@ labels through `BoundFairnessID`, subsystem `llm_d_epp`:
 | `..._requests_without_usage_total{fairness_id}` | Counter | **regression detector.** With `--enable-force-include-usage` set this is flat zero; non-zero means a model server shipped without the flag and that tenant's tab is estimate, not measurement. Alert on `> 0` |
 | `..._prompt_tokens_cached_ratio{fairness_id}` | Gauge | **the headline shadow-mode reading.** Per-group cache hit rate — decides whether `cachedInputTokenWeight` is a real lever or a no-op, and in whose favour. Also guards the second vLLM flag: a flat zero here means `--enable-prompt-tokens-details` is missing, not that the cache is cold |
 | `..._enforcing` | Gauge 0/1 | enforcing, or shadow mode |
+| `..._sfq_charged_cost_total{fairness_id}` | Counter | UNI-302. Cost booked to the group's SFQ finish tag, counted at settlement (measured actual, else the estimate) or at reap (worst case). `rate()` over `sum(rate())` is the live composition — see "UNI-302: the stamp explains itself" for the PromQL and why it means nothing outside contended time |
+| `..._sfq_dispatched_at_front_total{fairness_id}` | Counter | UNI-302. Dispatches stamped at rank 1 (no other group's next tag lower). Over `dispatch_total`, how often the group is at the front; a heavily weighted group should sit near 1 under contention |
 
 Do **not** label `unmatched_subscriptions_total` with the raw subscription string —
 that is attacker-controlled cardinality. Count it; put the values in the rate-limited
@@ -1726,6 +1728,104 @@ adds nothing to its call path: the only edits this ticket makes to `plugin.go` a
 V(4) path on `Pick` is exactly zero, not merely small — see `BenchmarkPick` in
 `pkg/fairness/weightedlas/pick_bench_test.go` for the regression guard and
 UNI-47's closing comment for the measured numbers.
+
+### UNI-302: the stamp explains itself
+
+One switch, `sfqDecisionLog` (`off` by default, `info`, `debug`), read only with
+`sfqPriorityStamp` on. Field-by-field shape is in `docs/log-field-contract.md` §3.4.
+
+- `info`: one `"sfq priority"` line per dispatched request — group, weight, the stamped
+  integer, its tag, its **rank** among the groups' next tags (`"rank":"2/4"`), `V`, and
+  how far above `V` the tag and the group's finish tag sit.
+- `debug`: the info line, plus one `"sfq decision"` record per dispatch (every input to
+  the stamp: `est`, `worst`, `V` before and after with the endpoint that supplied the
+  min, `start = max(F_g, V)`, `F_g` before and after, the quantised tag and `wireBase`,
+  **every group's finish tag**, every endpoint's `inFlight` / last-start age / `serving`,
+  and the tickets `reap()` charged this call) and one `"sfq settle"` record per
+  completion (`charged` vs `actual`, the `F_g` correction, `F_g` before and after).
+
+**Why config alone, not `-v`.** The V(4) tier above also needs `-v=4`, which the
+KServe-managed scheduler cannot be given (runbook, "On the KServe-managed
+scheduler"). These lines are emitted at the process's default verbosity and gated by
+the plugin config only, so `maas-epp-config` is enough to turn them on. Off, nothing
+new is logged.
+
+**Hot-path cost.** `dispatch` and `settle` return a record by value. With the log off it
+holds scalars only: `V`, `F_g`, the tag, the rank (one pass over the group map, no
+allocation) and any reaped tickets (allocated only when one is reaped, as before). The
+`finishTags` and `endpoints` copies are taken only at `debug`. Nothing is formatted or
+written under `sfqState.mu`: the record is a snapshot, and
+`TestSFQDecisionLogWrittenOutsideTheLock` fails if any line is written with the lock
+held. `Pick` is unchanged.
+
+**Rollout order — this can stop an EPP from starting.** llm-d-router decodes plugin
+`parameters` with `DisallowUnknownFields`. An EPP on an image older than this change
+fails to start if `sfqDecisionLog` appears in its config. The GPU and CPU schedulers
+read the same `maas-epp-config`, so roll the new image to **every** scheduler that
+reads it before adding the key.
+
+**Verification.** `TestSFQDecisionLogReproducesTheStamp` runs Arm A (and a variant
+where completions true up) with `debug` on, and checks every dispatch: `start =
+max(F_g, V)`, `F_g' = start + est/w`, `tag = round(start × 1000)`, `stamp = wireBase +
+tag`, the stamp equals the integer in the body, and the rank matches the logged
+`finishTags`. It also rebuilds every `F_g` from the log alone (decision and settle
+records), so a missing or wrong true-up record fails it. `TestSFQChargedCostConvergesInArmA`
+shows the counter's share over 30 s windows sits within 0.8 pt of 20/10/65, and within
+0.2 pt of the sim's own slot-second scoring.
+
+#### Reading the live distribution (Grafana)
+
+Set `$ns` to the scheduler's namespace. On the three-lane cluster every instance uses
+the same names, so the namespace filter is what keeps the lanes apart.
+
+Observed share, per group:
+
+```promql
+sum by (fairness_id) (rate(llm_d_epp_maas_fairness_sfq_charged_cost_total{namespace="$ns"}[5m]))
+  / ignoring (fairness_id) group_left
+sum (rate(llm_d_epp_maas_fairness_sfq_charged_cost_total{namespace="$ns"}[5m]))
+```
+
+Target share, normalised over the groups that had any traffic in the window:
+
+```promql
+(max by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{namespace="$ns"})
+   and on (fairness_id) (sum by (fairness_id) (rate(llm_d_epp_maas_fairness_sfq_charged_cost_total{namespace="$ns"}[5m])) > 0))
+  / ignoring (fairness_id) group_left
+sum (max by (fairness_id) (llm_d_epp_maas_fairness_configured_weight{namespace="$ns"})
+   and on (fairness_id) (sum by (fairness_id) (rate(llm_d_epp_maas_fairness_sfq_charged_cost_total{namespace="$ns"}[5m])) > 0))
+```
+
+Contended fraction of the window (put it on the same panel):
+
+```promql
+avg_over_time((sum (vllm:num_requests_waiting{namespace="$ns"}) > bool 0)[5m:15s])
+```
+
+To blank the share outside contention, append
+`and on () (sum (vllm:num_requests_waiting{namespace="$ns"}) > 0)` to the observed query.
+
+Read it with three caveats:
+
+1. **Contended time only.** With no queue, every group gets what it asks for and the
+   share tracks offered load, not the policy. Trust the share only while the contended
+   fraction is near 1. The gate uses vLLM's waiting queue rather than this plugin's
+   `contended_seconds_total`, because with the stamp on and no EPP hold, flow control
+   holds nothing and that counter can read 0 under full saturation.
+2. **"Had traffic" is not "backlogged".** A group sending less than its weighted share
+   is served in full and correctly sits below the target line. That is water-filling,
+   not starvation. Only a group that is persistently backlogged and still below target
+   is a defect.
+3. **The counter lags.** Cost is booked at completion, so a 5 m window over requests
+   that run for minutes is mostly earlier dispatches. Use a window several times the
+   pool's p95 request duration. It is in the plugin's cost unit (input + 2 × output,
+   with `outputTokenWeight` still uncalibrated), not GPU time.
+
+Rank at a glance:
+`sum by (fairness_id) (rate(llm_d_epp_maas_fairness_sfq_dispatched_at_front_total{namespace="$ns"}[5m])) / sum by (fairness_id) (rate(llm_d_epp_maas_fairness_dispatch_total{namespace="$ns"}[5m]))`.
+Tag spread: `llm_d_epp_maas_fairness_sfq_lag{namespace="$ns"}` (`F_g − V`, per group) and
+`..._sfq_virtual_time`. After an idle reset or threshold rebase every group's
+`sfq_finish_tag` / `sfq_lag` gauge is refreshed, not only the dispatching group's.
 
 ### Per-request attribution
 

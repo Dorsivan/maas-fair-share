@@ -210,6 +210,8 @@ type Plugin struct {
 
 	// sfq is the SFQ priority-stamp ledger, nil unless cfg.SFQPriorityStamp.
 	sfq *sfqState
+	// sfqLog is cfg.SFQDecisionLog; always off without the stamp.
+	sfqLog sfqLogLevel
 }
 
 // Factory builds the plugin from its `parameters` block.
@@ -236,7 +238,8 @@ func Factory(name string, parameters *json.Decoder, handle fwkplugin.Handle) (fw
 		log.FromContext(ctx).Info("SFQ priority stamp enabled; requestHandler.propagatePriority verified off",
 			"plugin", name, "config", source,
 			"tabRole", "observability only", "newcomerClampInert", cfg.NewcomerClamp,
-			"endpointStaleSeconds", cfg.SFQEndpointStaleSeconds, "settleTimeoutSeconds", cfg.SFQSettleTimeoutSeconds)
+			"endpointStaleSeconds", cfg.SFQEndpointStaleSeconds, "settleTimeoutSeconds", cfg.SFQSettleTimeoutSeconds,
+			"decisionLog", p.sfqLog.String())
 	}
 
 	if handle != nil {
@@ -280,6 +283,7 @@ func newPlugin(name string, cfg Config) (*Plugin, error) {
 	}
 	if cfg.SFQPriorityStamp {
 		p.sfq = newSFQState(&cfg)
+		p.sfqLog = parseSFQLogLevel(cfg.SFQDecisionLog)
 	}
 	return p, nil
 }
@@ -704,7 +708,7 @@ func (p *Plugin) publishNormalized(now time.Time, candidates []candidate) {
 // real token count only arrives 10-40s later, while scheduling decisions happen
 // every millisecond, so a group would dispatch thousands of requests before any
 // of them landed on its tab. The estimate is a hold, settled by ResponseBody.
-func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceRequest, result *fwksched.SchedulingResult) error {
+func (p *Plugin) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, result *fwksched.SchedulingResult) error {
 	if request == nil {
 		return nil
 	}
@@ -713,7 +717,7 @@ func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceReques
 	gs := p.stateFor(id)
 	// First, before any path below can return early. UNI-293: the priority
 	// field is a security boundary, not a tuning knob.
-	if err := p.stampPriority(request, result, id, gs, now); err != nil {
+	if err := p.stampPriority(ctx, request, result, id, gs, now); err != nil {
 		return err
 	}
 	dispatchTotal.WithLabelValues(boundID(id)).Inc()
@@ -756,7 +760,7 @@ func (p *Plugin) PreRequest(_ context.Context, request *fwksched.InferenceReques
 //     A body this plugin cannot rewrite (a raw or proto payload) is rejected,
 //     not forwarded, because forwarding it would pass through whatever
 //     priority it carries.
-func (p *Plugin) stampPriority(request *fwksched.InferenceRequest, result *fwksched.SchedulingResult,
+func (p *Plugin) stampPriority(ctx context.Context, request *fwksched.InferenceRequest, result *fwksched.SchedulingResult,
 	id string, gs *groupState, now time.Time,
 ) error {
 	body := request.Body
@@ -790,21 +794,133 @@ func (p *Plugin) stampPriority(request *fwksched.InferenceRequest, result *fwksc
 		worstOut = float64(*body.MaxOutputTokens)
 	}
 	worst := p.cost(p.estimatePromptTokens(request), 0, int(worstOut))
-	ticket, reaped := p.sfq.dispatch(now, gs.name, targetEndpoint(result), gs.weight, est, worst)
+	var corr correlation
+	if p.sfqLog != sfqLogOff {
+		corr = p.correlationFor(request, now)
+	}
+	ticket, rec := p.sfq.dispatch(now, corr.requestID, gs.name, targetEndpoint(result), gs.weight, est, worst)
 	body.MutatePayloadMap(func(m fwkrh.PayloadMap) { m["priority"] = ticket.priority })
 	request.PutAttribute(sfqTicketKey, ticket)
 
-	for _, g := range reaped {
-		sfqUnsettled.WithLabelValues(boundID(g)).Inc()
+	for _, r := range rec.Reaped {
+		sfqUnsettled.WithLabelValues(boundID(r.Group)).Inc()
+	}
+	if rec.Rank == 1 {
+		sfqDispatchedAtFront.WithLabelValues(boundID(gs.name)).Inc()
 	}
 	sfqStampedPriority.WithLabelValues(boundID(gs.name)).Set(float64(ticket.priority))
-	p.publishSFQ(gs.name)
-	for _, g := range reaped {
-		if g != gs.name {
-			p.publishSFQ(g)
+	if rec.Rebased || rec.IdleReset() {
+		// Every group's finish tag moved, not just this one's.
+		for name := range p.states {
+			p.publishSFQ(name)
+		}
+	} else {
+		p.publishSFQ(gs.name)
+		for _, r := range rec.Reaped {
+			if r.Group != gs.name {
+				p.publishSFQ(r.Group)
+			}
 		}
 	}
+	if p.sfqLog != sfqLogOff {
+		p.logSFQDispatch(ctx, request, corr, gs, ticket, est, &rec)
+	}
 	return nil
+}
+
+// sfqLogLevel is Config.SFQDecisionLog, parsed once.
+type sfqLogLevel int
+
+const (
+	sfqLogOff sfqLogLevel = iota
+	sfqLogInfo
+	sfqLogDebug
+)
+
+func parseSFQLogLevel(s string) sfqLogLevel {
+	switch s {
+	case SFQDecisionLogInfo:
+		return sfqLogInfo
+	case SFQDecisionLogDebug:
+		return sfqLogDebug
+	default:
+		return sfqLogOff
+	}
+}
+
+func (l sfqLogLevel) String() string {
+	switch l {
+	case sfqLogInfo:
+		return SFQDecisionLogInfo
+	case sfqLogDebug:
+		return SFQDecisionLogDebug
+	default:
+		return SFQDecisionLogOff
+	}
+}
+
+// correlationFor returns the request's correlation, resolving and storing it
+// if RequestHeader did not, so every later line carries the same id.
+func (p *Plugin) correlationFor(request *fwksched.InferenceRequest, now time.Time) correlation {
+	corr, ok := fwksched.ReadRequestAttribute[correlation](request, correlationKey)
+	if !ok {
+		corr = resolveCorrelation(request, now, p.genID)
+		request.PutAttribute(correlationKey, corr)
+	}
+	return corr
+}
+
+// logSFQDispatch writes the UNI-302 per-request lines. It runs after the
+// ledger lock is released: rec is a snapshot. See docs/log-field-contract.md
+// §3.4 for the fields.
+func (p *Plugin) logSFQDispatch(ctx context.Context, request *fwksched.InferenceRequest, corr correlation,
+	gs *groupState, t *sfqTicket, est float64, rec *sfqDispatchRecord,
+) {
+	logger := log.FromContext(ctx)
+	fields := append([]any{"plugin", p.name, "group", gs.name,
+		"band", request.Objectives.Priority, "enforcing", p.cfg.Enforce,
+		"weight", gs.weight, "priority", t.priority,
+		"tag", t.start, "rank", fmt.Sprintf("%d/%d", rec.Rank, rec.Groups), "rankPos", rec.Rank, "rankOf", rec.Groups,
+		"virtualTime", rec.V, "tagAboveV", t.start - rec.V,
+		"finishTag", rec.FinishAfter, "finishAboveV", rec.FinishAfter - rec.V,
+	}, corr.logFields()...)
+	logger.Info("sfq priority", fields...)
+	if p.sfqLog < sfqLogDebug {
+		return
+	}
+	reaped := rec.Reaped
+	if reaped == nil {
+		reaped = []sfqReaped{}
+	}
+	fields = append([]any{"plugin", p.name, "group", gs.name,
+		"band", request.Objectives.Priority, "enforcing", p.cfg.Enforce,
+		"weight", gs.weight, "est", est, "worst", t.worst, "endpoint", t.endpoint,
+		"vBefore", rec.VBefore, "virtualTime", rec.V, "vFrom", rec.VFrom, "servingEndpoints", rec.Serving,
+		"idleReset", rec.IdleReset(), "rebased", rec.Rebased, "epoch", rec.Epoch,
+		"finishBefore", rec.FinishBefore, "start", t.start, "finishAfter", rec.FinishAfter,
+		"tagScale", sfqTagScale, "quantisedTag", rec.Tag, "wireBase", rec.WireBase, "priority", t.priority,
+		"rankPos", rec.Rank, "rankOf", rec.Groups,
+		"finishTags", rec.FinishTags, "endpoints", rec.Endpoints,
+		"reapedTimeout", len(rec.Reaped), "reapedCompleted", rec.SettledDropped, "reaped", reaped,
+	}, corr.logFields()...)
+	logger.Info("sfq decision", fields...)
+}
+
+// logSFQSettle writes the UNI-302 true-up record. Debug only.
+func (p *Plugin) logSFQSettle(ctx context.Context, request *fwksched.InferenceRequest, t *sfqTicket, rec *sfqSettleRecord) {
+	corr, ok := fwksched.ReadRequestAttribute[correlation](request, correlationKey)
+	if !ok {
+		corr = correlation{requestID: t.id}
+	}
+	fields := append([]any{"plugin", p.name, "group", t.group,
+		"band", request.Objectives.Priority, "enforcing", p.cfg.Enforce,
+		"weight", t.weight, "priority", t.priority, "start", t.start,
+		"charged", rec.Charged, "actual", rec.Actual, "haveActual", rec.HaveActual,
+		"reaped", rec.Reaped, "staleEpoch", rec.StaleEpoch,
+		"finishBefore", rec.FinishBefore, "finishCorrection", rec.FinishCorrection, "finishAfter", rec.FinishAfter,
+		"virtualTime", rec.V,
+	}, corr.logFields()...)
+	log.FromContext(ctx).Info("sfq settle", fields...)
 }
 
 // publishSFQ refreshes the virtual-time gauges and one group's finish tag.
@@ -866,8 +982,11 @@ func (p *Plugin) ResponseBody(
 	sfqHaveActual := false
 	if haveTicket {
 		defer func() {
-			p.sfq.settle(ticket, now, sfqActual, sfqHaveActual)
+			rec, ok := p.sfq.settle(ticket, now, sfqActual, sfqHaveActual)
 			p.publishSFQ(ticket.group)
+			if ok && p.sfqLog == sfqLogDebug {
+				p.logSFQSettle(ctx, request, ticket, &rec)
+			}
 		}()
 	}
 	corr, haveCorr := fwksched.ReadRequestAttribute[correlation](request, correlationKey)

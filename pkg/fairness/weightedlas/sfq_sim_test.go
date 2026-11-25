@@ -126,6 +126,13 @@ type sfqSimParams struct {
 	staleAfter    float64
 	settleTimeout float64
 	sigma         float64
+
+	// UNI-302: decisionLog sets sfqDecisionLog, ctx carries the logger it
+	// writes to, and onEvent runs at each event's sim time, before it is
+	// processed.
+	decisionLog string
+	ctx         context.Context
+	onEvent     func(at float64)
 }
 
 func sfqSimBase(workers int) sfqSimParams {
@@ -284,6 +291,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 	if prm.settleTimeout > 0 {
 		cfg.SFQSettleTimeoutSeconds = prm.settleTimeout
 	}
+	cfg.SFQDecisionLog = prm.decisionLog
 	p, clock := newTestPlugin(t, cfg)
 	p.sfq.noTrueUp, p.sfq.vMax, p.sfq.tabPick = prm.noTrueUp, prm.vMax, prm.tabPick
 	p.sfq.noIdleReset, p.sfq.naiveRebase = prm.noIdleReset, prm.naiveRebase
@@ -291,6 +299,9 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		p.sfq.rebaseAt = prm.rebaseAt
 	}
 	ctx := context.Background()
+	if prm.ctx != nil {
+		ctx = prm.ctx
+	}
 	rng := rand.New(rand.NewSource(prm.seed))
 	at := func(s float64) { clock.t = testBasis.Add(time.Duration(s * float64(time.Second))) }
 
@@ -477,6 +488,9 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 			break
 		}
 		at(ev.at)
+		if prm.onEvent != nil {
+			prm.onEvent(ev.at)
+		}
 		if prm.snapAt > 0 && res.lag == nil && ev.at >= prm.snapAt {
 			v := p.sfq.view(clock.t)
 			res.lag = map[string]float64{}

@@ -76,6 +76,8 @@ which is the authoritative source for alerting.
 | `estimateCharged`, `trueUpDelta` | Debug-only | V(4) per-request tier line only |
 | `weight`, `attainedService`, `normalizedService`, `inFlight`, `provisionalCharge`, `ewmaOutputTokens`, `ewmaWarm` | Debug-only | flight-recorder lines only (each also has a Prometheus equivalent — see `docs/design.md` §Metrics) |
 | `subscription` | Debug-only, client-controlled, bounded sample | the unmatched-subscription event line only |
+| `weight`, `priority`, `tag`, `rank`, `rankPos`, `rankOf`, `virtualTime`, `tagAboveV`, `finishTag`, `finishAboveV` | Debug-only | `"sfq priority"` line only (§3.4) |
+| everything else on `"sfq decision"` / `"sfq settle"` | Debug-only | those records only (§3.4) |
 
 `requestID` is never empty on a request-scoped line: it is `x-request-id`
 from the inbound request, the framework's own backfilled id, or a
@@ -239,6 +241,61 @@ see `docs/runbook.md` "On the KServe-managed scheduler," which already
 records this as "an open problem, not a documented one." **This ticket does
 not solve that problem**; it is restated here because it directly limits
 what the field contract below can promise on the in-scope target. See §5.
+
+### 3.4 SFQ decision log (UNI-302) — config-gated, off by default
+
+Gated by `sfqDecisionLog` in the plugin config alone (`off` | `info` | `debug`), only
+with `sfqPriorityStamp` on. Emitted at the process's default verbosity, so unlike §3.3
+it needs no `-v` flag and works on the KServe-managed scheduler. Every line carries
+`plugin`, `group`, `band`, `enforcing`, `requestID` (and `traceId` when present). Tag
+units are cost/weight on the internal clock; the stamp is `wireBase + round(tag ×
+1000)`. **Do not add the key to a ConfigMap read by an older image**: plugin parameters
+are decoded strictly, so an unknown key stops that EPP from starting (`docs/design.md`
+"UNI-302").
+
+`"sfq priority"` (`info` and `debug`), one per dispatched request:
+
+```json
+{"body":"sfq priority","group":"app1","weight":20,"priority":1224000,
+ "tag":1224.0,"rank":"2/3","rankPos":2,"rankOf":3,
+ "virtualTime":1015.2,"tagAboveV":208.8,"finishTag":1231.2,"finishAboveV":216.0, ...}
+```
+
+`rank` is 1 plus the number of other groups whose next request would be tagged strictly
+lower (`max(F_h, V)`). Lower is served first, so `1/N` means nobody can currently get
+ahead of this request. Ties count in this request's favour. `rankOf` counts the groups
+that have dispatched since the last idle reset; one that has not would be tagged at `V`.
+
+`"sfq decision"` (`debug`), one per dispatch: `weight`, `est`, `worst`, `endpoint`,
+`vBefore` (on entry), `virtualTime` (tagged against), `vFrom` (the endpoint that
+supplied the min; `""` if none serving), `servingEndpoints`, `idleReset`, `rebased`,
+`epoch`, `finishBefore`, `start`, `finishAfter`, `tagScale`, `quantisedTag`,
+`wireBase`, `priority`, `rankPos`, `rankOf`, `finishTags` (object: every group's `F`
+after this dispatch), `endpoints` (object keyed by endpoint: `inFlight`,
+`newestStart`, `lastStartAgeSeconds` (`-1` = no start seen since it went busy),
+`serving`), `reapedTimeout`, `reapedCompleted` (settled tickets dropped, not charged),
+`reaped` (array: `requestID`, `group`, `endpoint`, `ageSeconds`, `charged`, `worst`,
+`finishCorrection`).
+
+`finishTags` and `endpoints` are objects so Loki's `| json` flattens them
+(`finishTags_app1`). `reaped` is an array, which Loki skips. `reapedTimeout` is the
+queryable count, and `jq` reads the array.
+
+`"sfq settle"` (`debug`), one per completion: `weight`, `priority`, `start`,
+`charged` (the estimate, or worst if reaped), `actual`, `haveActual`, `reaped`,
+`staleEpoch`, `finishBefore`, `finishCorrection` (`(actual − charged)/weight`; 0 with
+no usage block or a pre-reset ticket), `finishAfter`, `virtualTime`.
+
+Replaying a group's `F` from the log alone: each `"sfq decision"` sets it to
+`finishAfter`, each `"sfq settle"` adds `finishCorrection`, each reaped ticket adds its
+`finishCorrection`, `idleReset: true` zeroes all groups, and `rebased: true`
+subtracts the rise in `wireBase`, divided by 1000, from every group.
+`TestSFQDecisionLogReproducesTheStamp` does exactly this.
+
+```sh
+# One group's stamps and ranks, from a captured log
+jq -c 'select(.body=="sfq priority" and .group=="end-users") | [.priority,.rank,.tagAboveV]' epp.log
+```
 
 ---
 

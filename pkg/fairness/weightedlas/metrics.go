@@ -256,6 +256,29 @@ var (
 			Help:      help("Virtual-clock rebases, by reason: threshold (internal clock rebased, stamps unchanged) or idle (the pool emptied, so V and every finish tag restarted at 0)."),
 		}, []string{"reason"})
 
+	// UNI-302: the live distribution. rate() of this over sum(rate()) across
+	// groups is the composition the stamp produced, in the plugin's cost unit;
+	// compare it with configured_weight. Booked at settlement (the measured
+	// actual, else the dispatch estimate) or at reap (worst case), so it lags
+	// dispatch by the request's duration. See docs/design.md "UNI-302" for
+	// the PromQL and why it means nothing outside contended time.
+	sfqChargedCost = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_charged_cost_total",
+			Help:      help("Cost booked to the group's SFQ finish tag: the measured actual at completion, the dispatch estimate when no usage block came back, or the worst case when reaped."),
+		}, []string{"fairness_id"})
+
+	// UNI-302. Over dispatch_total, how often the group's request was tagged
+	// at or below every other group's next tag. A heavily weighted group
+	// should sit near 1 under contention.
+	sfqDispatchedAtFront = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_dispatched_at_front_total",
+			Help:      help("Requests stamped at rank 1: no other group's next request would have been tagged lower."),
+		}, []string{"fairness_id"})
+
 	sfqUnstampable = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
@@ -300,6 +323,8 @@ func collectors() []prometheus.Collector {
 		sfqLateCompletions,
 		sfqStaleDropouts,
 		sfqUnstampable,
+		sfqChargedCost,
+		sfqDispatchedAtFront,
 		clientPriorityOverwritten,
 	}
 }

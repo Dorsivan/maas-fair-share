@@ -67,6 +67,15 @@ def test_check_reports_each_kind_of_drift():
     assert "end-users: in the EPP config, not in the manifest" in problems
 
 
+def test_config_groups_accept_estimated_output_tokens():
+    # UNI-299: a group's estimatedOutputTokens must not make preflight fail.
+    cfg = ("        groups:\n"
+           "          - { name: app1, weight: 20, estimatedOutputTokens: 4000, match: { exact: [a] } }\n"
+           "          - { name: app2, weight: 10, match: { prefix: [b-] } }\n")
+    assert tenants.parse_config_groups(cfg) == [
+        ("app1", 20.0, ("exact", ("a",))), ("app2", 10.0, ("prefix", ("b-",)))]
+
+
 def test_manifest_rejects_keys_that_would_classify_elsewhere():
     raises("a 1 exact:a b - - -\n", "does not classify")
     raises("a 1 exact:a a - - -\na 1 exact:b b - - -\n", "listed twice")

@@ -148,6 +148,9 @@ def fmt_num(v):
 GROUPS_BLOCK = re.compile(r"^([ \t]*)groups:[ \t]*\n((?:\1[ \t]+(?:#.*|- \{.*\})[ \t]*\n)+)", re.MULTILINE)
 GROUP_ITEM = re.compile(
     r"-\s*\{\s*name:\s*(?P<name>[^,\s]+)\s*,\s*weight:\s*(?P<weight>[\d.]+)\s*,\s*"
+    # UNI-299: a group may carry its own output estimate. The manifest has no
+    # column for it, so it is accepted here and not compared.
+    r"(?:estimatedOutputTokens:\s*[\d.]+\s*,\s*)?"
     r"match:\s*\{\s*(?P<kind>exact|prefix):\s*\[(?P<vals>[^\]]*)\]\s*\}\s*\}")
 
 

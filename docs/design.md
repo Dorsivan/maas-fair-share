@@ -4,6 +4,31 @@
 > **Part 2** is the implementation detail for whoever writes the code.
 > **Part 3** is what you need to decide or accept.
 
+> **If you have never seen this project, start at [`AIRGAP-HANDOFF.md`](../AIRGAP-HANDOFF.md)
+> instead of here.** That document is the current-state entry point; this one is the design
+> **history** — real decisions, in the order they were made, including ones since
+> superseded. It is long (1,900+ lines) and reads front-to-back as a narrative, not as a
+> reference you can dip into at a random heading.
+>
+> **The one thing worth knowing before you read linearly:** everything below from here
+> through "The algorithm: a running tab" describes dispatch order as decided by an
+> **EPP-held queue ranked by a weighted least-attained-service tab**. That stopped being
+> true once [UNI-293](#uni-293-sfq-priority-stamp) shipped. UNI-288 (search this file)
+> found the EPP only ever held 6-8% of in-flight requests — vLLM's own FIFO
+> queue held the other ~90-94% and decided the real order, which is why the tab-only
+> mechanism was only partially effective. **UNI-293 ("SFQ priority stamp") is what
+> actually decides dispatch order today**: the plugin still runs the tab for accounting
+> and metrics, but ranks and dispatches by a start-time fair-queueing tag stamped into
+> vLLM's own `priority` field, so vLLM's queue (where the requests actually are) sorts by
+> the same number the EPP would have used. [UNI-302](#uni-302-the-stamp-explains-itself)
+> added a decision log and two metrics for reading that stamp's effect live. Everything
+> about *why* the earlier, tab-only version was built the way it was is still accurate
+> and still the reason the tab exists at all (it is now the thing the stamp is derived
+> from) — it only stops being the *ordering* mechanism at UNI-293.
+>
+> The "## Config" section (Part 2) is kept current and does include the SFQ fields —
+> read it, not the narrative prose, for what to actually put in a ConfigMap.
+
 ## Execution order
 
 The sequencing matters more than it looks — several parameters can't be chosen until
@@ -1163,19 +1188,28 @@ endpoint's in-flight count, newest start and serving flag.
   drain" estimate here. The idle reset bounds it to the current busy
   period, but does not remove it.
 - Nothing here changes vLLM. The stamp does nothing until the pool runs
-  `--scheduling-policy priority`. Whether the shipped RH image exposes that
-  flag is UNI-292.
+  `--scheduling-policy priority`. **UNI-292, resolved 2026-11-25 (UNI-303):** the
+  shipped RH vLLM build (`0.24.0+rhaiv.9`) accepts the flag as a non-default arg and
+  boots healthy -- confirmed on the CPU vLLM path
+  (`results/20261125T231600Z-uni303-image-rebuild-and-sched-policy-check/`). Not yet
+  confirmed on the GPU path specifically (same vLLM version, different container).
 - The CI sim (`sfq_sim_test.go`) drives the real plugin's stamp into a
   model of vLLM's priority queue. It is a model, not a live run.
 
-### Two vLLM flags are hard prerequisites
+### Three vLLM flags are hard prerequisites
 
-Both default to **off**, both fail silently, and both go on the **vLLM container**
-(`spec.template` in the LLMInferenceService), not the scheduler:
+All three go on the **vLLM container** (`spec.template` in the LLMInferenceService), not
+the scheduler. The first two default to **off** and fail silently. The third
+(`--scheduling-policy priority`, added for UNI-293) defaults to vLLM's own FCFS and is
+inert rather than silent-wrong when missing: with no `priority` stamped, FCFS and
+"priority with everyone tied" dispatch identically, so this one is safe to add any time,
+including before `sfqPriorityStamp` is ever turned on -- see
+[AIRGAP-HANDOFF.md §7.3](../AIRGAP-HANDOFF.md#73--stage-the-model-and-deploy-the-inference-service).
 
 ```
 --enable-force-include-usage     # "including usage on every request"
 --enable-prompt-tokens-details   # populates usage.prompt_tokens_details
+--scheduling-policy priority     # required for the SFQ stamp (UNI-293) to do anything
 ```
 
 **Why the first.** OpenAI streaming only emits a usage block when the client sets

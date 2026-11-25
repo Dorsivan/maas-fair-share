@@ -9,18 +9,40 @@ to test it the first time, and which healthy-looking outcomes are actually failu
 Read this top to bottom once before touching the cluster. The order matters more than any
 individual command.
 
-> **Status of this snapshot.** Cut 2026-11-11 at commit `c8a069d` (UNI-220). The edge-case
-> test series (UNI-117's plan) has continued well past the UNI-190 cut this doc was last
-> updated from — through at least UNI-230, with a further UNI-220 re-run landing as the
-> final commit on `main` — and `docs/poc-results.md` is the authoritative, current record;
-> its own ticket-ordered sections are the source of truth, not this paragraph or
-> [§10](#10-what-is-and-is-not-proven) below. The cluster was left at its documented
-> baseline (`enforce: false`, `queueDepthThreshold: 32`, weights `20/10/65/5`,
-> `newcomerClamp: true`) after the last run. Two threads are open, not closed, as of this
-> cut: a dispatch-accounting gap under an EPP restart for a high-concurrency tenant
-> ([UNI-193](/UNI/issues/UNI-193)/[UNI-194](/UNI/issues/UNI-194)), and whether the 8x-over-offer
-> correction ceiling [§10](#10-what-is-and-is-not-proven) documents needs an admission-side
-> fix — nothing further is in flight on either as of this commit.
+> **Status of this snapshot.** Rewritten 2026-11-25 (UNI-303) at commit `a70c5b9`, on top of
+> UNI-293/UNI-299/UNI-300 (the SFQ priority stamp), UNI-302 (its decision log) and UNI-306
+> (the `identityHeader` default fix). **The mechanism changed since the previous cut of this
+> document (2026-11-11, commit `c8a069d`, UNI-220): read [§2](#2-how-it-works-internally)
+> again even if you have read an earlier version.** Dispatch order is now decided by a
+> start-time fair-queueing tag stamped into vLLM's own `priority` field, not by the EPP's
+> internal queue alone — the EPP-held queue is 6-8% of in-flight requests under the load
+> shapes tested here; vLLM's FIFO holds the rest, which is why the earlier, EPP-only
+> ordering could not fully move the split.
+>
+> **This repository's `main` and its deployed artifact were out of sync for two weeks**
+> before this rewrite: the SFQ stamp code merged to `main` on 2026-11-25, but every deploy
+> manifest, and the live cluster, were still pinned to the UNI-220-era image, and the live
+> GPU and CPU EPPs were each running a *different*, uncommitted image digest found nowhere
+> in this repo — evidence of manual cluster patches never written back. This rewrite
+> rebuilt the EPP image from a clean clone of `main`, re-pinned all six manifests, and
+> live-verified the new image on both EPP schedulers in `maas-fairness-poc`. See
+> `results/20261125T231600Z-uni303-image-rebuild-and-sched-policy-check/README.md` for
+> exactly what was and was not re-verified. **Treat any digest cited anywhere else in this
+> repository's prose, including older parts of this file, as unverified until you check
+> `git log --oneline -- deploy/llmisvc.yaml`.**
+>
+> `docs/poc-results.md` is the authoritative record of *measurements* made before the
+> stamp (everything through UNI-230ish) and is not rewritten here. Two pre-stamp threads
+> remain open: a dispatch-accounting gap under an EPP restart for a high-concurrency
+> tenant ([UNI-193](/UNI/issues/UNI-193)/[UNI-194](/UNI/issues/UNI-194)), and whether the
+> pre-stamp 8x-over-offer correction ceiling needs an admission-side fix. **Not re-verified
+> live since the stamp shipped:** an end-to-end fairness run with `sfqPriorityStamp: true`
+> and `--scheduling-policy priority` against real contended GPU traffic. The stamp's
+> correctness is proven by the unit/sim suite (`sfq_sim_test.go`, `sfq_test.go`) and by an
+> earlier live session (tag `uni294-sfq-live`, not reproducible from a committed manifest);
+> this rewrite's own live check only confirms the image boots clean and vLLM accepts the
+> scheduling flag, not that the stamp moves a live split. Do that run before trusting a
+> share number against this image on your cluster.
 
 ---
 
@@ -35,10 +57,11 @@ individual command.
 | [5](#5-transfer-manifest--what-crosses-the-boundary) | Transfer manifest — what crosses the boundary |
 | [6](#6-blocking-items) | Blocking items |
 | [7](#7-deploy-in-order) | Deploy, in order |
-| [8](#8-initial-test-the-five-rung-ladder) | Initial test: the five-rung ladder |
+| [8](#8-initial-test-the-six-rung-ladder) | Initial test: the six-rung ladder |
 | [9](#9-failures-that-look-like-success) | Failures that look like success |
 | [10](#10-what-is-and-is-not-proven) | What is and is not proven |
 | [11](#11-changing-it) | Changing it |
+| [12](#the-weight-split-checker) | The weight-split checker |
 
 ---
 
@@ -104,24 +127,75 @@ Two consequences you must internalise:
 
 ### The algorithm
 
-**Weighted least-attained-service.** Each group carries a decaying *tab* of recently
-consumed tokens; the group with the lowest `tab ÷ weight` is served next. Equalising
-`tab ÷ weight` *is* proportional sharing, so the ratios converge on the configured weights
-without any constant describing how fast the GPUs are. That property is what makes it
-portable to your hardware without re-deriving a throughput model.
+**What decides dispatch order today: a start-time fair-queueing (SFQ) priority stamp,
+not the EPP's own queue.** UNI-288 (`docs/design.md`, "UNI-293: SFQ priority stamp")
+measured the EPP holding only 6-8% of in-flight requests under closed-loop load; vLLM's own FIFO
+waiting queue held the other ~88-94% and decided the real dispatch order regardless of
+what the EPP's internal ranking said. Reordering only the EPP's own small queue could
+never move the split by more than that 6-8%. **UNI-293 fixes this by moving the decision
+to where the requests actually are**: the plugin computes an SFQ start tag per request and
+stamps it into the request body as vLLM's own `priority` field (`PreRequest` →
+`MutatePayloadMap`). vLLM, run with `--scheduling-policy priority`, reorders its waiting
+queue by that stamped integer. The EPP's internal queue ranking by the tab (below) still
+runs, but on this small a queue it is now a secondary effect, not the mechanism.
 
-Three mechanisms make it work in practice. Each exists because the naive version fails
-without it, and each is a thing you can accidentally disable:
+**The tag.** Group `g` with weight `w` dispatching a request with estimated cost `c` gets
+start tag `S = max(F_g, V)`, then `F_g += c/w`. `V` is the minimum, over currently-serving
+endpoints, of each one's newest stamped start — not a wall-clock time. Equalising each
+group's rate of advancing `F_g` relative to `w` *is* proportional sharing, so the ratios
+converge on the configured weights without any constant describing how fast the GPUs are.
+At completion, `F_g` is trued up by `(actual − charged)/w`, **undecayed** — this closes a
+gaming vector where an under-estimated request would otherwise pay less than it cost, which
+the plugin's older, decayed true-up could not fully close. Full derivation, the virtual-time
+definition, the ceiling/rebase mechanism, and the idle-reset rule:
+`docs/design.md`, "UNI-293: SFQ priority stamp" and "UNI-300" review.
 
-- **Exponential decay** — the tab measures *recent* usage, not all-time. One lazy
-  `2^(-Δt/halfLife)` on read and write.
-- **Newcomer clamp** — a returning-idle tenant is raised to the current minimum, so it goes
-  first *once* rather than monopolising the pool for minutes. Without it, consuming spare
-  capacity becomes a debt and work conservation is poisoned.
+**Three non-negotiables, each a silent-failure mode if missed:**
+
+1. **`propagatePriority` must stay `false`** (`router.scheduler`'s `requestHandler` setting,
+   not a `maas-fairness` plugin parameter). It runs *after* `PreRequest` and overwrites the
+   stamped `priority` with the InferenceObjective's static priority, silently reverting the
+   whole mechanism with no error. The plugin refuses to start if it is `true` — it re-reads
+   the EPP's own `--config-file`/`--config-text` to check — **or if it cannot find the
+   setting to check at all**, so do not suppress that startup check.
+2. **vLLM must run `--scheduling-policy priority`.** Without it, a stamped `priority` field
+   is simply ignored and dispatch stays FIFO. Verified live in this environment
+   (`results/20261125T231600Z-uni303-image-rebuild-and-sched-policy-check/`) that this RH
+   vLLM build (`0.24.0+rhaiv.9`) accepts the flag.
+3. **The plugin, not the client, owns `priority`.** With the stamp on, every request's
+   `priority` is overwritten unconditionally, including unclassified groups and a client
+   that already set one — a client-supplied value is never honoured. With the stamp off, a
+   client-supplied `priority` is stripped (not forwarded), so it is a no-op under plain
+   FIFO either way. A request body the plugin cannot rewrite (non-JSON) is rejected (400),
+   never forwarded unstamped.
+
+**The EWMA tab still exists, underneath the stamp, for a different job: accounting.**
+Each group still carries a decaying *tab* of consumed tokens, decayed `2^(-Δt/halfLife)`.
+With `sfqPriorityStamp: true`, `Pick` ranks the EPP's own small queue by SFQ tag, not by
+the tab — the tab is charged and decayed only for `normalized_service`, the flight
+recorder, and the live state dump. Two of the three stabilising mechanisms below are
+**inert** once the stamp is on, because `max(F_g, V)` already does their job exactly; they
+are kept because their *absence* would reopen the vector they close if the stamp is ever
+turned back off:
+
+- **Exponential decay** — the tab measures *recent* usage, not all-time. Still active;
+  shapes only the accounting series, not dispatch, once the stamp is on.
+- **Newcomer clamp** — raises a returning-idle tenant to the current minimum so it goes
+  first *once* rather than monopolising the pool. **Inert when `sfqPriorityStamp` is on**
+  — it writes only to the tab, which no longer drives `Pick`. Leave it `true` regardless;
+  it is the thing that matters if the stamp is ever disabled.
 - **Provisional charge** — an estimate is charged at dispatch and trued up against the real
-  `usage` block at completion. Generations take 10–30s while scheduling decisions happen
-  every millisecond; without this a tenant dispatches thousands of requests before any
-  lands on its tab.
+  `usage` block at completion. **Still load-bearing with the stamp on** — the SFQ tag's
+  completion true-up (above) depends on provisional charging having happened at dispatch.
+  Generations take 10–30s while scheduling decisions happen every millisecond; without
+  this a tenant dispatches thousands of requests before any lands on its tag.
+
+**Semantics, stated plainly: this is proportional share among contending tenants, not a
+guaranteed minimum floor.** Under no contention, every tenant gets what it asks for, up
+to the pool's capacity — nothing is held back pre-emptively. If the board's ask is read as
+"app2 always gets at least 10% of the pool, including when it is idle and could not use
+it," that is **not** what is built, and is not what proportional sharing under contention
+can mean.
 
 ### How a request is attributed to a group
 
@@ -160,18 +234,20 @@ Do not treat anything in it as a dependency.
 
 ## 3. Orientation — which document answers which question
 
-The repository carries ~16,900 lines of documentation. You do not need to read it all. Go
-to the one that answers your question:
+The repository carries well over 18,000 lines of documentation (check with `wc -l docs/*.md
+AIRGAP-HANDOFF.md` — it grows fast and any count written here will be stale soon). You do
+not need to read it all. Go to the one that answers your question:
 
 | Your question | Document |
 |---|---|
-| Why does this exist, what are the design decisions and their rejected alternatives | `docs/design.md` (1,616 lines; Part 1 is plain-language) |
-| What was measured, on what hardware, and what the numbers were | `docs/poc-results.md` (9,683 lines — the evidence record) |
-| How do I actually run a thing on the cluster | `docs/runbook.md` (2,631 lines — task-indexed, start from its headings) |
+| **Is the configured split actually being honoured, right now, on my endpoint** | `deploy/poc/weight-split-check.py` ([§12](#the-weight-split-checker)) — a standalone script, run it, don't read about it first |
+| Why does this exist, what are the design decisions, and what decides dispatch order **today** | `docs/design.md` — read the banner at the very top first, it tells you which sections are current and which are historical narrative |
+| What was measured, on what hardware, and what the numbers were (through UNI-230ish; **not** updated for the SFQ stamp) | `docs/poc-results.md` — the pre-stamp evidence record |
+| How do I actually run a thing on the cluster | `docs/runbook.md` (task-indexed, start from its headings) |
 | What version is pinned, why, and how do I bump it | `docs/version-pinning.md` |
 | `outputTokenWeight` is 2.0 — what do I set it to here | `docs/calibrating-output-token-weight.md` ← **you must do this** |
 | How does header forgery work and how is it closed | `docs/gateway-header-stripping.md` |
-| What do the EPP log lines mean | `docs/log-field-contract.md`, `docs/logql-queries.md` |
+| What do the EPP log lines mean, including the SFQ decision log | `docs/log-field-contract.md`, `docs/logql-queries.md` |
 | How do I install Logging + LokiStack (optional) | `docs/logging-install-spec.md` |
 | How do I install MaaS itself | `deploy/maas/README.md` |
 | What did the Python prototype prove, and why was it replaced | `prototype/README.md` |
@@ -219,6 +295,7 @@ each of these before you start.
 |---|---|
 | NVIDIA GPU Operator + Node Feature Discovery | **Set `deviceLabelFields: [vendor]` on the NodeFeatureDiscovery CR.** With the default `[vendor, device]` it emits `pci-10de_20b5.present` while the GPU operator selects on the vendor-only `pci-10de.present`, so the operator logs "No GPU node found" indefinitely, creates zero daemonsets, and the cluster reports no `nvidia.com/gpu` capacity at all. This cost three weeks here and looks exactly like broken hardware. |
 | ≥2 GPUs | Two replicas, one per GPU. With a single pod the endpoint picker is a no-op and any endpoint-selection bug stays hidden. |
+| A vLLM build that accepts `--scheduling-policy priority` | **Required for the SFQ stamp to do anything** ([§2](#2-how-it-works-internally)). Confirmed on `registry.redhat.io/rhaii/vllm-cpu-rhel9:3.5.0` (`vllm==0.24.0+rhaiv.9`): the flag is accepted as a non-default arg and the pod boots healthy. Not yet confirmed on the GPU image from this same preset — it is the same vLLM version, but confirm on your own build before relying on it. Safe to add even before you are ready to enable the stamp: with no `priority` stamped, every request ties at the default and dispatches FIFO, identical to not setting the flag at all. |
 
 ### Optional
 
@@ -238,7 +315,7 @@ Every external dependency, with a verdict. `mirrorable` = copyable as bytes;
 
 | Item | Verdict | Evidence / note |
 |---|---|---|
-| `quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f` — **the EPP image, the actual deliverable** | mirrorable, **but see §6.1** | Built from commit `86159ee` (UNI-220's newcomer-clamp in-flight-gate fix), published via the `maas-epp-quay-publish` BuildConfig. Referenced by digest from six manifests. This is the fourth re-pin since UNI-29's original `fc27130` build — each code change to the plugin forces a rebuild (UNI-213 twice, UNI-212, UNI-220); check `git log --oneline -- deploy/llmisvc.yaml` before trusting any digest cited anywhere in this repository's prose, including this one. The Quay repository is **private**: an anonymous pull token is issued but the manifest GET returns `UNAUTHORIZED`, so it cannot be mirrored without the robot credential. |
+| `quay.io/rh-ee-dsivan/maas-fair-share@sha256:feba5e1d81143e3eee79cce12f0c8ad4a43fd3683b2b73e13befbdd52c6a4255` — **the EPP image, the actual deliverable** | mirrorable, **but see §6.1** | Built from commit `8968cc4` (UNI-306, which sits on top of the UNI-293/299/300 SFQ stamp), published via the `maas-epp-quay-publish` BuildConfig from a **clean clone**, not a working tree that may carry another session's uncommitted edits (see [§9](#9-failures-that-look-like-success), the shared-checkout item). This is at least the sixth re-pin since UNI-29's original `fc27130` build — each code change to the plugin forces a rebuild; **check `git log --oneline -- deploy/llmisvc.yaml` before trusting any digest cited anywhere in this repository's prose, including this one, and distrust any digest you find live on the cluster that does not also appear in a commit here** — before this rewrite, the live GPU and CPU EPPs were each running a different digest found in neither category. The Quay repository is **private**: an anonymous pull token is issued but the manifest GET returns `UNAUTHORIZED`, so it cannot be mirrored without the robot credential. |
 | `gcr.io/distroless/static:nonroot` | mirrorable | Runtime base, via `ARG BASE_IMAGE` in `Dockerfile.epp`. **Floating tag** — resolve to a digest before mirroring. |
 | `golang:1.26.8` | mirrorable | Builder image. Needed only if you rebuild. Must be **≥** the `go` directive in upstream's go.mod (currently `go 1.26.6`). **Floating tag.** |
 | `registry.redhat.io/rhaii/vllm-cpu-rhel9:3.5.0` | mirrorable | CPU inference path. Version tag, not a digest. |
@@ -334,9 +411,9 @@ Two. Both have a known unblock; neither is a design flaw in the plugin.
 
 **Finding.** `quay.io/rh-ee-dsivan/maas-fair-share` does not permit anonymous pulls. A
 registry auth token is issued, then the manifest GET for the digest currently pinned
-(`sha256:c8a08820…`, see [§5.1](#51-container-images) — **confirm the live digest with
-`git log --oneline -- deploy/llmisvc.yaml` before mirroring; it has moved four times since
-this repository's first Quay publish and will move again**) returns `UNAUTHORIZED`. An
+(`sha256:feba5e1d…`, see [§5.1](#51-container-images) — **confirm the live digest with
+`git log --oneline -- deploy/llmisvc.yaml` before mirroring; it has moved at least six times
+since this repository's first Quay publish and will move again**) returns `UNAUTHORIZED`. An
 air-gapped mirror run without the robot credential will fail on the one image that *is*
 the deliverable, and it will fail at mirror time, not at deploy time.
 
@@ -346,7 +423,7 @@ the deliverable, and it will fail at mirror time, not at deploy time.
    credential:
    ```sh
    skopeo copy --all \
-     docker://quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f \
+     docker://quay.io/rh-ee-dsivan/maas-fair-share@sha256:feba5e1d81143e3eee79cce12f0c8ad4a43fd3683b2b73e13befbdd52c6a4255 \
      dir:/transfer/maas-fair-share-epp
    ```
    Carry the directory; load it with `skopeo copy dir:… docker://<internal-registry>/…`.
@@ -354,7 +431,10 @@ the deliverable, and it will fail at mirror time, not at deploy time.
 2. **Rebuild on your side** from this source tree. This needs the Go module cache
    ([§5.3](#53-language-packages-and-build-tooling)) and the two base images, and it
    produces a **different digest**. If you rebuild, record your digest and update the six
-   manifests; do not leave them pointing at a digest your registry does not have.
+   manifests; do not leave them pointing at a digest your registry does not have. **Build
+   from a clean clone, not a working tree someone else may be editing** — a binary
+   `BuildConfig` upload sends whatever is on disk, committed or not, and this repository's
+   own checkout is sometimes shared across concurrent sessions.
 
 `docs/runbook.md`, "Rebuild and publish the EPP image", covers both the normal build and
 the in-cluster BuildConfig path used when no local podman is available.
@@ -384,7 +464,7 @@ model name clients send, and it is deliberately not the directory name.
 
 **Any open-weights model will do.** Nothing in the plugin is model-specific; the model
 only has to saturate. But two things move with the model and must be re-derived on your
-side: `outputTokenWeight` ([§8](#8-initial-test-the-five-rung-ladder), rung 0) and the
+side: `outputTokenWeight` ([§8](#8-initial-test-the-six-rung-ladder), rung 0) and the
 saturation point your load generator must exceed.
 
 > **Not a blocker, but adjacent:** `spec.model.name` is `llama-3-1-8b` while the weights are
@@ -459,16 +539,63 @@ oc apply -f deploy/poc/09-vllm-gpu.yaml       # GPU path
 the real EPP and the real gateway against `llm-d-inference-sim`, which needs no weights and
 no GPU. It will not give you a credible fairness measurement, but it proves the plugin
 loads, classifies, and emits metrics — and it unblocks rungs 2 and 3 of
-[§8](#8-initial-test-the-five-rung-ladder) weeks before the GPU path is ready.
+[§8](#8-initial-test-the-six-rung-ladder) weeks before the GPU path is ready.
 
-Two vLLM flags are **hard prerequisites** on any real-vLLM path. Both default off, and both
-fail silently — you get a working-looking deployment whose usage accounting is empty:
+Three vLLM flags are **hard prerequisites** on any real-vLLM path. All three default off.
+The first two fail silently — you get a working-looking deployment whose usage accounting
+is empty. The third is inert, not silent-wrong, when missing: without it a stamped
+`priority` is simply not honoured and dispatch stays FIFO, which is the same behaviour as
+`sfqPriorityStamp: false`, so it will not mislead you on its own — but it is required
+before the SFQ stamp ([§2](#2-how-it-works-internally)) can ever do anything, so set it now
+rather than rediscovering it when flipping `sfqPriorityStamp` later does nothing:
 
 ```yaml
 args:
   - --enable-force-include-usage
   - --enable-prompt-tokens-details
+  - --scheduling-policy
+  - priority
 ```
+
+Deploy manifests here already include all three. **If you are instead patching an
+*existing, already-running* GPU deployment** (not a fresh install) **to add this flag,
+read the warning in [§7.3b](#73b--enabling-the-sfq-priority-stamp) first** — on a GPU pool
+with no spare capacity, this triggers a rolling-update deadlock.
+
+### 7.3b — Enabling the SFQ priority stamp
+
+Shipped **off** (`sfqPriorityStamp: false`), same shadow-first convention as `enforce`.
+Turning it on is a deliberate, separate step from the base install above, not something to
+do on day one. In order:
+
+1. **Confirm `requestHandler.propagatePriority` is not set to `true`** on the
+   `LLMInferenceService`'s `router.scheduler` (it is unset/`false` by default in every
+   manifest here). If it is `true`, the plugin will refuse to start once you flip the next
+   step — that is deliberate, not a bug to work around.
+2. **Confirm `--scheduling-policy priority` is on the vLLM container** ([§7.3](#73--stage-the-model-and-deploy-the-inference-service)
+   above). Flipping the plugin flag with this missing produces silence, not an error: the
+   plugin stamps `priority`, vLLM ignores it, dispatch stays FIFO, and nothing in the logs
+   says why.
+3. **Set `sfqPriorityStamp: true`** in `maas-epp-config` (and, if you want the closed
+   gaming-vector fix, `undecayedTrueUp: true` alongside it — see `docs/design.md`,
+   "UNI-293: SFQ priority stamp"). **This recreates the EPP pod and zeroes its counters**,
+   the same as flipping `enforce` does ([§8](#8-initial-test-the-six-rung-ladder), Rung 5)
+   — take any metrics snapshot you need before this step, not after.
+4. **If you are updating an existing GPU deployment rather than installing fresh, expect
+   the rollout to deadlock.** An LLMInferenceService edit that changes the vLLM container's
+   args triggers the controller to roll its owned Deployment at the default 25%/25%
+   surge/unavailable. On a 2-GPU pool already running 2 replicas with zero spare GPU
+   capacity in the cluster (a real condition — three lanes sharing 6 GPUs on this cluster
+   ran fully allocated with no headroom), the surge pod cannot schedule and the rollout
+   hangs indefinitely with one old pod and one new, both counted, neither fully up. Fix:
+   `oc get rs -n <namespace> -l <the Deployment's selector>`, identify the **old**
+   ReplicaSet (lower `kubectl.kubernetes.io/revision` annotation), and
+   `oc scale rs <old-rs> --replicas=<n-1>` to free a GPU for the new pod — do **not** patch
+   the generated Deployment's strategy directly, the controller reverts it. This is a
+   temporary capacity dip on your own deployment during the rollout, not a destructive
+   action, but budget for it before doing this during a measurement window.
+5. **Confirm the stamp is landing** before trusting any share number — [§8](#8-initial-test-the-six-rung-ladder),
+   new Rung 6, below.
 
 ### 7.4 — Close the header-forgery hole
 
@@ -511,7 +638,7 @@ Grafana", exactly; do not restart first.
 
 ---
 
-## 8. Initial test: the five-rung ladder
+## 8. Initial test: the six-rung ladder
 
 Climb in order. Each rung depends on the one below, and each tells you something different
 about *where* a failure is. Resist the urge to start at the top — a failed benchmark with
@@ -639,6 +766,44 @@ A/B procedure.
 least likely to be wrong on day one; the group matching rules, the half-life and the cost
 weights are, and only real traffic knows them.
 
+### Rung 6 — confirm the SFQ stamp is landing (only if you turned it on, [§7.3b](#73b--enabling-the-sfq-priority-stamp))
+
+Rungs 0-5 exercise the EWMA tab and `enforce`; none of them touch
+`sfqPriorityStamp`. If you turned it on, confirm the stamp independently before trusting
+any share number against it — a missing `--scheduling-policy priority` flag or a
+`propagatePriority: true` both fail **silently** here (the request still dispatches, just
+unstamped or re-stamped by something else).
+
+Two ways to check, neither needs a wire capture (UNI-298):
+
+1. **The response header.** With `emitAttributionHeaders: true` (shipped default), every
+   response carries `x-maas-fairness-priority` with the stamped integer. Send one request
+   per tenant and confirm the header is present and the values are distinct, non-zero
+   integers that grow across repeated requests from the same tenant (`F_g` only
+   increases).
+   ```sh
+   curl -sD - -o /dev/null -H "x-maas-subscription: app1-production" \
+     https://<route>/v1/completions -d '{"prompt":"hi","max_tokens":1}' \
+     | grep -i x-maas-fairness-priority
+   ```
+2. **The metrics.** `maas_fairness_sfq_enabled` should read `1`.
+   `maas_fairness_sfq_stamped_priority{fairness_id}` should be non-zero and increasing per
+   tenant. `maas_fairness_client_priority_overwritten_total` increasing means a client (or
+   your own load generator) is sending its own `priority` and it is correctly being
+   overwritten — expected, not a bug. If you enabled `sfqDecisionLog: info`, one
+   `"sfq priority"` log line per dispatch gives you the group, the stamped integer, and its
+   rank among the groups' next tags directly — see `docs/design.md`, "UNI-302: the stamp
+   explains itself".
+
+**If the header is absent, or the metric is flat zero:** check, in order,
+`sfqPriorityStamp` is actually `true` in the ConfigMap the running pod loaded (not just
+the file on disk — confirm against the EPP's own startup log, which echoes its effective
+config), then `--scheduling-policy priority` on the vLLM container, then
+`propagatePriority` is not `true`. This is also precisely what
+`deploy/poc/weight-split-check.py` ([below](#the-weight-split-checker)) reports as its
+`contended` / `stamp_present` fields, so a single run of that tool answers all three at
+once against a live tenant pair.
+
 ---
 
 ## 9. Failures that look like success
@@ -732,6 +897,30 @@ script (`15-fairness-report.py`) now records each scrape's own exit code and rep
 before this fix needs the same by-hand cross-check** (monotonic counter + stable pod name)
 before you treat an apparent restart as real.
 
+**11. The checked-out working tree can be running code nobody committed, including a live
+image built from it.** Found during this rewrite (UNI-303): `main` had merged the SFQ
+stamp, but the deploy manifests, and the live cluster, were still on the UNI-220-era image
+— and the live GPU and CPU EPPs were each running a *third and fourth* digest, found in
+neither the manifests nor any commit. Separately, a repository checkout on this kind of
+shared agent host can carry another session's **uncommitted** edits at any moment — this
+rewrite's first image build accidentally included another session's in-progress,
+uncommitted changes to `pkg/fairness/weightedlas/`, because an OpenShift `BuildConfig`
+with `source.binary` uploads whatever is on disk, committed or not. The fix both times is
+the same: **never trust a running artifact's provenance from its behaviour or from prose
+describing it — check `git log --oneline -- deploy/llmisvc.yaml` against the digest
+actually running, and build any image you need from a freshly cloned checkout, not a
+working tree you did not create this session.**
+
+**12. A rolling update on a fully-allocated GPU pool does not fail — it hangs.** Changing
+an `LLMInferenceService`'s vLLM container args (image, command-line flags) triggers the
+owning controller to roll its Deployment at the default 25%/25% surge/unavailable. With a
+2-replica pool and zero spare GPUs anywhere in the cluster (confirmed during this rewrite:
+three lanes, six GPUs, all six allocated), the surge pod cannot schedule, and the rollout
+sits with one old pod and one new `Pending` pod indefinitely — no error, no event you would
+notice without looking, no timeout. See [§7.3b](#73b--enabling-the-sfq-priority-stamp) for
+the manual-scale-down fix. It only bites an **existing** deployment; a fresh install has no
+old ReplicaSet to roll and is unaffected.
+
 ---
 
 ## 10. What is and is not proven
@@ -800,6 +989,14 @@ before you treat an apparent restart as real.
   gap without breaking the board's mandated equal-load baseline — and are kept instead as
   the TTFT noise-floor control cited above. Before citing any other PASS in this repository
   as evidence the policy works, check its own worker-vs-weight gap the same way.
+- **(UNI-303, 2026-11-25) The SFQ-stamp-carrying image builds, passes its full test suite,
+  and boots clean on live EPP pods with no restarts, no flag-parse errors, and
+  `PropagatePriority:false` confirmed in its own logged effective config** — on both the
+  GPU and CPU schedulers in `maas-fairness-poc`. **Separately, vLLM `0.24.0+rhaiv.9`
+  accepts `--scheduling-policy priority` as a valid, non-default argument and boots a
+  healthy model server with it** (confirmed on the CPU path; see
+  `results/20261125T231600Z-uni303-image-rebuild-and-sched-policy-check/`). Neither of
+  these is a fairness measurement — see item 12 under "Not proven."
 
 ### Not proven
 
@@ -810,7 +1007,7 @@ before you treat an apparent restart as real.
    (`llm-d-uds-tokenizer:v0.7.1`) sharing a controller-injected `tokenizer-uds` volume,
    which 3.5 has no equivalent of. Untested, and the most likely surprise.
 2. **`outputTokenWeight` on any hardware but the source cluster's.** It ships as a
-   placeholder. [§8](#8-initial-test-the-five-rung-ladder) rung 0 is not optional.
+   placeholder. [§8](#8-initial-test-the-six-rung-ladder) rung 0 is not optional.
 3. **`cachedInputTokenWeight`** — evidence gathered (UNI-136), decision not taken.
 4. **Scale.** Everything here is two A100s, three to six tenant groups, runs of minutes to a
    two-hour soak. Nothing about many-GPU pools, many-tenant tables, or multi-day operation.
@@ -842,10 +1039,29 @@ before you treat an apparent restart as real.
     Root cause needs tracing the upstream `gateway-api-inference-extension` flow-control
     path, which is imported, not vendored, and is out of scope here. Open as
     [UNI-194](/UNI/issues/UNI-194).
-11. **This snapshot is current through commit `c8a069d` (UNI-220).** `docs/poc-results.md`
-    is complete through that point. Check that document's own ticket-ordered sections,
-    not this file, for anything landed after it — and note that ticket number and commit
-    order do not always agree (UNI-220 itself landed in two separate commits, days apart).
+11. **`docs/poc-results.md`'s measurements predate the SFQ stamp and are not re-verified
+    against it.** They remain the evidence record for the tab-only mechanism described
+    there (through roughly UNI-230) and should be read as that, not as current-state
+    proof for anything downstream of UNI-293.
+12. **An end-to-end fairness run with the SFQ stamp on, against real contended GPU
+    traffic, on this rebuilt image.** [§2](#2-how-it-works-internally)'s mechanism is
+    proven by the unit/sim suite (`sfq_sim_test.go`, `sfq_test.go`, run as part of
+    `go test ./...` on this exact commit before this rewrite) and was live-verified once
+    before (tag `uni294-sfq-live`), but that verification is not reproducible from a
+    committed manifest and this rewrite's own live check only confirmed the new image
+    boots clean and that vLLM accepts `--scheduling-policy priority` — not that the stamp
+    moves a live split on *this* image. Run [§8](#8-initial-test-the-six-rung-ladder)'s
+    Rung 6, or `deploy/poc/weight-split-check.py`, before citing a share number against
+    this build.
+13. **`--scheduling-policy priority` on the GPU vLLM workload specifically.** Confirmed
+    accepted on the CPU vLLM path (same `vllm==0.24.0+rhaiv.9`); the GPU path's own
+    workload was deliberately left unpatched in this rewrite because the cluster's GPUs
+    were fully allocated at the time ([§7.3b](#73b--enabling-the-sfq-priority-stamp)).
+    Confirm on the GPU path specifically before depending on it there.
+14. **Two uncommitted image digests found live on this cluster before this rewrite**
+    (`sha256:617509...` on the CPU EPP, `sha256:5ddee9a...` seen there previously) were
+    never traced to a source commit and are now overwritten. Whatever behaviour they
+    carried relative to `main` at the time cannot be recovered.
 
 ### Not examined in this transfer review
 
@@ -870,8 +1086,17 @@ loading and no config-only path to changing policy logic. What *is* config:
 |---|---|---|
 | Group names, prefixes, weights | ConfigMap `maas-epp-config` (`deploy/epp-config.yaml`) | no |
 | `enforce`, `halfLife`, `newcomerClamp`, `outputTokenWeight`, `cachedInputTokenWeight`, `queueDepthThreshold` | same ConfigMap | no |
+| `sfqPriorityStamp`, `undecayedTrueUp`, `sfqEndpointStaleSeconds`, `sfqSettleTimeoutSeconds`, `sfqUnboundedOutputTokens`, `sfqDecisionLog` | same ConfigMap — **but see the caution below** | no, with one exception |
+| `--scheduling-policy priority` on vLLM, `propagatePriority` on `requestHandler` | the `LLMInferenceService` spec, not the ConfigMap | no, but patching it changes the vLLM container's args, which can trigger the rolling-update deadlock in [§7.3b](#73b--enabling-the-sfq-priority-stamp) on a GPU pool with no spare capacity |
 | Policy logic, cost model, metrics | `pkg/fairness/weightedlas/` | **yes** |
 | Upstream `llm-d-router` version | `go.mod` **and** `Dockerfile.epp`'s builder image, together | **yes** |
+
+> **The one exception: `sfqDecisionLog` needs a rebuild on every scheduler reading the
+> ConfigMap, even though it is itself a config key.** Plugin parameters are decoded with
+> `DisallowUnknownFields`, so an EPP on an image older than UNI-302 refuses to start the
+> moment this key appears in its config at all — "off" included. The GPU and CPU
+> schedulers read the same `maas-epp-config`, so roll **both** to an image that has
+> UNI-302 before adding the key to either.
 
 Rules that are load-bearing, each because something broke without it:
 
@@ -904,3 +1129,39 @@ This guide was written from the repository, not from your cluster. Where your en
 contradicts it, your environment is right. Record the delta in this file as you go — the
 next person across the boundary reads this one, and a correction written down beats a
 correction remembered.
+
+---
+
+## The weight-split checker
+
+`deploy/poc/weight-split-check.py` (UNI-303) is a **single, standalone file** — it is not
+part of this POC's harness and imports nothing else from this repository. Copy it anywhere
+and point it at a running deployment to get a plain PASS/FAIL/UNCONTENDED verdict on
+whether the configured weights are actually being honoured, without reading any other
+document first. Its own module docstring (`python3 deploy/poc/weight-split-check.py --help`)
+is the complete reference — config file shape, what it needs (one API key per tenant, a
+metrics-reader token, network reach to the gateway and the EPP's `:9090`), and a
+troubleshooting section keyed to a flat/missing split. It reuses the plugin's own
+`llm_d_epp_maas_fairness_contended_service_tokens_total` counter for the weighted-cost
+share rather than recomputing the cost model client-side, so it cannot disagree with the
+plugin about what "cost" means, and it uses the same 10-point pass bar and the same
+`fairness_id`-keyed grouping as `deploy/poc/15-fairness-report.py`.
+
+It is deliberately **not** a replacement for that report script: it has no phases, no
+chaos-event timeline, no TTFT/ITL secondary verdict, and no comparison against a stored
+benchmark baseline. It answers one question — "right now, pointed at this endpoint, is the
+split correct" — standalone, from outside the harness, which is what an agent doing a
+first health check on a freshly-deployed internal environment needs. Reach for
+`15-fairness-report.py` for an actual scored benchmark run.
+
+What it will tell you that a naive glance at traffic will not:
+- **Whether the pool was actually contended**, and for how much of the scored window — a
+  flat/near-equal split under no contention is the correct result, not a failure, and the
+  tool says so (`UNCONTENDED`) instead of printing a misleading verdict either way.
+- **How much of a FIFO/queue-fill warm-up it excluded**, and exactly how many requests per
+  tenant had already gone out before scoring started — a shallow burst measures how fast
+  a tenant repays its own queueing, not the weighted split.
+- Rung 6 ([§8](#8-initial-test-the-six-rung-ladder)) is this tool's natural first use: run
+  it once with `sfqPriorityStamp` off (expect a near-equal split or `UNCONTENDED`, since
+  shadow mode leaves FCFS in charge) and once with it on, the same way the ladder's own
+  Rung 5 A/B works for `enforce`.

@@ -121,6 +121,30 @@ data:
           newcomerClampIdleSeconds: 2
 
           provisionalCharge: true
+
+          # --- SFQ priority stamp (UNI-293/299/300/302) -- OFF by default, same
+          # shadow-first convention as `enforce` above. With this off, everything
+          # below is dead config; Pick still ranks the EPP's own small queue by
+          # the EWMA tab, exactly as without this section. Flip sfqPriorityStamp
+          # only once --scheduling-policy priority is confirmed on the vLLM
+          # container (AIRGAP-HANDOFF.md section 7.3) and
+          # router.scheduler.requestHandler.propagatePriority is confirmed OFF on
+          # the LLMInferenceService -- the plugin refuses to start if it finds
+          # that on, but it needs to be ABLE to find the setting to check, so do
+          # not run this behind a config-file layout the plugin cannot read.
+          undecayedTrueUp: false          # UNI-293 (1/3): undecayed completion true-up
+          sfqPriorityStamp: false         # UNI-293 (2/3): stamp vLLM's `priority` field
+          sfqEndpointStaleSeconds: 60     # bounds how long a wedged endpoint can freeze V
+          sfqSettleTimeoutSeconds: 900    # no completion by then = lost, charged worst case
+          sfqUnboundedOutputTokens: 4096  # worst-case length for a lost request with no max_tokens
+          # off | info | debug -- UNI-302's decision log, read only while
+          # sfqPriorityStamp is true. See docs/log-field-contract.md section 3.4.
+          # CAUTION: this key is decoded with DisallowUnknownFields, so an EPP
+          # on an image older than UNI-302 refuses to start if it is present at
+          # all (even "off"). Roll every scheduler reading this ConfigMap to an
+          # image that has UNI-302 before adding this key.
+          sfqDecisionLog: "off"
+
           # Fallback only. The output estimate is min(max_tokens, the group's
           # estimatedOutputTokens, else its EWMA of observed output tokens); this
           # applies when the group has neither.

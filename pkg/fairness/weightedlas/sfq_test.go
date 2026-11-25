@@ -329,12 +329,18 @@ func TestIdleEndpointDoesNotFreezeVirtualTime(t *testing.T) {
 	firstByte(p, once)
 	complete(p, once, 100, 64)
 
-	// a-group keeps e0 busy for a long time.
+	// a-group keeps e0 busy for a long time. Each request overlaps the next,
+	// so the pool never empties: an empty pool resets the clock (UNI-300),
+	// which is a different case.
+	var prev *fwksched.InferenceRequest
 	for i := 0; i < 200; i++ {
 		r := sfqRequest("a-group", nil, 64)
 		require.NoError(t, p.PreRequest(ctx, r, onEndpoint("e0")))
 		firstByte(p, r)
-		complete(p, r, 100, 64)
+		if prev != nil {
+			complete(p, prev, 100, 64)
+		}
+		prev = r
 		clock.advance(100 * time.Millisecond)
 	}
 	vNow := p.sfq.view(clock.now()).VirtualTime
@@ -422,6 +428,136 @@ func TestCompletionTrueUpMovesTheFinishTag(t *testing.T) {
 	complete(p, req, 100, 1000)
 	assert.InDelta(t, p.cost(100, 0, 1000)/2, p.sfq.view(clock.now()).FinishTags["a-group"], 1e-9,
 		"the finish tag carries the measured cost, undecayed")
+}
+
+// ---------------------------------------------------------------------------
+// UNI-300: rebasing and the idle reset
+// ---------------------------------------------------------------------------
+
+// The threshold rebase moves the internal clock and nothing else: every stamp
+// and every gap between finish tags is the one a never-rebased ledger
+// produces. The pool stays busy throughout (one request is always in
+// flight), so the idle reset never fires.
+func TestThresholdRebaseKeepsStampsAndGaps(t *testing.T) {
+	t.Parallel()
+	run := func(rebaseAt float64) ([]int64, sfqView) {
+		p, clock := newTestPlugin(t, sfqConfig())
+		if rebaseAt > 0 {
+			p.sfq.rebaseAt = rebaseAt
+		}
+		ctx := context.Background()
+		var stamps []int64
+		var prev *fwksched.InferenceRequest
+		for i := 0; i < 300; i++ {
+			g := "a-group"
+			if i%3 == 0 {
+				g = "b-group"
+			}
+			r := sfqRequest(g, nil, 64)
+			require.NoError(t, p.PreRequest(ctx, r, onEndpoint("e0")))
+			stamps = append(stamps, stamped(t, r))
+			firstByte(p, r)
+			if prev != nil {
+				complete(p, prev, 100, 20+i%50)
+			}
+			prev = r
+			clock.advance(10 * time.Millisecond)
+		}
+		return stamps, p.sfq.view(clock.now())
+	}
+	ref, refView := run(0)
+	got, view := run(100)
+	require.Equal(t, ref, got, "a rebase must not move any stamp")
+	assert.Zero(t, refView.WireBase)
+	assert.Positive(t, view.WireBase, "the run must cross the threshold, or nothing was rebased")
+	assert.Less(t, view.VirtualTime, 100.0+1)
+	assert.InDelta(t, refView.FinishTags["a-group"]-refView.FinishTags["b-group"],
+		view.FinishTags["a-group"]-view.FinishTags["b-group"], 1e-6, "gaps between groups are preserved")
+	assert.InDelta(t, refView.VirtualTime, view.VirtualTime+float64(view.WireBase)/sfqTagScale, 1e-6)
+	assert.Zero(t, view.Epoch)
+}
+
+// Once nothing is in flight, the next dispatch starts a new epoch: V and every
+// finish tag back to 0, and the stamp with them.
+func TestIdlePoolResetsTheLedger(t *testing.T) {
+	t.Parallel()
+	p, clock := newTestPlugin(t, sfqConfig())
+	ctx := context.Background()
+	a, b := sfqRequest("a-group", nil, 64), sfqRequest("b-group", nil, 64)
+	require.NoError(t, p.PreRequest(ctx, a, onEndpoint("e0")))
+	require.NoError(t, p.PreRequest(ctx, b, onEndpoint("e1")))
+	firstByte(p, a)
+	firstByte(p, b)
+	complete(p, a, 100, 64)
+	complete(p, b, 100, 1000) // b goes idle well ahead
+	before := p.sfq.view(clock.now())
+	require.Positive(t, before.FinishTags["b-group"]-before.VirtualTime, "b-group must go idle in debt")
+
+	clock.advance(time.Hour)
+	again := sfqRequest("b-group", nil, 64)
+	require.NoError(t, p.PreRequest(ctx, again, onEndpoint("e0")))
+	assert.Zero(t, stamped(t, again), "the debt from the last busy period does not carry")
+	view := p.sfq.view(clock.now())
+	assert.EqualValues(t, 1, view.Epoch)
+	assert.Zero(t, view.VirtualTime)
+	assert.NotContains(t, view.FinishTags, "a-group")
+}
+
+// Not while a request presumed lost might still be queued in vLLM with an old
+// stamp: the reset waits one more settleTimeout after the reap. Until then the
+// worst-case charge stays on the books. A completion that turns up after the
+// reset settles without touching the new epoch.
+func TestPresumedLostRequestHoldsOffTheReset(t *testing.T) {
+	t.Parallel()
+	cfg := sfqConfig()
+	cfg.SFQSettleTimeoutSeconds = 60
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+
+	lost := sfqRequest("a-group", nil, 1024)
+	require.NoError(t, p.PreRequest(ctx, lost, onEndpoint("e0")))
+	clock.advance(61 * time.Second)
+	probe := sfqRequest("b-group", nil, 64) // reaps lost, which leaves e0 idle
+	require.NoError(t, p.PreRequest(ctx, probe, onEndpoint("e1")))
+	complete(p, probe, 100, 64)
+
+	clock.advance(30 * time.Second)
+	held := sfqRequest("b-group", nil, 64)
+	require.NoError(t, p.PreRequest(ctx, held, onEndpoint("e1")))
+	view := p.sfq.view(clock.now())
+	assert.Zero(t, view.Epoch, "a reaped request 30 s ago must hold the reset off")
+	assert.InDelta(t, p.cost(100, 0, 1024)/2, view.FinishTags["a-group"], 1e-9, "and its worst-case charge stands")
+	complete(p, held, 100, 64)
+
+	clock.advance(31 * time.Second)
+	fresh := sfqRequest("a-group", nil, 64)
+	require.NoError(t, p.PreRequest(ctx, fresh, onEndpoint("e0")))
+	assert.Zero(t, stamped(t, fresh))
+	assert.EqualValues(t, 1, p.sfq.view(clock.now()).Epoch)
+	after := p.sfq.view(clock.now()).FinishTags["a-group"]
+
+	complete(p, lost, 100, 200) // the old epoch's completion turns up late
+	assert.Equal(t, after, p.sfq.view(clock.now()).FinishTags["a-group"],
+		"a ticket from an earlier epoch must not move this epoch's finish tag")
+}
+
+// The stamp saturates at vLLM's real ceiling, 2^63-1, rather than wrapping
+// negative, which would put the request at the front of every queue.
+func TestStampSaturatesAtTheVLLMCeiling(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, int64(math.MaxInt64), addSaturating(math.MaxInt64-5, 10))
+	assert.Equal(t, int64(math.MaxInt64), addSaturating(math.MaxInt64, math.MaxInt64))
+	assert.Equal(t, int64(15), addSaturating(5, 10))
+	assert.Equal(t, maxQuantisedTag, quantiseTag(1e300))
+
+	p, _ := newTestPlugin(t, sfqConfig())
+	ctx := context.Background()
+	first := sfqRequest("a-group", nil, 64)
+	require.NoError(t, p.PreRequest(ctx, first, onEndpoint("e0"))) // keeps the pool busy
+	p.sfq.wireBase = math.MaxInt64 - 10
+	r := sfqRequest("a-group", nil, 64)
+	require.NoError(t, p.PreRequest(ctx, r, onEndpoint("e0")))
+	assert.Equal(t, int64(math.MaxInt64), stamped(t, r))
 }
 
 // ---------------------------------------------------------------------------

@@ -1033,10 +1033,81 @@ Calibration is out of scope here.
    already-parsed flag set. It refuses to start if the setting is on, **or if
    it cannot find the config to check**.
 
+**Bounding the stamp: rebase and idle reset (UNI-300).** V only ever
+increases, and the stamp is V-scale times 1000, so something has to stop it
+reaching a ceiling. The ceiling was measured, not assumed. vLLM 0.24.0+rhaiv.9
+declares `priority: int` with `le=2^63-1`: 2^63-1 is served, 2^63 is a 400.
+Integer literals arrive exact at the scheduler's heap compare, 2^53+1
+included (in-pod check of vLLM's own parse, msgpack and compare path). The
+one silent failure is a *float-formatted* value above 2^53, which rounds.
+The stamp is an `int64` marshalled as an integer literal, so that does not
+happen on this path.
+
+The failure being prevented is silent. A clamped stamp ties with every other
+clamped stamp, ties go by arrival, and arrival order is FIFO. No error is
+raised. Time to reach the ceiling under continuous saturation, with V's rate
+taken as pool cost rate over the contending weight. The token-model
+anchor was measured: 320 tag units/s live on 16 slots at weights
+20/10/65, where C/Σw predicts 326. Large requests assume 50k-token
+prompts, 4k-token outputs at ~30 tok/s per sequence.
+
+| cost model, sizes | slots | Σw contending | to 2^53 (before) | to 2^63-1 (now) |
+|---|---|---|---|---|
+| token, today's | 800 | 95 / 15 | 18 y / 3 y | 17,900 y / 2,800 y |
+| token, 50k / 4k | 800 | 95 / 15 | 81 y / 13 y | 82,800 y / 13,000 y |
+| vramtime, today's | 800 | 95 / 15 | 113 d / 18 d | 317 y / 50 y |
+| vramtime, 50k / 4k | 800 | 95 / 15 | **8 d / 31 h** | 23 y / 4 y |
+
+Weights are not normalised, so V's rate scales with 1/Σw: the same shares
+written as 0.2/0.1/0.65 run the clock 100 times faster. In the token model,
+larger requests make V *slower*, not faster. Cost is linear in tokens, so its
+rate is bounded by token throughput, and long decodes have less of that than
+today's prefill-heavy traffic.
+
+Two mechanisms, for two different jobs:
+
+- **Threshold rebase** (`sfqState.rebase`, at V >= 2^30 tag units).
+  Subtracts the integer part of V from V, every F_g and every endpoint's
+  newest start, and adds it to `wireBase`. The stamp is `wireBase` plus the
+  quantised internal tag, so **no stamp moves**. That is the requirement,
+  not a nicety. vLLM already holds requests stamped on the old numbering
+  and cannot renumber them. A rebase that let the stamp drop would sort
+  every later request ahead of all of them.
+  `TestSFQSimRebaseIsInvisible` rebases every 50 tag units, hundreds of
+  times a run, and the stamped priorities match the no-rebase run request
+  for request. Its power check drops the stamp instead: in the flood that
+  took max e2e from 110 s to 257 s and app2 to 5% against 10.5%. What the
+  rebase buys is internal tags that stay small and exact, so the stamp can
+  use vLLM's whole range, 1024 times the old headroom.
+- **Idle reset** (`sfqState.resetIfIdle`). Once no endpoint has a request
+  in flight, the next dispatch starts a new epoch: V, every F_g and the
+  stamp go back to 0. This is SFQ's published busy-period rule (Goyal, Vin
+  and Cheng 1996: at the end of a busy period V is set to the largest finish
+  tag, which levels every flow). It is the board's "numbers go back to 0".
+  Without it, V froze across the idle, and `max(F_g, V)` erased stale credit
+  but kept stale debt. `TestSFQSimIdleResetsTheLedger` measures that debt.
+  With fixed-size requests a tenant goes idle about one request ahead, and
+  nothing measurable follows. With variable output lengths, the requests
+  still running when traffic stops are the long, under-estimated ones,
+  trued up after V stopped. In the sim app1 went idle 709 tag units
+  ahead, then waited 13.3 s for its first request after the idle (others
+  ~0.6 s) and got 0% of the first 10 s. With the reset it waited 0.17 s.
+  The delay is debt over V's rate, so it is bounded and does not grow with
+  the idle. It does grow with request duration and with Σw over the
+  tenant's weight, and it recurred every episode.
+  A request presumed lost (reaped) holds the reset off for one more
+  `sfqSettleTimeoutSeconds`. It may still be queued in vLLM with an old
+  stamp, and its worst-case charge should not vanish across a short idle.
+
+Under saturation that never idles, only the threshold rebase runs, and the
+stamp's headroom is the right-hand column. An EPP restart also resets the
+ledger (see Limits). `_sfq_rebases_total{reason="threshold"|"idle"}`
+counts both. `_sfq_stamped_priority` approaching 9.2e18 is the alert.
+
 **Observability.** Metrics `maas_fairness_sfq_enabled`, `_sfq_virtual_time`,
 `_sfq_serving_endpoints`, `_sfq_finish_tag{fairness_id}`,
 `_sfq_lag{fairness_id}` (F - V), `_sfq_stamped_priority{fairness_id}`,
-`_sfq_unsettled_total`, `_sfq_unstampable_total`. Response header
+`_sfq_unsettled_total`, `_sfq_rebases_total{reason}`, `_sfq_unstampable_total`. Response header
 `x-maas-fairness-priority` (when `emitAttributionHeaders`). Flight-recorder
 fields `sfqVirtualTime` and `sfqFinishTag`. V(4) fields `sfqPriority` and
 `sfqStartTag`. A `sfq` section in the `StateDumper` output with every
@@ -1045,9 +1116,14 @@ endpoint's in-flight count, newest start and serving flag.
 **Limits, stated plainly.**
 - One EPP replica is one clock. Two replicas would stamp tags that cannot
   be compared. The EPP is `replicas: 1` today.
-- An EPP restart resets every tag to 0. For as long as the old high-tag
-  requests stay queued in vLLM, new requests jump them. The impact is one
-  queue drain, not lasting.
+- An EPP restart resets every tag to 0 while requests stamped by the old
+  process may still be queued in vLLM. New requests sort ahead of them, and
+  under sustained saturation they wait until the new stamps climb back to
+  theirs, roughly as long as V took to get there, or until the saturation
+  ends. That is the mechanism of the rejected rebase arm in
+  `TestSFQSimRebaseIsInvisible`. UNI-300 corrected an earlier "one queue
+  drain" estimate here. The idle reset bounds it to the current busy
+  period, but does not remove it.
 - Nothing here changes vLLM. The stamp does nothing until the pool runs
   `--scheduling-policy priority`. Whether the shipped RH image exposes that
   flag is UNI-292.

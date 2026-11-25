@@ -202,7 +202,7 @@ var (
 		prometheus.GaugeOpts{
 			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
 			Name:      metricPrefix + "sfq_stamped_priority",
-			Help:      help("The integer priority most recently written into a request body for the group (start tag x 1000)."),
+			Help:      help("The integer priority most recently written into a request body for the group (start tag x 1000, plus what threshold rebases have subtracted from the internal clock)."),
 		}, []string{"fairness_id"})
 
 	// Lost completions, charged at worst case. On a cluster where PreStop
@@ -213,6 +213,15 @@ var (
 			Name:      metricPrefix + "sfq_unsettled_total",
 			Help:      help("Requests with no completion observed within sfqSettleTimeoutSeconds, charged their worst-case cost on the finish tag."),
 		}, []string{"fairness_id"})
+
+	// UNI-300. threshold: the internal clock was rebased, stamps unchanged.
+	// idle: the pool emptied and a new epoch started from zero.
+	sfqRebases = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_rebases_total",
+			Help:      help("Virtual-clock rebases, by reason: threshold (internal clock rebased, stamps unchanged) or idle (the pool emptied, so V and every finish tag restarted at 0)."),
+		}, []string{"reason"})
 
 	sfqUnstampable = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -253,6 +262,7 @@ func collectors() []prometheus.Collector {
 		sfqLag,
 		sfqStampedPriority,
 		sfqUnsettled,
+		sfqRebases,
 		sfqUnstampable,
 		clientPriorityOverwritten,
 	}

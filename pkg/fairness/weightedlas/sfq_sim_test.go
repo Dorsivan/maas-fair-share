@@ -106,6 +106,19 @@ type sfqSimParams struct {
 	hold    int
 	tabPick bool
 	noClamp bool
+
+	// snapAt > 0 records each tenant's lag (F_g - V) as the first event at or
+	// after snapAt is about to be processed. UNI-300 uses it to read the
+	// state a second saturation episode inherits.
+	snapAt float64
+	// noIdleReset keeps V and every F_g across a fully idle pool, as before
+	// UNI-300.
+	noIdleReset bool
+	// rebaseAt overrides the threshold rebase (tag units); 0 keeps the
+	// default. naiveRebase subtracts V from the stamp too, which is what a
+	// rebase would do if it ignored the tags already queued in vLLM.
+	rebaseAt    float64
+	naiveRebase bool
 }
 
 func sfqSimBase(workers int) sfqSimParams {
@@ -172,6 +185,21 @@ type sfqSimResult struct {
 	served     []sfqSimServed
 	throughput float64
 	reqs       map[string]int
+	lag        map[string]float64 // F_g - V at snapAt
+	prios      []int64            // every stamped priority, in dispatch order
+	epochs     uint64             // idle resets over the run
+}
+
+// firstStart is when tn's first request starting at or after from began
+// service, relative to from. -1 if none did.
+func (r sfqSimResult) firstStart(tn string, from float64) float64 {
+	best := -1.0
+	for _, s := range r.served {
+		if s.tenant == tn && s.started >= from && (best < 0 || s.started-from < best) {
+			best = s.started - from
+		}
+	}
+	return best
 }
 
 // share is the slot-second composition of requests that started in [from, to).
@@ -242,6 +270,10 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 	cfg.NewcomerClamp = !prm.noClamp
 	p, clock := newTestPlugin(t, cfg)
 	p.sfq.noTrueUp, p.sfq.vMax, p.sfq.tabPick = prm.noTrueUp, prm.vMax, prm.tabPick
+	p.sfq.noIdleReset, p.sfq.naiveRebase = prm.noIdleReset, prm.naiveRebase
+	if prm.rebaseAt > 0 {
+		p.sfq.rebaseAt = prm.rebaseAt
+	}
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(prm.seed))
 	at := func(s float64) { clock.t = testBasis.Add(time.Duration(s * float64(time.Second))) }
@@ -313,6 +345,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		since[best]++
 		require.NoError(t, p.PreRequest(ctx, r.req, results[best]))
 		r.prio = r.req.Body.Payload.(fwkrh.PayloadMap)["priority"].(int64)
+		res.prios = append(res.prios, r.prio)
 		waiting[best] = append(waiting[best], r)
 		admit(best, now)
 	}
@@ -407,8 +440,10 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 			submit(tn, 0)
 		}
 	}
-	for tn, w := range prm.idle {
-		if w[0] > 0 {
+	// In tenant order, not map order: tenants returning at the same instant
+	// must submit in the same order every run.
+	for _, tn := range sfqSimTenants {
+		if w, ok := prm.idle[tn]; ok && w[0] > 0 {
 			push(sfqSimEvent{at: w[1], ep: -1, tn: tn})
 		}
 	}
@@ -420,6 +455,13 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 			break
 		}
 		at(ev.at)
+		if prm.snapAt > 0 && res.lag == nil && ev.at >= prm.snapAt {
+			v := p.sfq.view(clock.t)
+			res.lag = map[string]float64{}
+			for _, tn := range sfqSimTenants {
+				res.lag[tn] = v.FinishTags[tn] - v.VirtualTime
+			}
+		}
 		if ev.ep < 0 {
 			for n := outstanding[ev.tn]; n < prm.workers[ev.tn]; n++ {
 				submit(ev.tn, ev.at)
@@ -445,6 +487,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		}
 	}
 	res.throughput = float64(completed) / prm.duration
+	res.epochs = p.sfq.view(clock.t).Epoch
 	return res
 }
 
@@ -785,5 +828,113 @@ func TestSFQSimHoldReturnNeedsNoClamp(t *testing.T) {
 		sfqSimLog(t, "app2 "+sc.name+" at 250 s behind EPP hold, Pick by tab, no clamp: first 30 s", bare, bfirst, all)
 		assert.Greater(t, bfirst["app2"], all["app2"]+10,
 			"%s: the tab without a clamp must burst, or this test proves nothing", sc.name)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// UNI-300: rebasing, and resetting the clock when the pool goes idle
+// ---------------------------------------------------------------------------
+
+// Part 4: a threshold rebase leaves every stamp where it was. rebaseAt 50 tag
+// units rebases the internal clock every ~1.5 s (hundreds of times a run);
+// the stamped priorities must match the no-rebase run exactly, request for
+// request, so the composition is the same run, not a similar one. The power
+// check is a rebase that also drops the stamp back towards zero, ignoring
+// the requests already queued in vLLM on the old numbering: every request
+// after it sorts ahead of all of them. Measured: in the flood, max e2e 110 s
+// -> 257 s and app2 4-6% against 10.5%.
+func TestSFQSimRebaseIsInvisible(t *testing.T) {
+	t.Parallel()
+	all := sfqSimTarget(sfqSimTenants)
+	for _, workers := range []int{32, 256} {
+		ref := runSFQSim(t, sfqSimBase(workers))
+		prm := sfqSimBase(workers)
+		prm.rebaseAt = 50
+		r := runSFQSim(t, prm)
+		refSh, sh := ref.share(30, 300), r.share(30, 300)
+		sfqSimLog(t, fmt.Sprintf("%d workers, no rebase", workers), ref, refSh, all)
+		sfqSimLog(t, fmt.Sprintf("%d workers, internal clock rebased every 50 tag units", workers), r, sh, all)
+		require.Equal(t, ref.prios, r.prios, "%d workers: a rebase must not move any stamp", workers)
+		assert.Equal(t, refSh, sh)
+		assert.Greater(t, ref.prios[len(ref.prios)-1], int64(50*sfqTagScale*100),
+			"the run must go far past the threshold, or nothing was rebased")
+	}
+
+	ref := runSFQSim(t, sfqSimBase(256))
+	prm := sfqSimBase(256)
+	prm.rebaseAt, prm.naiveRebase = 2000, true
+	naive := runSFQSim(t, prm)
+	sh := naive.share(30, 300)
+	sfqSimLog(t, "256 workers, rebase that also drops the stamp (rejected)", naive, sh, all)
+	t.Logf("max e2e: %.1f s without a rebase, %.1f s with the rejected rebase", ref.maxE2E(30, 300), naive.maxE2E(30, 300))
+	assert.Greater(t, naive.maxE2E(30, 300), 2*ref.maxE2E(30, 300),
+		"dropping the stamp must strand the requests already queued, or this test proves nothing")
+	assert.Greater(t, sfqSimDev(sh, all), 2.0)
+}
+
+// Part 5: should the ledger reset when saturation ends? All tenants saturate,
+// then app2 and end-users stop at 100 s and app1 runs alone to 150 s: the
+// heavy morning tenant. Then the pool is fully idle until 450 s, far past
+// every endpoint dropping out. End-users and app2 return at 450 s and app1 at
+// 451 s, so app1 arrives into a queue it has to compete for.
+//
+// Before UNI-300, V froze across the idle and every F_g kept its value. The
+// returning tenants with F_g below V restart at V: their stale credit is
+// erased. A tenant with F_g above V keeps the difference: its stale debt
+// carries into the next episode.
+//
+// How much debt there is depends on what was in flight when traffic stopped.
+// With every request costing what it was estimated at ("fixed"), app1 goes
+// idle one request ahead (7.2 tag units) and nothing measurable happens.
+// The asymmetry is real but self-correcting. With variable output
+// ("variable": three 0.05x requests to one 10x, estimated from the average),
+// the requests still running when traffic stopped are the long ones. They
+// were estimated low and trued up on completion, after V had stopped
+// moving. Measured: app1 went idle 709 tag units ahead and, without the
+// reset, waited 13.3 s for its first request against ~0.6 s for the others,
+// and served 0% of the first 10 s. The delay is the debt over V's rate, not
+// the length of the idle. At production sizes it scales with request
+// duration and with total weight over the tenant's weight.
+//
+// With the reset it waited 0.17 s.
+func TestSFQSimIdleResetsTheLedger(t *testing.T) {
+	t.Parallel()
+	all := sfqSimTarget(sfqSimTenants)
+	run := func(variable, noReset bool) sfqSimResult {
+		prm := sfqSimBase(32)
+		prm.duration, prm.snapAt, prm.noIdleReset = 600, 450, noReset
+		prm.idle = map[string][2]float64{"app1": {150, 451}, "app2": {100, 450}, "end-users": {100, 450}}
+		if variable {
+			prm.maxTokens = 1024
+			prm.gamer, prm.gamerLong = "app1", 10
+		}
+		return runSFQSim(t, prm)
+	}
+	for _, variable := range []bool{false, true} {
+		name := "fixed"
+		if variable {
+			name = "variable"
+		}
+		for _, noReset := range []bool{true, false} {
+			r := run(variable, noReset)
+			arm := "idle reset"
+			if noReset {
+				arm = "no reset (before UNI-300)"
+			}
+			t.Logf("%s, %s: lag at idle %.1f/%.1f/%.1f, first start after return app1 %.2f s, app2 %.2f s, end-users %.2f s, %d resets",
+				name, arm, r.lag["app1"], r.lag["app2"], r.lag["end-users"],
+				r.firstStart("app1", 451), r.firstStart("app2", 450), r.firstStart("end-users", 450), r.epochs)
+			sfqSimLog(t, fmt.Sprintf("  %s, %s: first 10 s", name, arm), r, r.share(451, 461), all)
+			sfqSimLog(t, fmt.Sprintf("  %s, %s: 481-600 s", name, arm), r, r.share(481, 600), all)
+			assert.Less(t, sfqSimDev(r.share(481, 600), all), 3.0, "%s %s", name, arm)
+			switch {
+			case noReset && variable:
+				assert.Greater(t, r.lag["app1"], 100.0, "app1 must go idle in debt, or this test proves nothing")
+				assert.Greater(t, r.firstStart("app1", 451), 5.0, "the stale debt must delay app1, or this test proves nothing")
+			case !noReset:
+				assert.EqualValues(t, 1, r.epochs)
+				assert.Less(t, r.firstStart("app1", 451), 1.0, "%s: no debt survives the reset", name)
+			}
+		}
 	}
 }

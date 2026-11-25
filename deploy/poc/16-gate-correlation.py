@@ -44,6 +44,7 @@ schedule/weights machinery there is built for whole-run and phase-aware
 share tables, not a two-bucket gate-state split).
 """
 import argparse
+import importlib.util
 import os
 import re
 import sys
@@ -211,14 +212,27 @@ def main():
                          "Default 1.0 -- the gauge is already normalized against "
                          "queueDepthThreshold/kv threshold, this is NOT a raw queue "
                          "depth number.")
-    ap.add_argument("--weights", default="app1=20,app2=10,end-users=65",
-                    help="comma-separated group=weight, default matches "
-                         "deploy/poc/00-config.yaml's 3-group config")
+    ap.add_argument("--tenants", default=None,
+                    help="UNI-305: tenant manifest (deploy/poc/tenants/*.tenants) the run used; "
+                         "supplies --weights, and --workers if its workers column is filled. "
+                         "Default deploy/poc/tenants/default.tenants")
+    ap.add_argument("--weights", default=None,
+                    help="comma-separated group=weight; overrides the manifest's")
     ap.add_argument("--workers", default=None,
-                    help="comma-separated group=workers offered this run. No default "
-                         "-- required to get an explicit bypass-confirmed/dead verdict; "
+                    help="comma-separated group=workers offered this run. Required (here or "
+                         "in the manifest) to get an explicit bypass-confirmed/dead verdict; "
                          "omit to get bucket compositions and weight-distance only")
     args = ap.parse_args()
+
+    spec = importlib.util.spec_from_file_location(
+        "tenants", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tenants.py"))
+    tenants_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tenants_mod)
+    manifest = tenants_mod.load_manifest(args.tenants)
+    if args.weights is None:
+        args.weights = ",".join(f"{t['group']}={tenants_mod.fmt_num(t['weight'])}" for t in manifest)
+    if args.workers is None and all(t["workers"] is not None for t in manifest):
+        args.workers = ",".join(f"{t['group']}={t['workers']}" for t in manifest)
 
     ts_path = os.path.join(args.results_dir, "metrics-timeseries.txt")
     if not os.path.exists(ts_path):

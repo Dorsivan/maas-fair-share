@@ -20,6 +20,11 @@
 # Overrides: GW, MODELPATH, DURATION, RATE_APP1, RATE_APP2, RATE_END_USERS,
 # SEED, OUT, NAMESPACE.
 #
+# Tenants (UNI-305): TENANT_MANIFEST names the tenant set, default
+# deploy/poc/tenants/default.tenants (app1/app2/end-users). Each group's rate
+# is RATE_<TOKEN> (RATE_APP1, RATE_END_USERS, RATE_APP3, ...), else the
+# manifest's rate column, else 0 (not offered).
+#
 # EPP container log (UNI-46): for the duration of the run, the GPU EPP
 # container log is followed into $OUT/epp-container.log, bounded to start
 # when the generator starts and stop when it exits -- this POC cluster has no
@@ -44,9 +49,7 @@ NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
 GW="${GW:-http://maas-poc-gateway-data-science-gateway-class.${NAMESPACE}.svc.cluster.local}"
 MODELPATH="${MODELPATH:-/${NAMESPACE}/maas-vllm-gpu}"
 DURATION="${DURATION:-240}"
-RATE_APP1="${RATE_APP1:-0}"
-RATE_APP2="${RATE_APP2:-0}"
-RATE_END_USERS="${RATE_END_USERS:-0}"
+TENANT_MANIFEST="${TENANT_MANIFEST:-$(dirname "${BASH_SOURCE[0]}")/tenants/default.tenants}"
 SEED="${SEED:-1}"
 OUT="${OUT:-/tmp/poisson-codes-$(date +%s)}"
 MAX_WORKERS="${MAX_WORKERS:-1000}"
@@ -83,7 +86,27 @@ KEYS="$(mktemp -d)"
 # exactly once. SIGKILL (-9) still cannot be trapped by any process.
 trap cleanup EXIT
 trap 'exit 1' INT TERM HUP
-for k in app1-production app2-batch end-user-alpha end-user-beta; do
+# One --tenant GROUP=RATE=KEYFILE[,KEYFILE] per manifest group, rate-0 groups
+# included: the generator logs them as offered nothing, as it always has for
+# app1/app2/end-users.
+SPECS="$(python3 -I "$SCRIPT_DIR/tenants.py" loadgen-groups "$TENANT_MANIFEST")"
+RATES="$(python3 -I "$SCRIPT_DIR/tenants.py" rates "$TENANT_MANIFEST")"
+TENANT_ARGS=()
+ALL_KEYS=()
+while read -r g manifest_rate; do
+  tok="${g^^}"; tok="${tok//[^A-Z0-9]/_}"
+  v="RATE_$tok"
+  keys=""
+  for spec in $SPECS; do [ "${spec%%:*}" = "$g" ] && keys="${spec##*:}"; done
+  keyfiles=""
+  for k in ${keys//,/ }; do
+    keyfiles="${keyfiles:+$keyfiles,}$KEYS/$k"
+    case " ${ALL_KEYS[*]-} " in *" $k "*) ;; *) ALL_KEYS+=("$k") ;; esac
+  done
+  TENANT_ARGS+=(--tenant "$g=${!v:-$manifest_rate}=$keyfiles")
+done <<< "$RATES"
+
+for k in "${ALL_KEYS[@]}"; do
   $OC get secret maas-loadgen-keys -n "$NAMESPACE" -o jsonpath="{.data.$k}" | base64 -d > "$KEYS/$k"
 done
 
@@ -220,9 +243,7 @@ start_epp_log_capture
 set +e
 python3 "$SCRIPT_DIR/13-loadgen-poisson.py" \
   --gw "$GW" --modelpath "$MODELPATH" --duration "$DURATION" \
-  --rate-app1 "$RATE_APP1" --rate-app2 "$RATE_APP2" --rate-end-users "$RATE_END_USERS" \
-  --key-app1 "$KEYS/app1-production" --key-app2 "$KEYS/app2-batch" \
-  --key-end-alpha "$KEYS/end-user-alpha" --key-end-beta "$KEYS/end-user-beta" \
+  "${TENANT_ARGS[@]}" \
   --out "$OUT" --seed "$SEED" --max-workers "$MAX_WORKERS" --drain-timeout "$DRAIN_TIMEOUT" \
   --client-timeout "$CLIENT_TIMEOUT"
 GEN_STATUS=$?

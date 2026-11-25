@@ -20,6 +20,12 @@
 #             structurally the highest hit rate, which is exactly why the
 #             discount is coupled to the group weights.
 #
+# UNI-305: the tenant -> shape table is PROFILE_TENANTS (below), one
+# "<key>[,<key>...]:<group>:<shape>" entry per tenant, and its default is the
+# three-tenant set above. For any other tenant manifest, generate it with
+#   python3 -I deploy/poc/tenants.py cache-profile deploy/poc/tenants/<set>.tenants
+# and set it on the Job.
+#
 # If the three come out materially different, cachedInputTokenWeight is a real
 # differential lever and lowering it would re-price end-users against the
 # others. If they come out the same, it is a no-op however it is set.
@@ -60,10 +66,15 @@ data:
       done
     }
 
+    PROFILE_TENANTS="${PROFILE_TENANTS:-app1-production:app1:fixed app2-batch:app2:unique end-user-alpha,end-user-beta:end-users:long}"
+    # Worker i of a multi-key group sends with key (i mod n): for end-users
+    # that is the original even=alpha / odd=beta split.
     for i in $(seq 1 "$W"); do
-      worker app1-production app1      fixed  &
-      worker app2-batch      app2      unique &
-      if [ $((i % 2)) -eq 0 ]; then worker end-user-alpha end-users long & else worker end-user-beta end-users long & fi
+      for spec in $PROFILE_TENANTS; do
+        IFS=: read -r keys group shape <<< "$spec"
+        IFS=, read -r -a k <<< "$keys"
+        worker "${k[$(( i % ${#k[@]} ))]}" "$group" "$shape" &
+      done
     done
     wait
     echo "done:"; for f in "$OUT"/*; do printf '  %-12s %s\n' "$(basename "$f")" "$(sort "$f" | uniq -c | tr '\n' ' ')"; done
@@ -85,6 +96,8 @@ spec:
           env:
             - {name: DURATION, value: "180"}
             - {name: WORKERS,  value: "8"}
+            # UNI-305: unset = the three-tenant default in run.sh.
+            # - {name: PROFILE_TENANTS, value: "app1-production:app1:fixed app2-batch:app2:unique end-user-alpha,end-user-beta:end-users:long"}
           volumeMounts:
             - {name: script, mountPath: /script}
             - {name: keys, mountPath: /keys, readOnly: true}

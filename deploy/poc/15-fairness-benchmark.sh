@@ -370,7 +370,7 @@
 # every scenario before this ticket byte-for-byte unaffected.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations kv-cache-fill shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; scenarios: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations kv-cache-fill shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating manifest}"
 LABEL="${2:-$SCENARIO}"
 
 # UNI-174: computed this early (rather than just before the manifest-resolve
@@ -1589,8 +1589,23 @@ case "$SCENARIO" in
     PER_TENANT_OVERRIDES=(WORKERS_APP1=400)
     WORKERS="${WORKERS:-50}"
     ;;
+  manifest)
+    # UNI-305: the tenant set, each group's keys and (optionally) its worker
+    # count come from TENANT_MANIFEST (deploy/poc/tenants/*.tenants) instead
+    # of a case branch. The named scenarios above are unchanged. Before
+    # anything runs, the LIVE maas-epp-config's groups are checked against
+    # the manifest (see the preflight below the case statement): a group
+    # the EPP does not know falls to defaultGroup and scores against a target
+    # nobody configured. Apply the manifest's config first with
+    #   python3 -I deploy/poc/tenants.py render-config "$TENANT_MANIFEST" | oc apply -f -
+    # A blank workers column means WORKERS (default 32) or WORKERS_<TOKEN>.
+    : "${TENANT_MANIFEST:?the manifest scenario requires TENANT_MANIFEST=deploy/poc/tenants/<set>.tenants}"
+    TENANTS="$(python3 -I "$(dirname "$0")/tenants.py" names "$TENANT_MANIFEST")"
+    LOADGEN_GROUPS="$(python3 -I "$(dirname "$0")/tenants.py" loadgen-groups "$TENANT_MANIFEST")"
+    PER_TENANT_OVERRIDES=()
+    ;;
   *)
-    echo "unknown scenario: $SCENARIO (expected one of: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations kv-cache-fill misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating)" >&2
+    echo "unknown scenario: $SCENARIO (expected one of: full-contention full-contention-discriminating full-contention-2x full-contention-2x-discriminating end-users-idle end-users-idle-discriminating equal-workers-control app1-alone app2-alone app2-idle app2-idle-discriminating app1-idle app1-idle-discriminating app2-trickle app2-trickle-discriminating asymmetric-demand below-capacity cache-heavy-vs-cache-cold max-tokens-skew asymmetric-request-shapes near-timeout-long-generations kv-cache-fill misclassified-prefix shadow-mode-control app1-flood app1-flood-moderate app1-flood-light app1-flood-2x app1-flood-3x app3-joins-at-saturation six-group-board-case twenty-group-scale uni165-equal-discriminating uni165-graded-discriminating uni165-subset-3-idle-discriminating uni165-equal-2x-discriminating twenty-group-scale-discriminating manifest)" >&2
     exit 1
     ;;
 esac
@@ -1605,6 +1620,20 @@ if [ "$ENFORCE_LIVE" = "true" ] && [ "$SHADOW_MODE" = "true" ]; then
 fi
 
 echo "[benchmark] scenario: $SCENARIO  artifact dir: $ARTIFACT_DIR"
+
+# UNI-305 preflight: a run that names a tenant manifest must be run against an
+# EPP config that agrees with it -- same groups, weights and match rules --
+# or the report scores observed shares against weights the EPP never had.
+# Read-only (one `oc get`), before anything is patched or launched. The
+# manifest is copied into the artifact dir so the run records who it offered.
+if [ -n "${TENANT_MANIFEST:-}" ]; then
+  if ! $OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}' \
+       | python3 -I "$(dirname "$0")/tenants.py" check "$TENANT_MANIFEST" --config -; then
+    echo "[benchmark] FATAL: live $CONFIGMAP_NAME in $NAMESPACE does not match $TENANT_MANIFEST (MISMATCH lines above)" >&2
+    exit 1
+  fi
+  cp "$TENANT_MANIFEST" "$ARTIFACT_DIR/tenants.manifest"
+fi
 
 METRICS_BEFORE="$ARTIFACT_DIR/metrics-before.txt"
 METRICS_AFTER="$ARTIFACT_DIR/metrics-after.txt"

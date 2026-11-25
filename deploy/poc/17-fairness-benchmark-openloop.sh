@@ -23,6 +23,9 @@
 #
 # RATE_APP1/RATE_APP2/RATE_END_USERS are req/s Poisson means, passed straight
 # through to 13-loadgen-poisson.py -- 0 (the default) disables that tenant.
+# UNI-305: those are the default manifest's RATE_<TOKEN> names. For another
+# tenant set, set TENANT_MANIFEST=deploy/poc/tenants/<set>.tenants and
+# RATE_<TOKEN> per group (or the manifest's rate column); both are forwarded.
 # "Full-contention mix" (the only shape this ticket's B5 case uses) means all
 # three > 0, each at the SAME rate, per UNI-34's own methodology ("every
 # tenant must offer more load than its entitlement... size load so demand,
@@ -44,7 +47,7 @@
 # for why -- so this script does not duplicate it.
 set -euo pipefail
 
-SCENARIO="${1:?usage: $0 <scenario> [label]; set RATE_APP1/RATE_APP2/RATE_END_USERS and DURATION}"
+SCENARIO="${1:?usage: $0 <scenario> [label]; set RATE_<TOKEN> per tenant (RATE_APP1/RATE_APP2/RATE_END_USERS by default) and DURATION}"
 LABEL="${2:-$SCENARIO}"
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -55,9 +58,7 @@ BACKEND="${BACKEND:-vllm-gpu (real)}"
 THRESHOLD_POINTS="${THRESHOLD_POINTS:-10}"
 DURATION="${DURATION:-240}"
 SEED="${SEED:-1}"
-RATE_APP1="${RATE_APP1:-0}"
-RATE_APP2="${RATE_APP2:-0}"
-RATE_END_USERS="${RATE_END_USERS:-0}"
+TENANT_MANIFEST="${TENANT_MANIFEST:-$(dirname "$0")/tenants/default.tenants}"
 JOB_NAME="maas-loadgen"
 
 # --- Rule 1 (UNI-117 series): one benchmark on the GPU pool at a time. This
@@ -73,20 +74,28 @@ if [ -n "$ACTIVE" ] && [ "$ACTIVE" -ge 1 ] 2>/dev/null; then
   exit 1
 fi
 
-python3 -I -c "
-import sys
-rates = [float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])]
-sys.exit(0 if any(r > 0 for r in rates) else 1)
-" "$RATE_APP1" "$RATE_APP2" "$RATE_END_USERS" || {
-  echo "[openloop] FATAL: at least one of RATE_APP1/RATE_APP2/RATE_END_USERS must be > 0" >&2
+# Effective per-group rate, resolved the way 13-loadgen-poisson.sh will:
+# RATE_<TOKEN>, else the manifest's rate column, else 0.
+MANIFEST_RATES="$(python3 -I "$(dirname "$0")/tenants.py" rates "$TENANT_MANIFEST")"
+RATES_LINE=""; RATE_VARS=(); ANY_RATE=0
+while read -r g manifest_rate; do
+  tok="${g^^}"; tok="${tok//[^A-Z0-9]/_}"
+  v="RATE_$tok"
+  r="${!v:-$manifest_rate}"
+  RATES_LINE="$RATES_LINE $g=$r"
+  [ -n "${!v-}" ] && RATE_VARS+=("$v=${!v}")
+  python3 -I -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)' "$r" && ANY_RATE=1
+done <<< "$MANIFEST_RATES"
+if [ "$ANY_RATE" != 1 ]; then
+  echo "[openloop] FATAL: every tenant in $TENANT_MANIFEST has rate 0 -- set RATE_<TOKEN> (e.g. RATE_APP1) for at least one" >&2
   exit 1
-}
+fi
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 ARTIFACT_DIR="$(pwd)/results/${TS}-${LABEL}"
 mkdir -p "$ARTIFACT_DIR"
 echo "[openloop] scenario: $SCENARIO  artifact dir: $ARTIFACT_DIR"
-echo "[openloop] rates (req/s): app1=$RATE_APP1 app2=$RATE_APP2 end-users=$RATE_END_USERS  duration=${DURATION}s"
+echo "[openloop] rates (req/s):${RATES_LINE}  duration=${DURATION}s"
 
 EPP_POD="$($OC get pods -n "$NAMESPACE" -l "$EPP_SELECTOR" -o jsonpath='{.items[0].metadata.name}')"
 if [ -z "$EPP_POD" ]; then
@@ -113,7 +122,7 @@ set +e
 OPENSHIFT_TOKEN="$OPENSHIFT_TOKEN" OPENSHIFT_SERVER="${OPENSHIFT_SERVER:-https://api.ocp.paladinaura.com:6443}" \
   NAMESPACE="$NAMESPACE" EPP_POD_LABEL_SELECTOR="$EPP_SELECTOR" EPP_CONTAINER="$EPP_CONTAINER" \
   DURATION="$DURATION" SEED="$SEED" OUT="$ARTIFACT_DIR" \
-  RATE_APP1="$RATE_APP1" RATE_APP2="$RATE_APP2" RATE_END_USERS="$RATE_END_USERS" \
+  TENANT_MANIFEST="$TENANT_MANIFEST" env "${RATE_VARS[@]+"${RATE_VARS[@]}"}" \
   "$(dirname "$0")/13-loadgen-poisson.sh" 2>&1 | tee "$LOADGEN_LOG"
 GEN_STATUS="${PIPESTATUS[0]}"
 set -e

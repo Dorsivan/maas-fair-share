@@ -26,6 +26,7 @@
 #
 # Usage:
 #   OPENSHIFT_TOKEN=... ./24-patch-all-weights.sh <app1-weight> <app2-weight> <end-users-weight>
+#   OPENSHIFT_TOKEN=... ./24-patch-all-weights.sh app1=40 app2=20 app3=15 ...   (UNI-305: any groups)
 # Example (98/1/1 for UNI-226's prioritisation row):
 #   OPENSHIFT_TOKEN=... ./24-patch-all-weights.sh 98 1 1
 # Restore to baseline afterward:
@@ -45,9 +46,20 @@ CPU_LLMISVC_NAME="${CPU_LLMISVC_NAME:-maas-vllm-cpu}"
 WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-180}"
 OC="${OC:-oc}"
 
-W_APP1="${1:?usage: $0 <app1-weight> <app2-weight> <end-users-weight>}"
-W_APP2="${2:?usage: $0 <app1-weight> <app2-weight> <end-users-weight>}"
-W_END_USERS="${3:?usage: $0 <app1-weight> <app2-weight> <end-users-weight>}"
+# UNI-305: any group set, as <group>=<weight> pairs. Three bare numbers are
+# still accepted and mean app1, app2, end-users, so every existing caller
+# (22-/23- batches, docs/runbook.md) runs exactly as before.
+USAGE="usage: $0 <group>=<weight> [<group>=<weight> ...]   (or legacy: $0 <app1-weight> <app2-weight> <end-users-weight>)"
+PAIRS=()
+if [ "$#" -eq 3 ] && [[ "$1$2$3" != *=* ]]; then
+  PAIRS=("app1=$1" "app2=$2" "end-users=$3")
+else
+  [ "$#" -ge 1 ] || { echo "$USAGE" >&2; exit 2; }
+  for kv in "$@"; do
+    [[ "$kv" =~ ^[a-z0-9-]+=[0-9.]+$ ]] || { echo "bad pair '$kv'; $USAGE" >&2; exit 2; }
+    PAIRS+=("$kv")
+  done
+fi
 
 log() { echo "[patch-all-weights] $(date -u +%H:%M:%S) $*" >&2; }
 
@@ -67,15 +79,14 @@ trap 'rm -rf "$SCRATCH_DIR"' EXIT
 
 $OC get configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" -o jsonpath='{.data.epp}' > "$SCRATCH_DIR/before.yaml"
 
-python3 -I - "$SCRATCH_DIR/before.yaml" "$SCRATCH_DIR/after.yaml" \
-  "$W_APP1" "$W_APP2" "$W_END_USERS" << 'PYEOF'
+python3 -I - "$SCRATCH_DIR/before.yaml" "$SCRATCH_DIR/after.yaml" "${PAIRS[@]}" << 'PYEOF'
 import re
 import sys
 
-src, dst, w_app1, w_app2, w_end_users = sys.argv[1:6]
+src, dst = sys.argv[1:3]
 text = open(src).read()
 
-for group, val in (("app1", w_app1), ("app2", w_app2), ("end-users", w_end_users)):
+for group, val in (kv.split("=", 1) for kv in sys.argv[3:]):
     pat = re.compile(r"(\{\s*name:\s*" + re.escape(group) + r",\s*weight:\s*)[0-9.]+")
     text, n = pat.subn(lambda m: m.group(1) + val, text, count=1)
     if n == 0:
@@ -84,7 +95,7 @@ for group, val in (("app1", w_app1), ("app2", w_app2), ("end-users", w_end_users
 open(dst, "w").write(text)
 PYEOF
 
-log "patching $CONFIGMAP_NAME: app1=$W_APP1 app2=$W_APP2 end-users=$W_END_USERS"
+log "patching $CONFIGMAP_NAME: ${PAIRS[*]}"
 $OC patch configmap "$CONFIGMAP_NAME" -n "$NAMESPACE" --type=merge \
   -p "$(python3 -I -c "
 import json
@@ -120,17 +131,20 @@ read_weight() {
 }
 
 wait_for_weights() {
-  local svc_ip="$1" label="$2" waited=0 a1 a2 eu
+  local svc_ip="$1" label="$2" waited=0 kv got all read
   while :; do
-    a1="$(read_weight "$svc_ip" app1)"
-    a2="$(read_weight "$svc_ip" app2)"
-    eu="$(read_weight "$svc_ip" end-users)"
-    if [ "$a1" = "$W_APP1" ] && [ "$a2" = "$W_APP2" ] && [ "$eu" = "$W_END_USERS" ]; then
-      log "confirmed on $label: configured_weight app1=$a1 app2=$a2 end-users=$eu"
+    all=1; read=""
+    for kv in "${PAIRS[@]}"; do
+      got="$(read_weight "$svc_ip" "${kv%%=*}")"
+      read="${read:+$read }${kv%%=*}=${got:-?}"
+      [ "$got" = "${kv#*=}" ] || all=0
+    done
+    if [ "$all" = 1 ]; then
+      log "confirmed on $label: configured_weight $read"
       return 0
     fi
     if [ "$waited" -ge "$WAIT_TIMEOUT_SECONDS" ]; then
-      log "WARNING: timed out after ${WAIT_TIMEOUT_SECONDS}s waiting for $label to report app1=$W_APP1 app2=$W_APP2 end-users=$W_END_USERS (last read: app1=${a1:-?} app2=${a2:-?} end-users=${eu:-?})"
+      log "WARNING: timed out after ${WAIT_TIMEOUT_SECONDS}s waiting for $label to report ${PAIRS[*]} (last read: $read)"
       return 1
     fi
     sleep 2
@@ -149,4 +163,4 @@ if [ "$rc" -ne 0 ]; then
   exit 1
 fi
 
-log "done: $([ -n "$CPU_SVC_IP" ] && echo "both EPPs" || echo "the GPU EPP (no CPU EPP in $NAMESPACE)") confirmed app1=$W_APP1 app2=$W_APP2 end-users=$W_END_USERS"
+log "done: $([ -n "$CPU_SVC_IP" ] && echo "both EPPs" || echo "the GPU EPP (no CPU EPP in $NAMESPACE)") confirmed ${PAIRS[*]}"

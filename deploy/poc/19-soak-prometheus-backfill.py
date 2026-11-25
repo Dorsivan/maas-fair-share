@@ -52,13 +52,15 @@ Usage:
       --namespace maas-fairness-poc \\
       --pod maas-vllm-gpu-kserve-router-scheduler-58fd8c459d-bsl76 \\
       --job maas-vllm-gpu-epp-service \\
-      --weights app1=20,app2=10,end-users=65 \\
+      --tenants deploy/poc/tenants/default.tenants \\
       --threshold-pts 10 --window-seconds 300 \\
       --out-json results/<dir>/full-run-backfill.json \\
       --out-md results/<dir>/full-run-backfill.md
 """
 import argparse
 import bisect
+import importlib.util
+import os
 import json
 import subprocess
 import sys
@@ -121,7 +123,10 @@ def main():
     ap.add_argument("--namespace", required=True)
     ap.add_argument("--pod", required=True, help="EPP pod name at run time")
     ap.add_argument("--job", required=True, help="Prometheus job label for the EPP's /metrics scrape")
-    ap.add_argument("--weights", required=True, help="comma-separated group=weight for OFFERED groups only, e.g. app1=20,app2=10,end-users=65")
+    wg = ap.add_mutually_exclusive_group(required=True)
+    wg.add_argument("--weights", help="comma-separated group=weight for OFFERED groups only, e.g. app1=20,app2=10,end-users=65")
+    wg.add_argument("--tenants", help="UNI-305: tenant manifest (deploy/poc/tenants/*.tenants); every "
+                                      "group in it is taken as offered")
     ap.add_argument("--threshold-pts", type=float, default=10.0)
     ap.add_argument("--window-seconds", type=int, default=300)
     ap.add_argument("--out-json", required=True)
@@ -130,6 +135,12 @@ def main():
 
     start = parse_ts(args.start)
     end = parse_ts(args.end)
+    if args.tenants:
+        spec = importlib.util.spec_from_file_location(
+            "tenants", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tenants.py"))
+        tenants_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tenants_mod)
+        args.weights = ",".join(f"{t['group']}={t['weight']}" for t in tenants_mod.load_manifest(args.tenants))
     weights = dict(kv.split("=") for kv in args.weights.split(","))
     weights = {k: float(v) for k, v in weights.items()}
     active = list(weights.keys())

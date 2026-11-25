@@ -54,6 +54,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,7 +71,24 @@ import (
 var sfqSimWeights = map[string]float64{"app1": 20, "app2": 10, "end-users": 65}
 var sfqSimTenants = []string{"app1", "app2", "end-users"}
 
+// sfqSimTenant is one tenant of a sim run. UNI-305: the tenant set is a
+// parameter (sfqSimParams.tenants), so the sim runs any N; unset, it is the
+// POC's three above and every case behaves exactly as before.
+type sfqSimTenant struct {
+	name   string
+	weight float64
+}
+
+func sfqSimDefaultTenants() []sfqSimTenant {
+	out := make([]sfqSimTenant, len(sfqSimTenants))
+	for i, tn := range sfqSimTenants {
+		out[i] = sfqSimTenant{tn, sfqSimWeights[tn]}
+	}
+	return out
+}
+
 type sfqSimParams struct {
+	tenants   []sfqSimTenant // nil = sfqSimDefaultTenants()
 	workers   map[string]int
 	endpoints int
 	seqs      int
@@ -198,6 +216,7 @@ type sfqSimServed struct {
 }
 
 type sfqSimResult struct {
+	tenants    []string // in submission order
 	served     []sfqSimServed
 	starts     [][]float64 // per endpoint, every service start time
 	throughput float64
@@ -230,7 +249,7 @@ func (r sfqSimResult) share(from, to float64) map[string]float64 {
 		}
 	}
 	out := map[string]float64{}
-	for _, tn := range sfqSimTenants {
+	for _, tn := range r.tenants {
 		if tot > 0 {
 			out[tn] = 100 * sum[tn] / tot
 		}
@@ -249,13 +268,22 @@ func (r sfqSimResult) maxE2E(from, to float64) float64 {
 }
 
 func sfqSimTarget(present []string) map[string]float64 {
+	ts := make([]sfqSimTenant, len(present))
+	for i, tn := range present {
+		ts[i] = sfqSimTenant{tn, sfqSimWeights[tn]}
+	}
+	return sfqSimTargetOf(ts)
+}
+
+// sfqSimTargetOf is each tenant's weight share, in percent.
+func sfqSimTargetOf(ts []sfqSimTenant) map[string]float64 {
 	var s float64
-	for _, tn := range present {
-		s += sfqSimWeights[tn]
+	for _, t := range ts {
+		s += t.weight
 	}
 	out := map[string]float64{}
-	for _, tn := range present {
-		out[tn] = 100 * sfqSimWeights[tn] / s
+	for _, t := range ts {
+		out[t.name] = 100 * t.weight / s
 	}
 	return out
 }
@@ -269,7 +297,16 @@ func sfqSimDev(share, target map[string]float64) float64 {
 }
 
 func fmtShare(m map[string]float64) string {
-	return fmt.Sprintf("%.1f/%.1f/%.1f", m["app1"], m["app2"], m["end-users"])
+	return fmtShareOf(sfqSimTenants, m)
+}
+
+// fmtShareOf prints m's shares in the given tenant order, "a/b/c/...".
+func fmtShareOf(names []string, m map[string]float64) string {
+	parts := make([]string, len(names))
+	for i, tn := range names {
+		parts[i] = fmt.Sprintf("%.1f", m[tn])
+	}
+	return strings.Join(parts, "/")
 }
 
 func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
@@ -277,10 +314,15 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 	cfg := DefaultConfig()
 	cfg.StateLogIntervalSeconds = 0
 	cfg.SFQPriorityStamp = true
-	cfg.Groups = []GroupConfig{
-		{Name: "app1", Weight: 20, Match: GroupMatch{Exact: []string{"app1"}}},
-		{Name: "app2", Weight: 10, Match: GroupMatch{Exact: []string{"app2"}}},
-		{Name: "end-users", Weight: 65, Match: GroupMatch{Exact: []string{"end-users"}}},
+	tenantSet := prm.tenants
+	if tenantSet == nil {
+		tenantSet = sfqSimDefaultTenants()
+	}
+	tenants := make([]string, len(tenantSet))
+	cfg.Groups = nil
+	for i, ts := range tenantSet {
+		tenants[i] = ts.name
+		cfg.Groups = append(cfg.Groups, GroupConfig{Name: ts.name, Weight: ts.weight, Match: GroupMatch{Exact: []string{ts.name}}})
 	}
 	cfg.DefaultGroup = DefaultGroupConfig{Name: "unclassified", Weight: 5}
 	cfg.Enforce = true
@@ -325,7 +367,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 	push := func(ev sfqSimEvent) { evSeq++; ev.seq = evSeq; heap.Push(events, ev) }
 	nth := map[string]int{}
 	outstanding := map[string]int{}
-	res := sfqSimResult{reqs: map[string]int{}, starts: make([][]float64, prm.endpoints)}
+	res := sfqSimResult{tenants: tenants, reqs: map[string]int{}, starts: make([][]float64, prm.endpoints)}
 	active := func(tn string, now float64) bool {
 		w, ok := prm.idle[tn]
 		return !ok || now < w[0] || now >= w[1]
@@ -392,7 +434,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 				return
 			}
 			var active []flowcontrol.FlowQueueAccessor
-			for _, tn := range sfqSimTenants {
+			for _, tn := range tenants {
 				if q := held[tn]; len(q) > 0 {
 					active = append(active, &fwkfcmocks.MockFlowQueueAccessor{
 						LenV: len(q), FlowKeyV: flowcontrol.FlowKey{ID: tn},
@@ -464,7 +506,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 	}
 
 	at(0)
-	for _, tn := range sfqSimTenants {
+	for _, tn := range tenants {
 		if w, ok := prm.idle[tn]; ok && w[0] <= 0 {
 			push(sfqSimEvent{at: w[1], ep: -1, tn: tn})
 			continue
@@ -475,7 +517,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 	}
 	// In tenant order, not map order: tenants returning at the same instant
 	// must submit in the same order every run.
-	for _, tn := range sfqSimTenants {
+	for _, tn := range tenants {
 		if w, ok := prm.idle[tn]; ok && w[0] > 0 {
 			push(sfqSimEvent{at: w[1], ep: -1, tn: tn})
 		}
@@ -494,7 +536,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		if prm.snapAt > 0 && res.lag == nil && ev.at >= prm.snapAt {
 			v := p.sfq.view(clock.t)
 			res.lag = map[string]float64{}
-			for _, tn := range sfqSimTenants {
+			for _, tn := range tenants {
 				res.lag[tn] = v.FinishTags[tn] - v.VirtualTime
 			}
 		}

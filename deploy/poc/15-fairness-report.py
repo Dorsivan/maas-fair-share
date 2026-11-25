@@ -209,13 +209,17 @@ from datetime import datetime, timezone
 
 METRIC_LINE = re.compile(r'^([^{\s]+)(?:\{(.*)\})?\s+([^\s]+)$')
 LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+# UNI-305: the workers field is read as whatever group=N pairs it carries.
+# 04-loadgen.yaml's run.sh always writes app1/app2/end-users/custom there (its
+# built-ins; app3..appN come from GROUPS_LINE below), 12-loadgen-route.sh
+# writes its manifest's groups. "custom" is skipped, never captured (UNI-129:
+# its fairness id is whatever its arbitrary subscription classifies to).
 TENANTS_LINE = re.compile(
-    r'load: tenants=\[(?P<tenants>.*?)\] '
-    r'workers app1=(?P<app1>\d+) app2=(?P<app2>\d+) end-users=(?P<end_users>\d+) '
-    r'(?:custom=\d+ )?'  # UNI-129 added this field to 04-loadgen.yaml's run.sh;
-                         # it is not a GROUPS member, so it is skipped, not captured.
+    r'load: (?:GW=\S+ )?tenants=\[(?P<tenants>.*?)\] '  # GW=: 12-loadgen-route.sh's form
+    r'workers (?P<workers>(?:[a-z0-9-]+=\d+ )+)'
     r'duration=(?P<duration>\d+)s'
 )
+WORKERS_PAIR = re.compile(r'(?P<name>[a-z0-9-]+)=(?P<n>[\d.]+)')
 TABLE_ROW = re.compile(r'^(\S+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(.+)$')
 STATUS_PAIR = re.compile(r'(\d+)=(\d+)')
 
@@ -227,16 +231,17 @@ STATUS_PAIR = re.compile(r'(\d+)=(\d+)')
 # closed-loop log that matches TENANTS_LINE is tried first (see
 # parse_loadgen_log), so every scenario before this ticket is byte-for-byte
 # unaffected.
+# UNI-305: one group=rate/s pair per tenant the generator was given --
+# app1/app2/end-users for every run before it, any manifest's groups after.
 OPEN_LOOP_TENANTS_LINE = re.compile(
-    r'load: open-loop Poisson arrivals rate app1=(?P<app1>[\d.]+)/s app2=(?P<app2>[\d.]+)/s '
-    r'end-users=(?P<end_users>[\d.]+)/s duration=(?P<duration>[\d.]+)s'
+    r'load: open-loop Poisson arrivals rate (?P<rates>(?:[a-z0-9-]+=[\d.]+/s )+)'
+    r'duration=(?P<duration>[\d.]+)s'
 )
 OPEN_LOOP_ROW = re.compile(
     r'^(?P<group>\S+)\s+sent=(?P<sent>\d+)\s+completion_tokens=(?P<tok>-?\d+)\s+'
     r'p50=(?P<p50>[\d.]+)s\s+p95=(?P<p95>[\d.]+)s\s+p99=(?P<p99>[\d.]+)s\s+codes=\[(?P<codes>.*)\]$'
 )
 
-GROUPS = ("app1", "app2", "end-users")
 
 # UNI-179: 04-loadgen.yaml's run.sh now dispatches any declared group set
 # (LOADGEN_GROUPS) and logs it as one extra line. TENANTS_LINE above still
@@ -357,31 +362,29 @@ def parse_loadgen_log(path):
     labels the column correctly for whichever generator produced the log."""
     text = open(path).read()
     m = TENANTS_LINE.search(text)
-    offered_workers = {g: 0 for g in GROUPS}
+    offered_workers = {}
     duration = None
     generator = "closed-loop"
     if m:
         tenants = set(m.group('tenants').split())
-        by_name = {"app1": m.group('app1'), "app2": m.group('app2'), "end-users": m.group('end_users')}
-        for g in GROUPS:
-            if g in tenants:
-                offered_workers[g] = int(by_name[g])
+        for pair in WORKERS_PAIR.finditer(m.group('workers')):
+            g = pair.group('name')
+            if g != "custom":
+                offered_workers[g] = int(pair.group('n')) if g in tenants else 0
         duration = int(m.group('duration'))
         gm = GROUPS_LINE.search(text)
         if gm:
             for entry in GROUPS_ENTRY.finditer(gm.group('groups')):
                 name = entry.group('name')
-                if name not in GROUPS and name != "custom":
+                if name not in offered_workers and name != "custom":
                     offered_workers[name] = int(entry.group('workers'))
     else:
         m = OPEN_LOOP_TENANTS_LINE.search(text)
         if m:
             generator = "open-loop"
-            by_name = {"app1": m.group('app1'), "app2": m.group('app2'), "end-users": m.group('end_users')}
-            for g in GROUPS:
-                rate = float(by_name[g])
-                if rate > 0:
-                    offered_workers[g] = rate
+            for pair in WORKERS_PAIR.finditer(m.group('rates')):
+                rate = float(pair.group('n'))
+                offered_workers[pair.group('name')] = rate if rate > 0 else 0
             duration = float(m.group('duration'))
 
     rows = {}
@@ -405,7 +408,7 @@ def parse_loadgen_log(path):
             if not row:
                 continue
             group = row.group('group')
-            if group not in GROUPS:
+            if group not in offered_workers:
                 continue
             rows[group] = {
                 "total": int(row.group('sent')),
@@ -935,7 +938,10 @@ def resolve_schedule(timeline_tenants, offered_groups, run_duration):
     either."""
     schedule = {}
     timeline_tenants = timeline_tenants or {}
-    for g in list(GROUPS) + [g for g in offered_groups if g not in GROUPS]:
+    # In offered order (the loadgen log's), so a manifest's tenants print in
+    # the manifest's order. Was app1/app2/end-users then set order, which
+    # shuffled app3..appN between two scorings of the same run.
+    for g in offered_groups:
         if g in timeline_tenants:
             e = timeline_tenants[g]
             stop = e.get("stop")
@@ -1730,7 +1736,7 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     if timeline_config_path:
         with open(timeline_config_path) as f:
             timeline_cfg = json.load(f)
-    schedule = resolve_schedule(timeline_cfg.get("tenants"), set(offered_groups), run_duration)
+    schedule = resolve_schedule(timeline_cfg.get("tenants"), offered_groups, run_duration)
     chaos_events = timeline_cfg.get("chaos_events", [])
     windows, windows_epp_restarted, windows_scrape_gap = [], False, False
     schedule_aware_shares = {}

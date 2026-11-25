@@ -31,6 +31,18 @@ Usage (see 13-loadgen-poisson.sh for the wrapper that fetches keys):
         --out /tmp/poisson-codes --seed 1
 
 A rate of 0 (the default) disables that tenant entirely.
+
+UNI-305: for any other tenant set, give one --tenant per group instead of the
+--rate-*/--key-* flags (13-loadgen-poisson.sh builds these from a tenant
+manifest, deploy/poc/tenants.py):
+
+    --tenant app1=4=/keys/app1-production --tenant app3=2=/keys/app3 \
+    --tenant end-users=4=/keys/end-user-alpha,/keys/end-user-beta
+
+A group with several key files round-robins them. The two forms are
+exclusive. The --rate-*/--key-* flags are exactly
+--tenant app1=R=K --tenant app2=R=K --tenant end-users=R=ALPHA,BETA, and
+every log line is the same either way.
 """
 import argparse
 import itertools
@@ -156,6 +168,8 @@ def main():
     ap.add_argument("--key-app2")
     ap.add_argument("--key-end-alpha")
     ap.add_argument("--key-end-beta")
+    ap.add_argument("--tenant", action="append", default=[], metavar="GROUP=RATE=KEYFILE[,KEYFILE...]",
+                    help="UNI-305: one tenant of any name; repeat per group. Excludes --rate-*/--key-*.")
     ap.add_argument("--out", required=True, help="directory for per-request logs")
     ap.add_argument("--max-workers", type=int, default=1000)
     ap.add_argument("--drain-timeout", type=float, default=100.0, help="seconds to wait for in-flight requests after the arrival window closes")
@@ -176,8 +190,27 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
+    if args.tenant:
+        if args.rate_app1 or args.rate_app2 or args.rate_end_users:
+            ap.error("--tenant and --rate-* are exclusive")
+        tenants = []
+        for spec in args.tenant:
+            try:
+                group, rate, keyfiles = spec.split("=", 2)
+                tenants.append((group, float(rate), keyfiles.split(",")))
+            except ValueError:
+                ap.error(f"--tenant {spec!r}: expected GROUP=RATE=KEYFILE[,KEYFILE...]")
+        if len({g for g, _, _ in tenants}) != len(tenants):
+            ap.error("--tenant: a group is listed twice")
+    else:
+        tenants = [
+            ("app1", args.rate_app1, [args.key_app1]),
+            ("app2", args.rate_app2, [args.key_app2]),
+            ("end-users", args.rate_end_users, [args.key_end_alpha, args.key_end_beta]),
+        ]
+
     executor = ThreadPoolExecutor(max_workers=args.max_workers)
-    results = {"app1": [], "app2": [], "end-users": []}
+    results = {g: [] for g, _, _ in tenants}
     locks = {g: threading.Lock() for g in results}
     futures = []
     futures_lock = threading.Lock()
@@ -204,21 +237,20 @@ def main():
 
     end_time = time.time() + args.duration
     threads = []
-    if args.rate_app1 > 0:
-        threads.append(threading.Thread(target=make_worker(args.rate_app1, "app1", itertools.cycle([read_key(args.key_app1)]), end_time)))
-    if args.rate_app2 > 0:
-        threads.append(threading.Thread(target=make_worker(args.rate_app2, "app2", itertools.cycle([read_key(args.key_app2)]), end_time)))
-    if args.rate_end_users > 0:
-        end_cycle = itertools.cycle([read_key(args.key_end_alpha), read_key(args.key_end_beta)])
-        threads.append(threading.Thread(target=make_worker(args.rate_end_users, "end-users", end_cycle, end_time)))
+    for group, rate, keyfiles in tenants:
+        if rate > 0:
+            cycle = itertools.cycle([read_key(k) for k in keyfiles])
+            threads.append(threading.Thread(target=make_worker(rate, group, cycle, end_time)))
 
     if not threads:
         print("no tenant has rate > 0, nothing to do", file=sys.stderr)
         sys.exit(1)
 
+    # 15-fairness-report.py reads every group=rate/s pair off this line.
     print(
-        f"load: open-loop Poisson arrivals rate app1={args.rate_app1}/s app2={args.rate_app2}/s "
-        f"end-users={args.rate_end_users}/s duration={args.duration}s seed={args.seed}",
+        "load: open-loop Poisson arrivals rate "
+        + " ".join(f"{g}={rate}/s" for g, rate, _ in tenants)
+        + f" duration={args.duration}s seed={args.seed}",
         flush=True,
     )
 

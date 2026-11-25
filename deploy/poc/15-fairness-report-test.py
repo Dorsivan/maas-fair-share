@@ -2647,6 +2647,61 @@ def test_saturation_section_renders_markdown_and_handles_missing_timeseries():
         assert "Bound at this run's peak roofline score: `queue`" in md2
 
 
+
+# --- UNI-305: N-tenant logs ----------------------------------------------------
+
+def test_open_loop_rates_line_reads_any_group_set():
+    # 13-loadgen-poisson.py given a six-tenant manifest: the rates line names
+    # whatever groups it was given, rate-0 groups included.
+    with tempfile.TemporaryDirectory() as tmp:
+        log = write(tmp, "loadgen.log", "\n".join([
+            "load: open-loop Poisson arrivals rate app1=4.0/s app2=2.0/s app3=0.0/s app10=1.5/s duration=240.0s seed=1",
+            "load: done.",
+            "app1         sent=960    completion_tokens=72000    p50=0.75s p95=1.10s p99=1.50s codes=[200=960]",
+            "app2         sent=480    completion_tokens=36000    p50=0.75s p95=1.10s p99=1.50s codes=[200=480]",
+            "app3         sent=0",
+            "app10        sent=360    completion_tokens=27000    p50=0.75s p95=1.10s p99=1.50s codes=[200=360]",
+        ]) + "\n")
+        offered, rows, duration, generator = fairness_report.parse_loadgen_log(log)
+        assert generator == "open-loop", generator
+        assert offered == {"app1": 4.0, "app2": 2.0, "app3": 0, "app10": 1.5}, offered
+        assert list(offered) == ["app1", "app2", "app3", "app10"], "manifest order kept"
+        assert sorted(rows) == ["app1", "app10", "app2"], rows
+        assert rows["app10"]["total"] == 360
+
+
+def test_closed_loop_workers_field_reads_any_group_set():
+    # 12-loadgen-route.sh given a manifest without app1/app2/end-users at all.
+    with tempfile.TemporaryDirectory() as tmp:
+        log = write(tmp, "loadgen.log", "\n".join([
+            "load: GW=x tenants=[app3 app4] workers app3=32 app4=8 app5=16 duration=240s",
+            "load: done.",
+            "TENANT       TOTAL   P50_SEC   P95_SEC   STATUSES",
+            "app3         1000    0.80      1.00      200=1000",
+            "app4         250     0.80      1.00      200=250",
+        ]) + "\n")
+        offered, rows, duration, generator = fairness_report.parse_loadgen_log(log)
+        assert generator == "closed-loop"
+        assert offered == {"app3": 32, "app4": 8, "app5": 0}, offered
+        assert sorted(rows) == ["app3", "app4"], rows
+        assert duration == 240
+
+
+def test_three_tenant_log_parses_as_before():
+    # The legacy closed-loop line, custom field included: same dict, same
+    # order, custom skipped -- the baseline every scored run used.
+    with tempfile.TemporaryDirectory() as tmp:
+        log = write(tmp, "loadgen.log", loadgen_log("app1 end-users", 32, 32, 128, 240, CLEAN_ROWS, w_custom=4))
+        offered, _, _, _ = fairness_report.parse_loadgen_log(log)
+        assert list(offered.items()) == [("app1", 32), ("app2", 0), ("end-users", 128)], offered
+
+
+def test_resolve_schedule_follows_offered_order_not_set_order():
+    groups = ["app1", "app2"] + [f"app{n}" for n in range(3, 21)]
+    orders = {tuple(fairness_report.resolve_schedule(None, groups, 240)) for _ in range(5)}
+    assert orders == {tuple(groups)}, orders
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

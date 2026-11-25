@@ -20,8 +20,12 @@
 # Usage:
 #   OPENSHIFT_TOKEN=... ./12-loadgen-route.sh
 # Overrides (same semantics as 04-loadgen.yaml):
-#   GW, MODELPATH, DURATION, WORKERS, WORKERS_APP1, WORKERS_APP2,
-#   WORKERS_END_USERS, TENANTS, OUT
+#   GW, MODELPATH, DURATION, WORKERS, WORKERS_<TOKEN> (WORKERS_APP1,
+#   WORKERS_END_USERS, ...), TENANTS, OUT
+# Tenants (UNI-305): TENANT_MANIFEST names the tenant set, default
+# deploy/poc/tenants/default.tenants (app1/app2/end-users). TENANTS picks a
+# subset of it; unset = all of it. A group's worker count is WORKERS_<TOKEN>,
+# else the manifest's workers column, else WORKERS.
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-maas-fairness-poc}"
@@ -32,9 +36,29 @@ WORKERS="${WORKERS:-32}"
 OUT="${OUT:-/tmp/route-codes}"
 
 OC="oc --token=${OPENSHIFT_TOKEN:?set OPENSHIFT_TOKEN} --server=${OPENSHIFT_SERVER:-https://api.ocp.paladinaura.com:6443}"
+TENANT_MANIFEST="${TENANT_MANIFEST:-$(dirname "$0")/tenants/default.tenants}"
+TENANTS_PY="$(dirname "$0")/tenants.py"
+
+# group -> "workers keys" from the manifest, workers resolved per the header.
+declare -A G_WORKERS G_KEYS
+ALL_GROUPS=()
+SPECS="$(python3 -I "$TENANTS_PY" loadgen-groups "$TENANT_MANIFEST")"   # a bad manifest exits here
+for spec in $SPECS; do
+  IFS=: read -r g w keys <<< "$spec"
+  tok="${g^^}"; tok="${tok//[^A-Z0-9]/_}"
+  v="WORKERS_$tok"
+  ALL_GROUPS+=("$g")
+  G_WORKERS[$g]="${!v:-${w:-$WORKERS}}"
+  G_KEYS[$g]="${keys//,/ }"
+done
+TENANTS="${TENANTS:-${ALL_GROUPS[*]}}"
+for t in $TENANTS; do
+  [ -n "${G_KEYS[$t]+set}" ] || { echo "unknown tenant: $t (not in $TENANT_MANIFEST)" >&2; exit 1; }
+done
+
 KEYS="$(mktemp -d)"
 trap 'rm -rf "$KEYS"' EXIT
-for k in app1-production app2-batch end-user-alpha end-user-beta; do
+for k in $(for t in $TENANTS; do echo ${G_KEYS[$t]}; done | awk '!seen[$0]++'); do
   $OC get secret maas-loadgen-keys -n "$NAMESPACE" -o jsonpath="{.data.$k}" | base64 -d > "$KEYS/$k"
 done
 
@@ -55,21 +79,18 @@ worker() {
   done
 }
 
-TENANTS="${TENANTS:-app1 app2 end-users}"
-W_APP1="${WORKERS_APP1:-$WORKERS}"
-W_APP2="${WORKERS_APP2:-$WORKERS}"
-W_END="${WORKERS_END_USERS:-$WORKERS}"
-echo "load: GW=$GW tenants=[${TENANTS}] workers app1=${W_APP1} app2=${W_APP2} end-users=${W_END} duration=${DURATION}s"
+WORKERS_LINE=""
+for g in "${ALL_GROUPS[@]}"; do WORKERS_LINE="$WORKERS_LINE $g=${G_WORKERS[$g]}"; done
+echo "load: GW=$GW tenants=[${TENANTS}] workers${WORKERS_LINE} duration=${DURATION}s"
 
+# A group with several keys round-robins them across its workers: worker i
+# sends with key (i mod n) -- for end-users' alpha,beta that is the original
+# even=alpha / odd=beta split.
 for t in $TENANTS; do
-  case "$t" in
-    app1)      for _ in $(seq 1 "$W_APP1"); do worker "app1-production" app1 & done ;;
-    app2)      for _ in $(seq 1 "$W_APP2"); do worker "app2-batch"      app2 & done ;;
-    end-users) for i in $(seq 1 "$W_END");  do
-                 if [ $((i % 2)) -eq 0 ]; then worker end-user-alpha end-users & else worker end-user-beta end-users & fi
-               done ;;
-    *) echo "unknown tenant: $t" >&2; exit 1 ;;
-  esac
+  read -r -a keys <<< "${G_KEYS[$t]}"
+  for i in $(seq 1 "${G_WORKERS[$t]}"); do
+    worker "${keys[$(( i % ${#keys[@]} ))]}" "$t" &
+  done
 done
 wait
 

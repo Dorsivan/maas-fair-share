@@ -18,6 +18,7 @@ package weightedlas
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -43,9 +44,18 @@ type GroupMatch struct {
 // GroupConfig is one weighted group: a name, a share, and the subscription IDs
 // that resolve to it.
 type GroupConfig struct {
-	Name   string     `json:"name"`
-	Weight float64    `json:"weight"`
-	Match  GroupMatch `json:"match,omitempty"`
+	Name   string  `json:"name"`
+	Weight float64 `json:"weight"`
+
+	// EstimatedOutputTokens is the operator's expected completion length for
+	// this group's traffic. UNI-299: when set it is the group's dispatch
+	// estimate, ahead of the group's output EWMA and the global
+	// defaultEstimatedOutputTokens. It does not learn: if the group's traffic
+	// changes, edit it. max_tokens still caps it per request. Omitted means
+	// the EWMA-then-default chain, i.e. the behaviour before this field existed.
+	EstimatedOutputTokens *float64 `json:"estimatedOutputTokens,omitempty"`
+
+	Match GroupMatch `json:"match,omitempty"`
 }
 
 // DefaultGroupConfig is the catch-all for subscription IDs that match no group,
@@ -281,6 +291,11 @@ func (c *Config) validate() error {
 		if g.Weight <= 0 {
 			return fmt.Errorf("groups[%d] (%s): weight must be > 0, got %v", i, g.Name, g.Weight)
 		}
+		if g.EstimatedOutputTokens != nil && (*g.EstimatedOutputTokens < 0 ||
+			math.IsNaN(*g.EstimatedOutputTokens) || math.IsInf(*g.EstimatedOutputTokens, 0)) {
+			return fmt.Errorf("groups[%d] (%s): estimatedOutputTokens must be a finite number >= 0, got %v",
+				i, g.Name, *g.EstimatedOutputTokens)
+		}
 		if len(g.Match.Exact) == 0 && len(g.Match.Prefix) == 0 {
 			return fmt.Errorf("groups[%d] (%s): match must set at least one of exact or prefix", i, g.Name)
 		}
@@ -371,8 +386,11 @@ type groupTable struct {
 	exact    map[string]string // subscription ID -> group name
 	prefixes []prefixRule      // longest prefix first
 	weights  map[string]float64
-	order    []string // config order, default group last; stable output ordering
-	fallback string
+	// estOutput holds the groups that set estimatedOutputTokens; absent means
+	// defaultEstimatedOutputTokens.
+	estOutput map[string]float64
+	order     []string // config order, default group last; stable output ordering
+	fallback  string
 }
 
 type prefixRule struct {
@@ -382,12 +400,16 @@ type prefixRule struct {
 
 func newGroupTable(c *Config) (*groupTable, error) {
 	t := &groupTable{
-		exact:    make(map[string]string, len(c.Groups)),
-		weights:  make(map[string]float64, len(c.Groups)+1),
-		fallback: c.DefaultGroup.Name,
+		exact:     make(map[string]string, len(c.Groups)),
+		weights:   make(map[string]float64, len(c.Groups)+1),
+		estOutput: make(map[string]float64),
+		fallback:  c.DefaultGroup.Name,
 	}
 	for _, g := range c.Groups {
 		t.weights[g.Name] = g.Weight
+		if g.EstimatedOutputTokens != nil {
+			t.estOutput[g.Name] = *g.EstimatedOutputTokens
+		}
 		t.order = append(t.order, g.Name)
 		for _, id := range g.Match.Exact {
 			if prev, dup := t.exact[id]; dup {

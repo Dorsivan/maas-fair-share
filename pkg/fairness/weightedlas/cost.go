@@ -89,15 +89,33 @@ func (p *Plugin) estimatePromptTokens(request *fwksched.InferenceRequest) int {
 
 // estimateOutputTokens is where the estimator effort belongs: output is the
 // large term and the only genuinely unknown one.
+//
+// The chain is: the group's configured estimatedOutputTokens, then the
+// group's output EWMA once warm, then defaultEstimatedOutputTokens, all capped
+// by max_tokens. UNI-299: the configured value outranks the EWMA because the
+// board asked for exactly that ordering -- the operator gets the price they
+// configured, predictably. The cost is that the estimate stops learning for
+// that group: if its traffic drifts, the dispatch tags stay wrong until the
+// config is edited. The completion true-up corrects the group's finish tag on
+// every completion, so the error is bounded by what the group has in flight
+// rather than accumulating (sfq_sim_test.go TestSFQSimConfiguredEstimate).
+// The EWMA is still maintained and logged next to the configured value, so a
+// stale estimate is visible in the state log.
 func (p *Plugin) estimateOutputTokens(request *fwksched.InferenceRequest, gs *groupState) int {
 	est := p.cfg.DefaultEstimatedOutputTokens
 	if gs != nil {
-		if observed, ok := gs.outputEWMA(); ok {
+		observed, warm := gs.outputEWMA()
+		switch {
+		case gs.haveConfiguredOutput && !(p.configuredEstimateSeedOnly && warm):
+			est = gs.configuredOutput
+		case warm:
 			est = observed
 		}
 	}
 	// max_tokens is exact as a bound and useless as a central value: clients set
-	// 4096 and generate 200. Cap with it, never estimate from it.
+	// 4096 and generate 200. Cap with it, never estimate from it. The cap applies
+	// to the configured value too, so an operator estimate can never out-charge
+	// what the client declared it could generate.
 	if request.Body != nil && request.Body.MaxOutputTokens != nil {
 		if cap := float64(*request.Body.MaxOutputTokens); cap >= 0 && cap < est {
 			est = cap

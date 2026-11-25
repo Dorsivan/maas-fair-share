@@ -100,6 +100,11 @@ type groupState struct {
 	ewmaOutput  float64
 	ewmaSamples int
 
+	// configuredOutput is the group's estimatedOutputTokens, valid when
+	// haveConfiguredOutput. Immutable after construction, so read unlocked.
+	configuredOutput     float64
+	haveConfiguredOutput bool
+
 	inFlight         int64
 	provisionalTotal float64
 
@@ -247,12 +252,22 @@ type snapshot struct {
 	ProvisionalCharge float64 `json:"provisionalCharge"`
 	EWMAOutputTokens  float64 `json:"ewmaOutputTokens"`
 	EWMAWarm          bool    `json:"ewmaWarm"`
+	// EstimatedOutputTokens is the group's configured estimate, absent when it
+	// uses the EWMA-then-default chain. Next to the EWMA so a reader can see
+	// both what the operator configured and what the traffic actually does --
+	// the configured value outranks the EWMA, so this is how a stale one shows.
+	EstimatedOutputTokens *float64 `json:"estimatedOutputTokens,omitempty"`
 }
 
 func (gs *groupState) snapshot(now time.Time) snapshot {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 	a := gs.primary.read(now)
+	var configured *float64
+	if gs.haveConfiguredOutput {
+		v := gs.configuredOutput
+		configured = &v
+	}
 	return snapshot{
 		Name:              gs.name,
 		Weight:            gs.weight,
@@ -262,6 +277,8 @@ func (gs *groupState) snapshot(now time.Time) snapshot {
 		ProvisionalCharge: gs.provisionalTotal,
 		EWMAOutputTokens:  gs.ewmaOutput,
 		EWMAWarm:          gs.ewmaSamples >= ewmaWarmupSamples,
+
+		EstimatedOutputTokens: configured,
 	}
 }
 

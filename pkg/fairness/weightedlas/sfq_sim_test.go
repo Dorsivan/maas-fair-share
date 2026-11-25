@@ -115,6 +115,11 @@ type sfqSimParams struct {
 	gamerTightMax bool
 
 	noTrueUp bool // disable the finish-tag true-up (shows the vector is real)
+
+	// estOut sets a group's estimatedOutputTokens (UNI-299). seedOnly runs the
+	// not-shipped ordering, where a warm EWMA takes over from it.
+	estOut   map[string]float64
+	seedOnly bool
 	vMax     bool // V = max start tag, the rejected definition (shows the min matters)
 
 	// hold > 0 gates the EPP at that pool-wide vLLM waiting depth and orders
@@ -324,6 +329,11 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		tenants[i] = ts.name
 		cfg.Groups = append(cfg.Groups, GroupConfig{Name: ts.name, Weight: ts.weight, Match: GroupMatch{Exact: []string{ts.name}}})
 	}
+	for i := range cfg.Groups {
+		if v, ok := prm.estOut[cfg.Groups[i].Name]; ok {
+			cfg.Groups[i].EstimatedOutputTokens = &v
+		}
+	}
 	cfg.DefaultGroup = DefaultGroupConfig{Name: "unclassified", Weight: 5}
 	cfg.Enforce = true
 	cfg.NewcomerClamp = !prm.noClamp
@@ -340,6 +350,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 	if prm.rebaseAt > 0 {
 		p.sfq.rebaseAt = prm.rebaseAt
 	}
+	p.configuredEstimateSeedOnly = prm.seedOnly
 	ctx := context.Background()
 	if prm.ctx != nil {
 		ctx = prm.ctx
@@ -1138,4 +1149,82 @@ func TestSFQSimSettleTimeoutCountsQueueWait(t *testing.T) {
 	assert.Less(t, devOK, 2.0)
 	devDeep, _ := run(0, 4)
 	assert.Greater(t, devDeep, 3.0, "without a gate the queue wait outlives even 4 S")
+}
+
+// UNI-299: app1's configured estimatedOutputTokens is wrong by 10x in each
+// direction -- real output 10x the estimate (6.4 vs 64) and a tenth of it
+// (640 vs 64) -- with the completion true-up on. The other tenants are
+// configured exactly, so app1's error is the only one. app1 joins a warm pool
+// at 150 s so the transient is not mixed up with global cold start.
+//
+// The configured value outranks the EWMA (what ships), so the estimate never
+// corrects. The true-up corrects the finish tag on every completion, so the
+// error does not accumulate: what is left is a one-time offset of roughly
+// in-flight x |estimate - real| tokens, repaid at the tenant's fair rate.
+// Measured: under-estimate bursts app1 for ~5 s at 32 workers, ~30 s at 256;
+// over-estimate starves it to ~3% for ~60 s at 32 workers and ~400 s at 256.
+// After that both are within 1 pt of target. True-up off is the power check:
+// the same error becomes permanent (~37 pt and ~18 pt).
+func TestSFQSimConfiguredEstimate(t *testing.T) {
+	t.Parallel()
+	target := sfqSimTarget(sfqSimTenants)
+	run := func(workers int, est float64, seedOnly, noTrueUp bool, idle [2]float64, dur float64) sfqSimResult {
+		prm := sfqSimBase(workers)
+		prm.duration = dur
+		prm.maxTokens = 1024 // above both estimates, so the cap does not hide them
+		prm.idle = map[string][2]float64{"app1": idle}
+		prm.estOut = map[string]float64{"app1": est, "app2": 64, "end-users": 64}
+		prm.seedOnly, prm.noTrueUp = seedOnly, noTrueUp
+		return runSFQSim(t, prm)
+	}
+	for _, sc := range []struct {
+		workers   int
+		est       float64
+		settled   float64 // when the transient is over, from the measured runs
+		dur       float64
+		direction string
+	}{
+		{32, 6.4, 165, 450, "real 10x estimate"},
+		{32, 640, 210, 450, "real 1/10 estimate"},
+		{256, 6.4, 210, 750, "real 10x estimate"},
+		{256, 640, 600, 900, "real 1/10 estimate"},
+	} {
+		name := fmt.Sprintf("app1 est %g, %s, %d workers, joins at 150 s", sc.est, sc.direction, sc.workers)
+		r := run(sc.workers, sc.est, false, false, [2]float64{0, 150}, sc.dur)
+		first := r.share(150, 165)
+		settled := r.share(sc.settled, sc.dur)
+		sfqSimLog(t, name+": first 15 s", r, first, target)
+		sfqSimLog(t, fmt.Sprintf("%s: %.0f s on", name, sc.settled), r, settled, target)
+		assert.Less(t, sfqSimDev(settled, target), 1.0, "%s: the true-up must bound the error to a transient", name)
+		if sc.est < 64 {
+			assert.Greater(t, first["app1"], target["app1"]+5, "%s: the under-estimate must show, or this proves nothing", name)
+		} else {
+			assert.Less(t, first["app1"], target["app1"]-5, "%s: the over-estimate must show, or this proves nothing", name)
+		}
+		if sc.workers == 32 {
+			off := run(sc.workers, sc.est, false, true, [2]float64{0, 150}, sc.dur)
+			sh := off.share(sc.settled, sc.dur)
+			sfqSimLog(t, name+", true-up off", off, sh, target)
+			assert.Greater(t, sfqSimDev(sh, target), 10.0, "%s: without the true-up the error must be permanent", name)
+		}
+	}
+
+	// The cost of not learning. The transient is paid on every entry, not
+	// once: a tenant returning from idle restamps a fresh in-flight set at the
+	// configured value. app1 runs 0-150 s, idles to 300 s and returns. Seed
+	// only has a warm EWMA by then and returns at its weight; the shipped
+	// ordering repeats the starvation. A bursty tenant with an over-estimate
+	// pays this at the start of every burst.
+	all := map[bool]map[string]float64{}
+	for _, seedOnly := range []bool{false, true} {
+		r := run(32, 640, seedOnly, false, [2]float64{150, 300}, 450)
+		all[seedOnly] = r.share(300, 330)
+		mode := "configured first (shipped)"
+		if seedOnly {
+			mode = "seed only (not shipped)"
+		}
+		sfqSimLog(t, "app1 est 640, returns at 300 s, first 30 s, "+mode, r, all[seedOnly], target)
+	}
+	assert.Less(t, all[false]["app1"], target["app1"]-10, "the shipped ordering repeats the transient on return")
+	assert.Less(t, sfqSimDev(all[true], target), 3.0, "seed only has learned by the return")
 }

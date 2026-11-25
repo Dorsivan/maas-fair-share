@@ -711,7 +711,8 @@ the cached term drops out of the formula entirely and `C` needs no estimate at a
 - **Output — where the effort belongs.**
 
   ```
-  O_est = min( max_tokens ?? ∞ , ewma[group] ?? defaultEstimatedOutputTokens )
+  O_est = min( max_tokens ?? ∞ ,
+               estimatedOutputTokens[group] ?? ewma[group] ?? defaultEstimatedOutputTokens )
   ewma += (actual_O - ewma) / 64        # updated at every true-up
   ```
 
@@ -1210,6 +1211,48 @@ Residual: forcing usage appends a final streaming chunk with an empty `choices` 
 Standard SDKs handle it, hand-rolled clients sometimes don't — smoke-test real
 consumers.
 
+### UNI-299: per-group estimatedOutputTokens
+
+A group may set `estimatedOutputTokens` next to its weight. When set, it is
+that group's output estimate at dispatch: ahead of the group's EWMA and the
+global `defaultEstimatedOutputTokens`, and still capped by the request's
+`max_tokens`, so an operator value never out-charges what the client said it
+could generate. Omitted means the EWMA-then-default chain as before. `0` is
+honoured as zero, not as unset.
+
+The board chose this ordering (UNI-299, 2026-11-25) over using the value only
+as a cold-start seed. The consequence is that the estimate does not learn for a
+configured group. The EWMA is still kept and appears in the state log as
+`ewmaOutputTokens` next to `estimatedOutputTokens`, so a stale value shows as a
+gap between the two.
+
+What a wrong value costs, under the SFQ stamp with the completion true-up
+(`sfq_sim_test.go` `TestSFQSimConfiguredEstimate`, app1 wrong by 10x, other
+groups exact):
+
+- **No standing error.** The true-up fixes the finish tag on every completion,
+  so after a transient the split is within 1 pt of target in both directions.
+  With the true-up off the same error is permanent (~37 pt for an under-estimate,
+  ~18 pt for an over-estimate).
+- **A transient on every entry.** Requests already stamped keep their tags, so
+  each time the group starts sending -- EPP restart, ConfigMap edit, or return
+  from idle -- its in-flight set carries in-flight × |estimate − real| tokens
+  of error, repaid at its fair rate. Under-estimate (real 10x): app1 bursts to
+  ~28% (target 21%) for ~5 s at 32 workers, ~61% for ~30 s at 256. Over-estimate
+  (real 1/10): app1 is starved to ~3% for ~60 s at 32 workers and ~400 s at 256.
+  A seed-only value would have learned by the group's second burst; this one
+  repeats the transient on every burst (measured: 3.0% vs 20.8% in the first 30 s
+  after a return).
+- **Over-estimating is the expensive direction**, by the same ratio as the error
+  in tokens: 10x over is 576 tokens per request of debt, 10x under is 57.6 of
+  credit. It mostly hurts the configured group itself.
+
+Gaming: a low value is not a standing advantage while the true-up is on. It
+buys a burst on each entry of at most in-flight × (real − estimate) tokens,
+which the group repays straight after. A floor is not needed for that. If the
+true-up is ever turned off, a low value becomes a permanent advantage, and a
+floor (or seed-only) would be needed.
+
 ## Config
 
 ```yaml
@@ -1234,6 +1277,8 @@ plugins:
         - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
         - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
         - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+      # Optional per group: estimatedOutputTokens (UNI-299), e.g.
+      #   - { name: app1, weight: 20, estimatedOutputTokens: 4000, match: {...} }
       defaultGroup: { name: unclassified, weight: 5 }
 
       # false = account + emit every metric, but let FCFS decide. Deploy this way first.

@@ -56,6 +56,11 @@ data:
             - { name: app1,      weight: 20, match: { exact:  [app1-production] } }
             - { name: app2,      weight: 10, match: { exact:  [app2-batch] } }
             - { name: end-users, weight: 65, match: { prefix: [end-user-] } }
+          # Optional per group: estimatedOutputTokens: <n> is that group's dispatch
+          # output estimate, ahead of its EWMA and defaultEstimatedOutputTokens
+          # (UNI-299). It does not learn -- edit it if the group's traffic changes.
+          # An over-estimate starves the group at the start of every burst; see
+          # docs/design.md "UNI-299".
           defaultGroup: { name: unclassified, weight: 5 }
 
           # false = account and emit every metric, but let FCFS decide. Deploy this way
@@ -116,8 +121,9 @@ data:
           newcomerClampIdleSeconds: 2
 
           provisionalCharge: true
-          # Fallback only. The real output estimate is min(max_tokens, per-group EWMA
-          # of observed output tokens); this applies when neither is available.
+          # Fallback only. The output estimate is min(max_tokens, the group's
+          # estimatedOutputTokens, else its EWMA of observed output tokens); this
+          # applies when the group has neither.
           defaultEstimatedOutputTokens: 512
           # ~4 chars/token holds for Latin-script prose. CJK is ~1-2 and multimodal is
           # unrelated to byte size -- both appear as a PERSISTENT BIAS (not noise) in

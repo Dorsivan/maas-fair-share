@@ -161,6 +161,11 @@ type Plugin struct {
 	// normalizes request headers.
 	identityHeader string
 
+	// configuredEstimateSeedOnly is a test knob: a group's estimatedOutputTokens
+	// is only a cold-start seed and its warm EWMA takes over. It is the UNI-299
+	// alternative that was not shipped; it exists so the sim can measure it.
+	configuredEstimateSeedOnly bool
+
 	// now is injected so decay tests can advance time instead of sleeping.
 	now func() time.Time
 
@@ -279,7 +284,9 @@ func newPlugin(name string, cfg Config) (*Plugin, error) {
 		unmatchedSample: make(map[string]struct{}, maxLoggedUnmatched),
 	}
 	for _, gname := range table.names() {
-		p.states[gname] = newGroupState(gname, table.weight(gname), cfg.HalfLifeSeconds, cfg.ObservedHalfLivesSeconds)
+		gs := newGroupState(gname, table.weight(gname), cfg.HalfLifeSeconds, cfg.ObservedHalfLivesSeconds)
+		gs.configuredOutput, gs.haveConfiguredOutput = table.estOutput[gname]
+		p.states[gname] = gs
 	}
 	if cfg.SFQPriorityStamp {
 		p.sfq = newSFQState(&cfg)

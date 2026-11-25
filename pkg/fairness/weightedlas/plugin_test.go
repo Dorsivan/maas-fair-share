@@ -1040,6 +1040,10 @@ func TestFactoryValidation(t *testing.T) {
 		{"unknown cost model", `{"costModel": "flops"}`, "costModel must be"},
 		{"zero bytes per token", `{"estimatedBytesPerToken": 0}`, "estimatedBytesPerToken must be > 0"},
 		{"empty identity header", `{"identityHeader": ""}`, "identityHeader must not be empty"},
+		{"per-group estimatedOutputTokens", `{"groups":[{"name":"a","weight":1,"estimatedOutputTokens":4000,"match":{"exact":["a"]}}],
+            "defaultGroup":{"name":"d","weight":1}}`, ""},
+		{"negative estimatedOutputTokens", `{"groups":[{"name":"a","weight":1,"estimatedOutputTokens":-1,"match":{"exact":["a"]}}],
+            "defaultGroup":{"name":"d","weight":1}}`, "estimatedOutputTokens must be a finite number >= 0"},
 	}
 
 	for _, tc := range cases {
@@ -1092,6 +1096,54 @@ func TestOutputEstimator(t *testing.T) {
 	gs.recordCompletion(50, 1000, 0)
 	assert.Equal(t, 50, p.estimateOutputTokens(&fwksched.InferenceRequest{}, gs),
 		"once warm, the group's own history beats the global default")
+}
+
+// UNI-299: a group's estimatedOutputTokens is first in the chain -- ahead of
+// its warm EWMA and the global default -- and still capped by max_tokens.
+// A group without one keeps the EWMA-then-default chain.
+func TestConfiguredOutputEstimate(t *testing.T) {
+	t.Parallel()
+	est := 4000.0
+	cfg := twoGroupConfig(1, 1)
+	cfg.DefaultEstimatedOutputTokens = 512
+	cfg.Groups[0].EstimatedOutputTokens = &est
+	p, _ := newTestPlugin(t, cfg)
+	configured, plain := p.states["a-group"], p.states["b-group"]
+	none := &fwksched.InferenceRequest{}
+	withCap := func(c int64) *fwksched.InferenceRequest {
+		return &fwksched.InferenceRequest{Body: &fwkrh.InferenceRequestBody{MaxOutputTokens: &c}}
+	}
+
+	assert.Equal(t, 4000, p.estimateOutputTokens(none, configured), "cold: the configured value beats the default")
+	assert.Equal(t, 512, p.estimateOutputTokens(none, plain), "an unconfigured group keeps the default")
+	assert.Equal(t, 1000, p.estimateOutputTokens(withCap(1000), configured),
+		"max_tokens caps the configured value: an operator estimate never out-charges the client's bound")
+	assert.Equal(t, 4000, p.estimateOutputTokens(withCap(8192), configured), "a cap above it does not raise it")
+
+	for range ewmaWarmupSamples {
+		configured.recordCompletion(200, 100, 0)
+		plain.recordCompletion(200, 100, 0)
+	}
+	assert.Equal(t, 4000, p.estimateOutputTokens(none, configured),
+		"warm: the configured value still beats the group's own EWMA (the literal request)")
+	assert.Equal(t, 200, p.estimateOutputTokens(none, plain), "the unconfigured group learns")
+	ewma, warm := configured.outputEWMA()
+	assert.True(t, warm)
+	assert.Equal(t, 200.0, ewma, "the EWMA is still maintained under a configured value, so staleness is visible")
+	snap := configured.snapshot(time.Now())
+	require.NotNil(t, snap.EstimatedOutputTokens)
+	assert.Equal(t, 4000.0, *snap.EstimatedOutputTokens)
+	assert.Nil(t, plain.snapshot(time.Now()).EstimatedOutputTokens)
+
+	// The not-shipped alternative, seed only, for the sim's comparison.
+	p.configuredEstimateSeedOnly = true
+	assert.Equal(t, 200, p.estimateOutputTokens(none, configured))
+
+	zero := 0.0
+	cfg.Groups[0].EstimatedOutputTokens = &zero
+	p, _ = newTestPlugin(t, cfg)
+	assert.Equal(t, 0, p.estimateOutputTokens(none, p.states["a-group"]),
+		"0 is honoured, not treated as unset: omit the field for the default")
 }
 
 // The cost model is the one place a unit is chosen; everything downstream is

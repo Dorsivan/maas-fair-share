@@ -681,25 +681,22 @@ func (p *Plugin) stampPriority(request *fwksched.InferenceRequest, result *fwksc
 		sfqUnsettled.WithLabelValues(boundID(g)).Inc()
 	}
 	sfqStampedPriority.WithLabelValues(boundID(gs.name)).Set(float64(ticket.priority))
-	p.publishSFQ(now)
+	p.publishSFQ(gs.name)
+	for _, g := range reaped {
+		if g != gs.name {
+			p.publishSFQ(g)
+		}
+	}
 	return nil
 }
 
-// publishSFQ refreshes the virtual-time and finish-tag gauges.
-func (p *Plugin) publishSFQ(now time.Time) {
-	v := p.sfq.view(now)
-	sfqVirtualTime.Set(v.VirtualTime)
-	serving := 0
-	for _, ep := range v.Endpoints {
-		if ep.Serving {
-			serving++
-		}
-	}
+// publishSFQ refreshes the virtual-time gauges and one group's finish tag.
+func (p *Plugin) publishSFQ(group string) {
+	v, f, serving := p.sfq.gauges(group)
+	sfqVirtualTime.Set(v)
 	sfqServingEndpoints.Set(float64(serving))
-	for g, f := range v.FinishTags {
-		sfqFinishTag.WithLabelValues(boundID(g)).Set(f)
-		sfqLag.WithLabelValues(boundID(g)).Set(f - v.VirtualTime)
-	}
+	sfqFinishTag.WithLabelValues(boundID(group)).Set(f)
+	sfqLag.WithLabelValues(boundID(group)).Set(f - v)
 }
 
 // recordQueueWait finishes the correlation attribute RequestHeader started,
@@ -753,7 +750,7 @@ func (p *Plugin) ResponseBody(
 	if haveTicket {
 		defer func() {
 			p.sfq.settle(ticket, now, sfqActual, sfqHaveActual)
-			p.publishSFQ(now)
+			p.publishSFQ(ticket.group)
 		}()
 	}
 	corr, haveCorr := fwksched.ReadRequestAttribute[correlation](request, correlationKey)

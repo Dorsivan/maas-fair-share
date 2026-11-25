@@ -121,6 +121,7 @@ type sfqEndpoint struct {
 type sfqState struct {
 	mu        sync.Mutex
 	v         float64
+	nServing  int // endpoints in the min as of the last advanceV, for the gauge
 	finish    map[string]float64
 	endpoints map[string]*sfqEndpoint
 	// pending is every unreaped ticket in dispatch order. Tickets are
@@ -130,9 +131,12 @@ type sfqState struct {
 
 	settleTimeout time.Duration
 	staleAfter    time.Duration
-	// noTrueUp disables the completion true-up on the finish tag. Tests only:
-	// it exists so the CI sim can show the tight-max_tokens vector is real.
+	// noTrueUp disables the completion true-up on the finish tag, and vMax
+	// swaps V to the max-tag definition UNI-291 rejected. Tests only: they
+	// exist so the CI sim can show each case it passes would fail without
+	// the design choice it is guarding.
 	noTrueUp bool
+	vMax     bool
 }
 
 func newSFQState(cfg *Config) *sfqState {
@@ -190,13 +194,19 @@ func (s *sfqState) serving(ep *sfqEndpoint, now time.Time) bool {
 // advanceV moves V up to the min over serving endpoints, if any serve. Caller
 // holds s.mu.
 func (s *sfqState) advanceV(now time.Time) {
-	lo, found := math.Inf(1), false
+	lo, n := math.Inf(1), 0
 	for _, ep := range s.endpoints {
 		if s.serving(ep, now) {
-			lo, found = math.Min(lo, ep.newestStart), true
+			if s.vMax && n > 0 {
+				lo = math.Max(lo, ep.newestStart)
+			} else {
+				lo = math.Min(lo, ep.newestStart)
+			}
+			n++
 		}
 	}
-	if found && lo > s.v {
+	s.nServing = n
+	if n > 0 && lo > s.v {
 		s.v = lo
 	}
 }
@@ -320,6 +330,14 @@ func (s *sfqState) settle(t *sfqTicket, now time.Time, actual float64, haveActua
 		s.release(t)
 	}
 	s.advanceV(now)
+}
+
+// gauges reads what the per-request metric refresh needs, without building a
+// full view: that runs on every dispatch and completion.
+func (s *sfqState) gauges(group string) (v, finish float64, serving int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.v, s.finish[group], s.nServing
 }
 
 // sfqView is the ledger as seen by metrics, the debug dump and the flight

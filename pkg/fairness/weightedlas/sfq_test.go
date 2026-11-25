@@ -122,17 +122,22 @@ func TestClientPriorityIsOverwrittenOnEveryPath(t *testing.T) {
 
 func TestClientPriorityIsStrippedWhenStampIsOff(t *testing.T) {
 	t.Parallel()
-	p, _ := newTestPlugin(t, twoGroupConfig(1, 1))
-	before := testutil.ToFloat64(clientPriorityOverwritten.WithLabelValues("a-group"))
-	req := sfqRequest("a-group", fwkrh.PayloadMap{"model": "m", "priority": -5}, 64)
+	// Its own group name: the counter is process-global and other parallel
+	// tests send client priorities as a-group.
+	cfg := DefaultConfig()
+	cfg.Groups = []GroupConfig{{Name: "strip-only", Weight: 1, Match: GroupMatch{Exact: []string{"s"}}}}
+	cfg.StateLogIntervalSeconds = 0
+	p, _ := newTestPlugin(t, cfg)
+	before := testutil.ToFloat64(clientPriorityOverwritten.WithLabelValues("strip-only"))
+	req := sfqRequest("strip-only", fwkrh.PayloadMap{"model": "m", "priority": -5}, 64)
 	require.NoError(t, p.PreRequest(context.Background(), req, nil))
 	_, has := req.Body.Payload.(fwkrh.PayloadMap)["priority"]
 	assert.False(t, has, "with the stamp off a client priority is deleted, not forwarded")
 	assert.True(t, req.Body.Mutated)
-	assert.Equal(t, before+1, testutil.ToFloat64(clientPriorityOverwritten.WithLabelValues("a-group")))
+	assert.Equal(t, before+1, testutil.ToFloat64(clientPriorityOverwritten.WithLabelValues("strip-only")))
 
 	// A body with no priority is left byte-identical: no re-marshal.
-	clean := sfqRequest("a-group", nil, 64)
+	clean := sfqRequest("strip-only", nil, 64)
 	require.NoError(t, p.PreRequest(context.Background(), clean, nil))
 	assert.False(t, clean.Body.Mutated)
 }
@@ -345,8 +350,9 @@ func TestIdleEndpointDoesNotFreezeVirtualTime(t *testing.T) {
 // Completion never observed: the conservative failure
 // ---------------------------------------------------------------------------
 
+// Not parallel: it reads the process-global sfq_unsettled_total{a-group},
+// which other parallel tests also increment.
 func TestLostCompletionIsChargedWorstCase(t *testing.T) {
-	t.Parallel()
 	cfg := sfqConfig()
 	cfg.SFQSettleTimeoutSeconds = 60
 	p, clock := newTestPlugin(t, cfg)

@@ -220,8 +220,11 @@ func TestNewcomerClampIdleGate(t *testing.T) {
 // claim, independent of the clamp -- only that fixing the edge gate measurably
 // moves its share toward its weight and away from the legacy floor, and fires
 // far fewer clamps doing it.
+// Not parallel: it asserts a zero delta on the process-global
+// newcomer_clamps_total{b-group}, which parallel b-group Pick tests also
+// increment. UNI-293's longer-running parallel tests widened that window
+// enough to flake (2 in 15 runs).
 func TestNewcomerClampGateImprovesBurstyShare(t *testing.T) {
-	t.Parallel()
 
 	run := func(t *testing.T, idleSeconds float64) (share float64, clamps float64) {
 		t.Helper()

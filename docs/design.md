@@ -977,6 +977,39 @@ cancel) keeps its tag charge. That deliberately differs from the tab's
 UNI-213 refund: refunding the tag would let a client read most of a stream,
 disconnect, and get its queue position back.
 
+**What the stamp retires.** With `sfqPriorityStamp` on, there is one notion
+of accumulated service, the finish tag, and the code says so in `Pick`:
+
+- *The EWMA tab (`halfLifeSeconds`)* is no longer an input to any dispatch
+  decision. `Pick` ranks the EPP-held queue by each group's next start tag,
+  `max(F_g, V)`, so the EPP and vLLM's waiting queue rank by the same number.
+  The tab is still charged and decayed, for `maas_fairness_normalized_service`,
+  the flight recorder and the state dump only. `halfLifeSeconds` and
+  `undecayedTrueUp` then shape only that series. Behind an EPP hold of 4,
+  ranking by the tab instead lets the gaming vector back in: ~23.7% against
+  the 21.1% target, versus ~21.4% by tag (`TestSFQSimHoldOneNotionOfService`).
+- *`newcomerClamp`* does not run. `max(F_g, V)` is the exact form of the same
+  rule. The clamp writes only to the tab, so with both on it would change
+  nothing `Pick` decides. Skipping it keeps the clamp counter from reporting
+  firings that did nothing. `TestSFQSimHoldReturnNeedsNoClamp` shows a return
+  from idle and a new join behind an EPP hold with no burst by tag
+  (dev ≤0.4 pt in the first 30 s), against ~30-37% for a 10.5% target on the
+  tab with no clamp. UNI-283's joiner delay via the ratchet (315 s vs 77 s)
+  did **not** reproduce in this model in either arm. The redundancy is
+  measured; the misbehaviour is not.
+- *The `virtualTime` ratchet* (`bandState.virtualTime`) is not advanced. Its
+  only reader was the clamp floor. `sfqState.v` is the one V.
+- *`agingTokensPerSecond`* is in tab units, so a non-zero value is rejected at
+  startup when the stamp is on.
+
+**Estimate versus true-up.** The dispatch estimate fixes *this* request's
+tag. The completion true-up corrects the group's *future* tags. The gaming
+vector lives entirely in the second. The cost inputs are unchanged
+(`inputTokenWeight: 1.0`, `outputTokenWeight: 2.0`), but `outputTokenWeight`
+is still uncalibrated. It now sets the tag step directly rather than feeding a
+decaying average, so a mis-set value is a standing bias, not a transient.
+Calibration is out of scope here.
+
 **The three non-negotiables.**
 
 1. *The `priority` field is always the plugin's.* With
@@ -1142,6 +1175,7 @@ plugins:
       # ONLY so P4 can be run both ways and the question settled with data -- read
       # the OTHER tenants' throughput during the transition, not the newcomer's.
       # Turning it off re-couples fairness to idleness and breaks work conservation.
+      # Inert when sfqPriorityStamp is on: the SFQ start tag does the same job exactly.
       newcomerClamp: true
       provisionalCharge: true
       # UNI-293, off by default. An under-estimate's true-up lands at full weight

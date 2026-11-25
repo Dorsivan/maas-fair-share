@@ -227,6 +227,7 @@ func Factory(name string, parameters *json.Decoder, handle fwkplugin.Handle) (fw
 		}
 		log.FromContext(ctx).Info("SFQ priority stamp enabled; requestHandler.propagatePriority verified off",
 			"plugin", name, "config", source,
+			"tabRole", "observability only", "newcomerClampInert", cfg.NewcomerClamp,
 			"endpointStaleSeconds", cfg.SFQEndpointStaleSeconds, "settleTimeoutSeconds", cfg.SFQSettleTimeoutSeconds)
 	}
 
@@ -396,11 +397,38 @@ type candidate struct {
 	state      *groupState
 	id         string
 	normalized float64
+	// tag is the SFQ start tag this group's next dispatch would get. Set, and
+	// used as the score, only when the stamp is on. See Pick.
+	tag        float64
 	headWait   float64
 	enqueuedAt time.Time
 }
 
-// Pick selects the backlogged group with the lowest tab/weight.
+// Pick selects the backlogged group with the lowest tab/weight, or, with the
+// SFQ stamp on, the lowest next start tag.
+//
+// UNI-293: with the stamp on, the tab is not an input to this decision. The
+// tab is a decaying average of service and the SFQ finish tag is an
+// undecaying virtual finish time. They are two answers to "how much has this
+// group had", and ranking the EPP-held queue by one while vLLM's waiting
+// queue is ranked by the other would run two policies in series. So under
+// the stamp:
+//
+//   - Order: by max(F_g, V), the tag the group's next request will be
+//     stamped with. The EPP and vLLM then rank by the same number.
+//   - The tab: still charged, trued up and decayed exactly as before, but
+//     read only by metrics (maas_fairness_normalized_service), the flight
+//     recorder and the state dump. halfLifeSeconds and undecayedTrueUp then
+//     shape only that observability series.
+//   - newcomerClamp: does not run. The max(F_g, V) term is the exact form of
+//     the same rule: a group returning from idle cannot claim credit from
+//     before V. The clamp writes only to the tab, so leaving it on would
+//     change nothing this function decides; skipping it also stops the
+//     clamp counter reporting firings that had no effect. The sim case
+//     TestSFQSimHoldReturnNeedsNoClamp measures both arms.
+//   - The virtualTime ratchet: not advanced. Its only reader is the clamp
+//     floor. sfqState.v is the one V.
+//   - agingTokensPerSecond: rejected by validate. It is in tab units.
 func (p *Plugin) Pick(
 	ctx context.Context,
 	flowGroup flowcontrol.PriorityBandAccessor,
@@ -479,8 +507,9 @@ func (p *Plugin) Pick(
 	// group that is truly gone -- zero queue depth AND zero in-flight -- is
 	// unaffected: this adds a condition to when the clamp may fire, it does
 	// not relax the wall-clock gate that already decides genuine absence.
+	sfqPick := p.sfq != nil && !p.sfq.tabPick
 	idleThreshold := time.Duration(p.cfg.NewcomerClampIdleSeconds * float64(time.Second))
-	if p.cfg.NewcomerClamp {
+	if p.cfg.NewcomerClamp && !sfqPick {
 		floor := math.Max(bs.virtualTime, minNormalized)
 		for i := range candidates {
 			edge := bs.isBacklogEdge(candidates[i].id, seq, now, idleThreshold)
@@ -514,9 +543,25 @@ func (p *Plugin) Pick(
 		}
 	}
 
+	if sfqPick {
+		groups := make([]string, len(candidates))
+		for i := range candidates {
+			groups[i] = candidates[i].state.name
+		}
+		for i, tag := range p.sfq.nextStarts(now, groups) {
+			candidates[i].tag = tag
+		}
+	}
+
 	best := 0
 	bestScore := math.Inf(1)
 	for i := range candidates {
+		if sfqPick {
+			if candidates[i].tag < bestScore {
+				bestScore, best = candidates[i].tag, i
+			}
+			continue
+		}
 		// Aging is applied in raw units, not range-normalized against the
 		// currently-backlogged set: rescaling would change the mapping every
 		// cycle, leaving the equilibrium with no fixed point corresponding to
@@ -527,11 +572,13 @@ func (p *Plugin) Pick(
 		}
 	}
 
-	bs.mu.Lock()
-	if candidates[best].normalized > bs.virtualTime {
-		bs.virtualTime = candidates[best].normalized
+	if !sfqPick {
+		bs.mu.Lock()
+		if candidates[best].normalized > bs.virtualTime {
+			bs.virtualTime = candidates[best].normalized
+		}
+		bs.mu.Unlock()
 	}
-	bs.mu.Unlock()
 
 	p.publishNormalized(now, candidates)
 

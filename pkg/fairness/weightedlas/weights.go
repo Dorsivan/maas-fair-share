@@ -78,6 +78,8 @@ type Config struct {
 
 	// HalfLifeSeconds is the decay constant of the tab. 0 disables decay, which
 	// makes the tab cumulative since process start -- almost never what you want.
+	// With SFQPriorityStamp on, the tab feeds metrics only, so this shapes only
+	// that series; dispatch order comes from the undecaying SFQ finish tag.
 	HalfLifeSeconds float64 `json:"halfLifeSeconds,omitempty"`
 
 	// ObservedHalfLivesSeconds are additional half-lives accounted and reported
@@ -94,6 +96,8 @@ type Config struct {
 	// NewcomerClamp raises a returning-idle group's tab to the current minimum on
 	// the empty->non-empty queue edge. Exposed as a flag only so the load test can
 	// be run both ways; turning it off re-couples fairness to idleness.
+	// Inert when SFQPriorityStamp is on: Pick ranks by max(F_g, V), which is the
+	// exact form of this rule, and the clamp only ever wrote to the tab.
 	NewcomerClamp bool `json:"newcomerClamp"`
 
 	// NewcomerClampIdleSeconds is the minimum wall-clock time a group must have
@@ -296,6 +300,12 @@ func (c *Config) validate() error {
 		return fmt.Errorf("agingTokensPerSecond must be >= 0, got %v", c.AgingTokensPerSecond)
 	}
 	if c.SFQPriorityStamp {
+		// Aging is in tab units, and with the stamp on Pick ranks by SFQ tag,
+		// not the tab. Accepting it would be a knob that silently does nothing.
+		if c.AgingTokensPerSecond > 0 {
+			return fmt.Errorf("agingTokensPerSecond must be 0 when sfqPriorityStamp is on (Pick ranks by SFQ tag, "+
+				"not the tab), got %v", c.AgingTokensPerSecond)
+		}
 		if c.SFQEndpointStaleSeconds <= 0 {
 			return fmt.Errorf("sfqEndpointStaleSeconds must be > 0, got %v", c.SFQEndpointStaleSeconds)
 		}

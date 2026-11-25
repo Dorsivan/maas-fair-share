@@ -34,6 +34,28 @@ package weightedlas
 // decays, so the true-up is undecayed by construction. See
 // Config.UndecayedTrueUp for the equivalent fix on the tab.
 //
+// The two halves do different jobs and both have to be right. The dispatch
+// estimate c sets THIS request's position: its own tag S is fixed the moment
+// it is stamped. The completion true-up corrects the group's FUTURE
+// positions, by moving F_g before its next request is tagged. The UNI-283
+// gaming vector lives entirely in the second: an under-estimate that is never
+// trued up keeps every later tag too low.
+//
+// The cost inputs are unchanged from the tab: inputTokenWeight 1.0,
+// outputTokenWeight 2.0, the same group resolution. But outputTokenWeight is
+// still the uncalibrated placeholder it has always been, and here it sets
+// the tag step directly instead of feeding a decaying average that smooths
+// errors away over a half-life. A mis-set output weight is a standing bias in
+// every output-heavy group's queue position, not a transient. Calibrating it
+// is out of scope for UNI-293; it is called out so it does not slip into
+// this new role unnoticed.
+//
+// What this retires when the stamp is on (see Plugin.Pick): the tab stops
+// being a dispatch input and is kept for observability only; newcomerClamp
+// stops running, because max(F_g, V) is its exact form; the bandState
+// virtualTime ratchet stops advancing, because its only reader was the
+// clamp. sfqState.v is the one V.
+//
 // V is the minimum, over the endpoints that are serving, of the newest start
 // tag each one has begun serving. UNI-291 tested the max-tag definition: its
 // error with uneven endpoints grows ~1.5 pt per doubling of N (5.3 at N=8, 9.3
@@ -144,6 +166,11 @@ type sfqState struct {
 	// the design choice it is guarding.
 	noTrueUp bool
 	vMax     bool
+	// tabPick makes Pick order the EPP-held queue by the decayed tab, with the
+	// newcomer clamp and the virtualTime ratchet, as it did before UNI-293's
+	// review. Tests only: it is the "both notions live" arm the sim measures
+	// against.
+	tabPick bool
 }
 
 func newSFQState(cfg *Config) *sfqState {
@@ -288,6 +315,21 @@ func (s *sfqState) dispatch(now time.Time, group, endpoint string, weight, est, 
 	s.endpoint(endpoint).inFlight++
 	s.pending = append(s.pending, t)
 	return t, reaped
+}
+
+// nextStarts returns, for each group, the start tag its next dispatch would
+// get: max(F_g, V). With the stamp on, this is what Pick orders the EPP-held
+// queue by, so the EPP and vLLM's waiting queue rank requests by the same
+// number. Both are then layers of one SFQ queue, not two policies stacked.
+func (s *sfqState) nextStarts(now time.Time, groups []string) []float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.advanceV(now)
+	out := make([]float64, len(groups))
+	for i, g := range groups {
+		out[i] = math.Max(s.finish[g], s.v)
+	}
+	return out
 }
 
 // observeStart records that vLLM has begun serving t: the first response byte

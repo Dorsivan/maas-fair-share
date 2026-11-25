@@ -34,9 +34,14 @@ package weightedlas
 // there since, less the slots the scrape showed free (num_requests_running).
 // The router cannot see KV room. That is the real EPP's view, and it is what
 // sends extra work to KV-bound endpoints in the heterogeneous cases.
-// Workers are closed-loop with zero think time. There is no EPP depth gate,
-// which is the round-2 "SFQ alone, no depth gate" configuration: everything
-// is released at once and ordering happens entirely in vLLM.
+// Workers are closed-loop with zero think time. By default there is no EPP
+// depth gate, which is the round-2 "SFQ alone, no depth gate" configuration:
+// everything is released at once and ordering happens entirely in vLLM. With
+// `hold` set, the EPP holds requests in per-tenant FIFO flow queues while
+// vLLM's pool-wide waiting depth is at or above `hold`, and releases them one
+// at a time through the real plugin's Pick, as flow control does at
+// queueDepthThreshold. That is how the hold cases measure what the tab, the
+// newcomer clamp and the virtualTime ratchet do once the stamp is on.
 //
 // Scored on slot-seconds served (GPU-time composition) after warm-up, against
 // weights 20/10/65 normalised over the tenants present. It is an event-driven
@@ -55,6 +60,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	fwkfcmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
 	fwkrc "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -91,6 +98,14 @@ type sfqSimParams struct {
 
 	noTrueUp bool // disable the finish-tag true-up (shows the vector is real)
 	vMax     bool // V = max start tag, the rejected definition (shows the min matters)
+
+	// hold > 0 gates the EPP at that pool-wide vLLM waiting depth and orders
+	// the held requests with Pick. tabPick makes Pick rank by the tab with the
+	// newcomer clamp and ratchet (the pre-review behaviour); noClamp turns the
+	// clamp off.
+	hold    int
+	tabPick bool
+	noClamp bool
 }
 
 func sfqSimBase(workers int) sfqSimParams {
@@ -223,8 +238,10 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		{Name: "end-users", Weight: 65, Match: GroupMatch{Exact: []string{"end-users"}}},
 	}
 	cfg.DefaultGroup = DefaultGroupConfig{Name: "unclassified", Weight: 5}
+	cfg.Enforce = true
+	cfg.NewcomerClamp = !prm.noClamp
 	p, clock := newTestPlugin(t, cfg)
-	p.sfq.noTrueUp, p.sfq.vMax = prm.noTrueUp, prm.vMax
+	p.sfq.noTrueUp, p.sfq.vMax, p.sfq.tabPick = prm.noTrueUp, prm.vMax, prm.tabPick
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(prm.seed))
 	at := func(s float64) { clock.t = testBasis.Add(time.Duration(s * float64(time.Second))) }
@@ -277,6 +294,72 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		}
 	}
 
+	dispatch := func(r *sfqSimReq, now float64) {
+		if prm.staleness <= 0 || now >= nextScrape {
+			for e := range waiting {
+				snapW[e], snapFree[e], since[e] = float64(len(waiting[e])), float64(prm.seqs-running[e]), 0
+			}
+			nextScrape = now + prm.staleness
+		}
+		score := func(e int) float64 {
+			return math.Max(0, snapW[e]+since[e]-snapFree[e]) + 0.01*(float64(prm.seqs)-snapFree[e])/float64(prm.seqs)
+		}
+		best := 0
+		for e := 1; e < prm.endpoints; e++ {
+			if score(e) < score(best) {
+				best = e
+			}
+		}
+		since[best]++
+		require.NoError(t, p.PreRequest(ctx, r.req, results[best]))
+		r.prio = r.req.Body.Payload.(fwkrh.PayloadMap)["priority"].(int64)
+		waiting[best] = append(waiting[best], r)
+		admit(best, now)
+	}
+
+	// The EPP's flow queues, one FIFO per tenant, drained through Pick.
+	held := map[string][]*sfqSimReq{}
+	band := p.NewState(ctx)
+	release := func(now float64) {
+		for {
+			depth := 0
+			for e := range waiting {
+				depth += len(waiting[e])
+			}
+			if depth >= prm.hold {
+				return
+			}
+			var active []flowcontrol.FlowQueueAccessor
+			for _, tn := range sfqSimTenants {
+				if q := held[tn]; len(q) > 0 {
+					active = append(active, &fwkfcmocks.MockFlowQueueAccessor{
+						LenV: len(q), FlowKeyV: flowcontrol.FlowKey{ID: tn},
+						PeekV: &fwkfcmocks.MockQueueItemAccessor{
+							EnqueueTimeV: testBasis.Add(time.Duration(q[0].arrived * float64(time.Second)))},
+					})
+				}
+			}
+			if len(active) == 0 {
+				return
+			}
+			q, err := p.Pick(ctx, &fwkfcmocks.MockPriorityBandAccessor{
+				PolicyStateV: band,
+				IterateQueuesFunc: func(cb func(flowcontrol.FlowQueueAccessor) bool) {
+					for _, q := range active {
+						if !cb(q) {
+							return
+						}
+					}
+				},
+			})
+			require.NoError(t, err)
+			tn := q.FlowKey().ID
+			r := held[tn][0]
+			held[tn] = held[tn][1:]
+			dispatch(r, now)
+		}
+	}
+
 	submit := func(tn string, now float64) {
 		reqSeq++
 		nth[tn]++
@@ -304,28 +387,14 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 			req: &fwksched.InferenceRequest{RequestID: fmt.Sprintf("%s-%d", tn, reqSeq), FairnessID: tn,
 				Body: body, RequestSizeBytes: prm.promptToks * 4},
 		}
-		if prm.staleness <= 0 || now >= nextScrape {
-			for e := range waiting {
-				snapW[e], snapFree[e], since[e] = float64(len(waiting[e])), float64(prm.seqs-running[e]), 0
-			}
-			nextScrape = now + prm.staleness
-		}
-		score := func(e int) float64 {
-			return math.Max(0, snapW[e]+since[e]-snapFree[e]) + 0.01*(float64(prm.seqs)-snapFree[e])/float64(prm.seqs)
-		}
-		best := 0
-		for e := 1; e < prm.endpoints; e++ {
-			if score(e) < score(best) {
-				best = e
-			}
-		}
-		since[best]++
-		require.NoError(t, p.PreRequest(ctx, r.req, results[best]))
-		r.prio = r.req.Body.Payload.(fwkrh.PayloadMap)["priority"].(int64)
 		outstanding[tn]++
 		res.reqs[tn]++
-		waiting[best] = append(waiting[best], r)
-		admit(best, now)
+		if prm.hold > 0 {
+			held[tn] = append(held[tn], r)
+			release(now)
+			return
+		}
+		dispatch(r, now)
 	}
 
 	at(0)
@@ -371,6 +440,9 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 			submit(r.tenant, ev.at)
 		}
 		admit(e, ev.at)
+		if prm.hold > 0 {
+			release(ev.at)
+		}
 	}
 	res.throughput = float64(completed) / prm.duration
 	return res
@@ -646,4 +718,72 @@ func TestSFQSimLostCompletionsAreConservative(t *testing.T) {
 		noReaper, reaped)
 	assert.Greater(t, noReaper, 60.0, "without the reaper the lost completions must show up as an under-charge, or this test proves nothing")
 	assert.LessOrEqual(t, reaped, 50.0, "losing completions must never buy a group extra service")
+}
+
+// UNI-293 review: with the stamp on, the tab must not also rank the EPP-held
+// queue. Behind an EPP hold, the gaming vector is replayed with Pick ranking by
+// the SFQ tag (what ships) and by the decayed tab (the pre-review behaviour,
+// tabPick). The tab's true-up decays, so it under-charges the gamer's long
+// requests, and Pick lets that back in ahead of a stamp that has it right.
+// Measured: ~21.4% against the 21.1% target by tag, ~23.7% by tab.
+func TestSFQSimHoldOneNotionOfService(t *testing.T) {
+	t.Parallel()
+	target := sfqSimTarget(sfqSimTenants)
+	run := func(tabPick bool) map[string]float64 {
+		prm := sfqSimBase(32)
+		prm.hold = 4
+		prm.maxTokens = 1024
+		prm.gamer, prm.gamerLong, prm.gamerTightMax = "app1", 10, true
+		prm.tabPick = tabPick
+		r := runSFQSim(t, prm)
+		sh := r.share(prm.warmup, prm.duration)
+		name := "gamer behind EPP hold 4, Pick by SFQ tag"
+		if tabPick {
+			name = "gamer behind EPP hold 4, Pick by decayed tab"
+		}
+		sfqSimLog(t, name, r, sh, target)
+		return sh
+	}
+	byTab := run(true)
+	assert.Greater(t, byTab["app1"], target["app1"]+1.5,
+		"ranking by the tab must leak the vector, or this test proves nothing")
+	byTag := run(false)
+	assert.Less(t, sfqSimDev(byTag, target), 1.0)
+}
+
+// UNI-293 review: newcomerClamp is redundant under the stamp. A tenant returns
+// from 150 s idle, and then a newcomer joins, behind an EPP hold. With Pick
+// ranking by tag and the clamp skipped, neither gets a burst: max(F_g, V) does
+// the clamp's job exactly. The tab arm without the clamp shows the burst that
+// job exists to stop (~30% against a 10.5% target), so the absence of one
+// under the tag is the tag's doing. With the tab arm's clamp on, the burst is
+// also gone. UNI-283's joiner delay via the ratchet (315 s vs 77 s) did not
+// reproduce in this model in either arm; this case does not claim it.
+func TestSFQSimHoldReturnNeedsNoClamp(t *testing.T) {
+	t.Parallel()
+	all := sfqSimTarget(sfqSimTenants)
+	for _, sc := range []struct {
+		name string
+		idle [2]float64
+	}{{"returns", [2]float64{100, 250}}, {"joins", [2]float64{0, 250}}} {
+		run := func(tabPick, noClamp bool) sfqSimResult {
+			prm := sfqSimBase(128)
+			prm.hold = 4
+			prm.duration = 400
+			prm.idle = map[string][2]float64{"app2": sc.idle}
+			prm.tabPick, prm.noClamp = tabPick, noClamp
+			return runSFQSim(t, prm)
+		}
+		tag := run(false, false)
+		first := tag.share(250, 280)
+		sfqSimLog(t, "app2 "+sc.name+" at 250 s behind EPP hold, Pick by tag: first 30 s", tag, first, all)
+		assert.Less(t, sfqSimDev(first, all), 3.0, sc.name)
+		assert.Less(t, sfqSimDev(tag.share(280, 400), all), 2.0, sc.name)
+
+		bare := run(true, true)
+		bfirst := bare.share(250, 280)
+		sfqSimLog(t, "app2 "+sc.name+" at 250 s behind EPP hold, Pick by tab, no clamp: first 30 s", bare, bfirst, all)
+		assert.Greater(t, bfirst["app2"], all["app2"]+10,
+			"%s: the tab without a clamp must burst, or this test proves nothing", sc.name)
+	}
 }

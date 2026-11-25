@@ -468,3 +468,50 @@ func TestSFQStateIsVisible(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(raw), `"sfq"`)
 }
+
+// UNI-293 review: under the stamp, Pick ranks the EPP-held queue by the next
+// start tag, max(F_g, V), and the tab, the newcomer clamp and the virtualTime
+// ratchet take no part. The tab and the tag are set to disagree: a-group has
+// dispatched (F_a > 0) but has a near-zero tab; b-group has never dispatched
+// (F_b = 0) but a huge tab. The tag picks b-group. The pre-review path
+// (tabPick) picks a-group, so the test discriminates.
+func TestPickUnderStampRanksByTagNotTab(t *testing.T) {
+	t.Parallel()
+	pick := func(tabPick bool) (string, *Plugin, *bandState, float64) {
+		cfg := sfqConfig()
+		cfg.Enforce = true
+		p, clock := newTestPlugin(t, cfg)
+		p.sfq.tabPick = tabPick
+		ctx := context.Background()
+		for i := 0; i < 3; i++ {
+			require.NoError(t, p.PreRequest(ctx, sfqRequest("a-group", nil, 64), onEndpoint("e0")))
+		}
+		p.states["a-group"].setNormalizedService(clock.now(), 0)
+		p.states["b-group"].setNormalizedService(clock.now(), 1e9)
+		band := newSimBand(p,
+			&simFlow{id: "a-group", depth: 5, headAt: clock.now()},
+			&simFlow{id: "b-group", depth: 5, headAt: clock.now()})
+		q, err := p.Pick(ctx, band.accessor())
+		require.NoError(t, err)
+		return q.FlowKey().ID, p, band.state.(*bandState), p.states["b-group"].normalizedService(clock.now())
+	}
+
+	got, _, bs, bTab := pick(false)
+	assert.Equal(t, "b-group", got, "lowest next start tag wins, whatever the tab says")
+	assert.Zero(t, bs.virtualTime, "the ratchet must not advance under the stamp; sfqState.v is the one V")
+	assert.InDelta(t, 1e9, bTab, 1e3, "nothing under the stamp may write the tab from Pick")
+
+	got, _, _, _ = pick(true)
+	assert.Equal(t, "a-group", got, "the tab path must disagree, or this test proves nothing")
+}
+
+func TestAgingIsRejectedUnderTheStamp(t *testing.T) {
+	t.Parallel()
+	cfg := sfqConfig()
+	cfg.AgingTokensPerSecond = 1
+	_, err := newPlugin("x", cfg)
+	require.ErrorContains(t, err, "agingTokensPerSecond must be 0 when sfqPriorityStamp is on")
+	cfg.SFQPriorityStamp = false
+	_, err = newPlugin("x", cfg)
+	require.NoError(t, err)
+}

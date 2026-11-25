@@ -214,6 +214,25 @@ var (
 			Help:      help("Requests with no completion observed within sfqSettleTimeoutSeconds, charged their worst-case cost on the finish tag."),
 		}, []string{"fairness_id"})
 
+	// UNI-300. Divided by sfq_unsettled_total, the share of reaped requests
+	// that were not lost at all, only slower than sfqSettleTimeoutSeconds.
+	sfqLateCompletions = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_late_completions_total",
+			Help:      help("Requests charged worst-case by the reaper that then completed with a usage block: reaped while still legitimately queued or running."),
+		}, []string{"fairness_id"})
+
+	// UNI-300. Healthy endpoints land here between starts when
+	// sfqEndpointStaleSeconds is short against mean service time over
+	// effective concurrency.
+	sfqStaleDropouts = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_stale_dropouts_total",
+			Help:      help("Times an endpoint with work in flight left the virtual-time minimum because no start was observed within sfqEndpointStaleSeconds."),
+		})
+
 	// UNI-300. threshold: the internal clock was rebased, stamps unchanged.
 	// idle: the pool emptied and a new epoch started from zero.
 	sfqRebases = prometheus.NewCounterVec(
@@ -263,6 +282,8 @@ func collectors() []prometheus.Collector {
 		sfqStampedPriority,
 		sfqUnsettled,
 		sfqRebases,
+		sfqLateCompletions,
+		sfqStaleDropouts,
 		sfqUnstampable,
 		clientPriorityOverwritten,
 	}

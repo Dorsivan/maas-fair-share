@@ -119,6 +119,13 @@ type sfqSimParams struct {
 	// rebase would do if it ignored the tags already queued in vLLM.
 	rebaseAt    float64
 	naiveRebase bool
+
+	// staleAfter and settleTimeout override sfqEndpointStaleSeconds and
+	// sfqSettleTimeoutSeconds (sim seconds); 0 keeps the defaults. sigma is the
+	// log-normal spread of service time; 0 keeps 0.15.
+	staleAfter    float64
+	settleTimeout float64
+	sigma         float64
 }
 
 func sfqSimBase(workers int) sfqSimParams {
@@ -136,15 +143,16 @@ func sfqSimBase(workers int) sfqSimParams {
 }
 
 type sfqSimReq struct {
-	tenant  string
-	req     *fwksched.InferenceRequest
-	prio    int64
-	seq     int
-	arrived float64
-	started float64
-	service float64
-	out     int
-	kv      float64
+	tenant     string
+	req        *fwksched.InferenceRequest
+	prio       int64
+	seq        int
+	arrived    float64
+	started    float64
+	dispatched float64
+	service    float64
+	out        int
+	kv         float64
 }
 
 type sfqSimEvent struct {
@@ -179,10 +187,12 @@ type sfqSimServed struct {
 	started float64
 	service float64
 	e2e     float64
+	settle  float64 // dispatch to completion: what the reaper's clock sees
 }
 
 type sfqSimResult struct {
 	served     []sfqSimServed
+	starts     [][]float64 // per endpoint, every service start time
 	throughput float64
 	reqs       map[string]int
 	lag        map[string]float64 // F_g - V at snapAt
@@ -268,6 +278,12 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 	cfg.DefaultGroup = DefaultGroupConfig{Name: "unclassified", Weight: 5}
 	cfg.Enforce = true
 	cfg.NewcomerClamp = !prm.noClamp
+	if prm.staleAfter > 0 {
+		cfg.SFQEndpointStaleSeconds = prm.staleAfter
+	}
+	if prm.settleTimeout > 0 {
+		cfg.SFQSettleTimeoutSeconds = prm.settleTimeout
+	}
 	p, clock := newTestPlugin(t, cfg)
 	p.sfq.noTrueUp, p.sfq.vMax, p.sfq.tabPick = prm.noTrueUp, prm.vMax, prm.tabPick
 	p.sfq.noIdleReset, p.sfq.naiveRebase = prm.noIdleReset, prm.naiveRebase
@@ -298,7 +314,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 	push := func(ev sfqSimEvent) { evSeq++; ev.seq = evSeq; heap.Push(events, ev) }
 	nth := map[string]int{}
 	outstanding := map[string]int{}
-	res := sfqSimResult{reqs: map[string]int{}}
+	res := sfqSimResult{reqs: map[string]int{}, starts: make([][]float64, prm.endpoints)}
 	active := func(tn string, now float64) bool {
 		w, ok := prm.idle[tn]
 		return !ok || now < w[0] || now >= w[1]
@@ -320,6 +336,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 			running[e]++
 			kvUsed[e] += r.kv
 			r.started = now
+			res.starts[e] = append(res.starts[e], now)
 			// First token: the signal the plugin advances V on.
 			p.ResponseBody(ctx, r.req, &fwkrc.Response{}, nil)
 			push(sfqSimEvent{at: now + r.service, ep: e, r: r})
@@ -345,6 +362,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		since[best]++
 		require.NoError(t, p.PreRequest(ctx, r.req, results[best]))
 		r.prio = r.req.Body.Payload.(fwkrh.PayloadMap)["priority"].(int64)
+		r.dispatched = now
 		res.prios = append(res.prios, r.prio)
 		waiting[best] = append(waiting[best], r)
 		admit(best, now)
@@ -393,6 +411,10 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		}
 	}
 
+	sigma := prm.sigma
+	if sigma == 0 {
+		sigma = 0.15
+	}
 	submit := func(tn string, now float64) {
 		reqSeq++
 		nth[tn]++
@@ -415,7 +437,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		}
 		r := &sfqSimReq{
 			tenant: tn, seq: reqSeq, arrived: now, out: out,
-			service: m * prm.service * math.Exp(0.15*rng.NormFloat64()-0.5*0.15*0.15),
+			service: m * prm.service * math.Exp(sigma*rng.NormFloat64()-0.5*sigma*sigma),
 			kv:      float64(prm.promptToks + out),
 			req: &fwksched.InferenceRequest{RequestID: fmt.Sprintf("%s-%d", tn, reqSeq), FairnessID: tn,
 				Body: body, RequestSizeBytes: prm.promptToks * 4},
@@ -477,7 +499,7 @@ func runSFQSim(t *testing.T, prm sfqSimParams) sfqSimResult {
 		}, nil)
 		outstanding[r.tenant]--
 		completed++
-		res.served = append(res.served, sfqSimServed{tenant: r.tenant, started: r.started, service: r.service, e2e: ev.at - r.arrived})
+		res.served = append(res.served, sfqSimServed{tenant: r.tenant, started: r.started, service: r.service, e2e: ev.at - r.arrived, settle: ev.at - r.dispatched})
 		if active(r.tenant, ev.at) {
 			submit(r.tenant, ev.at)
 		}
@@ -937,4 +959,127 @@ func TestSFQSimIdleResetsTheLedger(t *testing.T) {
 			}
 		}
 	}
+}
+
+// sfqSimGaps returns the mean inter-start gap over endpoints eps after from,
+// and the share of gaps longer than tau.
+func sfqSimGaps(r sfqSimResult, eps []int, from, tau float64) (mean, over float64) {
+	var n, sum, long float64
+	for _, e := range eps {
+		st := r.starts[e]
+		for i := 1; i < len(st); i++ {
+			if st[i-1] < from {
+				continue
+			}
+			g := st[i] - st[i-1]
+			n++
+			sum += g
+			if g > tau {
+				long++
+			}
+		}
+	}
+	return sum / n, long / n
+}
+
+// UNI-300 review (Zeratul): is sfqEndpointStaleSeconds too short for long
+// requests? An endpoint counts toward V only if it started something within
+// staleAfter, and its mean gap between starts is S/N_eff: mean service time
+// over the concurrency it actually runs. That is KV-derived and can sit well
+// below max_num_seqs; here half the endpoints are KV-bound to 3 of 8. Gaps are
+// near-exponential (cv 0.7-1.1), so a healthy endpoint drops out of the min
+// with probability ~exp(-k) per gap, k = staleAfter * N_eff / S.
+//
+// What a drop-out costs is smaller than the rule suggests. The error needs
+// the whole slow cohort out of the min at once. Measured, with half of 8
+// endpoints slow, k in units of the slow endpoints' gap: k 0.67 within noise
+// (0.3-1.2 pt), k 0.5 ~2.5 pt, k 0.25 4-7 pt, as bad as the rejected max-tag
+// V. At N=64 there are 32 slow endpoints, one of them has always started
+// recently, and k 0.25 is within noise too. A single slow endpoint costs
+// little even under max-tag. So the error falls with fleet size; it does not
+// grow.
+func TestSFQSimStaleWindowRule(t *testing.T) {
+	t.Parallel()
+	all := sfqSimTarget(sfqSimTenants)
+	const slowN = 3.0
+	run := func(n int, k, sigma float64, seed int64) (sfqSimResult, sfqSimParams) {
+		prm := sfqSimBase(16 * n)
+		prm.endpoints, prm.duration, prm.sigma, prm.seed = n, 90, sigma, seed
+		typical := float64(prm.promptToks + prm.outToks)
+		prm.kvCaps = make([]float64, n)
+		for e := n / 2; e < n; e++ {
+			prm.kvCaps[e] = (slowN + 0.5) * typical
+		}
+		prm.staleAfter = k * prm.service / slowN
+		return runSFQSim(t, prm), prm
+	}
+	devAt := func(n int, k float64) float64 {
+		d := 0.0
+		for seed := int64(1); seed <= 3; seed++ {
+			r, prm := run(n, k, 0.15, seed)
+			d += sfqSimDev(r.share(prm.warmup, prm.duration), all) / 3
+		}
+		return d
+	}
+
+	for _, sigma := range []float64{0.15, 1.0} {
+		r, prm := run(8, 2, sigma, 1)
+		fast, slow := []int{0, 1, 2, 3}, []int{4, 5, 6, 7}
+		mf, _ := sfqSimGaps(r, fast, prm.warmup, math.Inf(1))
+		ms, over := sfqSimGaps(r, slow, prm.warmup, 2*prm.service/slowN)
+		t.Logf("sigma %.2f: mean gap %.4f s on 8-slot endpoints (S/N %.4f), %.4f s on KV-bound ones (S/N_eff %.4f); P(gap > 2 S/N_eff) %.3f (exp(-2) = 0.135)",
+			sigma, mf, prm.service/8, ms, prm.service/slowN, over)
+		assert.InEpsilon(t, prm.service/8, mf, 0.1, "the gap is S/N")
+		assert.InEpsilon(t, prm.service/slowN, ms, 0.1, "with N the effective concurrency, not max_num_seqs")
+		assert.InDelta(t, math.Exp(-2), over, 0.07, "gaps are near-exponential")
+	}
+
+	d067, d025, d64 := devAt(8, 0.67), devAt(8, 0.25), devAt(64, 0.25)
+	t.Logf("half of N=8 slow: dev %.1f pt at k 0.67, %.1f pt at k 0.25; half of N=64 slow, k 0.25: %.1f pt", d067, d025, d64)
+	assert.Less(t, d067, 2.0)
+	assert.Greater(t, d025, 2.5, "a window well under the gap must cost something, or this test proves nothing")
+	assert.Less(t, d64, 2.0, "many slow endpoints keep the min covered")
+}
+
+// UNI-300 review: sfqSettleTimeoutSeconds is measured from dispatch, so its
+// clock includes the wait in vLLM's queue, not just service. Under the stamp,
+// that wait is long by design for whoever is behind. A request reaped while
+// still legitimately queued or running is charged worst-case and trued down
+// when it completes. The reaps fall unevenly across groups, so the
+// composition moves. Measured, 32 workers per tenant, service spread
+// sigma 0.6, max_tokens 1024 against 64 generated:
+//
+//   - EPP gate at pool depth 8: settle 1.25 S reaps 52% and costs 6-7 pt;
+//     2 S reaps 20% for 2-3 pt; 2.8 S reaps 5-6% and is clean.
+//   - No gate (vLLM holds ~80): the low-weight tenant's median dispatch to
+//     completion is ~19 S, and even 4 S reaps ~30% for 5-7 pt.
+func TestSFQSimSettleTimeoutCountsQueueWait(t *testing.T) {
+	t.Parallel()
+	all := sfqSimTarget(sfqSimTenants)
+	run := func(hold int, settle float64) (dev, reaped float64) {
+		prm := sfqSimBase(32)
+		prm.hold, prm.sigma, prm.maxTokens = hold, 0.6, 1024
+		prm.settleTimeout = settle * prm.service
+		r := runSFQSim(t, prm)
+		n, over := 0, 0
+		for _, s := range r.served {
+			if s.started >= prm.warmup {
+				n++
+				if s.settle > prm.settleTimeout {
+					over++
+				}
+			}
+		}
+		dev, reaped = sfqSimDev(r.share(prm.warmup, prm.duration), all), 100*float64(over)/float64(n)
+		t.Logf("EPP gate %d, settle %.3g S: %.0f%% of completed requests outlived it, dev %.1f pt", hold, settle, reaped, dev)
+		return dev, reaped
+	}
+	devShort, reapedShort := run(8, 1.25)
+	assert.Greater(t, reapedShort, 40.0)
+	assert.Greater(t, devShort, 3.0, "false reaps must move the composition, or this test proves nothing")
+	devOK, reapedOK := run(8, 2.8)
+	assert.Less(t, reapedOK, 10.0)
+	assert.Less(t, devOK, 2.0)
+	devDeep, _ := run(0, 4)
+	assert.Greater(t, devDeep, 3.0, "without a gate the queue wait outlives even 4 S")
 }

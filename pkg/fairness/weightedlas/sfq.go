@@ -167,6 +167,7 @@ type sfqEndpoint struct {
 	newestStart float64   // highest start tag observed beginning service here
 	lastStartAt time.Time // when the most recent start was observed
 	haveStart   bool      // a start has been observed since the endpoint last went idle
+	wasServing  bool      // serving as of the last advanceV, to count stale drop-outs
 }
 
 // An endpoint exists in sfqState.endpoints only while it has work in flight.
@@ -281,7 +282,16 @@ func (s *sfqState) serving(ep *sfqEndpoint, now time.Time) bool {
 func (s *sfqState) advanceV(now time.Time) {
 	lo, n := math.Inf(1), 0
 	for _, ep := range s.endpoints {
-		if s.serving(ep, now) {
+		serving := s.serving(ep, now)
+		if ep.wasServing && !serving {
+			// Still has work in flight (release deletes an idle endpoint),
+			// but nothing seen to start within staleAfter. UNI-300: if
+			// sfqEndpointStaleSeconds is short for the pool's request
+			// length, healthy endpoints show up here between starts.
+			sfqStaleDropouts.Inc()
+		}
+		ep.wasServing = serving
+		if serving {
 			if s.vMax && n > 0 {
 				lo = math.Max(lo, ep.newestStart)
 			} else {
@@ -515,6 +525,13 @@ func (s *sfqState) settle(t *sfqTicket, now time.Time, actual float64, haveActua
 		return
 	}
 	s.observeStartLocked(t, now)
+	if t.reaped && haveActual {
+		// Presumed lost, then completed. UNI-300: with
+		// sfqSettleTimeoutSeconds short for the pool's dispatch-to-
+		// completion time (which includes vLLM queue wait), this counts
+		// legitimate requests the reaper charged worst-case.
+		sfqLateCompletions.WithLabelValues(boundID(t.group)).Inc()
+	}
 	if haveActual && !s.noTrueUp && t.epoch == s.epoch {
 		s.finish[t.group] += (actual - t.charged) / t.weight
 		t.charged = actual

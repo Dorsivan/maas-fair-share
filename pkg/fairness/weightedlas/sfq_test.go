@@ -560,6 +560,37 @@ func TestStampSaturatesAtTheVLLMCeiling(t *testing.T) {
 	assert.Equal(t, int64(math.MaxInt64), stamped(t, r))
 }
 
+// Not parallel: it reads process-global counters. A request reaped and then
+// completed counts as a late completion, which is how the live false-reap
+// rate is read. An endpoint with work in flight that stops starting things
+// counts as a stale drop-out once.
+func TestFalseReapsAndStaleDropoutsAreCounted(t *testing.T) {
+	cfg := sfqConfig()
+	cfg.SFQSettleTimeoutSeconds = 60
+	cfg.SFQEndpointStaleSeconds = 10
+	p, clock := newTestPlugin(t, cfg)
+	ctx := context.Background()
+	late0 := testutil.ToFloat64(sfqLateCompletions.WithLabelValues("a-group"))
+	stale0 := testutil.ToFloat64(sfqStaleDropouts)
+
+	slow := sfqRequest("a-group", nil, 1024)
+	require.NoError(t, p.PreRequest(ctx, slow, onEndpoint("e0")))
+	firstByte(p, slow)
+	other := sfqRequest("b-group", nil, 64)
+	require.NoError(t, p.PreRequest(ctx, other, onEndpoint("e0")))
+	clock.advance(11 * time.Second)
+	keep := sfqRequest("b-group", nil, 64) // advanceV notices e0 went stale
+	require.NoError(t, p.PreRequest(ctx, keep, onEndpoint("e1")))
+	assert.Equal(t, stale0+1, testutil.ToFloat64(sfqStaleDropouts))
+	require.NoError(t, p.PreRequest(ctx, sfqRequest("b-group", nil, 64), onEndpoint("e1")))
+	assert.Equal(t, stale0+1, testutil.ToFloat64(sfqStaleDropouts), "one drop-out, counted once")
+
+	clock.advance(50 * time.Second)
+	require.NoError(t, p.PreRequest(ctx, sfqRequest("b-group", nil, 64), onEndpoint("e1"))) // reaps slow
+	complete(p, slow, 100, 200)
+	assert.Equal(t, late0+1, testutil.ToFloat64(sfqLateCompletions.WithLabelValues("a-group")))
+}
+
 // ---------------------------------------------------------------------------
 // Observability
 // ---------------------------------------------------------------------------

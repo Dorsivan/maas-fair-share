@@ -1104,10 +1104,47 @@ stamp's headroom is the right-hand column. An EPP restart also resets the
 ledger (see Limits). `_sfq_rebases_total{reason="threshold"|"idle"}`
 counts both. `_sfq_stamped_priority` approaching 9.2e18 is the alert.
 
+**Sizing the stale window and the settle timeout (UNI-300 review).** Both
+defaults (60 s, 900 s) were set against 5-25 s requests.
+
+- *Stale window.* An endpoint's mean gap between starts is S/N_eff: mean
+  service time over the concurrency it actually runs. N_eff is KV-derived
+  and can sit far below `max_num_seqs`. With 50k-token prompts an 8B model
+  on one 80 GB GPU fits ~8 sequences, whatever `max_num_seqs` says. Gaps
+  are near-exponential, so a healthy endpoint drops out of the min with
+  probability ~exp(-k) per gap, where k = staleAfter·N_eff/S.
+  `TestSFQSimStaleWindowRule` confirms the gap to within 2%. The cost is
+  smaller than the rule suggests, because the error needs the whole slow
+  cohort out at once. With half of 8 endpoints slow: k 0.67 within noise,
+  0.5 costs ~2.5 pt, 0.25 costs 4-7 pt (as bad as max-tag). At N=64, k 0.25
+  is within noise: the error falls with fleet size.
+  **Guidance: staleAfter >= 3·S/N_eff.** That is ~5% drop-out per gap and
+  ~4x margin on the measured threshold. For 720 s requests that is 270 s at
+  N_eff 8 and 17 s at N_eff 128. The price of a longer window: a wedged
+  endpoint pins V for that long.
+  `_sfq_stale_dropouts_total` counts drop-outs live.
+- *Settle timeout.* Measured from dispatch, so it counts vLLM queue wait
+  as well as service, and under the stamp that wait is long for whoever
+  is behind. `TestSFQSimSettleTimeoutCountsQueueWait`, behind an EPP gate
+  of 8 on 16 slots, service spread sigma 0.6: 1.25 S reaps 52% of
+  legitimate requests and moves the composition 6-7 pt. 2 S reaps 20%
+  (2-3 pt). 2.8 S reaps 5% and is clean. With no gate (vLLM holding ~80),
+  the low-weight tenant's median dispatch-to-completion is ~19 S, and even
+  4 S costs 5-7 pt. **Guidance: settle >= 1.5x the p99 of
+  dispatch-to-completion.** By Little's law that is a group's in-flight
+  count over its completion rate. 900 s against 6-12 min requests is
+  inside the danger band. `_sfq_late_completions_total` /
+  `_sfq_unsettled_total` is the live share of reaps that were not lost
+  at all.
+- *Why not derive them at startup.* S, N_eff and queue depth are not known
+  at startup: they depend on traffic and prompt length. Deriving them at
+  runtime is feasible: per endpoint from the observed gap, per group from
+  observed dispatch-to-completion. That is filed as UNI-304, not built here.
+
 **Observability.** Metrics `maas_fairness_sfq_enabled`, `_sfq_virtual_time`,
 `_sfq_serving_endpoints`, `_sfq_finish_tag{fairness_id}`,
 `_sfq_lag{fairness_id}` (F - V), `_sfq_stamped_priority{fairness_id}`,
-`_sfq_unsettled_total`, `_sfq_rebases_total{reason}`, `_sfq_unstampable_total`. Response header
+`_sfq_unsettled_total`, `_sfq_late_completions_total`, `_sfq_stale_dropouts_total`, `_sfq_rebases_total{reason}`, `_sfq_unstampable_total`. Response header
 `x-maas-fairness-priority` (when `emitAttributionHeaders`). Flight-recorder
 fields `sfqVirtualTime` and `sfqFinishTag`. V(4) fields `sfqPriority` and
 `sfqStartTag`. A `sfq` section in the `StateDumper` output with every

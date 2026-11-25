@@ -811,6 +811,17 @@ once against a live tenant pair.
 This section is the one to re-read when a result seems fine. Every item here produced a
 healthy-looking run that measured nothing, on the source cluster, at least once.
 
+**"It isn't working" — jump straight to your symptom:**
+
+| Symptom | Most likely cause | Where |
+|---|---|---|
+| Split is flat / near-equal no matter the weights | Not actually contended (correct, work-conserving behaviour) — check item 1 below, and the checker's `contended` field | item 1 below |
+| Split is flat / near-equal, and it IS contended | `identityHeader` mismatch (all traffic landing in `unclassified`), or `sfqPriorityStamp`/`--scheduling-policy priority`/`propagatePriority` misconfigured | [§8](#8-initial-test-the-six-rung-ladder) Rung 3 (classification) and Rung 6 (stamp) |
+| EPP pod crash-looping / `0/1` | Plugin registered Alpha not Beta, a `command`/`args` override, an image the nodes can't pull, or (UNI-302) `sfqDecisionLog` set on an image without the decision-log code | [§8](#8-initial-test-the-six-rung-ladder) Rung 2, [§11](#11-changing-it) |
+| Run "succeeds" but the plugin was never in the path | `FailOpen` on an `ImagePullBackOff` EPP — latencies look fine because nothing was managed | item 2 below |
+| Stamp not taking effect (header/metric absent) | `--scheduling-policy priority` missing on vLLM, or `propagatePriority: true` | [§8](#8-initial-test-the-six-rung-ladder) Rung 6 |
+| Pool never saturating / can't get `contended: true` | Worker count too low for the configured weight | item 1 below, worker sizing under [§8](#8-initial-test-the-six-rung-ladder) Rung 4 |
+
 **1. Equal per-tenant concurrency makes work conservation read as a broken policy.**
 A weighted split can only be observed if **every tenant offers more load than its
 entitlement**. With equal concurrency the high-weight tenant runs out of work to be

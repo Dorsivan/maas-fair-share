@@ -167,8 +167,8 @@ periodic tick added nothing a trend query needed.
 
 ### 3.2 Events, rate-limited
 
-Two lines, each first-sighting-gated or otherwise naturally rare, both
-request-scoped:
+Three lines, each first-sighting-gated, window-gated or otherwise naturally
+rare. The first two are request-scoped:
 
 - **`"subscription matched no fairness group; using catch-all"`** — a
   subscription ID matched no configured group rule. Logged once per distinct
@@ -184,6 +184,15 @@ request-scoped:
   `..._requests_without_usage_total`): with
   `--enable-force-include-usage` set on every model server, this line and its
   counter should be flat zero forever.
+- **`"identity header missing from most requests; fairness is treating them all as the catch-all group"`**
+  (UNI-306) — window-scoped, not request-scoped, so it carries no
+  `requestID`/`traceId` and no `band`. Emitted at most once per 60s window,
+  when the window held ≥20 requests and ≥90% of them had no (or an empty)
+  identity header. Fields: `identityHeader`, `group`, `enforcing`,
+  `windowSeconds`, `requests`, `missing`, `absent`, `hint`. `absent` ≈
+  `requests` is the signature of a misnamed `identityHeader`; `missing` ≫
+  `absent` means the header is present but blank (the AuthPolicy's
+  non-API-key path). Pairs with `..._identity_header_missing_total{reason}`.
 
 ### 3.3 V(4) per-request tier — sampled, time-boxed, off by default
 

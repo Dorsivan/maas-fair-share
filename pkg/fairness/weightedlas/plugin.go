@@ -173,6 +173,14 @@ type Plugin struct {
 	unmatchedSample map[string]struct{}
 	unmatchedCount  uint64
 
+	// identityMu guards the tumbling window observeIdentity uses to decide
+	// whether the identity header is missing from nearly all recent traffic.
+	identityMu          sync.Mutex
+	identityWindowStart time.Time
+	identityTotal       uint64
+	identityMissing     uint64
+	identityAbsent      uint64
+
 	// lastContendedUnixNano gates the flight recorder: it logs only while
 	// contention is recent, so an idle cluster produces no output at all.
 	lastContendedUnixNano atomic.Int64
@@ -327,7 +335,7 @@ func (p *Plugin) RequestHeader(ctx context.Context, request *fwksched.InferenceR
 	if request == nil {
 		return nil
 	}
-	sub := p.subscriptionID(request)
+	sub, present := p.subscriptionID(request)
 	name, matched := p.groups.resolve(sub)
 	request.FairnessID = name
 
@@ -342,24 +350,86 @@ func (p *Plugin) RequestHeader(ctx context.Context, request *fwksched.InferenceR
 		unmatchedSubscriptions.Inc()
 		p.recordUnmatched(ctx, sub, corr, request.Objectives.Priority)
 	}
+	if sub == "" {
+		reason := "empty"
+		if !present {
+			reason = "absent"
+		}
+		identityHeaderMissing.WithLabelValues(reason).Inc()
+	}
+	p.observeIdentity(ctx, sub == "", !present)
 	return nil
 }
 
-func (p *Plugin) subscriptionID(request *fwksched.InferenceRequest) string {
+// subscriptionID returns the trimmed identity header value and whether the
+// header was present at all. The distinction matters: present-but-empty is the
+// AuthPolicy's non-API-key path, absent on every request is a misnamed header.
+func (p *Plugin) subscriptionID(request *fwksched.InferenceRequest) (string, bool) {
 	if request.Headers == nil {
-		return ""
+		return "", false
 	}
 	if v, ok := request.Headers[p.identityHeader]; ok {
-		return strings.TrimSpace(v)
+		return strings.TrimSpace(v), true
 	}
 	// The framework lowercases header keys, but a custom parser or a test may
 	// not have. The map is small enough that the fallback scan is free.
 	for k, v := range request.Headers {
 		if strings.EqualFold(k, p.identityHeader) {
-			return strings.TrimSpace(v)
+			return strings.TrimSpace(v), true
 		}
 	}
-	return ""
+	return "", false
+}
+
+// The identity-miss warning is judged over a tumbling window rather than per
+// request: a few unauthenticated callers are normal, and a startup check cannot
+// see a misnamed header at all -- it only shows under traffic.
+const (
+	identityMissWindow      = time.Minute
+	identityMissMinRequests = 20
+	identityMissWarnShare   = 0.9
+)
+
+// observeIdentity counts this request into the current window and, when the
+// window closes, warns if the identity header was missing from nearly all of
+// it. That is the one signature of a wrong identityHeader (UNI-306): every
+// request quietly lands in the catch-all, nothing mis-matches, and fairness
+// does nothing with no error. At most one line per window, so it cannot flood.
+//
+// The window closes on the first request after it expires, so an idle plugin
+// emits nothing -- the right behaviour, since an idle split is not broken.
+func (p *Plugin) observeIdentity(ctx context.Context, missing, absent bool) {
+	now := p.now()
+	p.identityMu.Lock()
+	if p.identityWindowStart.IsZero() {
+		p.identityWindowStart = now
+	}
+	var total, miss, abs uint64
+	var span time.Duration
+	closed := now.Sub(p.identityWindowStart) >= identityMissWindow
+	if closed {
+		total, miss, abs = p.identityTotal, p.identityMissing, p.identityAbsent
+		span = now.Sub(p.identityWindowStart)
+		p.identityWindowStart = now
+		p.identityTotal, p.identityMissing, p.identityAbsent = 0, 0, 0
+	}
+	p.identityTotal++
+	if missing {
+		p.identityMissing++
+	}
+	if absent {
+		p.identityAbsent++
+	}
+	p.identityMu.Unlock()
+
+	if !closed || total < identityMissMinRequests || float64(miss) < identityMissWarnShare*float64(total) {
+		return
+	}
+	log.FromContext(ctx).Info("identity header missing from most requests; fairness is treating them all as the catch-all group",
+		"plugin", p.name, "identityHeader", p.identityHeader, "group", p.groups.fallback,
+		"enforcing", p.cfg.Enforce, "windowSeconds", span.Seconds(),
+		"requests", total, "missing", miss, "absent", abs,
+		"hint", "absent ~= requests means identityHeader names a header the gateway never sends; the MaaS AuthPolicy injects "+DefaultIdentityHeader)
 }
 
 func (p *Plugin) recordUnmatched(ctx context.Context, sub string, corr correlation, band int) {

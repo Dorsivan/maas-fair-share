@@ -73,8 +73,8 @@ func TestUnmatchedSubscriptionLogCarriesRequestID(t *testing.T) {
 
 	req := &fwksched.InferenceRequest{
 		Headers: map[string]string{
-			"x-request-id":           "req-unmatched-1",
-			"x-maas-subscription-id": "totally-unknown-subscription",
+			"x-request-id":        "req-unmatched-1",
+			"x-maas-subscription": "totally-unknown-subscription",
 		},
 	}
 	require.NoError(t, p.RequestHeader(ctx, req))
@@ -93,7 +93,7 @@ func TestUnmatchedSubscriptionLogFallsBackWhenHeaderAbsent(t *testing.T) {
 	ctx, lines := capturingContext()
 
 	req := &fwksched.InferenceRequest{
-		Headers: map[string]string{"x-maas-subscription-id": "another-unknown-one"},
+		Headers: map[string]string{"x-maas-subscription": "another-unknown-one"},
 	}
 	require.NoError(t, p.RequestHeader(ctx, req))
 
@@ -136,9 +136,9 @@ func TestUnmatchedSubscriptionLogCarriesTraceIDWhenPresent(t *testing.T) {
 
 	req := &fwksched.InferenceRequest{
 		Headers: map[string]string{
-			"x-request-id":           "req-traced",
-			"traceparent":            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-			"x-maas-subscription-id": "yet-another-unknown",
+			"x-request-id":        "req-traced",
+			"traceparent":         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+			"x-maas-subscription": "yet-another-unknown",
 		},
 	}
 	require.NoError(t, p.RequestHeader(ctx, req))
@@ -159,8 +159,8 @@ func TestResponseHeaderSurfacesGroupQueueMsAndRequestID(t *testing.T) {
 	ctx := context.Background()
 
 	req := &fwksched.InferenceRequest{Headers: map[string]string{
-		"x-request-id":           "req-headers-1",
-		"x-maas-subscription-id": "a",
+		"x-request-id":        "req-headers-1",
+		"x-maas-subscription": "a",
 	}}
 	require.NoError(t, p.RequestHeader(ctx, req))
 	require.Equal(t, "a-group", req.FairnessID)
@@ -201,8 +201,8 @@ func TestResponseHeaderRequestIDMatchesLogLine(t *testing.T) {
 
 	req := &fwksched.InferenceRequest{
 		Headers: map[string]string{
-			"x-request-id":           "req-end-to-end",
-			"x-maas-subscription-id": "an-unmatched-id",
+			"x-request-id":        "req-end-to-end",
+			"x-maas-subscription": "an-unmatched-id",
 		},
 	}
 	require.NoError(t, p.RequestHeader(ctx, req))

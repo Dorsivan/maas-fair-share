@@ -62,7 +62,10 @@ type DefaultGroupConfig struct {
 // startup failure rather than a silently defaulted value.
 type Config struct {
 	// IdentityHeader is the request header carrying the authenticated
-	// subscription ID. Matched case-insensitively.
+	// subscription ID. Matched case-insensitively. The MaaS AuthPolicy injects
+	// X-MaaS-Subscription (no "-id" suffix); a name the gateway never sends is
+	// not a startup error, it is every request silently landing in
+	// DefaultGroup -- see Plugin.observeIdentity for how that is made loud.
 	IdentityHeader string `json:"identityHeader,omitempty"`
 
 	Groups       []GroupConfig      `json:"groups,omitempty"`
@@ -197,6 +200,13 @@ type Config struct {
 	RequestTierV4TimeBoxSeconds float64 `json:"requestTierV4TimeBoxSeconds,omitempty"`
 }
 
+// DefaultIdentityHeader is the header the MaaS AuthPolicy actually injects.
+// It was "x-maas-subscription-id" until UNI-306: the deployed ConfigMaps had
+// always overridden it, so the broken default only bit a config that omitted
+// the field -- and then fairness did nothing, with no error.
+// TestDefaultIdentityHeaderMatchesDeployedConfigs pins it to deploy/.
+const DefaultIdentityHeader = "x-maas-subscription"
+
 // DefaultConfig is what the plugin does with an empty parameters block: shadow
 // mode, undiscounted tokens, a 60s half-life, and a single catch-all group. The
 // zero-valued booleans in Config are deliberately not `omitempty`, so an explicit
@@ -204,7 +214,7 @@ type Config struct {
 // direction for all three of them.
 func DefaultConfig() Config {
 	return Config{
-		IdentityHeader:               "x-maas-subscription-id",
+		IdentityHeader:               DefaultIdentityHeader,
 		DefaultGroup:                 DefaultGroupConfig{Name: "unclassified", Weight: 1},
 		Enforce:                      false,
 		StateLogIntervalSeconds:      30,

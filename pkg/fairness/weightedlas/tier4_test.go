@@ -58,8 +58,8 @@ func runSettledRequest(t *testing.T, p *Plugin, ctx context.Context, reqID strin
 	t.Helper()
 	req := &fwksched.InferenceRequest{
 		Headers: map[string]string{
-			"x-request-id":           reqID,
-			"x-maas-subscription-id": "a",
+			"x-request-id":        reqID,
+			"x-maas-subscription": "a",
 		},
 	}
 	require.NoError(t, p.RequestHeader(ctx, req))

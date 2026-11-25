@@ -366,7 +366,7 @@ func TestGrouping(t *testing.T) {
 	ctx := context.Background()
 
 	resolve := func(sub string) string {
-		req := &fwksched.InferenceRequest{Headers: map[string]string{"x-maas-subscription-id": sub}}
+		req := &fwksched.InferenceRequest{Headers: map[string]string{"x-maas-subscription": sub}}
 		require.NoError(t, p.RequestHeader(ctx, req))
 		return req.FairnessID
 	}
@@ -427,7 +427,7 @@ func TestSpoofResistance(t *testing.T) {
 		FairnessID: "app1",
 		Headers: map[string]string{
 			"x-llm-d-inference-fairness-id": "app1",
-			"x-maas-subscription-id":        "end-user-mallory",
+			"x-maas-subscription":           "end-user-mallory",
 		},
 	}
 	require.NoError(t, p.RequestHeader(context.Background(), req))
@@ -1125,7 +1125,7 @@ func TestCostModels(t *testing.T) {
 func TestIdentityHeaderCaseInsensitive(t *testing.T) {
 	t.Parallel()
 	p, _ := newTestPlugin(t, testConfig())
-	req := &fwksched.InferenceRequest{Headers: map[string]string{"X-MaaS-Subscription-ID": " app1-production "}}
+	req := &fwksched.InferenceRequest{Headers: map[string]string{"X-MaaS-Subscription": " app1-production "}}
 	require.NoError(t, p.RequestHeader(context.Background(), req))
 	assert.Equal(t, "app1", req.FairnessID)
 }
@@ -1182,7 +1182,7 @@ func TestDumpStateIsBoundedAndSanitized(t *testing.T) {
 
 	for i := range 100 {
 		req := &fwksched.InferenceRequest{
-			Headers: map[string]string{"x-maas-subscription-id": "bogus-" + time.Duration(i).String()},
+			Headers: map[string]string{"x-maas-subscription": "bogus-" + time.Duration(i).String()},
 		}
 		require.NoError(t, p.RequestHeader(ctx, req))
 	}

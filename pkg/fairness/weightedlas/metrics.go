@@ -106,6 +106,20 @@ var (
 			Help:      help("Requests whose subscription ID matched no group rule and fell through to the catch-all."),
 		})
 
+	// unmatched_subscriptions_total never sees a request whose identity header
+	// was absent or empty: there was no subscription to mis-match. That blind
+	// spot is exactly where a wrong identityHeader hides (UNI-306), so it gets
+	// its own counter. reason is a closed set: "absent" (no such header -- if
+	// this is ~all traffic, identityHeader names a header the gateway never
+	// sends) or "empty" (header present, value blank -- the AuthPolicy's
+	// non-API-key path, legitimately unclassified).
+	identityHeaderMissing = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "identity_header_missing_total",
+			Help:      help("Requests attributed to the catch-all because the identity header was absent or empty."),
+		}, []string{"reason"})
+
 	// Symmetric noise here is fine and self-correcting. A persistent per-group
 	// bias is the signal: it means bytes-per-token is wrong for that group's
 	// content (CJK runs 1-2 bytes/token; multimodal token counts have no
@@ -269,6 +283,7 @@ func collectors() []prometheus.Collector {
 		dispatchTotal,
 		newcomerClamps,
 		unmatchedSubscriptions,
+		identityHeaderMissing,
 		truingError,
 		requestsWithoutUsage,
 		provisionalChargesExempted,

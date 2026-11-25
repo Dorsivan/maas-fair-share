@@ -44,8 +44,8 @@ func TestUnmatchedSubscriptionLogCarriesBandAndEnforcing(t *testing.T) {
 	req := &fwksched.InferenceRequest{
 		Objectives: fwksched.RequestObjectives{Priority: 7},
 		Headers: map[string]string{
-			"x-request-id":           "req-band-1",
-			"x-maas-subscription-id": "totally-unknown-subscription",
+			"x-request-id":        "req-band-1",
+			"x-maas-subscription": "totally-unknown-subscription",
 		},
 	}
 	require.NoError(t, p.RequestHeader(ctx, req))
@@ -103,8 +103,8 @@ func TestV4TierLineCarriesBandEnforcingAndRecorderTick(t *testing.T) {
 	req := &fwksched.InferenceRequest{
 		Objectives: fwksched.RequestObjectives{Priority: 2},
 		Headers: map[string]string{
-			"x-request-id":           "req-recorder-tick",
-			"x-maas-subscription-id": "a",
+			"x-request-id":        "req-recorder-tick",
+			"x-maas-subscription": "a",
 		},
 	}
 	require.NoError(t, p.RequestHeader(ctx, req))

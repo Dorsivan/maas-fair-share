@@ -46,6 +46,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -101,8 +102,11 @@ type sfqTicket struct {
 	worst float64
 
 	started bool // a response byte has come back, so vLLM has begun serving it
-	settled bool // ResponseBody's end-of-stream ran
-	reaped  bool // settleTimeout passed with no completion, so worst was charged
+	// startSeen mirrors started for the lock-free fast path in observeStart,
+	// which runs on every streamed chunk.
+	startSeen atomic.Bool
+	settled   bool // ResponseBody's end-of-stream ran
+	reaped    bool // settleTimeout passed with no completion, so worst was charged
 }
 
 // sfqEndpoint is the ledger's view of one model server.
@@ -112,6 +116,9 @@ type sfqEndpoint struct {
 	lastStartAt time.Time // when the most recent start was observed
 	haveStart   bool      // a start has been observed since the endpoint last went idle
 }
+
+// An endpoint exists in sfqState.endpoints only while it has work in flight.
+// See release.
 
 // sfqState is the shared virtual clock. One per plugin. The EPP is a single
 // replica, so this is the one clock every request on the pool is tagged
@@ -184,9 +191,10 @@ func (s *sfqState) endpoint(name string) *sfqEndpoint {
 // window set too long is that a wedged endpoint holds V that long. Either
 // way the freeze is bounded.
 //
-// An endpoint going idle also forgets its newest start (haveStart false).
-// When work returns to it, it stays out of the min until it is seen to start
-// something, rather than coming back with a stale tag.
+// An endpoint going idle is dropped from the ledger entirely (see release),
+// so it forgets its newest start. When work returns to it, it stays out of
+// the min until it is seen to start something, rather than coming back with
+// a stale tag.
 func (s *sfqState) serving(ep *sfqEndpoint, now time.Time) bool {
 	return ep.inFlight > 0 && ep.haveStart && now.Sub(ep.lastStartAt) <= s.staleAfter
 }
@@ -249,14 +257,17 @@ func (s *sfqState) reap(now time.Time) []string {
 	return reaped
 }
 
-// release takes a ticket off its endpoint's in-flight count. Caller holds s.mu.
+// release takes a ticket off its endpoint's in-flight count. Caller holds
+// s.mu. An endpoint that drops to zero is deleted outright. That is the
+// "forget the newest start on going idle" rule from serving, and it also
+// keeps the map from accumulating every pod name a rollout ever produced.
 func (s *sfqState) release(t *sfqTicket) {
-	ep := s.endpoint(t.endpoint)
-	if ep.inFlight > 0 {
-		ep.inFlight--
+	ep, ok := s.endpoints[t.endpoint]
+	if !ok {
+		return
 	}
-	if ep.inFlight == 0 {
-		ep.haveStart = false
+	if ep.inFlight--; ep.inFlight <= 0 {
+		delete(s.endpoints, t.endpoint)
 	}
 }
 
@@ -284,6 +295,11 @@ func (s *sfqState) dispatch(now time.Time, group, endpoint string, weight, est, 
 // non-streaming one it arrives with the completion, which is the "V from
 // completions" variant UNI-290 round 2 found equally robust.
 func (s *sfqState) observeStart(t *sfqTicket, now time.Time) {
+	// Every streamed chunk lands here. Only the first one does anything, so
+	// the rest must not contend on the pool-wide lock.
+	if t.startSeen.Load() {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observeStartLocked(t, now)
@@ -294,12 +310,16 @@ func (s *sfqState) observeStartLocked(t *sfqTicket, now time.Time) {
 		return
 	}
 	t.started = true
+	t.startSeen.Store(true)
 	if t.reaped {
 		// Already off its endpoint's in-flight count; a start this late says
 		// nothing about where the endpoint is now.
 		return
 	}
-	ep := s.endpoint(t.endpoint)
+	ep, ok := s.endpoints[t.endpoint]
+	if !ok {
+		return
+	}
 	ep.newestStart = math.Max(ep.newestStart, t.start)
 	ep.lastStartAt = now
 	ep.haveStart = true

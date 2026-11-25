@@ -410,7 +410,7 @@ func TestNoUsageCompletionKeepsTheTagCharge(t *testing.T) {
 		p.ResponseBody(context.Background(), req, &fwkrc.Response{EndOfStream: true, TerminationCause: cause}, nil)
 		view := p.sfq.view(clock.now())
 		assert.Equal(t, charged, view.FinishTags["a-group"], "cause %v", cause)
-		assert.Zero(t, view.Endpoints[0].InFlight, "cause %v: the request is still settled", cause)
+		assert.Empty(t, view.Endpoints, "cause %v: the request is still settled, and an idle endpoint leaves the ledger", cause)
 	}
 }
 

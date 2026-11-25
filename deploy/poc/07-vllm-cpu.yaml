@@ -72,7 +72,7 @@ spec:
           - llama-3-1-8b
           - --port
           - "8000"
-          # THE TWO HARD PREREQUISITES. Both default OFF and both fail
+          # THE THREE HARD PREREQUISITES. The first two default OFF and fail
           # SILENTLY -- without the first, streaming clients never true up and
           # are charged the estimate forever; without the second,
           # prompt_tokens_details is absent, cached_tokens reads 0 and
@@ -81,6 +81,12 @@ spec:
           # maas_fairness_prompt_tokens_cached_ratio must NOT be uniformly 0.
           - --enable-force-include-usage
           - --enable-prompt-tokens-details
+          # Required for the SFQ priority stamp (UNI-293) to do anything --
+          # inert (FIFO-equivalent) while sfqPriorityStamp is off. Confirmed
+          # live on this manifest (UNI-292): vLLM 0.24.0+rhaiv.9 accepts
+          # 'priority' as a non-default arg and the pod boots healthy.
+          - --scheduling-policy
+          - priority
           # Small batch so a modest client load produces a real queue.
           - --max-num-seqs
           - "4"
@@ -149,7 +155,7 @@ spec:
       template:
         containers:
           - name: main
-            image: quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f
+            image: quay.io/rh-ee-dsivan/maas-fair-share@sha256:feba5e1d81143e3eee79cce12f0c8ad4a43fd3683b2b73e13befbdd52c6a4255
             imagePullPolicy: Always
             resources:
               requests: {cpu: 200m, memory: 512Mi}

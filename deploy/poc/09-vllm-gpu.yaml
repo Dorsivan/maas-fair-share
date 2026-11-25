@@ -66,10 +66,19 @@ spec:
     containers:
       - name: main
         args:
-          # The two hard prerequisites, finally on a real GPU server. Both
-          # default off and both fail silently -- see deploy/llmisvc.yaml.
+          # The three hard prerequisites, finally on a real GPU server. All
+          # three default off (fcfs for the third) and fail silently -- see
+          # deploy/llmisvc.yaml.
           - --enable-force-include-usage
           - --enable-prompt-tokens-details
+          # Required for the SFQ priority stamp (UNI-293) to do anything.
+          # Verified live on this RH vLLM build (0.24.0+rhaiv.9, UNI-292): the
+          # flag is accepted and the pod starts healthy. With sfqPriorityStamp
+          # off and no client-set priority, every request ties at the same
+          # default and dispatches FIFO -- identical to fcfs -- so this is
+          # safe to leave on even before the plugin flag is flipped.
+          - --scheduling-policy
+          - priority
           # Small batch so a modest client load produces a genuine queue.
           # Without a backlog IterateQueues sees one non-empty queue and the
           # fairness policy is a no-op.
@@ -127,7 +136,7 @@ spec:
           - name: main
             # built from commit 86159ee (UNI-220); quay.io/rh-ee-dsivan/maas-fair-share:86159ee
             # is the human-readable tag for this digest, not what's pulled
-            image: quay.io/rh-ee-dsivan/maas-fair-share@sha256:c8a088203f6dc6c48c158d21b6295172a78f18646b06c334e5310a0caedb259f
+            image: quay.io/rh-ee-dsivan/maas-fair-share@sha256:feba5e1d81143e3eee79cce12f0c8ad4a43fd3683b2b73e13befbdd52c6a4255
             imagePullPolicy: Always
             resources:
               requests: {cpu: 200m, memory: 512Mi}

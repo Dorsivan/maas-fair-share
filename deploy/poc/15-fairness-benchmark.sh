@@ -2370,6 +2370,17 @@ fi
 stop_background_loops
 restore_chaos_scale
 
+# UNI-307: $EPP_LOG stays a local, regenerable run artifact only -- it is no
+# longer force-added to git past the results/ .gitignore rule. What gets
+# committed instead is this filtered sibling: same three bulk per-request
+# DEBUG line types stripped as 14-loadgen-with-log-archive.sh (UNI-46)
+# strips, same literal-"body"-text matching reasoning (see that script's
+# comment). Everything else, including WARN/ERROR bursts and "fairness
+# state" lines, survives verbatim.
+EPP_LOG_FILTERED="$ARTIFACT_DIR/epp-container-filtered.log"
+grep -vE '"body":"EPP received request"|"body":"EPP sent request body response\(s\) to proxy"|"body":"EPP sent response body back to proxy"' \
+  "$EPP_LOG" > "$EPP_LOG_FILTERED" || true
+
 LOADGEN_POD="$($OC get pods -n "$NAMESPACE" -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}')"
 $OC logs "$LOADGEN_POD" -n "$NAMESPACE" > "$LOADGEN_LOG" 2>&1 || echo "[benchmark] WARNING: could not fetch loadgen pod log" >&2
 
@@ -2487,4 +2498,5 @@ set -e
 
 echo "[benchmark] report: $REPORT_JSON , $REPORT_MD"
 echo "[benchmark] client-side request record: $CLIENT_RECORD_JSONL"
+echo "[benchmark] epp log: $EPP_LOG (local only, not committed) ; filtered: $EPP_LOG_FILTERED (commit this one)"
 exit "$REPORT_EXIT"

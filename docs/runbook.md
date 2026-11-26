@@ -580,6 +580,35 @@ log into:
 - `epp-container.log`, `loadgen.log`, `04-loadgen.patched.yaml` — same as
   UNI-46, for the same reason (archived evidence, not a log-retention bet).
 
+**Committing a run's results (UNI-307).** `results/` has been gitignored since
+UNI-33 for a reason: `epp-container.log` runs 5–32.5 MB and grows with run
+duration, and a repo that gains one such blob per scored run forever is an
+unprunable air-gap transfer liability ([UNI-172](/UNI/issues/UNI-172)'s
+review). Do **not** `git add -f results/<run>/` (force-adding the whole
+directory, the habit UNI-172 found and this ticket stops) or otherwise
+override `.gitignore` for `epp-container.log` itself — it stays a local,
+regenerable artifact, reproducible by rerunning the scenario. Both
+`14-loadgen-with-log-archive.sh` and `15-fairness-benchmark.sh` write a
+filtered sibling, `epp-container-filtered.log`, next to the raw log: every
+line except the three bulk per-request DEBUG types (confirmed ~66%+~33% of
+lines, zero fairness signal — two named in UNI-172's review plus an
+equal-sized third its table folded into an unlabeled "remainder"), so WARN
+and ERROR bursts and `"fairness state"` lines survive verbatim. Commit the
+run directory explicitly naming files, or force-add it and then unstage the
+raw log, e.g.:
+
+```sh
+git add -f results/<run>/manifest.json results/<run>/fairness-report.* \
+  results/<run>/metrics-*.txt results/<run>/epp-container-filtered.log \
+  results/<run>/loadgen.log results/<run>/04-loadgen.patched.yaml
+```
+
+`14-loadgen-with-log-archive.sh`'s `manifest.json` records both logs'
+presence and size (`eppLogCommitted: false`, `eppLogFilteredCommitted: true`)
+so a reviewer can see which one is expected in git without guessing.
+Existing commits that already carry a full raw log are untouched — this is a
+going-forward change only, not a history rewrite.
+
 The script's own exit code is the report's verdict: 0 on PASS, 1 on FAIL —
 wire it into anything that should break a pipeline on a regression.
 `equal-workers-control` (run with `--control`, which `15-fairness-benchmark.sh`

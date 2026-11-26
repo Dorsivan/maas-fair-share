@@ -1,0 +1,955 @@
+# Contention generator: three tenants, IDENTICAL load each, all through the
+# gateway so every request traverses Envoy's ext_proc filter and the plugin.
+#
+# Identical load is the whole point. If the tenants send different volumes the
+# result is confounded by work conservation -- a tenant that gets less than its
+# weight because it ASKED for less is correct behaviour and proves nothing.
+# Only when all three are individually capable of saturating the pool does the
+# delivered ratio mean anything.
+#
+# Sizing: the backend is 2 sim replicas x --max-num-seqs 4 = 8 concurrent
+# slots. 3 tenants x 32 workers = 96 in flight, a ~12x over-offer. That margin
+# is the point -- see the WORKERS comment below for why a merely-saturating
+# load produces an equal split and looks like a broken policy.
+#
+# end-users rotates across DISTINCT subscription IDs (default: the two keys
+# end-user-alpha/end-user-beta; UNI-129's END_USERS_KEYS below can widen this
+# to many more). That is a test, not decoration: every one of them must
+# collapse to the single `end-users` flow via the prefix rule. If grouping
+# were broken they would appear as N separate queues each holding weight 65,
+# and end users would receive Nx their share.
+#
+# UNI-179: "three tenants" is the DEFAULT, not a limit. LOADGEN_GROUPS (see
+# the group table in run.sh) declares any number of groups, each with its own
+# workers, keys, timeline and request shape; unset, it is exactly the
+# app1/app2/end-users set described above.
+#
+# Run it twice -- once with enforce:false (the FCFS control) and once with
+# enforce:true -- and diff the same counters across the two runs.
+#   oc apply -f deploy/poc/04-loadgen.yaml
+#   oc wait --for=condition=complete job/maas-loadgen -n maas-fairness-poc --timeout=10m
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maas-loadgen
+  namespace: maas-fairness-poc
+data:
+  run.sh: |
+    #!/bin/bash
+    GW="${GW:-http://maas-poc-gateway-data-science-gateway-class.maas-fairness-poc.svc.cluster.local}"
+    MODELPATH="${MODELPATH:-/maas-fairness-poc/maas-vllm-gpu}"
+    DURATION="${DURATION:-180}"
+    WORKERS="${WORKERS:-12}"
+    END=$(( $(date +%s) + DURATION ))
+
+    # UNI-128: per-request shape profile. Every knob below defaults to the
+    # single fixed shape this script used before this ticket (1200-word
+    # prompt, max_tokens=64, no stream, no abort, no oversized prompt) --
+    # that is the regression bar, not a suggestion. See docs/runbook.md
+    # "Request-shape profiles (UNI-128)" for the full story; this comment
+    # block is a pointer, not the source of truth.
+    # 1200 words = 300 repeats of the 4-word phrase below -- the exact prompt
+    # this script sent before UNI-128 (`for _ in $(seq 1 300); do PROMPT=...`).
+    PROMPT_WORDS_MIN="${PROMPT_WORDS_MIN:-1200}"
+    PROMPT_WORDS_MAX="${PROMPT_WORDS_MAX:-1200}"
+    MAX_TOKENS_DEFAULT="${MAX_TOKENS_DEFAULT:-64}"
+    MAX_TOKENS_OMIT_FRACTION="${MAX_TOKENS_OMIT_FRACTION:-0}"
+    MAX_TOKENS_HUGE_FRACTION="${MAX_TOKENS_HUGE_FRACTION:-0}"
+    MAX_TOKENS_HUGE_VALUE="${MAX_TOKENS_HUGE_VALUE:-32000}"
+    LONG_GEN_FRACTION="${LONG_GEN_FRACTION:-0}"
+    LONG_GEN_MAX_TOKENS="${LONG_GEN_MAX_TOKENS:-2000}"
+    STREAM_FRACTION="${STREAM_FRACTION:-0}"
+    ABORT_FRACTION="${ABORT_FRACTION:-0}"
+    ABORT_MIN_FRACTION="${ABORT_MIN_FRACTION:-0.1}"
+    ABORT_MAX_FRACTION="${ABORT_MAX_FRACTION:-0.6}"
+    OVERSIZED_FRACTION="${OVERSIZED_FRACTION:-0}"
+    OVERSIZED_PROMPT_WORDS="${OVERSIZED_PROMPT_WORDS:-12000}"
+    REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-300}"
+
+    # UNI-136 (C8): per-tenant cache-hit shape, independent of the PROMPT_WORDS_*
+    # knobs above. Unset (the default) means "use the global shape computed
+    # above" -- a plain invocation is unaffected, same contract as every other
+    # knob in this block. "hot" sends a byte-identical shared prefix plus a
+    # short unique tail (same construction as deploy/poc/10-cache-profile.yaml's
+    # app1 "fixed" shape); "cold" sends a fully unique body every request, no
+    # shared prefix at all (that file's app2 "unique"/control shape). This
+    # exists so two tenants in the SAME run can be given deliberately different
+    # cache-hit profiles -- the global PROMPT_WORDS_MIN/MAX shape is identical
+    # for every tenant and cannot do that.
+    CACHE_SHAPE_APP1="${CACHE_SHAPE_APP1:-}"
+    CACHE_SHAPE_APP2="${CACHE_SHAPE_APP2:-}"
+    CACHE_SHAPE_END_USERS="${CACHE_SHAPE_END_USERS:-}"
+
+    # UNI-145 (C2): per-tenant max_tokens shape, independent of the global
+    # MAX_TOKENS_OMIT_FRACTION/MAX_TOKENS_HUGE_FRACTION rolls above -- those
+    # apply the SAME fraction to every group's requests, which can't put one
+    # tenant on "always omits max_tokens" and another on "always sends
+    # MAX_TOKENS_HUGE_VALUE" in the same run. Unset (the default) means "use
+    # the global roll logic for this tenant", same contract as
+    # CACHE_SHAPE_APP1/APP2/END_USERS above. Values: "omit", "huge", or
+    # "longgen" (UNI-146: always LONG_GEN_MAX_TOKENS, unconditionally --
+    # unlike the global LONG_GEN_FRACTION roll below, which only ever hits a
+    # fraction of every tenant's requests the same way). PROMPT_WORDS_MIN/MAX
+    # is already a per-group knob via GROUP_KNOBS (UNI-179); pairing it with
+    # MAX_TOKENS_MODE_<TOKEN>=longgen on one group and leaving another on the
+    # global default is exactly UNI-146's asymmetric-request-shapes case.
+    MAX_TOKENS_MODE_APP1="${MAX_TOKENS_MODE_APP1:-}"
+    MAX_TOKENS_MODE_APP2="${MAX_TOKENS_MODE_APP2:-}"
+    MAX_TOKENS_MODE_END_USERS="${MAX_TOKENS_MODE_END_USERS:-}"
+
+    # UNI-129: identity variants (D1 key rotation, D3 forged header). Both
+    # default to this script's pre-UNI-129 behaviour -- two keys, no forged
+    # header -- so a plain invocation is unchanged. See docs/runbook.md
+    # "Identity-variant harness (UNI-129)" for the full story; this comment
+    # block is a pointer, not the source of truth.
+    #
+    # D1: space-separated list of /keys/<name> files to round-robin across
+    # for the end-users tenant, replacing the old fixed alpha/beta pair.
+    # Every name in the list must resolve to a REAL end-user-* MaaSSubscription
+    # (end-user-alpha or end-user-beta today -- see the key inventory), so
+    # this widens the number of distinct CREDENTIALS, not identities.
+    # UNI-179: the default lives in END_USERS_KEYS_DEFAULT rather than in
+    # END_USERS_KEYS itself, so an inline LOADGEN_GROUPS key list for
+    # end-users (see below) can still take effect when END_USERS_KEYS is unset.
+    END_USERS_KEYS_DEFAULT="end-user-alpha end-user-beta"
+    END_USERS_KEYS="${END_USERS_KEYS:-}"
+    # D3: forge x-llm-d-inference-fairness-id on this fraction of requests,
+    # set to FORGE_FAIRNESS_ID_VALUE. The ticket's own case sets this to
+    # "app1" while the request still authenticates with a real end-user key
+    # -- the point is to prove the plugin's unconditional PreRequest
+    # overwrite (design.md, "Security: headers must be stripped at the
+    # gateway") actually holds, not to find a new hole.
+    FORGE_FAIRNESS_ID_FRACTION="${FORGE_FAIRNESS_ID_FRACTION:-0}"
+    FORGE_FAIRNESS_ID_VALUE="${FORGE_FAIRNESS_ID_VALUE:-app1}"
+
+    # roll <fraction 0..1> -> prints 1 ("hit") or 0, using bash's own
+    # pseudo-random $RANDOM (0-32767). "$RANDOM" is re-read on every call, so
+    # every roll is independent.
+    roll() { awk -v f="$1" -v r="$RANDOM" 'BEGIN{printf "%d", (r/32767 < f)}'; }
+    rand_range() {
+      local lo="$1" hi="$2"
+      if [ "$lo" -ge "$hi" ]; then echo "$lo"; return; fi
+      echo $(( lo + RANDOM % (hi - lo + 1) ))
+    }
+
+    # A prompt long enough that prompt tokens are not noise next to output
+    # tokens, and long enough that the bytes/4 estimator is exercised on
+    # something realistic rather than a ten-word string ("words" here means
+    # one "the quick brown fox " repeat = 4 words).
+    build_prompt_words() {
+      local words="$1" reps out
+      reps=$(( (words + 3) / 4 ))
+      [ "$reps" -lt 1 ] && reps=1
+      out=""
+      for _ in $(seq 1 "$reps"); do out="${out}the quick brown fox "; done
+      printf '%s' "$out"
+    }
+
+    # TENANTS selects WHICH groups generate load, and it is the whole point of
+    # the work-conservation experiments. Running a subset is how you check that
+    # an absent tenant's weight is not being RESERVED: with end-users idle,
+    # app1+app2 must between them receive the FULL pool, not 30% of it.
+    TENANTS="${TENANTS:-app1 app2 end-users}"
+
+    # UNI-179: the group table. LOADGEN_GROUPS declares the groups this run
+    # dispatches, one space-separated entry per group:
+    #     <name>[:<workers>[:<key>,<key>,...]]
+    # and defaults to TENANTS, so every scenario written before this ticket
+    # (which only ever sets TENANTS) runs exactly the same groups. NOT named
+    # GROUPS: that is a bash special variable (the caller's gid list) and
+    # bash silently discards any value assigned to it, environment included.
+    #
+    # <name> is also the label this run records the group under (the
+    # $OUT/<name> file, the TENANT table row, CLIENT_RECORD_JSON "group") --
+    # 15-fairness-report.py joins those to the EPP's per-group metrics by
+    # name, so it must be the fairness id the group's keys classify to.
+    #
+    # Every per-group setting resolves as: the group's own env var, else the
+    # inline field above, else the built-in/global default. The env var name
+    # is the knob plus the group's TOKEN (name upper-cased, '-' -> '_'):
+    #     workers   WORKERS_<TOKEN>                 (else inline, else WORKERS)
+    #     keys      <TOKEN>_KEYS, space-separated   (else inline, else built-in)
+    #     timeline  <TOKEN>_START/_STOP/_DUTY       (UNI-127; else 0/DURATION/none)
+    #     shape     <KNOB>_<TOKEN> for each knob in GROUP_KNOBS (else global <KNOB>)
+    # which is exactly the naming the pre-existing app1/app2/end-users/custom
+    # knobs already used (WORKERS_APP1, END_USERS_KEYS, APP2_DUTY,
+    # CACHE_SHAPE_END_USERS, ...) -- those are now just instances of the rule.
+    # Built-in keys: app1 -> app1-production, app2 -> app2-batch, end-users ->
+    # END_USERS_KEYS_DEFAULT, custom -> CUSTOM_SUBSCRIPTION_NAME (required);
+    # any other group -> a key file named after the group itself. Several keys
+    # on one group (end-users' model) are round-robined across its workers.
+    # See docs/runbook.md "Per-group configuration (UNI-179)".
+    LOADGEN_GROUPS="${LOADGEN_GROUPS:-$TENANTS}"
+    KEYS_DIR="${KEYS_DIR:-/keys}"
+    GROUP_KNOBS="PROMPT_WORDS_MIN PROMPT_WORDS_MAX MAX_TOKENS_DEFAULT MAX_TOKENS_OMIT_FRACTION MAX_TOKENS_HUGE_FRACTION MAX_TOKENS_HUGE_VALUE LONG_GEN_FRACTION LONG_GEN_MAX_TOKENS STREAM_FRACTION ABORT_FRACTION ABORT_MIN_FRACTION ABORT_MAX_FRACTION OVERSIZED_FRACTION OVERSIZED_PROMPT_WORDS REQUEST_TIMEOUT_SECONDS FORGE_FAIRNESS_ID_FRACTION FORGE_FAIRNESS_ID_VALUE CACHE_SHAPE MAX_TOKENS_MODE"
+    # Globals for the two knobs that were only ever per-tenant (UNI-136,
+    # UNI-145): unset = no group gets that shape unless it sets its own.
+    CACHE_SHAPE="${CACHE_SHAPE:-}"
+    MAX_TOKENS_MODE="${MAX_TOKENS_MODE:-}"
+
+    group_token() { local t="${1^^}"; printf '%s' "${t//[^A-Z0-9]/_}"; }
+
+    # Resolved once, here, into arrays the workers inherit -- send_one reads
+    # GK["<KNOB>|<group>"] rather than re-resolving per request, so a
+    # per-group lookup costs no fork.
+    GROUP_NAMES=()
+    declare -A GTOK GWORKERS GKEYS GSTART GSTOP GDUTY GK
+    for spec in $LOADGEN_GROUPS; do
+      IFS=: read -r g inline_workers inline_keys <<< "$spec"
+      case "$g" in
+        ''|*[!a-z0-9-]*) echo "load: bad group name '$g' in LOADGEN_GROUPS (lowercase letters, digits, '-')" >&2; exit 1 ;;
+      esac
+      tok="$(group_token "$g")"
+      for other in "${GROUP_NAMES[@]}"; do
+        if [ "${GTOK[$other]}" = "$tok" ]; then
+          echo "load: groups '$other' and '$g' both map to env token $tok" >&2; exit 1
+        fi
+      done
+      GROUP_NAMES+=("$g")
+      GTOK[$g]="$tok"
+
+      v="WORKERS_$tok"
+      GWORKERS[$g]="${!v:-${inline_workers:-$WORKERS}}"
+
+      case "$g" in
+        app1)      builtin_keys="app1-production" ;;
+        app2)      builtin_keys="app2-batch" ;;
+        end-users) builtin_keys="$END_USERS_KEYS_DEFAULT" ;;
+        # UNI-129 D2: one arbitrary key/subscription name. No default, because
+        # there is no one arbitrary name to default to.
+        custom)    builtin_keys="${CUSTOM_SUBSCRIPTION_NAME:-}" ;;
+        *)         builtin_keys="$g" ;;
+      esac
+      v="${tok}_KEYS"
+      keys="${!v:-${inline_keys//,/ }}"
+      keys="${keys:-$builtin_keys}"
+      if [ -z "$keys" ]; then
+        if [ "$g" = "custom" ]; then
+          echo "load: set CUSTOM_SUBSCRIPTION_NAME to a /keys/<name> entry" >&2
+        else
+          echo "load: group '$g' has no keys (set ${tok}_KEYS)" >&2
+        fi
+        exit 1
+      fi
+      # Fail here, loudly, rather than run with an empty bearer token: a
+      # missing key file used to surface only as a column of 401s.
+      for k in $keys; do
+        if [ ! -r "$KEYS_DIR/$k" ]; then
+          echo "load: group '$g' key file $KEYS_DIR/$k does not exist" >&2; exit 1
+        fi
+      done
+      GKEYS[$g]="$keys"
+
+      v="${tok}_START"; GSTART[$g]="${!v:-0}"
+      v="${tok}_STOP";  GSTOP[$g]="${!v:-$DURATION}"
+      v="${tok}_DUTY";  GDUTY[$g]="${!v:-}"
+
+      for knob in $GROUP_KNOBS; do
+        v="${knob}_${tok}"
+        GK["$knob|$g"]="${!v:-${!knob}}"
+      done
+    done
+    if [ "${#GROUP_NAMES[@]}" -eq 0 ]; then
+      echo "load: LOADGEN_GROUPS/TENANTS is empty -- nothing to dispatch" >&2; exit 1
+    fi
+
+    # Precompute the common case (fixed length, the only shape this script
+    # had before UNI-128) once, same as the original single PROMPT= line, so
+    # a default invocation pays no extra per-request cost. Only a
+    # PROMPT_WORDS_MIN != MAX profile builds a prompt per request. UNI-179:
+    # one per group, but built once per distinct LENGTH -- a default run
+    # still builds exactly one 1200-word prompt that every group shares.
+    declare -A PROMPT_CACHE GFIXED_PROMPT GOVERSIZED_PROMPT
+    cache_prompt() {
+      [ -n "${PROMPT_CACHE[$1]+x}" ] || PROMPT_CACHE[$1]="$(build_prompt_words "$1")"
+    }
+    for g in "${GROUP_NAMES[@]}"; do
+      GFIXED_PROMPT[$g]=""
+      if [ "${GK[PROMPT_WORDS_MIN|$g]}" = "${GK[PROMPT_WORDS_MAX|$g]}" ]; then
+        cache_prompt "${GK[PROMPT_WORDS_MIN|$g]}"
+        GFIXED_PROMPT[$g]="${PROMPT_CACHE[${GK[PROMPT_WORDS_MIN|$g]}]}"
+      fi
+      # UNI-128 C6: deliberately oversized prompts that exceed the backend's
+      # context window (8192 tokens, see deploy/poc/09-vllm-gpu.yaml
+      # --max-model-len) and should get a 400, not a 200. Built once, up
+      # front, same reasoning as the fixed prompt -- its length never varies.
+      GOVERSIZED_PROMPT[$g]=""
+      if awk -v f="${GK[OVERSIZED_FRACTION|$g]}" 'BEGIN{exit !(f+0>0)}'; then
+        cache_prompt "${GK[OVERSIZED_PROMPT_WORDS|$g]}"
+        GOVERSIZED_PROMPT[$g]="${PROMPT_CACHE[${GK[OVERSIZED_PROMPT_WORDS|$g]}]}"
+      fi
+    done
+
+    # UNI-136 (C8): built once, same reasoning as the fixed/oversized prompts
+    # above -- only when some tenant actually needs the "hot" shape. 160 words
+    # = 40 reps of the 4-word phrase, matching 10-cache-profile.yaml's
+    # APP1_PREFIX (mk 40) exactly, so a group's measured hit rate here is
+    # directly comparable to that already-measured baseline.
+    HOT_PREFIX=""
+    for g in "${GROUP_NAMES[@]}"; do
+      if [ "${GK[CACHE_SHAPE|$g]}" = "hot" ]; then
+        HOT_PREFIX="$(build_prompt_words 160)"
+        break
+      fi
+    done
+
+    pick_prompt() {
+      local group="${1:-}" cache_shape
+      cache_shape="${GK[CACHE_SHAPE|$group]}"
+      if [ "$cache_shape" = "hot" ]; then
+        printf '%s question %s%s' "$HOT_PREFIX" "$RANDOM" "$RANDOM"
+        return
+      fi
+      if [ "$cache_shape" = "cold" ]; then
+        local p="" i
+        for i in $(seq 1 40); do p="${p}w$RANDOM "; done
+        printf '%s' "$p"
+        return
+      fi
+      if [ -n "${GOVERSIZED_PROMPT[$group]}" ] && [ "$(roll "${GK[OVERSIZED_FRACTION|$group]}")" = "1" ]; then
+        printf '%s' "${GOVERSIZED_PROMPT[$group]}"
+        return
+      fi
+      if [ -n "${GFIXED_PROMPT[$group]}" ]; then
+        printf '%s' "${GFIXED_PROMPT[$group]}"
+        return
+      fi
+      build_prompt_words "$(rand_range "${GK[PROMPT_WORDS_MIN|$group]}" "${GK[PROMPT_WORDS_MAX|$group]}")"
+    }
+
+    # Echoes "<max_tokens value, or -1 for omitted> <kind>". Precedence is
+    # omit > huge > longgen > default -- a request can only have one shape,
+    # so when more than one fraction rolls a hit for the same request, the
+    # one listed first in this ticket's own prose wins. Independent rolls
+    # (not mutually exclusive buckets) keep each knob's fraction meaning
+    # exactly what it says: "this fraction of ALL requests", not "this
+    # fraction of requests not already claimed by an earlier knob".
+    pick_max_tokens() {
+      local group="${1:-}" mode
+      mode="${GK[MAX_TOKENS_MODE|$group]}"
+      case "$mode" in
+        omit) echo "-1 omit"; return ;;
+        huge) echo "${GK[MAX_TOKENS_HUGE_VALUE|$group]} huge"; return ;;
+        # UNI-146 (C1): unlike the LONG_GEN_FRACTION roll below (a fraction
+        # of every group's requests), an explicit MAX_TOKENS_MODE_<TOKEN>=longgen
+        # makes EVERY request from this group long -- needed to put one
+        # whole tenant on "short prompt / long output" opposite another on
+        # "long prompt / short output" in the same run.
+        longgen) echo "${GK[LONG_GEN_MAX_TOKENS|$group]} longgen"; return ;;
+      esac
+      if [ "$(roll "${GK[MAX_TOKENS_OMIT_FRACTION|$group]}")" = "1" ]; then
+        echo "-1 omit"
+        return
+      fi
+      if [ "$(roll "${GK[MAX_TOKENS_HUGE_FRACTION|$group]}")" = "1" ]; then
+        echo "${GK[MAX_TOKENS_HUGE_VALUE|$group]} huge"
+        return
+      fi
+      if [ "$(roll "${GK[LONG_GEN_FRACTION|$group]}")" = "1" ]; then
+        echo "${GK[LONG_GEN_MAX_TOKENS|$group]} longgen"
+        return
+      fi
+      echo "${GK[MAX_TOKENS_DEFAULT|$group]} default"
+    }
+
+    # One request: builds the body from the profile knobs above, sends it,
+    # and -- for the ABORT_FRACTION draw -- cancels it client-side at a
+    # random point inside [ABORT_MIN_FRACTION, ABORT_MAX_FRACTION] of
+    # REQUEST_TIMEOUT_SECONDS ("a random cancel point", per the ticket).
+    # Usage (prompt_tokens/completion_tokens) is read from whatever body
+    # curl captured by grepping for the field names rather than parsing
+    # JSON -- this image has neither jq nor python3, and vLLM's
+    # --enable-force-include-usage (deploy/poc/09-vllm-gpu.yaml) means the
+    # same two field names appear exactly once, in the final chunk, whether
+    # the response was streamed or not -- so one grep path covers both.
+    send_one() {
+      local sub="$1" group="$2"
+      local prompt mt_value mt_kind max_tokens_json stream stream_json body
+      local tmp http_code latency start end aborted=0 curl_pid abort_flag="" canceller_pid=""
+      local forged=0 timeout_s
+      local -a curl_args
+      prompt="$(pick_prompt "$group")"
+      read -r mt_value mt_kind <<< "$(pick_max_tokens "$group")"
+      max_tokens_json=""
+      [ "$mt_kind" != "omit" ] && max_tokens_json="\"max_tokens\": ${mt_value}, "
+      # UNI-146: "longgen" alone is not enough -- vLLM stops at the model's
+      # own EOS token regardless of max_tokens, so a short/generic prompt
+      # with no reason to ramble produces a short completion no matter how
+      # high max_tokens is set (confirmed live: the first
+      # asymmetric-request-shapes attempt averaged ~68 completion tokens
+      # against a requested max_tokens of 1500). vLLM's chat completions
+      # endpoint accepts "min_tokens"/"ignore_eos" as server-specific
+      # extensions beyond the OpenAI schema; forcing both here is what
+      # actually makes "long generation" mean long.
+      [ "$mt_kind" = "longgen" ] && max_tokens_json="${max_tokens_json}\"min_tokens\": ${mt_value}, \"ignore_eos\": true, "
+      stream=0
+      [ "$(roll "${GK[STREAM_FRACTION|$group]}")" = "1" ] && stream=1
+      stream_json=""
+      [ "$stream" = "1" ] && stream_json='"stream": true, '
+      body="{\"model\":\"llama-3-1-8b\", ${stream_json}${max_tokens_json}\"messages\":[{\"role\":\"user\",\"content\":\"${prompt}\"}]}"
+
+      tmp="$(mktemp)"
+      start=$(date +%s.%N)
+      timeout_s="${GK[REQUEST_TIMEOUT_SECONDS|$group]}"
+      curl_args=(-sS -o "$tmp" -m "$timeout_s" -w '%{http_code}' -X POST)
+      [ "$stream" = "1" ] && curl_args+=(-N)
+      # UNI-129 D3: a fraction of requests additionally forge the fairness-id
+      # header while still authenticating with this call's real key/subscription
+      # -- see the FORGE_FAIRNESS_ID_FRACTION comment above.
+      [ "$(roll "${GK[FORGE_FAIRNESS_ID_FRACTION|$group]}")" = "1" ] && forged=1
+      [ "$forged" = "1" ] && curl_args+=(-H "x-llm-d-inference-fairness-id: ${GK[FORGE_FAIRNESS_ID_VALUE|$group]}")
+      curl "${curl_args[@]}" "$GW$MODELPATH/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer $(cat "$KEYS_DIR/$sub")" \
+        -d "$body" > "${tmp}.code" 2>/dev/null &
+      curl_pid=$!
+
+      if [ "$(roll "${GK[ABORT_FRACTION|$group]}")" = "1" ]; then
+        abort_flag="$(mktemp)"
+        local cancel_at
+        cancel_at=$(awk -v lo="${GK[ABORT_MIN_FRACTION|$group]}" -v hi="${GK[ABORT_MAX_FRACTION|$group]}" \
+          -v t="$timeout_s" -v r="$RANDOM" \
+          'BEGIN{ frac = lo + (r/32767)*(hi-lo); printf "%.2f", frac*t }')
+        ( sleep "$cancel_at"
+          if kill -0 "$curl_pid" 2>/dev/null; then
+            kill -TERM "$curl_pid" 2>/dev/null
+            touch "$abort_flag"
+          fi
+        ) &
+        canceller_pid=$!
+      fi
+
+      wait "$curl_pid" 2>/dev/null
+      local curl_exit=$?
+      if [ -n "$canceller_pid" ]; then
+        kill "$canceller_pid" 2>/dev/null
+        wait "$canceller_pid" 2>/dev/null
+      fi
+      end=$(date +%s.%N)
+      latency=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.4f", e-s}')
+
+      http_code="000"
+      if [ -n "$abort_flag" ] && [ -f "$abort_flag" ]; then
+        aborted=1
+        http_code="ABORT"
+      elif [ "$curl_exit" -eq 0 ] && [ -s "${tmp}.code" ]; then
+        http_code="$(cat "${tmp}.code")"
+      fi
+      [ -n "$abort_flag" ] && rm -f "$abort_flag"
+
+      local ptok=-1 ctok=-1
+      if [ "$http_code" != "ABORT" ] && [ -s "$tmp" ]; then
+        ptok=$(grep -oP '"prompt_tokens"\s*:\s*\K[0-9]+' "$tmp" | tail -1)
+        ctok=$(grep -oP '"completion_tokens"\s*:\s*\K[0-9]+' "$tmp" | tail -1)
+        [ -z "$ptok" ] && ptok=-1
+        [ -z "$ctok" ] && ctok=-1
+      fi
+
+      # UNI-128 client-side record: code, latency(s), prompt_tokens,
+      # completion_tokens, aborted(0/1), max_tokens value sent (-1=omitted),
+      # max_tokens kind, stream(0/1). Columns 1-2 are exactly the original
+      # "code time_total" shape the closing table and 15-fairness-report.py
+      # already parse by position ($1, $2) -- everything after is additive.
+      # UNI-129 appends a 9th column: forged(0/1), whether this request carried
+      # the D3 forged fairness-id header -- lets a later pass confirm delivered
+      # share didn't follow the forged value even on the requests that sent it.
+      echo "$http_code $latency $ptok $ctok $aborted $mt_value $mt_kind $stream $forged" >> "$OUT/$group"
+      rm -f "$tmp" "${tmp}.code"
+    }
+
+    # Every response's HTTP status is recorded. This is NOT optional bookkeeping:
+    # `curl -sS` treats a 503 as a perfectly good request and says nothing, so a
+    # run where the backend rejected everything looks identical to a healthy one
+    # -- fast, silent, and completely meaningless. An earlier run of this POC did
+    # exactly that, and only the plugin's own
+    # maas_fairness_requests_without_usage_total gave it away. Tally the codes
+    # here so the generator can indict itself without needing the EPP.
+    # UNI-179: overridable only so an off-cluster run of this script cannot
+    # collide with another on the same host; the Job never sets it.
+    OUT="${LOADGEN_OUT_DIR:-/tmp/codes}"
+    mkdir -p "$OUT"
+
+    # UNI-127: per-tenant timeline. A tenant can join/leave mid-run (START/STOP,
+    # seconds offset from this script's own start) and duty-cycle on/off while
+    # active (DUTY, "<on>/<off>" seconds -- e.g. "30/30"). Unset START/STOP means
+    # "active for the whole run" (START=0, STOP=DURATION), the prior, only
+    # behaviour, so a run that sets none of these is unchanged. The benchmark
+    # computes the same schedule independently (as seconds, no unit suffix, by
+    # the time it reaches this script) and writes it to timeline-config.json
+    # for the report step -- this loop and that file must agree on what "active"
+    # means at a given offset, see tenant_active_at() in 15-fairness-report.py.
+    SCRIPT_START=$(date +%s)
+    tenant_active() {
+      local group="$1" start="$2" stop="$3" duty="$4" now elapsed on off cycle phase
+      now=$(date +%s)
+      elapsed=$(( now - SCRIPT_START ))
+      if [ "$elapsed" -lt "$start" ] || [ "$elapsed" -ge "$stop" ]; then
+        return 1
+      fi
+      if [ -z "$duty" ]; then
+        return 0
+      fi
+      on="${duty%%/*}"
+      off="${duty##*/}"
+      cycle=$(( on + off ))
+      if [ "$cycle" -le 0 ]; then
+        return 0
+      fi
+      phase=$(( (elapsed - start) % cycle ))
+      [ "$phase" -lt "$on" ]
+    }
+
+    # Latency is recorded alongside the status code because the work-conservation
+    # tests are latency tests, not throughput tests. "app1 is not throttled when
+    # the pool is half empty" means its per-request latency matches its solo
+    # baseline; a throughput number alone cannot distinguish "not throttled"
+    # from "throttled but asking for less". UNI-128: send_one (defined above,
+    # before $OUT existed) now owns the actual request -- prompt, max_tokens,
+    # streaming, and client-abort all come from this run's profile knobs, and
+    # every default is the single fixed shape this loop sent before that
+    # ticket, so a plain invocation is unchanged.
+    # UNI-179: start barrier. Forking ~1000 workers is not instant, and how
+    # long it takes depends on the CPU this pod gets (0.3s for 960 workers on
+    # an idle 8-core host; a CPU-limited pod on a busy worker is far slower).
+    # With each worker starting the moment it was forked, app1's workers
+    # would be sending before app20's existed, and identically-configured
+    # groups would come out apart in requests sent: a client-side artefact
+    # that reads exactly like unfairness. So every worker first blocks (in
+    # open(), no CPU) on a
+    # FIFO until the dispatcher has forked them all, then reads the run's
+    # real clock (SCRIPT_START/END, set at release) and starts together.
+    GATE="$(mktemp -u /tmp/loadgen-gate.XXXXXX)"
+    mkfifo "$GATE"
+    worker() {
+      local sub="$1" group="$2" start="$3" stop="$4" duty="$5"
+      : < "$GATE"
+      read -r SCRIPT_START END < "$GATE.clock"
+      while [ "$(date +%s)" -lt "$END" ]; do
+        if ! tenant_active "$group" "$start" "$stop" "$duty"; then
+          sleep 1
+          continue
+        fi
+        send_one "$sub" "$group"
+      done
+    }
+
+    # SIZE THESE ABOVE EACH TENANT'S ENTITLEMENT, NOT EQUALLY.
+    #
+    # This is the single most important thing about running a fairness test,
+    # and getting it wrong produces a confident wrong answer. The generator is
+    # closed-loop: a tenant can never have more than its worker count
+    # outstanding. Give every tenant the same count and the HIGH-WEIGHT tenant
+    # runs out of work to be favoured with -- it is served faster than its
+    # workers can resubmit, its queue drains, it stops being a candidate in
+    # Pick, and the surplus correctly goes to everyone else.
+    #
+    # The measured result then looks like a hard ceiling around 1.8:1 no matter
+    # what the weights say. It is not. It is work conservation, and it cost a
+    # long detour to diagnose (docs/poc-results.md).
+    #
+    # Rule of thumb: offered concurrency for tenant i should exceed
+    #     (its weight share) x (pool capacity) x (mean latency)
+    # So for 20/10/65 against this pool, 64/64/208 works; 32/32/32 does not.
+    #
+    # Per-tenant overrides (WORKERS_<TOKEN>, resolved into GWORKERS in the
+    # group table above), defaulting to WORKERS. These exist for the
+    # ASYMMETRIC-DEMAND test, which is the realistic case and a stricter check
+    # than simply removing a tenant: a tenant sending a trickle still has a
+    # non-empty queue, so it stays a live candidate in every Pick decision,
+    # whereas an absent tenant is never a candidate at all. A policy that
+    # wrongly treats weight as a ceiling passes the absent-tenant test and
+    # fails this one.
+    #
+    # UNI-127 timeline: seconds-offset START/STOP (default: active the whole
+    # run) and an optional "<on>/<off>" DUTY cycle (default: no cycling, i.e.
+    # on for the whole [START,STOP) window). No suffix on these -- plain
+    # integer seconds; 15-fairness-benchmark.sh strips any "120s"-style
+    # shorthand before setting them, since this is the one place both this
+    # script and the report's independent schedule math have to agree on.
+    #
+    # The first five lines below are the pre-UNI-179 log lines, kept
+    # byte-identical for a 3-group run because 15-fairness-report.py parses
+    # the first one. They only ever name the four built-in groups; a group
+    # that is not declared shows what it WOULD have resolved to, as before.
+    builtin_workers() { local v="WORKERS_$(group_token "$1")"; printf '%s' "${GWORKERS[$1]:-${!v:-$WORKERS}}"; }
+    builtin_timeline() {
+      local tok v s e d
+      tok="$(group_token "$1")"
+      v="${tok}_START"; s="${GSTART[$1]:-${!v:-0}}"
+      v="${tok}_STOP";  e="${GSTOP[$1]:-${!v:-$DURATION}}"
+      v="${tok}_DUTY";  d="${GDUTY[$1]:-${!v:-}}"
+      printf '%s-%ss/duty=%s' "$s" "$e" "${d:-none}"
+    }
+    echo "load: tenants=[${GROUP_NAMES[*]}] workers app1=$(builtin_workers app1) app2=$(builtin_workers app2) end-users=$(builtin_workers end-users) custom=$(builtin_workers custom) duration=${DURATION}s"
+    echo "load: timeline app1=$(builtin_timeline app1) app2=$(builtin_timeline app2) end-users=$(builtin_timeline end-users)"
+    echo "load: UNI-129 end-users-keys=[${GKEYS[end-users]:-${END_USERS_KEYS:-$END_USERS_KEYS_DEFAULT}}] forge-fairness-id-fraction=${FORGE_FAIRNESS_ID_FRACTION} forge-fairness-id-value=${FORGE_FAIRNESS_ID_VALUE} custom-subscription=${CUSTOM_SUBSCRIPTION_NAME:-none}"
+    echo "load: UNI-136 cache-shape app1=${GK[CACHE_SHAPE|app1]:-${CACHE_SHAPE_APP1:-default}} app2=${GK[CACHE_SHAPE|app2]:-${CACHE_SHAPE_APP2:-default}} end-users=${GK[CACHE_SHAPE|end-users]:-${CACHE_SHAPE_END_USERS:-default}}"
+    echo "load: UNI-145 max-tokens-mode app1=${GK[MAX_TOKENS_MODE|app1]:-${MAX_TOKENS_MODE_APP1:-default}} app2=${GK[MAX_TOKENS_MODE|app2]:-${MAX_TOKENS_MODE_APP2:-default}} end-users=${GK[MAX_TOKENS_MODE|end-users]:-${MAX_TOKENS_MODE_END_USERS:-default}}"
+    # UNI-179: the full group table, any N. The groups= line is what
+    # 15-fairness-report.py reads to learn the group set beyond the three
+    # built-ins; the per-group lines list only knobs that differ from the
+    # global value, so a default run's lines say "overrides=[]".
+    _groups_line=""; _total_workers=0
+    for g in "${GROUP_NAMES[@]}"; do
+      _groups_line="${_groups_line:+$_groups_line }$g=${GWORKERS[$g]}"
+      _total_workers=$(( _total_workers + ${GWORKERS[$g]} ))
+    done
+    echo "load: UNI-179 groups=[${_groups_line}] total-workers=${_total_workers}"
+    for g in "${GROUP_NAMES[@]}"; do
+      _ovr=""
+      for knob in $GROUP_KNOBS; do
+        [ "${GK[$knob|$g]}" != "${!knob}" ] && _ovr="${_ovr:+$_ovr }$knob=${GK[$knob|$g]}"
+      done
+      echo "load: UNI-179 group $g token=${GTOK[$g]} workers=${GWORKERS[$g]} keys=[${GKEYS[$g]}] timeline=${GSTART[$g]}-${GSTOP[$g]}s/duty=${GDUTY[$g]:-none} overrides=[${_ovr}]"
+    done
+
+    # One loop for every group. Several keys on one group are round-robined
+    # across its workers -- UNI-129 D1's end-users model (default: the
+    # original two-key alpha/beta alternation), and every one of them must
+    # still collapse to the single group via the prefix rule. If grouping
+    # were broken they would appear as N separate queues each holding the
+    # group's weight, and the group would receive Nx its share. A one-key
+    # group (app1, app2, custom) is the n=1 case of the same loop.
+    _dispatch_t0=$(date +%s.%N)
+    for g in "${GROUP_NAMES[@]}"; do
+      read -r -a _keys <<< "${GKEYS[$g]}"
+      _n=${#_keys[@]}
+      for i in $(seq 1 "${GWORKERS[$g]}"); do
+        worker "${_keys[$(( (i - 1) % _n ))]}" "$g" "${GSTART[$g]}" "${GSTOP[$g]}" "${GDUTY[$g]}" &
+      done
+    done
+    echo "load: UNI-179 dispatched ${_total_workers} workers in $(awk -v s="$_dispatch_t0" -v e="$(date +%s.%N)" 'BEGIN{printf "%.2f", e-s}')s"
+    # Release. The clock file is written first, so no worker can pass the
+    # gate and read a stale one; the write end then stays open until every
+    # worker has exited, so one that reaches the gate late still passes.
+    SCRIPT_START=$(date +%s)
+    END=$(( SCRIPT_START + DURATION ))
+    echo "$SCRIPT_START $END" > "$GATE.clock"
+    exec 9> "$GATE"
+    wait
+    exec 9>&-
+    rm -f "$GATE" "$GATE.clock"
+
+    echo "load: done."
+    printf '%-12s %-7s %-9s %-9s %s\n' TENANT TOTAL P50_SEC P95_SEC STATUSES
+    for f in "$OUT"/*; do
+      n=$(wc -l < "$f")
+      stats=$(awk '{print $2}' "$f" | sort -n | awk -v n="$n" '
+        {a[NR]=$1}
+        END{ p50=a[int(NR*0.50)+0>0?int(NR*0.50):1]; p95=a[int(NR*0.95)+0>0?int(NR*0.95):1];
+             printf "%.2f %.2f", p50, p95 }')
+      codes=$(awk '{print $1}' "$f" | sort | uniq -c | sort -rn | awk '{printf "%s=%s ", $2, $1}')
+      printf '%-12s %-7s %-9s %-9s %s\n' "$(basename "$f")" "$n" $stats "$codes"
+    done
+    echo "A run is only meaningful if the statuses are overwhelmingly 200."
+    # Note: the STATUSES column above includes ABORT as a literal code (it is
+    # whatever $1 values appear in the file), but 15-fairness-report.py's
+    # STATUS_PAIR regex only extracts \d+=\d+ pairs into its structured
+    # status_tally, so a client abort is visible in this printed line and in
+    # the CLIENT_RECORD_JSON line below, but not in that report field. Out of
+    # this ticket's scope to change -- see docs/runbook.md.
+
+    # UNI-128: per-tenant client-side record, so G2 (ledger cross-check) can
+    # compare what the client actually sent/received against the EPP's own
+    # counters. One line per group, prefixed so 15-fairness-benchmark.sh can
+    # pull it out of this pod's log into the run's results directory without
+    # touching the TENANT/TOTAL/... table above.
+    emit_client_record() {
+      local group="$1" file="$2"
+      awk -v group="$group" '
+        {
+          total++
+          code=$1; ptok=$3; ctok=$4; aborted=$5; mtkind=$7; stream=$8; forged=$9
+          codecount[code]++
+          if (aborted=="1") aborts++
+          if (code=="000") errors++
+          if (ptok+0>0) ptok_total+=ptok
+          if (ctok+0>0) ctok_total+=ctok
+          if (stream=="1") stream_count++
+          if (mtkind=="omit") omit_count++
+          if (mtkind=="huge") huge_count++
+          if (mtkind=="longgen") longgen_count++
+          if (forged=="1") forged_count++
+        }
+        END {
+          printf "CLIENT_RECORD_JSON {\"group\":\"%s\",\"requests_sent\":%d,\"status_tally\":{", group, total+0
+          first=1
+          for (c in codecount) { if(!first) printf ","; printf "\"%s\":%d", c, codecount[c]; first=0 }
+          printf "},\"aborts\":%d,\"errors\":%d,\"prompt_tokens_total\":%d,\"completion_tokens_total\":%d,\"stream_requests\":%d,\"max_tokens_omitted\":%d,\"max_tokens_huge\":%d,\"long_generations\":%d,\"forged_fairness_id\":%d}\n", \
+            aborts+0, errors+0, ptok_total+0, ctok_total+0, stream_count+0, omit_count+0, huge_count+0, longgen_count+0, forged_count+0
+        }
+      ' "$file"
+    }
+    for f in "$OUT"/*; do
+      emit_client_record "$(basename "$f")" "$f"
+    done
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: maas-loadgen
+  namespace: maas-fairness-poc
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      # UNI-231: keep the client OFF the GPU nodes. Unpinned, it landed next
+      # to a vLLM replica (ocp-gpu-worker-1, 2026-11-11), and with three lanes
+      # it could land on ANOTHER lane's model server and spend that node's CPU
+      # on this lane's load -- cross-lane interference in exactly the latency
+      # the verdicts measure.
+      #
+      # UNI-249: and pin it to ONE named node per instance, chosen to host none
+      # of the request-path components another instance uses. Unpinned, the
+      # scheduler only ever picked ocp-worker-2/3 (0/1 are more CPU-requested,
+      # though barely used), and in the three-lane A/A both runs that
+      # collapsed to uncontended had their loadgen on ocp-worker-2, the node
+      # with every gateway, both lane EPPs, Authorino and maas-api. Instance 1
+      # gets ocp-worker-3 because that node's only per-instance component is
+      # instance 1's own GPU EPP (plus Limitador, which every lane shares
+      # wherever it runs); lanes 2/3 get ocp-worker-0/1. lanes.py rewrites the
+      # hostname line per lane -- keep it literal.
+      #
+      # The pod anti-affinity matches every harness loadgen in every namespace
+      # (the Job controller labels them all job-name=maas-loadgen), so even an
+      # older, unpinned loadgen can't share a node with a pinned one. A
+      # collision leaves the newer pod Pending, which the poll loop reports,
+      # instead of a run that silently shares a node.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: feature.node.kubernetes.io/pci-10de.present
+                    operator: DoesNotExist
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: [ocp-worker-3]
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  job-name: maas-loadgen
+              namespaceSelector: {}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: loadgen
+          image: registry.access.redhat.com/ubi9/ubi:latest
+          command: ["/bin/bash", "/script/run.sh"]
+          env:
+            # Which tenants generate load. Override to run the
+            # work-conservation experiments:
+            #   "app1 app2 end-users"  full contention (the weight split)
+            #   "app1 app2"            end-users idle -- their 65% must be
+            #                          absorbed, not reserved
+            #   "app1"                 app1 alone must receive ~100%
+            - name: TENANTS
+              value: "app1"
+            # UNI-179: the group table, for any N. Unset = TENANTS above.
+            # Each entry is <name>[:<workers>[:<key>,<key>,...]]; the name is
+            # also the label the run records the group under, so it must be
+            # the fairness id its keys classify to. Every per-group setting
+            # is also reachable as an env var -- WORKERS_<TOKEN>,
+            # <TOKEN>_KEYS, <TOKEN>_START/_STOP/_DUTY, and <KNOB>_<TOKEN> for
+            # every request-shape knob below (TOKEN = name upper-cased,
+            # '-' -> '_'), e.g. STREAM_FRACTION_APP2=1 streams only app2.
+            # See docs/runbook.md "Per-group configuration (UNI-179)".
+            # - name: LOADGEN_GROUPS
+            #   value: "app1:64 app2:32 app3:32:app3-key-a,app3-key-b"
+            # Per-tenant worker counts. Unset = use WORKERS for everyone.
+            # The asymmetric-demand run sets WORKERS_APP1=32 with
+            # WORKERS_END_USERS=2: app1 saturating while end-users trickles,
+            # to confirm app1 is not held near its 20% weight when end-users
+            # leaves most of its 65% unused.
+            # - name: WORKERS_APP1
+            #   value: "32"
+            # - name: WORKERS_APP2
+            #   value: "0"
+            # - name: WORKERS_END_USERS
+            #   value: "2"
+            # UNI-127: per-tenant timeline. START/STOP are seconds offset from
+            # this Job's own start (unset = active for the whole run); DUTY is
+            # an "<on>/<off>" seconds duty cycle while active (unset = no
+            # cycling). For example, to have end-users join at the 120s mark:
+            #   END_USERS_START=120
+            # and to duty-cycle app1 30s on/30s off the whole run:
+            #   APP1_DUTY=30/30
+            # - name: APP1_START
+            #   value: "0"
+            # - name: APP1_STOP
+            #   value: "240"
+            # - name: APP1_DUTY
+            #   value: "30/30"
+            # - name: APP2_START
+            #   value: "0"
+            # - name: APP2_STOP
+            #   value: "240"
+            # - name: APP2_DUTY
+            #   value: "30/30"
+            # - name: END_USERS_START
+            #   value: "120"
+            # - name: END_USERS_STOP
+            #   value: "240"
+            # - name: END_USERS_DUTY
+            #   value: "30/30"
+            # UNI-128: per-request shape profile. Every one of these defaults
+            # to the single fixed shape this Job sent before this ticket, so
+            # leaving all of them commented out (the shipped state) is the
+            # regression case. See docs/runbook.md "Request-shape profiles
+            # (UNI-128)" for what each fraction/value does and how they
+            # compose (independent per-request rolls, not mutually exclusive
+            # buckets).
+            # - name: PROMPT_WORDS_MIN
+            #   value: "200"
+            # - name: PROMPT_WORDS_MAX
+            #   value: "2000"
+            # - name: MAX_TOKENS_DEFAULT
+            #   value: "64"
+            # - name: MAX_TOKENS_OMIT_FRACTION
+            #   value: "0.1"
+            # - name: MAX_TOKENS_HUGE_FRACTION
+            #   value: "0.1"
+            # - name: MAX_TOKENS_HUGE_VALUE
+            #   value: "32000"
+            # - name: STREAM_FRACTION
+            #   value: "0.3"
+            # - name: ABORT_FRACTION
+            #   value: "0.05"
+            # - name: ABORT_MIN_FRACTION
+            #   value: "0.1"
+            # - name: ABORT_MAX_FRACTION
+            #   value: "0.6"
+            # - name: OVERSIZED_FRACTION
+            #   value: "0.02"
+            # - name: OVERSIZED_PROMPT_WORDS
+            #   value: "12000"
+            # - name: LONG_GEN_FRACTION
+            #   value: "0.05"
+            # - name: LONG_GEN_MAX_TOKENS
+            #   value: "2000"
+            # - name: REQUEST_TIMEOUT_SECONDS
+            #   value: "300"
+            # UNI-129: identity variants (D1 key rotation, D2 custom identity,
+            # D3 forged header). All default to this Job's pre-UNI-129
+            # behaviour -- two end-user keys, no custom tenant, no forged
+            # header. See docs/runbook.md "Identity-variant harness
+            # (UNI-129)" for the full story.
+            # - name: END_USERS_KEYS
+            #   value: "end-user-gen01 end-user-gen02 end-user-gen03 end-user-gen04 end-user-gen05 end-user-gen06 end-user-gen07 end-user-gen08 end-user-gen09 end-user-gen10 end-user-gen11 end-user-gen12 end-user-gen13 end-user-gen14 end-user-gen15 end-user-gen16 end-user-gen17 end-user-gen18 end-user-gen19 end-user-gen20"
+            # - name: FORGE_FAIRNESS_ID_FRACTION
+            #   value: "0.1"
+            # - name: FORGE_FAIRNESS_ID_VALUE
+            #   value: "app1"
+            # - name: CUSTOM_SUBSCRIPTION_NAME
+            #   value: "app1-production"
+            # - name: WORKERS_CUSTOM
+            #   value: "8"
+            # UNI-136 (C8): per-tenant cache-hit shape -- "hot" (shared prefix,
+            # see deploy/poc/10-cache-profile.yaml's app1 shape) or "cold"
+            # (fully unique, that file's app2/control shape). Unset = use the
+            # PROMPT_WORDS_MIN/MAX shape above for that tenant, unchanged.
+            # - name: CACHE_SHAPE_APP1
+            #   value: "hot"
+            # - name: CACHE_SHAPE_APP2
+            #   value: "cold"
+            # - name: CACHE_SHAPE_END_USERS
+            #   value: "hot"
+            # UNI-145 (C2): per-tenant max_tokens shape -- "omit" (no
+            # max_tokens field at all), "huge" (MAX_TOKENS_HUGE_VALUE), or
+            # "longgen" (UNI-146: always LONG_GEN_MAX_TOKENS, with
+            # min_tokens/ignore_eos forcing a genuinely long completion).
+            # Unset = use the global MAX_TOKENS_OMIT_FRACTION/HUGE_FRACTION/
+            # LONG_GEN_FRACTION rolls above for that tenant, unchanged.
+            # Combine with the per-group PROMPT_WORDS_MIN/MAX_<TOKEN> knob
+            # (GROUP_KNOBS, UNI-179) to put one tenant on "short prompt/long
+            # output" opposite another on "long prompt/short output" --
+            # UNI-146's own asymmetric-request-shapes scenario does exactly
+            # this: end-users short (30-word) prompt + longgen, app1 left on
+            # every global default (long prompt, short MAX_TOKENS_DEFAULT
+            # output).
+            # - name: MAX_TOKENS_MODE_APP1
+            #   value: "omit"
+            # - name: MAX_TOKENS_MODE_APP2
+            #   value: "huge"
+            # - name: MAX_TOKENS_MODE_END_USERS
+            #   value: "longgen"
+            # - name: PROMPT_WORDS_MIN_END_USERS
+            #   value: "30"
+            # - name: PROMPT_WORDS_MAX_END_USERS
+            #   value: "30"
+            - name: DURATION
+              # Several half-lives (halfLifeSeconds: 60). The tabs start empty
+              # after every EPP restart, so a run shorter than ~3 half-lives
+              # measures the warm-up rather than the equilibrium.
+              value: "60"
+            - name: WORKERS
+              # 32 per tenant = 96 offered against 8 backend slots.
+              #
+              # This number is the single easiest thing to get wrong. At 8
+              # workers/tenant the pool reported saturation and the policy was
+              # consulted, but queue depths sat at 1-4 items -- and a weighted
+              # queue can only apportion work that is actually QUEUED. With
+              # barely more backlog than there are slots, every group gets
+              # served almost immediately and the measured split comes out at
+              # equal thirds no matter what the weights say. That reads exactly
+              # like a broken policy and is really an under-offered load.
+              #
+              # The generator is closed-loop, so a tenant's offered load is
+              # capped by its worker count: it cannot exceed WORKERS requests
+              # in flight however favourably it is scheduled. Each tenant needs
+              # enough workers to saturate the pool ON ITS OWN, or the result
+              # is confounded by work conservation.
+              value: "32"
+          volumeMounts:
+            - name: script
+              mountPath: /script
+            - name: keys
+              mountPath: /keys
+              readOnly: true
+          resources:
+            # UNI-249: 1 core requested, 4 allowed. The old 100m/2-core sizing
+            # assumed a CPU-starved generator slows every tenant equally and
+            # leaves the ratio alone. The three-lane A/A disproved that: every
+            # loadgen hit its 2-core limit and was CFS-throttled in 30-64% of
+            # periods even solo, and the two most-throttled ones collapsed to
+            # uncontended runs. The generator is part of the instrument, so
+            # results from before this change are not directly comparable.
+            #
+            # UNI-167: the memory LIMIT (not the request, which stays tiny and
+            # doesn't affect scheduling) needs headroom for high-group-count
+            # scale scenarios -- each tenant's worker loop forks a curl per
+            # request, and at ~1000 concurrent workers that blew through 2Gi
+            # with "fork: Cannot allocate memory" after ~55s.
+            requests:
+              cpu: "1"
+              memory: 256Mi
+            limits:
+              cpu: "4"
+              memory: 6Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: script
+          configMap:
+            name: maas-loadgen
+            defaultMode: 0755
+        # One MaaS API key file per credential. Authentication is now the REAL
+        # path: Authorino validates the sk-oai key and injects
+        # X-MaaS-Subscription, which is what the plugin classifies on. The
+        # generator no longer asserts its own identity.
+        #
+        # UNI-129: this Secret holds more key FILES than SUBSCRIPTIONS --
+        # end-user-gen01..20 are 20 distinct sk-oai- credentials minted
+        # against the same two real MaaSSubscriptions (end-user-alpha/beta)
+        # for D1's key-rotation case. See docs/runbook.md's key inventory
+        # (names and subscriptions only -- never values).
+        - name: keys
+          secret:
+            secretName: maas-loadgen-keys

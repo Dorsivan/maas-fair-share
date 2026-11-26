@@ -188,6 +188,26 @@ BYTE_COUNT="$(wc -c < "$EPP_LOG" | tr -d ' ')"
 # and to any future encoder change.
 FLIGHT_RECORDER_LINES="$(grep -c '"fairness state"' "$EPP_LOG" || true)"
 
+# UNI-307: $EPP_LOG itself is no longer force-added to git -- it stays a
+# local, regenerable run artifact only (results/ has been gitignored since
+# UNI-33; this just stops the manual override). What gets committed instead
+# is this filtered sibling, built by stripping the three bulk per-request
+# DEBUG line types UNI-172's review measured at ~66%+~33% of lines (the
+# "EPP received request"/"EPP sent request body response(s) to proxy" pair
+# that review named explicitly, plus "EPP sent response body back to proxy",
+# an equal-sized third per-request DEBUG line that review's table folded
+# into its unlabeled "remainder" bucket without calling out -- all three
+# carry a request id/trace id and zero fairness signal). Same literal-text
+# matching reasoning as FLIGHT_RECORDER_LINES above. Everything else survives
+# verbatim, including WARN/ERROR bursts (UNI-172 found a real 300-line
+# eviction-error burst invisible in every derived artifact) and "fairness
+# state" lines.
+EPP_LOG_FILTERED="$ARTIFACT_DIR/epp-container-filtered.log"
+grep -vE '"body":"EPP received request"|"body":"EPP sent request body response\(s\) to proxy"|"body":"EPP sent response body back to proxy"' \
+  "$EPP_LOG" > "$EPP_LOG_FILTERED" || true
+FILTERED_BYTE_COUNT="$(wc -c < "$EPP_LOG_FILTERED" | tr -d ' ')"
+FILTERED_LINE_COUNT="$(wc -l < "$EPP_LOG_FILTERED" | tr -d ' ')"
+
 cat > "$MANIFEST_FILE" << JSON
 {
   "label": "$LABEL",
@@ -201,12 +221,17 @@ cat > "$MANIFEST_FILE" << JSON
   "eppContainerRestartsAtEnd": $END_RESTARTS,
   "eppPodRestartedMidRun": $([ "$START_RESTARTS" != "$END_RESTARTS" ] && echo true || echo false),
   "eppLogFile": "epp-container.log",
+  "eppLogCommitted": false,
   "eppLogByteCount": $BYTE_COUNT,
   "eppLogFlightRecorderLineCount": $FLIGHT_RECORDER_LINES,
+  "eppLogFilteredFile": "epp-container-filtered.log",
+  "eppLogFilteredCommitted": true,
+  "eppLogFilteredByteCount": $FILTERED_BYTE_COUNT,
+  "eppLogFilteredLineCount": $FILTERED_LINE_COUNT,
   "loadgenLogFile": "loadgen.log",
   "manifestFile": "manifest.json"
 }
 JSON
 
-echo "[archive] done. byte_count=$BYTE_COUNT flight_recorder_lines=$FLIGHT_RECORDER_LINES restarted_mid_run=$([ "$START_RESTARTS" != "$END_RESTARTS" ] && echo true || echo false)"
+echo "[archive] done. byte_count=$BYTE_COUNT filtered_byte_count=$FILTERED_BYTE_COUNT flight_recorder_lines=$FLIGHT_RECORDER_LINES restarted_mid_run=$([ "$START_RESTARTS" != "$END_RESTARTS" ] && echo true || echo false)"
 echo "[archive] manifest: $MANIFEST_FILE"

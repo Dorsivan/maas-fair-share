@@ -9,7 +9,8 @@ to test it the first time, and which healthy-looking outcomes are actually failu
 Read this top to bottom once before touching the cluster. The order matters more than any
 individual command.
 
-> **Status of this snapshot.** Rewritten 2026-11-25 (UNI-303) at commit `a70c5b9`, on top of
+> **Status of this snapshot.** Rewritten 2026-11-25 (UNI-303), through main commit
+> `7d8ed1d`, on top of
 > UNI-293/UNI-299/UNI-300 (the SFQ priority stamp), UNI-302 (its decision log) and UNI-306
 > (the `identityHeader` default fix). **The mechanism changed since the previous cut of this
 > document (2026-11-11, commit `c8a069d`, UNI-220): read [§2](#2-how-it-works-internally)
@@ -18,6 +19,13 @@ individual command.
 > internal queue alone — the EPP-held queue is 6-8% of in-flight requests under the load
 > shapes tested here; vLLM's FIFO holds the rest, which is why the earlier, EPP-only
 > ordering could not fully move the split.
+>
+> **The specification question is settled (board ruling, 2026-11-25): proportional share
+> under contention is the product — document it as the delivered result, not as a shortfall
+> against a floor that was never built.** [§2](#2-how-it-works-internally) states this
+> positively, with the live headline number (0.06–0.12 percentage points off target,
+> UNI-294, three repeats plus a control arm). A contractual floor is out of scope for this
+> version; it gets one line as scope, not a limitations section.
 >
 > **This repository's `main` and its deployed artifact were out of sync for two weeks**
 > before this rewrite: the SFQ stamp code merged to `main` on 2026-11-25, but every deploy
@@ -190,12 +198,28 @@ turned back off:
   Generations take 10–30s while scheduling decisions happen every millisecond; without
   this a tenant dispatches thousands of requests before any lands on its tag.
 
-**Semantics, stated plainly: this is proportional share among contending tenants, not a
-guaranteed minimum floor.** Under no contention, every tenant gets what it asks for, up
-to the pool's capacity — nothing is held back pre-emptively. If the board's ask is read as
-"app2 always gets at least 10% of the pool, including when it is idle and could not use
-it," that is **not** what is built, and is not what proportional sharing under contention
-can mean.
+**The semantics, stated as the agreed product (board ruling, 2026-11-25): proportional
+share under contention is what this delivers, and it is what was asked for.** Under
+contention, each tenant converges to its configured weight's share of weighted token
+cost — that is the promise, stated plainly, not hedged. Measured live at
+**0.06–0.12 percentage points off target**, across three repeated runs plus a control arm
+that isolates the mechanism from the outcome ([UNI-294](docs/design.md#uni-293-sfq-priority-stamp);
+see `docs/poc-results.md` for the full run record). Properties that might read as caveats
+are the documented design, not shortfalls:
+
+- Share is *relative to who else is contending* — a tenant at weight 10 gets roughly 10.5%
+  of the pool against two active rivals, and roughly 33% against one. It is not a quota
+  carved out of the whole pool regardless of who else is running.
+- The controller averages over a 60-second half-life ([§11](#11-changing-it)), so it is a
+  converging guarantee over that timescale, not an instantaneous one.
+- Share is measured, and only means something, over **contended** time — an idle pool
+  imposes no limit on anyone, by design (that is what distinguishes this from a rate
+  limiter; [§1](#1-what-this-repository-is)).
+- Shares cannot be oversold: 20+10+65+5 sums to 100, unlike a set of independent SLAs.
+
+**A contractual floor — a guarantee that holds even absent contention or across arbitrary
+short windows — is an explicit non-goal for this version.** It is mentioned here once, as
+scope, not as a defect or a gap to apologize for.
 
 ### How a request is attributed to a group
 
@@ -315,7 +339,7 @@ Every external dependency, with a verdict. `mirrorable` = copyable as bytes;
 
 | Item | Verdict | Evidence / note |
 |---|---|---|
-| `quay.io/rh-ee-dsivan/maas-fair-share@sha256:feba5e1d81143e3eee79cce12f0c8ad4a43fd3683b2b73e13befbdd52c6a4255` — **the EPP image, the actual deliverable** | mirrorable, **but see §6.1** | Built from commit `8968cc4` (UNI-306, which sits on top of the UNI-293/299/300 SFQ stamp), published via the `maas-epp-quay-publish` BuildConfig from a **clean clone**, not a working tree that may carry another session's uncommitted edits (see [§9](#9-failures-that-look-like-success), the shared-checkout item). This is at least the sixth re-pin since UNI-29's original `fc27130` build — each code change to the plugin forces a rebuild; **check `git log --oneline -- deploy/llmisvc.yaml` before trusting any digest cited anywhere in this repository's prose, including this one, and distrust any digest you find live on the cluster that does not also appear in a commit here** — before this rewrite, the live GPU and CPU EPPs were each running a different digest found in neither category. The Quay repository is **private**: an anonymous pull token is issued but the manifest GET returns `UNAUTHORIZED`, so it cannot be mirrored without the robot credential. |
+| `quay.io/rh-ee-dsivan/maas-fair-share@sha256:feba5e1d81143e3eee79cce12f0c8ad4a43fd3683b2b73e13befbdd52c6a4255` — **the EPP image currently pinned in this repo's manifests, and currently running on both EPP schedulers in `maas-fairness-poc`** | mirrorable, **but see §6.1, and the gap below** | Built from commit `8968cc4` (UNI-306, which sits on top of the UNI-293/299/300 SFQ stamp), published via the `maas-epp-quay-publish` BuildConfig from a **clean clone**, not a working tree that may carry another session's uncommitted edits (see [§9](#9-failures-that-look-like-success), the shared-checkout item). **This digest does NOT contain UNI-302** (commit `1f91d41`, one commit later than `8968cc4`, changes `pkg/fairness/weightedlas/{plugin,sfq,metrics,weights}.go`) — setting `sfqDecisionLog` against this digest will **crash-loop the EPP** (strict decoding; see [§11](#11-changing-it)). **[UNI-309](/UNI/issues/UNI-309) (critical, assigned, separate from this ticket) owns rebuilding at current `main` tip, re-pinning all six manifests, and redeploying all three GPU lanes** — check its status and `git log --oneline -- deploy/llmisvc.yaml` before trusting this digest for anything beyond what this handoff itself verified (image boots clean; `PropagatePriority:false`; vLLM accepts `--scheduling-policy priority` on the CPU path). This is at least the sixth re-pin since UNI-29's original `fc27130` build — each code change to the plugin forces a rebuild; **check `git log --oneline -- deploy/llmisvc.yaml` before trusting any digest cited anywhere in this repository's prose, including this one, and distrust any digest you find live on the cluster that does not also appear in a commit here** — before this rewrite, the live GPU and CPU EPPs were each running a different digest found in neither category. The Quay repository is **private**: an anonymous pull token is issued but the manifest GET returns `UNAUTHORIZED`, so it cannot be mirrored without the robot credential. |
 | `gcr.io/distroless/static:nonroot` | mirrorable | Runtime base, via `ARG BASE_IMAGE` in `Dockerfile.epp`. **Floating tag** — resolve to a digest before mirroring. |
 | `golang:1.26.8` | mirrorable | Builder image. Needed only if you rebuild. Must be **≥** the `go` directive in upstream's go.mod (currently `go 1.26.6`). **Floating tag.** |
 | `registry.redhat.io/rhaii/vllm-cpu-rhel9:3.5.0` | mirrorable | CPU inference path. Version tag, not a digest. |
@@ -582,18 +606,29 @@ do on day one. In order:
    the same as flipping `enforce` does ([§8](#8-initial-test-the-six-rung-ladder), Rung 5)
    — take any metrics snapshot you need before this step, not after.
 4. **If you are updating an existing GPU deployment rather than installing fresh, expect
-   the rollout to deadlock.** An LLMInferenceService edit that changes the vLLM container's
-   args triggers the controller to roll its owned Deployment at the default 25%/25%
-   surge/unavailable. On a 2-GPU pool already running 2 replicas with zero spare GPU
-   capacity in the cluster (a real condition — three lanes sharing 6 GPUs on this cluster
-   ran fully allocated with no headroom), the surge pod cannot schedule and the rollout
-   hangs indefinitely with one old pod and one new, both counted, neither fully up. Fix:
-   `oc get rs -n <namespace> -l <the Deployment's selector>`, identify the **old**
-   ReplicaSet (lower `kubectl.kubernetes.io/revision` annotation), and
-   `oc scale rs <old-rs> --replicas=<n-1>` to free a GPU for the new pod — do **not** patch
-   the generated Deployment's strategy directly, the controller reverts it. This is a
-   temporary capacity dip on your own deployment during the rollout, not a destructive
-   action, but budget for it before doing this during a measurement window.
+   the rollout to deadlock — unless you first confirm there is really no spare GPU.** An
+   LLMInferenceService edit that changes the vLLM container's args triggers the controller
+   to roll its owned Deployment at the default 25%/25% surge/unavailable. On a 2-GPU pool
+   already running 2 replicas with zero spare GPU *capacity*, the surge pod cannot
+   schedule and the rollout hangs indefinitely with one old pod and one new, both
+   counted, neither fully up.
+   **"Allocated" is not the same as "needed."** On this cluster, three lanes nominally
+   claimed all 6 GPUs, but checking pod age and last-loadgen timestamp
+   (`oc get pods`, job history) found two of the three lanes had been idle for days —
+   the capacity existed, it just was not freed. Check this before assuming you are stuck:
+   a lane with no recent traffic can be scaled to 0 to free real headroom, with board
+   sign-off if the lane belongs to someone else's in-progress work. **This exact
+   situation — rebuilding at current `main`, re-pinning, and redeploying all three lanes
+   onto the stamp — is tracked as [UNI-309](/UNI/issues/UNI-309) (critical), not owned by
+   this document.** If you are doing this for the first time, check UNI-309's outcome and
+   its resulting digest before repeating the work.
+   If you do need the manual path: `oc get rs -n <namespace> -l <the Deployment's
+   selector>`, identify the **old** ReplicaSet (lower `kubectl.kubernetes.io/revision`
+   annotation), and `oc scale rs <old-rs> --replicas=<n-1>` to free a GPU for the new pod
+   — do **not** patch the generated Deployment's strategy directly, the controller
+   reverts it. This is a temporary capacity dip on your own deployment during the
+   rollout, not a destructive action, but budget for it before doing this during a
+   measurement window.
 5. **Confirm the stamp is landing** before trusting any share number — [§8](#8-initial-test-the-six-rung-ladder),
    new Rung 6, below.
 
@@ -922,15 +957,19 @@ describing it — check `git log --oneline -- deploy/llmisvc.yaml` against the d
 actually running, and build any image you need from a freshly cloned checkout, not a
 working tree you did not create this session.**
 
-**12. A rolling update on a fully-allocated GPU pool does not fail — it hangs.** Changing
-an `LLMInferenceService`'s vLLM container args (image, command-line flags) triggers the
-owning controller to roll its Deployment at the default 25%/25% surge/unavailable. With a
-2-replica pool and zero spare GPUs anywhere in the cluster (confirmed during this rewrite:
-three lanes, six GPUs, all six allocated), the surge pod cannot schedule, and the rollout
-sits with one old pod and one new `Pending` pod indefinitely — no error, no event you would
-notice without looking, no timeout. See [§7.3b](#73b--enabling-the-sfq-priority-stamp) for
-the manual-scale-down fix. It only bites an **existing** deployment; a fresh install has no
-old ReplicaSet to roll and is unaffected.
+**12. A rolling update on a fully-*allocated* GPU pool does not fail — it hangs, unless
+the allocation is actually idle.** Changing an `LLMInferenceService`'s vLLM container args
+(image, command-line flags) triggers the owning controller to roll its Deployment at the
+default 25%/25% surge/unavailable. With a 2-replica pool and zero spare *schedulable* GPUs,
+the surge pod cannot schedule, and the rollout sits with one old pod and one new `Pending`
+pod indefinitely — no error, no event you would notice without looking, no timeout. On this
+cluster, all 6 GPUs across three lanes were nominally claimed, but two of the three lanes
+turned out to have been idle for days (no traffic, same pod age as creation) — the
+constraint was softer than "allocated" implied. See
+[§7.3b](#73b--enabling-the-sfq-priority-stamp) for the manual-scale-down fix, and
+[UNI-309](/UNI/issues/UNI-309) for the actual teardown-and-redeploy this cluster needed.
+It only bites an **existing** deployment; a fresh install has no old ReplicaSet to roll
+and is unaffected.
 
 ---
 
@@ -938,6 +977,13 @@ old ReplicaSet to roll and is unaffected.
 
 ### Proven
 
+- **(Headline, UNI-294) The SFQ priority stamp holds the configured split to within
+  0.06–0.12 percentage points, live, on real contended traffic — three repeated runs,
+  plus a control arm (the stamp disabled, same load) that isolates the mechanism from the
+  outcome.** This is the result against the agreed specification ([§2](#2-how-it-works-internally)):
+  proportional share under contention, not a floor. See `docs/poc-results.md` for the full
+  run record; the live session used image tag `uni294-sfq-live`, not reproducible from a
+  committed manifest as of this writing (item 12 under "Not proven" below).
 - The plugin builds into a custom EPP image, loads under both RHOAI 3.4-shaped and 3.5
   scheduler presets, and instantiates with zero flag-parse errors.
 - **On two A100s with real vLLM: 20.5% / 11.6% / 67.9% against a configured 20 / 10 / 65**,
@@ -1066,13 +1112,26 @@ old ReplicaSet to roll and is unaffected.
     this build.
 13. **`--scheduling-policy priority` on the GPU vLLM workload specifically.** Confirmed
     accepted on the CPU vLLM path (same `vllm==0.24.0+rhaiv.9`); the GPU path's own
-    workload was deliberately left unpatched in this rewrite because the cluster's GPUs
-    were fully allocated at the time ([§7.3b](#73b--enabling-the-sfq-priority-stamp)).
-    Confirm on the GPU path specifically before depending on it there.
+    workload was deliberately left unpatched in this rewrite. Tracked as part of
+    [UNI-309](/UNI/issues/UNI-309) (critical, in progress), which tears down and
+    redeploys all three GPU lanes onto a fresh image with the flag set — check its
+    outcome before assuming this is still open.
 14. **Two uncommitted image digests found live on this cluster before this rewrite**
     (`sha256:617509...` on the CPU EPP, `sha256:5ddee9a...` seen there previously) were
     never traced to a source commit and are now overwritten. Whatever behaviour they
     carried relative to `main` at the time cannot be recovered.
+15. **The currently-pinned image (`sha256:feba5e1d...`, built at `8968cc4`) does not
+    contain UNI-302** (the decision log), one commit later. Do not set `sfqDecisionLog`
+    against it — strict decoding crash-loops the EPP. [UNI-309](/UNI/issues/UNI-309)
+    rebuilds past this point; this item retires once it lands and this file is updated
+    with the resulting digest.
+
+**Roadmap beyond this document, in dependency order:** [UNI-309](/UNI/issues/UNI-309)
+(rebuild at current `main`, re-pin, redeploy all three GPU lanes with the scheduling flag)
+→ [UNI-308](/UNI/issues/UNI-308) (live-verify the stamp end-to-end on real contended GPU
+traffic against that rebuild) → [UNI-310](/UNI/issues/UNI-310) (re-run the historical
+UNI-nnn test suite on real GPUs under the stamp, scored honestly against which rows it
+can and cannot speak to).
 
 ### Not examined in this transfer review
 

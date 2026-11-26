@@ -342,7 +342,7 @@ Every external dependency, with a verdict. `mirrorable` = copyable as bytes;
 
 | Item | Verdict | Evidence / note |
 |---|---|---|
-| `quay.io/rh-ee-dsivan/maas-fair-share@sha256:feba5e1d81143e3eee79cce12f0c8ad4a43fd3683b2b73e13befbdd52c6a4255` — **the EPP image currently pinned in this repo's manifests, and currently running on both EPP schedulers in `maas-fairness-poc`** | mirrorable, **but see §6.1, and the gap below** | Built from commit `8968cc4` (UNI-306, which sits on top of the UNI-293/299/300 SFQ stamp), published via the `maas-epp-quay-publish` BuildConfig from a **clean clone**, not a working tree that may carry another session's uncommitted edits (see [§9](#9-failures-that-look-like-success), the shared-checkout item). **This digest does NOT contain UNI-302** (commit `1f91d41`, one commit later than `8968cc4`, changes `pkg/fairness/weightedlas/{plugin,sfq,metrics,weights}.go`) — setting `sfqDecisionLog` against this digest will **crash-loop the EPP** (strict decoding; see [§11](#11-changing-it)). **[UNI-309](/UNI/issues/UNI-309) (critical, assigned, separate from this ticket) owns rebuilding at current `main` tip, re-pinning all six manifests, and redeploying all three GPU lanes** — check its status and `git log --oneline -- deploy/llmisvc.yaml` before trusting this digest for anything beyond what this handoff itself verified (image boots clean; `PropagatePriority:false`; vLLM accepts `--scheduling-policy priority` on the CPU path). This is at least the sixth re-pin since UNI-29's original `fc27130` build — each code change to the plugin forces a rebuild; **check `git log --oneline -- deploy/llmisvc.yaml` before trusting any digest cited anywhere in this repository's prose, including this one, and distrust any digest you find live on the cluster that does not also appear in a commit here** — before this rewrite, the live GPU and CPU EPPs were each running a different digest found in neither category. The Quay repository is **private**: an anonymous pull token is issued but the manifest GET returns `UNAUTHORIZED`, so it cannot be mirrored without the robot credential. |
+| `quay.io/rh-ee-dsivan/maas-fair-share@sha256:d496a0cf5075a1024b9f556524312653103eab14d656645dd8115d820905b537` — **the EPP image pinned in this repo's manifests as of UNI-309** | mirrorable, **but see §6.1** | Built from commit `6e49e0c` (`main` tip at the time of the UNI-309 rebuild — includes UNI-302's decision log/rank/live-share and the UNI-290-composition merge, test-only), published via the `maas-epp-quay-publish` BuildConfig from a **clean clone**, not a working tree that may carry another session's uncommitted edits (see [§9](#9-failures-that-look-like-success), the shared-checkout item). **This digest DOES contain UNI-302**, so `sfqDecisionLog` can be set against it without crash-looping (strict decoding; see [§11](#11-changing-it)) — it is still committed `"off"` in `deploy/poc/00-config.yaml`, which also now carries `sfqPriorityStamp: true` for the first time (previously only `deploy/epp-config.yaml`'s production template had the key; the POC config never did). This is at least the seventh re-pin since UNI-29's original `fc27130` build — each code change to the plugin forces a rebuild; **check `git log --oneline -- deploy/llmisvc.yaml` before trusting any digest cited anywhere in this repository's prose, including this one, and distrust any digest you find live on the cluster that does not also appear in a commit here**. The Quay repository is **private**: an anonymous pull token is issued but the manifest GET returns `UNAUTHORIZED`, so it cannot be mirrored without the robot credential. |
 | `gcr.io/distroless/static:nonroot` | mirrorable | Runtime base, via `ARG BASE_IMAGE` in `Dockerfile.epp`. **Floating tag** — resolve to a digest before mirroring. |
 | `golang:1.26.8` | mirrorable | Builder image. Needed only if you rebuild. Must be **≥** the `go` directive in upstream's go.mod (currently `go 1.26.6`). **Floating tag.** |
 | `registry.redhat.io/rhaii/vllm-cpu-rhel9:3.5.0` | mirrorable | CPU inference path. Version tag, not a digest. |
@@ -438,8 +438,8 @@ Two. Both have a known unblock; neither is a design flaw in the plugin.
 
 **Finding.** `quay.io/rh-ee-dsivan/maas-fair-share` does not permit anonymous pulls. A
 registry auth token is issued, then the manifest GET for the digest currently pinned
-(`sha256:feba5e1d…`, see [§5.1](#51-container-images) — **confirm the live digest with
-`git log --oneline -- deploy/llmisvc.yaml` before mirroring; it has moved at least six times
+(`sha256:d496a0cf…`, see [§5.1](#51-container-images) — **confirm the live digest with
+`git log --oneline -- deploy/llmisvc.yaml` before mirroring; it has moved at least seven times
 since this repository's first Quay publish and will move again**) returns `UNAUTHORIZED`. An
 air-gapped mirror run without the robot credential will fail on the one image that *is*
 the deliverable, and it will fail at mirror time, not at deploy time.
@@ -450,7 +450,7 @@ the deliverable, and it will fail at mirror time, not at deploy time.
    credential:
    ```sh
    skopeo copy --all \
-     docker://quay.io/rh-ee-dsivan/maas-fair-share@sha256:feba5e1d81143e3eee79cce12f0c8ad4a43fd3683b2b73e13befbdd52c6a4255 \
+     docker://quay.io/rh-ee-dsivan/maas-fair-share@sha256:d496a0cf5075a1024b9f556524312653103eab14d656645dd8115d820905b537 \
      dir:/transfer/maas-fair-share-epp
    ```
    Carry the directory; load it with `skopeo copy dir:… docker://<internal-registry>/…`.
@@ -1125,20 +1125,24 @@ and is unaffected.
     Rung 6, or `deploy/poc/weight-split-check.py`, before citing a share number against
     this build.
 13. **`--scheduling-policy priority` on the GPU vLLM workload specifically.** Confirmed
-    accepted on the CPU vLLM path (same `vllm==0.24.0+rhaiv.9`); the GPU path's own
-    workload was deliberately left unpatched in this rewrite. Tracked as part of
-    [UNI-309](/UNI/issues/UNI-309) (critical, in progress), which tears down and
-    redeploys all three GPU lanes onto a fresh image with the flag set — check its
-    outcome before assuming this is still open.
+    accepted on the CPU vLLM path (same `vllm==0.24.0+rhaiv.9`). [UNI-309](/UNI/issues/UNI-309)
+    put the flag in the committed manifest (`deploy/poc/09-vllm-gpu.yaml`) and applied it
+    across all three GPU lanes on the rebuilt image. **Not yet verified: that the stamp
+    moves a live split on real GPU traffic.** UNI-309 only confirmed the mechanics (image
+    boots, config decodes, flag accepted) — see its own report for exactly what each lane's
+    pod health and `sfq_stamped_priority` check showed. The actual A/B fairness result is
+    the follow-up suite's job, explicitly blocked on this ticket.
 14. **Two uncommitted image digests found live on this cluster before this rewrite**
     (`sha256:617509...` on the CPU EPP, `sha256:5ddee9a...` seen there previously) were
     never traced to a source commit and are now overwritten. Whatever behaviour they
     carried relative to `main` at the time cannot be recovered.
-15. **The currently-pinned image (`sha256:feba5e1d...`, built at `8968cc4`) does not
-    contain UNI-302** (the decision log), one commit later. Do not set `sfqDecisionLog`
-    against it — strict decoding crash-loops the EPP. [UNI-309](/UNI/issues/UNI-309)
-    rebuilds past this point; this item retires once it lands and this file is updated
-    with the resulting digest.
+15. **Retired by UNI-309.** The image is now built from `main` tip (`6e49e0c`, which
+    contains UNI-302), re-pinned across all six manifests
+    (`sha256:d496a0cf5075a1024b9f556524312653103eab14d656645dd8115d820905b537`), and
+    `deploy/poc/00-config.yaml` carries `sfqPriorityStamp: true` for the first time — it
+    previously had none of the UNI-293/299/300/302 keys at all, not even at their `false`
+    defaults. `sfqDecisionLog` is committed `"off"`; flip it only for a single measurement
+    run per its own comment.
 
 **Roadmap beyond this document, in dependency order:** [UNI-309](/UNI/issues/UNI-309)
 (rebuild at current `main`, re-pin, redeploy all three GPU lanes with the scheduling flag)

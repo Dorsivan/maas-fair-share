@@ -998,6 +998,15 @@ def compute_phase_edges(schedule, chaos_events, run_duration):
     return sorted(e for e in edges if 0.0 <= e <= run_duration)
 
 
+# UNI-137 (B5): shared with build_report's whole-run UNCONTENDED verdict and
+# with compute_windows' per-window flag below (UNI-223/UNI-311) -- one number
+# so the two readings of "was this contended" can't drift apart. See the
+# module docstring's UNI-135 paragraph for the ~9s/240s reasoning this is
+# derived from.
+UNCONTENDED_SECONDS_THRESHOLD = 1.0
+UNCONTENDED_REFERENCE_RUN_SECONDS = 240.0
+
+
 def compute_windows(timeseries, schedule, weights):
     """One row per consecutive pair of time-series snapshots: per-group
     delivered-token delta, which groups were active at the window's midpoint,
@@ -1013,7 +1022,26 @@ def compute_windows(timeseries, schedule, weights):
     as before, but only a real restart sets any_restart; a failed scrape sets
     any_scrape_gap instead, so a flaky scrape doesn't get misread as a process
     restart with no corroborating pod/container evidence. Returns (windows,
-    any_restart, any_scrape_gap)."""
+    any_restart, any_scrape_gap).
+
+    UNI-311 (review of UNI-223's fix): a window's `uncontended` flag is now a
+    tri-state, not a bool, for the same reason build_report's whole-run
+    UNCONTENDED verdict requires two corroborating signals instead of one
+    (UNI-137): `contended_service_tokens_total` hitting zero for every active
+    group is also exactly what a *clamped* window looks like (the restart/
+    scrape-gap handling above forces every delta in it to 0.0), so the
+    tokens-only reading could not tell a genuinely quiet window apart from an
+    unobservable one. `uncontended` is `True` only when nothing in the window
+    was clamped AND `contended_seconds_total` stayed flat for every active
+    group too (the same corroborating metric the whole-run verdict reads);
+    `None` ("unknown") when the window was clamped -- the true value is
+    unobservable, not zero, and must keep disqualifying convergence exactly
+    as an ordinary out-of-threshold window would (compute_convergence only
+    short-circuits on `is True`, so `None` falls through to the normal
+    deviation check, same as `False`); `False` otherwise, e.g. tokens flat
+    but `contended_seconds` still advancing -- a long-request window that
+    delivered nothing this slice while still genuinely backlogged, which is
+    active non-convergence, not quiet."""
     if len(timeseries) < 2:
         return [], False, False
     t0 = timeseries[0][0]
@@ -1023,9 +1051,13 @@ def compute_windows(timeseries, schedule, weights):
     for (e0, _, s0, _scrape_failed0), (e1, _, s1, scrape_failed1) in zip(timeseries, timeseries[1:]):
         tok0 = s0.get("llm_d_epp_maas_fairness_contended_service_tokens_total", {})
         tok1 = s1.get("llm_d_epp_maas_fairness_contended_service_tokens_total", {})
+        seconds0 = s0.get("llm_d_epp_maas_fairness_contended_seconds_total", {})
+        seconds1 = s1.get("llm_d_epp_maas_fairness_contended_seconds_total", {})
         start_s, end_s = e0 - t0, e1 - t0
         mid_s = (start_s + end_s) / 2.0
         deltas = {}
+        seconds_deltas = {}
+        window_clamped = False
         for gid in schedule:
             b, a = tok0.get(gid, 0.0), tok1.get(gid, 0.0)
             d = a - b
@@ -1034,8 +1066,23 @@ def compute_windows(timeseries, schedule, weights):
                     any_scrape_gap = True
                 else:
                     any_restart = True
+                window_clamped = True
                 d = 0.0
             deltas[gid] = d
+
+            sb, sa = seconds0.get(gid), seconds1.get(gid)
+            if sb is None or sa is None:
+                seconds_deltas[gid] = None
+                continue
+            sd = sa - sb
+            if sd < 0:
+                if scrape_failed1:
+                    any_scrape_gap = True
+                else:
+                    any_restart = True
+                window_clamped = True
+                sd = 0.0
+            seconds_deltas[gid] = sd
         active = [g for g in schedule if tenant_active_at(schedule[g], mid_s)]
         weight_total = sum(weights.get(g) or 0.0 for g in active)
         tokens_total = sum(deltas.get(g, 0.0) for g in active)
@@ -1051,7 +1098,31 @@ def compute_windows(timeseries, schedule, weights):
         # are actually being served. See compute_convergence below, which
         # relies on this flag to tell a genuine non-convergence apart from
         # a window with nothing to converge from.
-        uncontended = bool(active) and tokens_total <= 0
+        #
+        # UNI-311: that alone is ambiguous with a clamped window (see the
+        # docstring above), so it is corroborated with contended_seconds_total
+        # scaled to this window's own duration -- the same order-of-magnitude
+        # margin the whole-run UNCONTENDED_SECONDS_THRESHOLD uses, linearly
+        # scaled down from its 240s reference run.
+        window_duration = end_s - start_s
+        seconds_threshold = (
+            UNCONTENDED_SECONDS_THRESHOLD * (window_duration / UNCONTENDED_REFERENCE_RUN_SECONDS)
+            if window_duration > 0 else UNCONTENDED_SECONDS_THRESHOLD
+        )
+
+        def _group_quiet(gid):
+            sd = seconds_deltas.get(gid)
+            if sd is not None:
+                return sd < seconds_threshold
+            return deltas.get(gid, 0.0) <= 0
+
+        tokens_flat = bool(active) and tokens_total <= 0
+        if window_clamped:
+            uncontended = None
+        elif tokens_flat and all(_group_quiet(g) for g in active):
+            uncontended = True
+        else:
+            uncontended = False
         groups = []
         for gid in schedule:
             is_active = gid in active
@@ -1546,7 +1617,15 @@ def compute_convergence(windows, phase_edges, threshold_points):
     reader the settled state found was uncontended quiet, not a real
     bounded split, so "never converged" / "converged because uncontended"
     / "converged with a real bounded split" read as three different
-    findings instead of being conflated into pass/fail."""
+    findings instead of being conflated into pass/fail.
+
+    UNI-311: `uncontended` is a tri-state (True/False/None), not a bool --
+    `in_threshold` below only short-circuits on `is True`. A clamped window
+    (`None`, an EPP restart or failed scrape mid-window) falls through to
+    the ordinary deviation check exactly like `False` does, so it keeps
+    disqualifying convergence instead of being misread as quiet -- the
+    true value is unobservable, not zero. See compute_windows for how the
+    three states are decided."""
     edges_sorted = sorted(phase_edges)
     results = []
     for i, edge in enumerate(edges_sorted):
@@ -1901,7 +1980,10 @@ def build_report(*, scenario, enforce, duration_seconds, backend, epp_image_dige
     # scored it FAIL ("the EPP accounted nothing for this run") when the
     # correct verdict is UNCONTENDED; see
     # test_open_loop_below_saturation_reports_uncontended_when_metric_never_materialized.
-    UNCONTENDED_SECONDS_THRESHOLD = 1.0
+    #
+    # UNI-311: this constant is now module-level (see above compute_windows)
+    # so the per-window uncontended flag and this whole-run verdict read the
+    # same number instead of two independently-maintained 1.0s.
     def _group_uncontended(g):
         seconds = contended_seconds_deltas.get(g)
         if seconds is not None:
@@ -2888,8 +2970,15 @@ def render_markdown(report):
                     return "n/a" if v is None else f"{v:.1f}{suffix}"
                 # UNI-223: "uncontended" only has a meaning while the group is
                 # active -- an inactive group's n/a observed%/deviation is
-                # schedule membership, not a contention state.
-                uncontended_cell = (str(w.get("uncontended", False)) if g["active"] else "n/a")
+                # schedule membership, not a contention state. UNI-311: a
+                # clamped window's true value is unobservable, not quiet --
+                # render it distinctly rather than as the `False` it
+                # disqualifies convergence the same way as.
+                raw_uncontended = w.get("uncontended")
+                uncontended_cell = (
+                    ("unknown (clamped)" if raw_uncontended is None else str(raw_uncontended))
+                    if g["active"] else "n/a"
+                )
                 lines.append(
                     f"| {w['start_s']:.1f} | {w['end_s']:.1f} | {g['group']} | {g['active']} | "
                     f"{uncontended_cell} | "

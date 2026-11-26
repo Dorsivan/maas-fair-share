@@ -10382,7 +10382,7 @@ equal 3.0/3.0 scorer weights:
 |---|---|---|---|
 | `full-contention` (regression) | **PASS** (max deviation 0.1pt) | phase 0: 10.0s | `results/20261126T012544Z-uni223-full-contention/` |
 | `b1-cold-join` (regression) | **PASS** (max deviation 1.0pt) | phase 0 (app1+app2 only): 0.0s, **uncontended** -- app1+app2 alone never cross thr32 either; phase 120 (end-users joins): 131.0s, a real settle 11s after the join | `results/20261126T013545Z-uni223-b1-cold-join/` |
-| `b2-tenant-leaves` (the ticket) | **PASS** (max deviation 0.1pt, whole-run) | phase 0: 10.0s; phase 120 (end-users leaves): 141.0s, **uncontended** (21s after departure) | `results/20261126T014257Z-uni223-b2-tenant-leaves/` |
+| `b2-tenant-leaves` (the ticket) | **PASS** (max deviation 0.2pt, whole-run) | phase 0: 10.0s; phase 120 (end-users leaves): 141.0s, **uncontended** (21s after departure) | `results/20261126T014257Z-uni223-b2-tenant-leaves/` |
 
 None of these three regressed or changed verdict from the fix -- `full-contention` and
 `b1-cold-join` stay PASS, and `b2-tenant-leaves`'s own whole-run verdict was already PASS before

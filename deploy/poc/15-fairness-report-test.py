@@ -1157,6 +1157,92 @@ def test_compute_windows_a_group_actually_getting_zero_share_is_not_uncontended(
     assert by_group["app2"]["deviation_pts"] == -50.0
 
 
+def test_compute_windows_restart_window_is_unknown_not_uncontended():
+    # UNI-311 (review of UNI-223's fix): tokens_total hitting zero because a
+    # counter went backwards (an EPP restart) looks identical, on the tokens
+    # signal alone, to a genuinely quiet window -- that ambiguity is exactly
+    # what let a restart read as "converged, uncontended" before this fix.
+    # The window's true value is unobservable, not zero, so it must come back
+    # unknown (None), not True.
+    schedule = fairness_report.resolve_schedule(None, {"app1", "app2"}, 20)
+    weights = {"app1": 66.7, "app2": 33.3}
+    tok = "llm_d_epp_maas_fairness_contended_service_tokens_total"
+    timeseries = [
+        (0, "t0", {tok: {"app1": 9000.0, "app2": 1000.0}}, False),
+        (10, "t1", {tok: {"app1": 50.0, "app2": 1200.0}}, False),  # app1 went backwards: restart
+    ]
+    windows, epp_restarted, scrape_gap = fairness_report.compute_windows(timeseries, schedule, weights)
+    assert epp_restarted is True
+    assert scrape_gap is False
+    assert windows[0]["uncontended"] is None
+
+
+def test_compute_windows_failed_scrape_window_is_unknown_not_uncontended():
+    # Same ambiguity as the restart case above, but for UNI-230's other
+    # clamp cause: the closing scrape itself failed outright, not a process
+    # restart. Either way the window's true value is unknown, not quiet.
+    schedule = fairness_report.resolve_schedule(None, {"app1", "app2"}, 20)
+    weights = {"app1": 66.7, "app2": 33.3}
+    tok = "llm_d_epp_maas_fairness_contended_service_tokens_total"
+    timeseries = [
+        (0, "t0", {tok: {"app1": 9000.0, "app2": 1000.0}}, False),
+        (10, "t1", {}, True),  # scrape failed outright: empty snapshot, not a reset
+    ]
+    windows, epp_restarted, scrape_gap = fairness_report.compute_windows(timeseries, schedule, weights)
+    assert epp_restarted is False
+    assert scrape_gap is True
+    assert windows[0]["uncontended"] is None
+
+
+def test_compute_windows_tokens_flat_while_contended_seconds_advancing_is_not_uncontended():
+    # The long-request regime (UNI-283/UNI-146): a 10s window can legitimately
+    # deliver zero contended tokens while the band is still heavily
+    # backlogged -- requests are in flight but none finished this slice. That
+    # is active non-convergence, not quiet, so it must NOT be corroborated as
+    # uncontended just because contended_service_tokens_total is flat.
+    schedule = fairness_report.resolve_schedule(None, {"app1", "app2"}, 20)
+    weights = {"app1": 66.7, "app2": 33.3}
+    tok = "llm_d_epp_maas_fairness_contended_service_tokens_total"
+    secs = "llm_d_epp_maas_fairness_contended_seconds_total"
+    timeseries = [
+        (0, "t0", {
+            tok: {"app1": 5000.0, "app2": 5000.0},
+            secs: {"app1": 100.0, "app2": 100.0},
+        }, False),
+        (10, "t1", {
+            tok: {"app1": 5000.0, "app2": 5000.0},  # flat: nobody finished this window
+            secs: {"app1": 105.0, "app2": 105.0},   # but both groups kept accruing contended time
+        }, False),
+    ]
+    windows, epp_restarted, scrape_gap = fairness_report.compute_windows(timeseries, schedule, weights)
+    assert epp_restarted is False
+    assert scrape_gap is False
+    assert windows[0]["uncontended"] is False
+
+
+def test_compute_convergence_unknown_tail_does_not_count_as_converged():
+    # UNI-311: contrast with test_compute_convergence_treats_uncontended_tail_
+    # as_converged below -- a clamped window (restart/scrape-gap) still
+    # carries the same manufactured full-magnitude deviation a clamp has
+    # always produced (every delta forced to 0.0). `uncontended=None` must
+    # NOT short-circuit that away the way `True` does; it has to fall through
+    # to the ordinary, disqualifying deviation check.
+    def window(start, end, dev, uncontended=False):
+        return {"start_s": start, "end_s": end, "uncontended": uncontended, "groups": [
+            {"group": "app1", "active": True, "deviation_pts": dev},
+            {"group": "app2", "active": True, "deviation_pts": -dev},
+        ]}
+    windows = [
+        window(0, 10, 15.2),
+        window(10, 20, 10.3),
+        window(20, 30, 25.0, uncontended=None),  # a restart/scrape-gap window: unknown, not quiet
+        window(30, 40, 25.0, uncontended=None),
+    ]
+    results = fairness_report.compute_convergence(windows, phase_edges=[0.0], threshold_points=10.0)
+    assert results[0]["converged_at_s"] is None
+    assert results[0]["converged_because_uncontended"] is None
+
+
 def test_compute_convergence_treats_uncontended_tail_as_converged():
     # UNI-223: mirrors the live b2-tenant-leaves finding at queueDepthThreshold
     # 32 -- a tenant leaves, the remaining two settle briefly with real

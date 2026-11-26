@@ -917,11 +917,15 @@ tenant idle long enough for its decayed tab to reach the newcomer-clamp
 floor returns on equal footing with whoever it finds already contending
 (by design — see `### Returning-from-idle clamp` above), is low-latency for
 its first dispatch, and converges back toward its configured weight share
-within roughly one settling period (~110–132s measured across
-UNI-141/142/143/144) once it is actually contending again; it earns no
-credit for having been away, and is not expected to make up the
-tokens/share it would have received had it been contending the whole time
-it chose to be idle. A scoring methodology that expects the latter (the
+within roughly one settling period once it is actually contending again
+(~110–132s measured across UNI-141/142/143/144 at that era's
+`queueDepthThreshold: 5`; UNI-223 re-measured the same guarantee at the
+now-live `queueDepthThreshold: 32` / `halfLifeSeconds: 60` config and found
+~10–20s while the pool stays contended -- see docs/poc-results.md "UNI-223"
+for the correction and why it does not apply once the pool drops out of
+contention); it earns no credit for having been away, and is not expected to
+make up the tokens/share it would have received had it been contending the
+whole time it chose to be idle. A scoring methodology that expects the latter (the
 pre-UNI-222 flat whole-run ratio, for any case with a declared idle/join
 schedule) is checking the wrong thing.
 

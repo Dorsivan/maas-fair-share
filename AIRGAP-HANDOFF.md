@@ -24,8 +24,9 @@ individual command.
 > under contention is the product — document it as the delivered result, not as a shortfall
 > against a floor that was never built.** [§2](#2-how-it-works-internally) states this
 > positively, with the live headline number (0.06–0.12 percentage points off target,
-> UNI-294, three repeats plus a control arm). A contractual floor is out of scope for this
-> version; it gets one line as scope, not a limitations section.
+> UNI-294, three repeats — `results/UNI-294-INDEX.md` has the full, precisely-sourced
+> comparison). A contractual floor is out of scope for this version; it gets one line as
+> scope, not a limitations section.
 >
 > **This repository's `main` and its deployed artifact were out of sync for two weeks**
 > before this rewrite: the SFQ stamp code merged to `main` on 2026-11-25, but every deploy
@@ -202,10 +203,12 @@ turned back off:
 share under contention is what this delivers, and it is what was asked for.** Under
 contention, each tenant converges to its configured weight's share of weighted token
 cost — that is the promise, stated plainly, not hedged. Measured live at
-**0.06–0.12 percentage points off target**, across three repeated runs plus a control arm
-that isolates the mechanism from the outcome ([UNI-294](docs/design.md#uni-293-sfq-priority-stamp);
-see `docs/poc-results.md` for the full run record). Properties that might read as caveats
-are the documented design, not shortfalls:
+**0.06–0.12 percentage points off target**, across three repeated runs, on a scenario
+with equal offered worker counts per tenant — so the result tracks the policy, not the
+load shape (UNI-294; `results/UNI-294-INDEX.md` has the full comparison, including a
+fourth run with the same EPP-side config that missed by 32.5 points — read it before
+citing these numbers). Properties that might read as caveats are the documented design,
+not shortfalls:
 
 - Share is *relative to who else is contending* — a tenant at weight 10 gets roughly 10.5%
   of the pool against two active rivals, and roughly 33% against one. It is not a quota
@@ -978,12 +981,23 @@ and is unaffected.
 ### Proven
 
 - **(Headline, UNI-294) The SFQ priority stamp holds the configured split to within
-  0.06–0.12 percentage points, live, on real contended traffic — three repeated runs,
-  plus a control arm (the stamp disabled, same load) that isolates the mechanism from the
-  outcome.** This is the result against the agreed specification ([§2](#2-how-it-works-internally)):
-  proportional share under contention, not a floor. See `docs/poc-results.md` for the full
-  run record; the live session used image tag `uni294-sfq-live`, not reproducible from a
-  committed manifest as of this writing (item 12 under "Not proven" below).
+  0.06–0.12 percentage points, live, on real contended traffic, across three repeated
+  runs** (0.057, 0.112, 0.120 pts; `results/20261125T0107/0115/0122*-uni294-arm2-run*`),
+  **on a scenario with equal offered worker counts per tenant** — so the tight split
+  tracks the configured *weights*, not the offered load shape, which is strong evidence.
+  A fourth run with the identical EPP-side config (`sfqPriorityStamp: true`) missed by
+  32.5 points (`...-arm3-isolation`) — the EPP-side config alone does not explain the
+  difference, and the most likely remaining variable is whether vLLM was actually running
+  `--scheduling-policy priority` for that run, consistent with the mechanism `docs/design.md`
+  describes, though that specific flag was not captured in this run's own artifacts (see
+  `results/UNI-294-INDEX.md` for the full, precisely-sourced comparison — read it before
+  citing these numbers, it corrects a wrong first-pass labelling of the arms from this same
+  rewrite). This is the result against the agreed specification
+  ([§2](#2-how-it-works-internally)): proportional share under contention, not a floor.
+  `docs/poc-results.md` does **not** contain this result (checked; it predates the stamp)
+  — `results/UNI-294-INDEX.md` is the full run record. The live session used image tag
+  `uni294-sfq-live`, not reproducible from a committed manifest as of this writing (item 12
+  under "Not proven" below).
 - The plugin builds into a custom EPP image, loads under both RHOAI 3.4-shaped and 3.5
   scheduler presets, and instantiates with zero flag-parse errors.
 - **On two A100s with real vLLM: 20.5% / 11.6% / 67.9% against a configured 20 / 10 / 65**,

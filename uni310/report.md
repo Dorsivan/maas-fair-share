@@ -8,7 +8,7 @@ Runs from 2026-11-26 02:12Z to 08:31Z, on lanes 2 (`poc-maas-lane2`) and 3 (`poc
 - An extra `kv-cache-utilization-scorer` (weight 2.0).
 - thr32 and halfLife 60 unchanged.
 
-Before any result came in, each row was classified as discriminating, non-discriminating, noise floor, dynamics, or solo (`classification.md`, commit 6c61fba). Enforcement was confirmed on every row via `llm_d_epp_maas_fairness_enforcing` (1 before the row, 0 after). The driver also proved the ConfigMap restore with a server-side dry-run diff after every row.
+Before any result came in, each row was classified as discriminating, non-discriminating, noise floor, dynamics, or solo (`classification.md`, commit 463b862). Enforcement was confirmed on every row via `llm_d_epp_maas_fairness_enforcing` (1 before the row, 0 after). The driver also proved the ConfigMap restore with a server-side dry-run diff after every row.
 
 ## Headline
 

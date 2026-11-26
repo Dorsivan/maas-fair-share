@@ -279,6 +279,88 @@ from zero (UNI-98)" above.
 
 ---
 
+## Enable the SFQ priority stamp (UNI-293/303)
+
+The procedures above get an EPP built, pushed and running; they do not by
+themselves prove the fix is doing anything. A pod built from an image with the
+UNI-293 stamp code, deployed with `sfqPriorityStamp: false` and vLLM not running
+`--scheduling-policy priority`, looks exactly like a healthy install and produces no
+fairness effect at all -- which is indistinguishable from a genuinely broken build.
+Confirm each step below; a committed default in a config file is not proof of what
+a given running pod actually loaded.
+
+1. **Confirm the image.** The stamp requires a build at or after `7aeb797`
+   (UNI-293); the decision log (`sfqDecisionLog`) requires `1f91d41` (UNI-302) or
+   later and will not merely no-op on an older image -- plugin config is decoded
+   with `DisallowUnknownFields`, so an EPP built before UNI-302 **crash-loops**
+   the moment `sfqDecisionLog` appears in its config at all, `"off"` included. Check
+   `git log --oneline -- deploy/llmisvc.yaml` for the digest actually pinned and
+   confirm it descends from the commit you need before relying on it. Roll both
+   the GPU and CPU scheduler to that image first -- they read the same
+   `maas-epp-config`.
+
+2. **Confirm `sfqPriorityStamp: true`** in the live `maas-epp-config`. `sfqPriorityStamp`
+   is **independent of `enforce`** -- it governs vLLM's own queue, not the EPP's pick
+   -- so it is not covered by whatever `enforce` happens to be set to, and checking
+   one tells you nothing about the other. `deploy/poc/00-config.yaml` (POC rig) has
+   shipped this key `true` since UNI-309; `deploy/epp-config.yaml` (production
+   template) still ships it `false`, same shadow-first convention as `enforce`, and
+   needs an explicit edit. Either way, set the key in the manifest and
+   `oc apply -f <that file> -n <namespace>` -- the ConfigMap edit alone reaches the
+   KServe-managed scheduler, since the `LLMInferenceService` controller watches
+   `scheduler.config.ref` and rolls the pod itself -- but it **recreates the EPP pod
+   and zeroes its counters**, the same as flipping `enforce` does (see "Live enforce
+   flip" below). Take any metrics snapshot you need before this step, not after.
+
+3. **Confirm `--scheduling-policy priority` is actually on the vLLM container.**
+   `deploy/poc/09-vllm-gpu.yaml` / `07-vllm-cpu.yaml` ship it since UNI-303, but
+   check the live Deployment, not just the manifest in git, if this deployment
+   was not a clean apply of the current repo. Flipping `sfqPriorityStamp` with
+   this flag missing fails **silently**: the plugin stamps `priority`, vLLM
+   ignores it, dispatch stays FIFO, and nothing in the logs says why. This is not
+   theoretical -- UNI-294's fourth run (`arm3-isolation`) had
+   `sfqPriorityStamp: true` on the EPP side and still missed the configured split
+   by 32.5 points; the leading explanation is that this flag was not actually in
+   effect for that run (`results/UNI-294-INDEX.md`). Also confirm
+   `router.scheduler.requestHandler.propagatePriority` is **not** `true` on the
+   `LLMInferenceService` -- if it is, the plugin refuses to start once the stamp
+   is on.
+
+4. **Flip `enforce: true`.** This does not gate the stamp -- `sfqPriorityStamp` is
+   independent of `enforce`, and governs vLLM's queue regardless of what `enforce`
+   is set to -- but it is still required to make the EPP's own pick (the 6–8% share
+   of requests the EPP holds directly) honour the weighted order instead of FCFS.
+   Use `ENFORCE_LIVE=true` on `15-fairness-benchmark.sh` (see "Live enforce flip,
+   and unconditional cleanup (UNI-174)" below), or patch the ConfigMap by hand the
+   same way as step 2. Wait for `llm_d_epp_maas_fairness_enforcing=1` on **both**
+   the GPU and CPU EPP metrics endpoints before trusting any result -- one
+   ConfigMap edit reaches both schedulers, and a result read before both confirm
+   is not a result.
+
+5. **Verify the stamp is actually landing**, independent of steps 1-4 each having
+   been done correctly -- any one of them can silently not take effect:
+   - `maas_fairness_sfq_enabled` reads `1`.
+   - `maas_fairness_sfq_stamped_priority{fairness_id}` is non-zero and
+     increasing per tenant.
+   - Or, with no metrics access: send one request per tenant and check the
+     response header `x-maas-fairness-priority` (needs `emitAttributionHeaders:
+     true`, shipped default) is present with distinct, non-zero values that grow
+     across repeated requests from the same tenant.
+
+   If the header is absent or the metric is flat zero, check, in order:
+   `sfqPriorityStamp` is `true` in the ConfigMap the **running pod** actually
+   loaded (its startup log echoes the effective config -- a file on disk is not
+   proof of what the pod has), then step 3's vLLM flag, then `propagatePriority`.
+   `deploy/poc/weight-split-check.py`'s `stamp_present` field checks all three
+   against a live tenant pair in one run.
+
+See [AIRGAP-HANDOFF.md §7.3b](../AIRGAP-HANDOFF.md#73b--enabling-the-sfq-priority-stamp)
+for the full version of this procedure, including the rolling-update deadlock this
+can trigger on a GPU pool with no spare capacity, and `docs/design.md`,
+"UNI-293: SFQ priority stamp", for why each of these steps exists.
+
+---
+
 ## A load run returned nothing / looks broken
 
 In order of how often it was the cause:

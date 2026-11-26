@@ -92,32 +92,52 @@ one registered plugin, pointed at by `LLMInferenceService.spec.router.scheduler`
 
 ## The algorithm
 
-Weighted least-attained-service. Each group carries a decaying **tab** of recently
-consumed tokens; the group with the lowest `tab ÷ weight` is served next. Equalising
-`tab ÷ weight` *is* proportional sharing, so the ratios converge on the configured
-weights without any constant describing how fast the GPUs are.
+Start-time fair queueing (SFQ). Each group has a **finish tag** that only ever moves
+forward: dispatching a request of cost `c` to group `g` sets its next start tag to
+`S = max(finish[g], V)`, then advances `finish[g] = S + c/weight[g]`. `V`, the
+system's virtual clock, is the *minimum* over currently-serving endpoints of the
+newest start tag each one has begun serving. The plugin stamps `S` into vLLM's own
+`priority` field, and vLLM's priority-ordered queue — where almost all in-flight
+requests actually sit, not the EPP's own small one — dispatches by that number.
+Equalising the rate finish tags advance *is* proportional sharing, so the ratios
+converge on the configured weights without any constant describing how fast the
+GPUs are.
 
-Three things make it work in practice, and each exists because the naive version
-fails without it:
+This replaced an earlier design (UNI-293) where the EPP ranked its *own* queue by a
+decaying **tab** of recently consumed tokens, the group with the lowest `tab ÷
+weight` going next. That mechanism is why the tab still exists — the finish tag is
+derived from it — but it stopped deciding dispatch order once the stamp landed: UNI-288
+found the EPP only ever held 6–8% of in-flight requests, with vLLM's own FIFO queue
+holding the rest and deciding the real order regardless of what the tab said. Under
+the stamp, the tab is accounting and metrics only; the newcomer clamp and the ratchet
+that used to protect it are off the dispatch path entirely (UNI-293's "one notion of
+accumulated service").
 
-- **Exponential decay** — the tab measures recent usage, not all-time. One lazy
-  `2^(-Δt/halfLife)` on read and write.
-- **Newcomer clamp** — a returning-idle tenant is raised to the current minimum, so it
-  goes first *once* rather than monopolising the pool for minutes. Without it,
-  consuming spare capacity becomes a debt and work conservation is poisoned.
+One thing from the tab-only design still matters and still runs:
+
 - **Provisional charge** — an estimate is charged at dispatch and trued up against the
   real `usage` block at completion. Generations take 10–30s while scheduling decisions
   happen every millisecond; without this a tenant dispatches thousands of requests
-  before any lands on its tab.
+  before any lands on its ledger.
+
+The stamp only decides anything if vLLM is actually running `--scheduling-policy
+priority` — with it absent, the plugin still stamps `priority`, vLLM just ignores it
+and dispatches FIFO, silently. See [docs/runbook.md](docs/runbook.md#enable-the-sfq-priority-stamp-uni-293303)
+for the enable procedure and [docs/design.md](docs/design.md) ("UNI-293: SFQ priority
+stamp") for the full mechanism, including the bounding (rebase/idle-reset) that keeps
+the tag from growing without limit.
 
 ## What it can and cannot promise
 
 - ✅ "Under contention, app1 receives at least 20% of delivered throughput."
 - ❌ "app1 is guaranteed 20,000 tokens/second."
 
-Capacity loss lowers everyone's absolute throughput together — the *ratio* holds, the
-*floor* does not. A tenant that sends no traffic receives nothing; capacity cannot be
-reserved for requests that have not arrived.
+**This is by design, not a shortfall.** The board settled (2026-11-25) that
+proportional share under contention is the product this plugin ships, and a
+contractual throughput floor is an explicit non-goal — not something later work is
+expected to close. Capacity loss lowers everyone's absolute throughput together; the
+*ratio* holds. A tenant that sends no traffic receives nothing, by the same logic:
+capacity cannot be reserved for requests that have not arrived.
 
 ## Platform compatibility
 
@@ -253,8 +273,24 @@ which parts of it the EPP architecture deletes outright.
 
 ## Rollout
 
-Ships with `enforce: false` — **shadow mode**. The plugin classifies every request,
-tracks every tab and publishes every metric, while leaving the existing dispatch order
-untouched. The algorithm is the part least likely to be wrong on day one; the group
-matching rules, the half-life and the cost weights are, and only real traffic knows
-them.
+Two independent switches, both shadow-first by convention — flipping one does not
+flip the other, and checking one does not tell you the other's state:
+
+- **`enforce`** governs the EPP's own pick, which only ever decided the ordering of
+  the small share of in-flight requests the EPP holds directly (6–8%, per UNI-288).
+  Ships `false`.
+- **`sfqPriorityStamp`** governs the start-time fair-queueing tag stamped into
+  vLLM's `priority` field — where the real reordering happens, since vLLM holds the
+  other 90%+. The Go-level default and the production config template
+  (`deploy/epp-config.yaml`) ship it `false`. The POC rig's committed config
+  (`deploy/poc/00-config.yaml`) has shipped it `true` since UNI-309, so a clean
+  deploy of this repo's own POC manifests is **not** shadow mode for dispatch order,
+  even with `enforce: false`.
+
+With either switch off, the plugin still classifies every request, tracks every
+tab/tag and publishes every metric — the switches only decide whether that
+bookkeeping is allowed to change serving order. The group matching rules, the
+half-life and the cost weights are the parts most likely to be wrong on day one, and
+only real traffic knows them; see
+[docs/runbook.md](docs/runbook.md#enable-the-sfq-priority-stamp-uni-293303) for how
+to check which state a given deployment is actually in.

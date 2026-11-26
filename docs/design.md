@@ -1174,7 +1174,7 @@ defaults (60 s, 900 s) were set against 5-25 s requests.
 **Observability.** Metrics `maas_fairness_sfq_enabled`, `_sfq_virtual_time`,
 `_sfq_serving_endpoints`, `_sfq_finish_tag{fairness_id}`,
 `_sfq_lag{fairness_id}` (F - V), `_sfq_stamped_priority{fairness_id}`,
-`_sfq_unsettled_total`, `_sfq_late_completions_total`, `_sfq_stale_dropouts_total`, `_sfq_rebases_total{reason}`, `_sfq_unstampable_total`. Response header
+`_sfq_unsettled_total`, `_sfq_late_completions_total`, `_sfq_stale_dropouts_total`, `_sfq_rebases_total{reason}`, `_sfq_unstampable_total`, `_sfq_floor_lift_total{fairness_id}` (UNI-315: accumulates `V - F_g` whenever the dispatch floor binds, since `_sfq_lag` is a gauge and does not). Response header
 `x-maas-fairness-priority` (when `emitAttributionHeaders`). Flight-recorder
 fields `sfqVirtualTime` and `sfqFinishTag`. V(4) fields `sfqPriority` and
 `sfqStartTag`. A `sfq` section in the `StateDumper` output with every
@@ -1687,6 +1687,7 @@ labels through `BoundFairnessID`, subsystem `llm_d_epp`:
 | `..._enforcing` | Gauge 0/1 | enforcing, or shadow mode |
 | `..._sfq_charged_cost_total{fairness_id}` | Counter | UNI-302. Cost booked to the group's SFQ finish tag, counted at settlement (measured actual, else the estimate) or at reap (worst case). `rate()` over `sum(rate())` is the live composition — see "UNI-302: the stamp explains itself" for the PromQL and why it means nothing outside contended time |
 | `..._sfq_dispatched_at_front_total{fairness_id}` | Counter | UNI-302. Dispatches stamped at rank 1 (no other group's next tag lower). Over `dispatch_total`, how often the group is at the front; a heavily weighted group should sit near 1 under contention |
+| `..._sfq_floor_lift_total{fairness_id}` | Counter | UNI-315. Sums `V − F_g` whenever the dispatch floor (`start = max(F_g, V)`) picks `V`. `sfq_lag` is a gauge and does not accumulate, so a standing leak here would not otherwise show up. A continuously backlogged group should read ~0; non-trivial, sustained growth on a high-weight group is the UNI-314 failure mode (its earned tag drowned by virtual time) — see the UNI-315 comment in `sfq.go` for why it did not reproduce offline |
 
 Do **not** label `unmatched_subscriptions_total` with the raw subscription string —
 that is attacker-controlled cardinality. Count it; put the values in the rate-limited

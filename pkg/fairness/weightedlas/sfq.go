@@ -34,6 +34,21 @@ package weightedlas
 // decays, so the true-up is undecayed by construction. See
 // Config.UndecayedTrueUp for the equivalent fix on the tab.
 //
+// UNI-314 diagnosed a live 98/1/1 failure (lanes 2 and 3, ~40pt) as this
+// floor binding on app1 on nearly every dispatch: sfq_charged_cost_total/w
+// put its earned tag at 41k but sfq_finish_tag read 1.53M, a 97% lift. UNI-315
+// tried to reproduce that offline -- weights 98/1/1, offered concurrency
+// 64/64/256, 2 endpoints x 8 slots, thr32, and variants (no EPP gate, KV
+// asymmetry between endpoints, a pool sized so app1's 64 workers cannot fill
+// it, run lengths to 1200s) -- and could not: sfq_floor_lift_total stayed at
+// 0 for app1 in every arm, including the one with the floor applied
+// unconditionally with no guard at all. The counter itself is verified live
+// (TestSFQSimNewcomerBehindDeepBacklog's returning tenant does floor-lift, as
+// expected). So the floor binding on a continuously backlogged group is not
+// reproducible from weights and offered concurrency alone in this harness;
+// see the UNI-315 comment on the ticket for what that leaves open. The
+// counter ships regardless, as the direct measure to watch live.
+//
 // The two halves do different jobs and both have to be right. The dispatch
 // estimate c sets THIS request's position: its own tag S is fixed the moment
 // it is stamped. The completion true-up corrects the group's FUTURE
@@ -471,6 +486,11 @@ func (s *sfqState) dispatch(now time.Time, id, group, endpoint string, weight, e
 	}
 	rec.FinishBefore = s.finish[group]
 	start := math.Max(rec.FinishBefore, s.v)
+	if s.v > rec.FinishBefore {
+		// UNI-315: the direct measure of the floor raising this group's tag
+		// above what it earned. See the package comment above.
+		sfqFloorLift.WithLabelValues(boundID(group)).Add(s.v - rec.FinishBefore)
+	}
 	s.finish[group] = start + est/weight
 	tag := quantiseTag(start)
 	priority := addSaturating(s.wireBase, tag)

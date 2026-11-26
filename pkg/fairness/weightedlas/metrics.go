@@ -286,6 +286,18 @@ var (
 			Help:      help("Requests rejected because their body could not be rewritten to carry the priority stamp."),
 		}, []string{"fairness_id"})
 
+	// UNI-315: sfq_lag is an instantaneous gauge and does not accumulate, which
+	// is why the floor's tax on a dominant tenant went unnoticed. This sums
+	// V - F_g every time the floor binds at dispatch (start = max(F_g, V) picks
+	// V over the group's own earned tag), so a standing leak shows up as a
+	// counter that keeps climbing rather than a gauge that comes and goes.
+	sfqFloorLift = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      metricPrefix + "sfq_floor_lift_total",
+			Help:      help("Tag units added above the group's earned finish tag by the max(F_g, V) floor binding at dispatch (V - F_g, when V > F_g)."),
+		}, []string{"fairness_id"})
+
 	// Non-zero means a client is setting `priority` itself, whether out of
 	// ignorance or as an attempt. Either way it was removed or overwritten.
 	clientPriorityOverwritten = prometheus.NewCounterVec(
@@ -323,6 +335,7 @@ func collectors() []prometheus.Collector {
 		sfqLateCompletions,
 		sfqStaleDropouts,
 		sfqUnstampable,
+		sfqFloorLift,
 		sfqChargedCost,
 		sfqDispatchedAtFront,
 		clientPriorityOverwritten,

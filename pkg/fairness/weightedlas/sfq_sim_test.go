@@ -58,6 +58,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -612,6 +613,62 @@ func TestSFQSimFlood(t *testing.T) {
 	sh := r.share(prm.warmup, prm.duration)
 	sfqSimLog(t, "flood, 256 workers/tenant", r, sh, target)
 	assert.Less(t, sfqSimDev(sh, target), 2.0)
+}
+
+// UNI-315: the offline reproduction attempt for UNI-314's live diagnosis
+// (lanes 2 and 3, f3-98-1-1, ~40pt miss: app1's finish tag was measured 97%
+// floor lift, sfq_charged_cost_total/w at 41k against sfq_finish_tag at
+// 1.53M). This arm matches the failing row's parameters exactly -- weights
+// 98/1/1, offered concurrency 64/64/256, 2 endpoints x 8 seqs (the row's
+// real backend: 2 vLLM replicas at --max-num-seqs 8), thr32 EPP hold -- and
+// does NOT reproduce it: sfq_floor_lift_total{app1} is 0 and the composition
+// lands within 0.2pt of target.
+//
+// That is not for lack of trying. Floor lift also stayed at 0 with: the EPP
+// hold removed (hold 0, ordering entirely vLLM-side); one endpoint made
+// KV-bound to induce the stale-dropout that TestSFQSimStaleWindowRule shows
+// does happen in this harness; run length out to 1200 s; sigma up to 1.0.
+// The counter itself is not silently broken -- it reads 5760 tag units in
+// TestSFQSimNewcomerBehindDeepBacklog, where the floor legitimately binds on
+// a returning group. A separate sweep (not kept here) found a pool sized so
+// app1's 64 workers cannot fill it (e.g. 10 endpoints x 8) DOES produce a
+// large deviation, but with floor lift still 0 -- that is plain work
+// conservation (app1 is not offering enough concurrency to claim its weight
+// share of a bigger pool), the mechanism TestSFQSimUnequalWorkers already
+// documents, not the diagnosed defect.
+//
+// Per the gate in UNI-315: this is the predicted ~40pt deviation /
+// ~90%+-of-tag floor lift failing to reproduce, so no fix (F1/F2/F3) is
+// implemented or shipped from this ticket. sfq_floor_lift_total ships
+// anyway, as the direct live measure, since sfq_lag is a gauge and does not
+// accumulate. See the UNI-315 comment thread for the open question: the live
+// anomaly may need a trigger this closed-loop, uniform-service-time model
+// cannot produce (sfq_serving_endpoints transiently dropping to 1, which
+// UNI-314 observed as a single ~20 s excursion, not a steady-state
+// condition), possibly tied to real infrastructure jitter the lane 2 run
+// shared with an overlapping lane 3 benchmark (see concurrent-runs.txt in
+// that run's artifacts).
+//
+// Not parallel: it reads the process-global sfq_floor_lift_total{app1},
+// which other parallel sim tests in this package also increment.
+func TestSFQSimDominantCannotReproduceUNI314FloorLift(t *testing.T) {
+	tenants := []sfqSimTenant{{"app1", 98}, {"app2", 1}, {"end-users", 1}}
+	order := []string{"app1", "app2", "end-users"}
+	target := sfqSimTargetOf(tenants)
+
+	liftBefore := testutil.ToFloat64(sfqFloorLift.WithLabelValues("app1"))
+	prm := sfqSimBase(0)
+	prm.tenants = tenants
+	prm.workers = map[string]int{"app1": 64, "app2": 64, "end-users": 256}
+	prm.hold = 32
+	r := runSFQSim(t, prm)
+	sh := r.share(prm.warmup, prm.duration)
+	lift := testutil.ToFloat64(sfqFloorLift.WithLabelValues("app1")) - liftBefore
+	t.Logf("f3-98-1-1 offline: served %s target %s dev %.1f pt, app1 floor lift %.0f",
+		fmtShareOf(order, sh), fmtShareOf(order, target), sfqSimDev(sh, target), lift)
+	assert.Less(t, sfqSimDev(sh, target), 2.0,
+		"this row's parameters compose correctly offline -- the UNI-314 live failure did not reproduce here")
+	assert.Zero(t, lift, "the floor must not bind on app1 at this configuration, or UNI-315's null result above is stale")
 }
 
 // Unequal worker counts: the stamp composes by weight, not by who sends more,

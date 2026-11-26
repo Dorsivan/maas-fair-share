@@ -1039,12 +1039,25 @@ def compute_windows(timeseries, schedule, weights):
         active = [g for g in schedule if tenant_active_at(schedule[g], mid_s)]
         weight_total = sum(weights.get(g) or 0.0 for g in active)
         tokens_total = sum(deltas.get(g, 0.0) for g in active)
+        # UNI-223: tokens_total == 0 with active groups present means nobody
+        # delivered any contended service tokens this window -- most often
+        # because remaining demand dropped below the admission-control
+        # threshold once another tenant stopped offering load, so the pool
+        # went uncontended and the EPP correctly stopped holding/arbitrating
+        # anything. That is "no share was measured," not "every group's
+        # share fell to zero" -- treating it as the latter (the old
+        # `else 0.0`) manufactures a permanent full-magnitude deviation
+        # that can never resolve, no matter how well the remaining tenants
+        # are actually being served. See compute_convergence below, which
+        # relies on this flag to tell a genuine non-convergence apart from
+        # a window with nothing to converge from.
+        uncontended = bool(active) and tokens_total <= 0
         groups = []
         for gid in schedule:
             is_active = gid in active
             expected_pct = 100.0 * weights.get(gid, 0.0) / weight_total if is_active and weight_total > 0 else None
             if is_active:
-                observed_pct = 100.0 * deltas.get(gid, 0.0) / tokens_total if tokens_total > 0 else 0.0
+                observed_pct = 100.0 * deltas.get(gid, 0.0) / tokens_total if tokens_total > 0 else None
             else:
                 observed_pct = None
             deviation = (observed_pct - expected_pct) if (expected_pct is not None and observed_pct is not None) else None
@@ -1056,7 +1069,7 @@ def compute_windows(timeseries, schedule, weights):
                 "observed_share_pct": observed_pct,
                 "deviation_pts": deviation,
             })
-        windows.append({"start_s": start_s, "end_s": end_s, "groups": groups})
+        windows.append({"start_s": start_s, "end_s": end_s, "groups": groups, "uncontended": uncontended})
     return windows, any_restart, any_scrape_gap
 
 
@@ -1516,25 +1529,47 @@ def compute_convergence(windows, phase_edges, threshold_points):
     active group's deviation stays within threshold_points for the rest of
     that phase (up to the next edge). A single in-threshold window surrounded
     by out-of-threshold ones does not count -- "converges and stays there" is
-    the literal bar this ticket sets."""
+    the literal bar this ticket sets.
+
+    UNI-223: a window compute_windows flagged `uncontended` (no active group
+    delivered any contended service tokens) counts as in-threshold rather
+    than disqualifying convergence. There is no measured deviation to
+    converge from when nothing was being arbitrated -- most often because
+    remaining demand dropped below the admission-control threshold once
+    another tenant stopped offering load. Before this, such a window had
+    every active group's deviation forced to its full negative expected
+    share (compute_windows used to read "nobody delivered tokens" as
+    "everybody's observed share is 0%"), which is a permanent, unresolvable
+    "out of threshold" reading that is reported back as "never converged in
+    this phase" regardless of how well the remaining tenants are actually
+    being served. `converged_because_uncontended` on the result tells a
+    reader the settled state found was uncontended quiet, not a real
+    bounded split, so "never converged" / "converged because uncontended"
+    / "converged with a real bounded split" read as three different
+    findings instead of being conflated into pass/fail."""
     edges_sorted = sorted(phase_edges)
     results = []
     for i, edge in enumerate(edges_sorted):
         next_edge = edges_sorted[i + 1] if i + 1 < len(edges_sorted) else float("inf")
         segment = [w for w in windows if w["start_s"] >= edge - 1e-9 and w["start_s"] < next_edge]
         converged_at = None
+        converged_because_uncontended = None
         for j, w in enumerate(segment):
             rest = segment[j:]
 
             def in_threshold(win):
+                if win.get("uncontended"):
+                    return True
                 devs = [g["deviation_pts"] for g in win["groups"] if g["active"] and g["deviation_pts"] is not None]
                 return bool(devs) and all(abs(d) <= threshold_points for d in devs)
 
             if all(in_threshold(w2) for w2 in rest):
                 converged_at = w["start_s"]
+                converged_because_uncontended = all(w2.get("uncontended") for w2 in rest)
                 break
         results.append({
             "phase_edge_s": edge,
+            "converged_because_uncontended": converged_because_uncontended,
             "converged_at_s": converged_at,
             "seconds_to_converge": (converged_at - edge) if converged_at is not None else None,
         })
@@ -2835,6 +2870,8 @@ def render_markdown(report):
         lines.append("|---|---|---|")
         for c in t["convergence"]:
             conv = "n/a (never converged in this phase)" if c["converged_at_s"] is None else f"{c['converged_at_s']:.1f}"
+            if c["converged_at_s"] is not None and c.get("converged_because_uncontended"):
+                conv += " (uncontended -- no group delivered contended tokens from here on, nothing was being arbitrated)"
             secs = "n/a" if c["seconds_to_converge"] is None else f"{c['seconds_to_converge']:.1f}"
             lines.append(f"| {c['phase_edge_s']:.1f} | {conv} | {secs} |")
         lines.append("")
@@ -2843,14 +2880,19 @@ def render_markdown(report):
                       (", a metrics scrape failed mid-window at least once (UNI-230, not a restart)" if t.get("windows_scrape_gap") else "") +
                       "):")
         lines.append("")
-        lines.append("| start (s) | end (s) | group | active | delivered tokens | expected % | observed % | deviation (pts) |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append("| start (s) | end (s) | group | active | uncontended | delivered tokens | expected % | observed % | deviation (pts) |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for w in t["windows"]:
             for g in w["groups"]:
                 def wfmt(v, suffix=""):
                     return "n/a" if v is None else f"{v:.1f}{suffix}"
+                # UNI-223: "uncontended" only has a meaning while the group is
+                # active -- an inactive group's n/a observed%/deviation is
+                # schedule membership, not a contention state.
+                uncontended_cell = (str(w.get("uncontended", False)) if g["active"] else "n/a")
                 lines.append(
                     f"| {w['start_s']:.1f} | {w['end_s']:.1f} | {g['group']} | {g['active']} | "
+                    f"{uncontended_cell} | "
                     f"{wfmt(g['delivered_tokens'])} | {wfmt(g['expected_share_pct'], '%')} | "
                     f"{wfmt(g['observed_share_pct'], '%')} | {wfmt(g['deviation_pts'])} |"
                 )

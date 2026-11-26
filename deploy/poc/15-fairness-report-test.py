@@ -1113,6 +1113,104 @@ def test_compute_convergence_reports_none_when_it_never_settles():
     assert results[0]["seconds_to_converge"] is None
 
 
+def test_compute_windows_uncontended_window_reports_none_not_zero_deviation():
+    # UNI-223: app1/app2 stop delivering ANY contended tokens for a window
+    # (e.g. remaining demand dropped below the admission threshold once
+    # another tenant left) while both are still active/offered. The old
+    # behaviour forced observed_share_pct to 0.0 for both, manufacturing a
+    # full-magnitude deviation from a state where nothing was measured.
+    schedule = fairness_report.resolve_schedule(None, {"app1", "app2"}, 20)
+    weights = {"app1": 66.7, "app2": 33.3}
+    tok = "llm_d_epp_maas_fairness_contended_service_tokens_total"
+    timeseries = [
+        (0, "t0", {tok: {"app1": 5000.0, "app2": 5000.0}}, False),
+        (10, "t1", {tok: {"app1": 5000.0, "app2": 5000.0}}, False),  # flat: nobody delivered anything
+    ]
+    windows, _, _ = fairness_report.compute_windows(timeseries, schedule, weights)
+    assert len(windows) == 1
+    w = windows[0]
+    assert w["uncontended"] is True
+    by_group = {g["group"]: g for g in w["groups"]}
+    for gid in ("app1", "app2"):
+        assert by_group[gid]["active"] is True
+        assert by_group[gid]["expected_share_pct"] is not None  # the target is still known
+        assert by_group[gid]["observed_share_pct"] is None      # but nothing was observed
+        assert by_group[gid]["deviation_pts"] is None            # so no deviation is claimed either way
+
+
+def test_compute_windows_a_group_actually_getting_zero_share_is_not_uncontended():
+    # Contrast case: app2 is active and gets genuinely 0% of a nonzero pool
+    # (app1 took everything) -- that IS a real, scoreable deviation and must
+    # stay distinct from the "nobody got anything" uncontended case above.
+    schedule = fairness_report.resolve_schedule(None, {"app1", "app2"}, 20)
+    weights = {"app1": 50.0, "app2": 50.0}
+    tok = "llm_d_epp_maas_fairness_contended_service_tokens_total"
+    timeseries = [
+        (0, "t0", {tok: {"app1": 0.0, "app2": 0.0}}, False),
+        (10, "t1", {tok: {"app1": 1000.0, "app2": 0.0}}, False),
+    ]
+    windows, _, _ = fairness_report.compute_windows(timeseries, schedule, weights)
+    w = windows[0]
+    assert w["uncontended"] is False
+    by_group = {g["group"]: g for g in w["groups"]}
+    assert by_group["app2"]["observed_share_pct"] == 0.0
+    assert by_group["app2"]["deviation_pts"] == -50.0
+
+
+def test_compute_convergence_treats_uncontended_tail_as_converged():
+    # UNI-223: mirrors the live b2-tenant-leaves finding at queueDepthThreshold
+    # 32 -- a tenant leaves, the remaining two settle briefly with real
+    # (bounded) deviations, then the pool drops out of contention entirely
+    # for the rest of the phase (nobody delivers any more contended tokens).
+    # That tail must read as "converged, uncontended," not "never converged."
+    def window(start, end, dev, uncontended=False):
+        return {"start_s": start, "end_s": end, "uncontended": uncontended, "groups": [
+            {"group": "app1", "active": True, "deviation_pts": None if uncontended else dev},
+            {"group": "app2", "active": True, "deviation_pts": None if uncontended else -dev},
+        ]}
+    windows = [
+        window(0, 10, 15.2),
+        window(10, 20, 10.3),
+        window(20, 30, 0.0, uncontended=True),
+        window(30, 40, 0.0, uncontended=True),
+        window(40, 50, 0.0, uncontended=True),
+    ]
+    results = fairness_report.compute_convergence(windows, phase_edges=[0.0], threshold_points=10.0)
+    assert results[0]["converged_at_s"] == 20.0
+    assert results[0]["converged_because_uncontended"] is True
+
+
+def test_compute_convergence_uncontended_does_not_mask_real_divergence_after_it():
+    # An uncontended lull followed by a real out-of-threshold window must
+    # still report "never converged" -- going quiet once doesn't retroactively
+    # excuse a later genuine deviation.
+    def window(start, end, dev=None, uncontended=False):
+        return {"start_s": start, "end_s": end, "uncontended": uncontended, "groups": [
+            {"group": "app1", "active": True, "deviation_pts": dev},
+        ]}
+    windows = [
+        window(0, 10, uncontended=True),
+        window(10, 20, dev=25.0),  # genuinely diverges again, right up to the end
+    ]
+    results = fairness_report.compute_convergence(windows, phase_edges=[0.0], threshold_points=10.0)
+    assert results[0]["converged_at_s"] is None
+    assert results[0]["converged_because_uncontended"] is None
+
+
+def test_compute_convergence_real_settle_is_not_mislabeled_uncontended():
+    # A genuine, bounded settle (never uncontended) must keep
+    # converged_because_uncontended False, not None/True -- the UNI-223 flag
+    # should only ever fire when the tail it found really was quiet.
+    def window(start, end, dev):
+        return {"start_s": start, "end_s": end, "uncontended": False, "groups": [
+            {"group": "app1", "active": True, "deviation_pts": dev},
+        ]}
+    windows = [window(0, 10, 30.0), window(10, 20, 2.0), window(20, 30, -1.0)]
+    results = fairness_report.compute_convergence(windows, phase_edges=[0.0], threshold_points=10.0)
+    assert results[0]["converged_at_s"] == 10.0
+    assert results[0]["converged_because_uncontended"] is False
+
+
 def test_compute_convergence_per_phase_edge_resets_the_window():
     # Two phases: [0,20) settles immediately; a chaos event at t=20 knocks it
     # back out of threshold, and it re-settles at t=40. Convergence for the

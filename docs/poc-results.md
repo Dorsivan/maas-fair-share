@@ -10326,3 +10326,118 @@ latency cost is required.
 via `oc get configmap maas-epp-config` after the final run, matching the committed
 `deploy/poc/00-config.yaml` baseline exactly. No plugin code was changed (out of scope per the
 ticket). New tooling only: `deploy/poc/28-vllm-queue-scrape.sh`.
+
+## UNI-223: `b2-tenant-leaves` "never converges" at thr32 -- a reporting bug, not a settling failure; the real post-departure gap closes in ~20s, under threshold, before it finishes
+
+[UNI-218](/UNI/issues/UNI-218) found `b2-tenant-leaves` split-verdict PASS at the live config
+(`queueDepthThreshold: 32`, `halfLifeSeconds: 60`) while its own windowed time-to-converge table
+said "never converged in this phase" at both phase edges (120s and 240s). The ask: is that genuine
+slow settling, a phase-length/half-life artifact ([UNI-201](/UNI/issues/UNI-201) warned the
+whole-run ratio misleads for staggered membership changes), confirm whether the original
+threshold-5 series' ~55% throughput dip at departure still happens at thr32, and fix or document
+the real guarantee.
+
+**Root cause: `compute_windows` conflated "nothing was measured" with "everything deviated to
+zero."** `15-fairness-report.py`'s per-window share calculation divided each active group's
+delivered tokens by the window's *total* delivered tokens across all active groups, falling back
+to `observed_share_pct = 0.0` whenever that total was zero. A window where the pool went
+uncontended -- nobody's requests were being held/arbitrated, so
+`llm_d_epp_maas_fairness_contended_service_tokens_total` simply stopped incrementing for everyone
+-- was indistinguishable from "every active group's observed share actually fell to 0%." The
+latter is a huge, permanent deviation from any nonzero expected share; `compute_convergence` saw
+that and correctly reported "never converged," because by that math it never did. This is the same
+failure class as the missing-Prometheus-label lesson from earlier tickets (absent means never-
+measured, not zero) -- just at the level of the window's own total instead of one group's label.
+
+**Confirmed independently, not just inferred from the report's own numbers.** The UNI-224
+saturation-limb reconstruction (`compute_saturation_limb`, driven by the EPP's own
+`llm_d_epp_average_queue_size` / `queueDepthThreshold` ratio -- the actual admission-control
+gate, nothing to do with the fairness plugin's token ledger) crosses below 1.0 -- the point the
+gate stops holding requests at all -- between t+131s and t+141s on the fresh run below, the exact
+same 10s window `contended_service_tokens_total` goes flat for both remaining tenants. Two
+independent signals agree to within one window: once `end-users` drains, app1+app2's combined
+demand (64 closed-loop workers against this backend) does not sustain the pool above
+`queueDepthThreshold: 32`, so the EPP correctly stops holding/arbitrating anything -- there is
+nothing left to converge, not a mechanism failing to converge.
+
+**The fix (`15-fairness-report.py`, UNI-223):** a window with active groups but zero total
+delivered contended tokens is now flagged `uncontended`, and both active groups' `observed_share_pct`
+/ `deviation_pts` are reported as `None` ("not measured"), not `0.0`. `compute_convergence` treats
+an `uncontended` window as trivially in-threshold (there is no deviation to disqualify it on) and
+reports `converged_because_uncontended` so a reader can tell "settled because nothing is being
+arbitrated" apart from "settled with a real, bounded split." The rendered report surfaces this on
+both the time-to-converge table (an inline note on the converged-at cell) and the per-window table
+(a new `uncontended` column). Five new unit tests cover the window-level fix, the convergence-level
+fix, and the two ways it must NOT fire (a group genuinely getting 0% of a nonzero pool; a real
+divergence that happens to follow an uncontended lull). All 104 of `15-fairness-report-test.py`'s
+cases (99 previous + 5 new) pass.
+
+**Re-measured live, current main tip, thr32** (the SFQ priority stamp has been live since
+[UNI-309](/UNI/issues/UNI-309); the committed Nov 10 artifact behind UNI-218's original finding
+predates it). Three runs, `enforce: true` self-reverting per run
+(`ENFORCE_LIVE=true`), `queueDepthThreshold: 32`, `halfLifeSeconds: 60`, weights 20/10/65/5,
+equal 3.0/3.0 scorer weights:
+
+| scenario | verdict | time-to-converge | raw results |
+|---|---|---|---|
+| `full-contention` (regression) | **PASS** (max deviation 0.1pt) | phase 0: 10.0s | `results/20261126T012544Z-uni223-full-contention/` |
+| `b1-cold-join` (regression) | **PASS** (max deviation 1.0pt) | phase 0 (app1+app2 only): 0.0s, **uncontended** -- app1+app2 alone never cross thr32 either; phase 120 (end-users joins): 131.0s, a real settle 11s after the join | `results/20261126T013545Z-uni223-b1-cold-join/` |
+| `b2-tenant-leaves` (the ticket) | **PASS** (max deviation 0.1pt, whole-run) | phase 0: 10.0s; phase 120 (end-users leaves): 141.0s, **uncontended** (21s after departure) | `results/20261126T014257Z-uni223-b2-tenant-leaves/` |
+
+None of these three regressed or changed verdict from the fix -- `full-contention` and
+`b1-cold-join` stay PASS, and `b2-tenant-leaves`'s own whole-run verdict was already PASS before
+and after (the bug was confined to the windowed convergence table, which carries no verdict).
+
+**Answering the ticket's three questions:**
+
+1. **Neither "genuinely slow" nor "phase too short for the half-life" -- a third thing: remaining
+   demand drops below the admission floor.** `b1-cold-join`'s post-join settle (131.0s, 11s after
+   the t=120 edge) and `b2-tenant-leaves`'s own pre-departure settle (10.0s) show the mechanism
+   itself converges in 10-20s whenever the pool stays genuinely contended -- both comfortably under
+   the 60s half-life, nothing like "a 120s phase leaves little room." The post-departure phase in
+   `b2-tenant-leaves` does start a real transient (window 121-131s: app1/app2 at +2.4/-2.4pts,
+   already in-threshold; window 131-141s: -26.6/+26.6pts, briefly *worse*) but the pool drops out
+   of contention at t+141s -- about 20s after the departure, before that transient resolves under
+   the fairness mechanism's own action. The windowed table's "converged at 141.0s, uncontended" is
+   therefore honest about what actually happened: the question stopped applying, not that it
+   was answered.
+2. **No throughput dip at thr32 -- the opposite.** Dispatched-request counts per 10s window
+   (`llm_d_epp_flow_control_request_queue_duration_seconds`, `outcome="Dispatched"` -- a count
+   independent of the contended-token ledger, so it still means something once the pool goes
+   uncontended) go from app1=41/app2=22 (window 111-121s, still contended, p50 waits 1.9s/7.5s) to
+   app1=146/app2=73 (window 141-151s, uncontended, p50 waits 0ms/0ms) -- roughly tripling, not
+   dipping. The original threshold-5 series' ~55% dip came from the admission gate staying *closed*
+   through the transition, smoothing the capacity handoff under the fairness mechanism's control;
+   at thr32 the gate opens immediately once demand drops, so there is no smoothing phase to produce
+   a dip in -- app1/app2 get immediate, unthrottled access to the freed capacity instead.
+3. **Fix applied (the report), and the guarantee to document (the design):** the 60s half-life
+   guarantees settling within roughly 10-20s of a genuine contended-membership change (both
+   measurements here, and the original A-series numbers, are well inside it) -- but only while the
+   pool stays above `queueDepthThreshold`. Below that, "time to converge" is not a meaningful
+   question: the EPP is correctly not arbitrating anything, and "converged because uncontended" is
+   the correct terminal state, not a target to avoid. **Scenario target correction:** `b2-tenant-
+   leaves`'s pass criteria ("app1 and app2 absorb the freed pool within about one half-life,
+   holding their 2:1 ratio, with no dip in throughput") should read, at thr32 specifically: the
+   mechanism must settle any residual imbalance within one half-life *while the pool remains
+   contended*; if remaining demand drops below the admission threshold first, reaching
+   "uncontended" before the half-life elapses is a PASS, not a failure to converge.
+
+**Not fixed, out of scope, pre-existing and shared by every scenario:** the 240.0s (run-end) phase
+edge still reads "never converged in this phase" in all three reports above, including the two
+regression scenarios. Every tenant's schedule entry ends at `run_duration` by construction
+(`compute_phase_edges`/`resolve_schedule`), so this edge always starts a phase with zero active
+tenants for the rest of the run; a pre-UNI-294 test (`test_build_report_timeline_section_populated_
+with_timeseries_and_config`) already shows a 20s default-schedule run getting `phase_edges ==
+[0.0, 20.0]` with the same trailing n/a. This is a cosmetic quirk of "the end of the run is itself
+a phase edge," not a convergence defect, and is unrelated to the UNI-223 fix above.
+
+**Cluster restored.** `enforce: false` confirmed after the final (`b2-tenant-leaves`) snapshot via
+`ENFORCE_LIVE=true`'s own self-revert (`15-fairness-benchmark.sh`'s existing contract, unchanged by
+this ticket) -- `oc get configmap maas-epp-config` shows `enforce: false`,
+`queueDepthThreshold: 32`, weights 20/10/65/5, scorer weights 3.0/2.0/3.0, matching
+`deploy/poc/00-config.yaml` exactly. No live config was left in a non-baseline state between runs
+either, since the flag self-reverts per invocation. Saturation limb: all three runs bound on
+`queue` throughout their contended windows (`kv_ratio` stayed at 0.000 -- KV cache utilization
+reads zero on this backend at these worker counts, consistent with every prior UNI-224 finding).
+Scratch driver: `uni223-batch.sh` (repo working tree root, not committed -- mirrors UNI-218's
+`batchB.sh` `do_run` pattern).
